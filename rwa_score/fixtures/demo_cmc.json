@@ -1,0 +1,242 @@
+{
+  "meta": {
+    "kind": "demo_fixture",
+    "label": "DEMO FIXTURE DATA — not live CoinMarketCap API responses",
+    "generated_for": "CMC Build-a-thon offline judging",
+    "note": "Payload shapes follow public CMC Pro RWA docs. Values are synthetic so the demo runs without an API key and without burning credits."
+  },
+  "map": [
+    {
+      "name": "Nvidia Corp",
+      "symbol": "NVDA",
+      "slug": "nvidia",
+      "rwa_id": 2,
+      "asset_type": "stock",
+      "rwa_rank": 2,
+      "has_tokens": true
+    },
+    {
+      "name": "Tesla Inc",
+      "symbol": "TSLA",
+      "slug": "tesla",
+      "rwa_id": 15,
+      "asset_type": "stock",
+      "rwa_rank": 8,
+      "has_tokens": true
+    },
+    {
+      "name": "Apple Inc",
+      "symbol": "AAPL",
+      "slug": "apple",
+      "rwa_id": 16,
+      "asset_type": "stock",
+      "rwa_rank": 3,
+      "has_tokens": true
+    },
+    {
+      "name": "Meta Platforms Inc",
+      "symbol": "META",
+      "slug": "meta-platforms",
+      "rwa_id": 18,
+      "asset_type": "stock",
+      "rwa_rank": 6,
+      "has_tokens": true
+    }
+  ],
+  "info": {
+    "2": {
+      "name": "Nvidia Corp",
+      "symbol": "NVDA",
+      "slug": "nvidia",
+      "website": "https://www.nvidia.com",
+      "employees": 36000,
+      "founded": "1993-04-04",
+      "industry": "Semiconductors & Related Devices",
+      "cik": "0001045810",
+      "rwa_id": 2,
+      "asset_type": "stock",
+      "primary_exchange": "Nasdaq",
+      "issuer": { "name": "Backed Finance" }
+    },
+    "15": {
+      "name": "Tesla Inc",
+      "symbol": "TSLA",
+      "slug": "tesla",
+      "website": "https://www.tesla.com",
+      "employees": 140000,
+      "founded": "2003-07-01",
+      "industry": "Motor Vehicles",
+      "cik": null,
+      "rwa_id": 15,
+      "asset_type": "stock",
+      "primary_exchange": "Nasdaq",
+      "issuer": { "name": "NoteVault Demo Issuer" }
+    },
+    "16": {
+      "name": "Apple Inc",
+      "symbol": "AAPL",
+      "slug": "apple",
+      "website": "https://www.apple.com",
+      "employees": 164000,
+      "founded": "1976-04-01",
+      "industry": "Electronic Computers",
+      "cik": "0000320193",
+      "rwa_id": 16,
+      "asset_type": "stock",
+      "primary_exchange": "Nasdaq",
+      "issuer": { "name": "xStocks" }
+    },
+    "18": {
+      "name": "Meta Platforms Inc",
+      "symbol": "META",
+      "slug": "meta-platforms",
+      "website": "https://www.meta.com",
+      "employees": 74000,
+      "founded": "2004-02-04",
+      "industry": "Services-Computer Programming, Data Processing",
+      "cik": "0001326801",
+      "rwa_id": 18,
+      "asset_type": "stock",
+      "primary_exchange": "Nasdaq",
+      "issuer": { "name": "Ondo" }
+    }
+  },
+  "issuers_list": [
+    {
+      "name": "Backed Finance",
+      "website": "https://assets.backed.fi/",
+      "issuer_id": "6878977dcbbf471de3366e85",
+      "num_tokens": 1
+    },
+    {
+      "name": "xStocks",
+      "website": "https://xstocks.com",
+      "issuer_id": "69af7c7fef8bc60199c88622",
+      "num_tokens": 1
+    },
+    {
+      "name": "NoteVault Demo Issuer",
+      "website": null,
+      "issuer_id": "64656d6f00000000000000d1",
+      "num_tokens": 1
+    },
+    {
+      "name": "Ondo",
+      "website": "https://ondo.finance",
+      "issuer_id": "6f6e646f00000000000000d2",
+      "num_tokens": 1
+    }
+  ],
+  "issuers": {
+    "6878977dcbbf471de3366e85": {
+      "name": "Backed Finance",
+      "website": "https://assets.backed.fi/",
+      "issuer_id": "6878977dcbbf471de3366e85",
+      "num_tokens": 1,
+      "tokens": [
+        {
+          "name": "NVIDIA tokenized stock (Backed) [FIXTURE]",
+          "symbol": "NVDAx",
+          "crypto_id": 36992,
+          "rwa_id": 2
+        }
+      ]
+    },
+    "69af7c7fef8bc60199c88622": {
+      "name": "xStocks",
+      "website": "https://xstocks.com",
+      "issuer_id": "69af7c7fef8bc60199c88622",
+      "num_tokens": 1,
+      "tokens": [
+        {
+          "name": "Apple tokenized stock (xStocks) [FIXTURE]",
+          "symbol": "AAPLx",
+          "crypto_id": 36993,
+          "rwa_id": 16
+        }
+      ]
+    },
+    "64656d6f00000000000000d1": {
+      "name": "NoteVault Demo Issuer",
+      "website": null,
+      "issuer_id": "64656d6f00000000000000d1",
+      "num_tokens": 1,
+      "tokens": [
+        {
+          "name": "Tesla wrapped note (NoteVault) [FIXTURE]",
+          "symbol": "TSLAn",
+          "crypto_id": 90015,
+          "rwa_id": 15
+        }
+      ]
+    },
+    "6f6e646f00000000000000d2": {
+      "name": "Ondo",
+      "website": "https://ondo.finance",
+      "issuer_id": "6f6e646f00000000000000d2",
+      "num_tokens": 1,
+      "tokens": [
+        {
+          "name": "Meta tokenized stock (Ondo) [FIXTURE]",
+          "symbol": "METAx",
+          "crypto_id": 36994,
+          "rwa_id": 18
+        }
+      ]
+    }
+  },
+  "quotes": {
+    "36992": {
+      "id": 36992,
+      "name": "NVIDIA tokenized stock (Backed) [FIXTURE]",
+      "symbol": "NVDAx",
+      "quote": {
+        "USD": {
+          "price": 118.45,
+          "volume_24h": 4200000.0,
+          "percent_change_24h": 0.8,
+          "market_cap": 8500000.0
+        }
+      }
+    },
+    "36993": {
+      "id": 36993,
+      "name": "Apple tokenized stock (xStocks) [FIXTURE]",
+      "symbol": "AAPLx",
+      "quote": {
+        "USD": {
+          "price": 226.1,
+          "volume_24h": 1800000.0,
+          "percent_change_24h": 3.1,
+          "market_cap": 4100000.0
+        }
+      }
+    },
+    "90015": {
+      "id": 90015,
+      "name": "Tesla wrapped note (NoteVault) [FIXTURE]",
+      "symbol": "TSLAn",
+      "quote": {
+        "USD": {
+          "price": 241.0,
+          "volume_24h": 12000.0,
+          "percent_change_24h": 28.4,
+          "market_cap": 180000.0
+        }
+      }
+    },
+    "36994": {
+      "id": 36994,
+      "name": "Meta tokenized stock (Ondo) [FIXTURE]",
+      "symbol": "METAx",
+      "quote": {
+        "USD": {
+          "price": 512.2,
+          "volume_24h": 2600000.0,
+          "percent_change_24h": 1.2,
+          "market_cap": 6200000.0
+        }
+      }
+    }
+  }
+}
