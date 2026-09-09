@@ -29,6 +29,8 @@ BAND_COLORS = {
 }
 
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
+DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
+MAX_COMPARE_SLOTS = 4
 
 st.set_page_config(
     page_title="RWA Transparency Score",
@@ -52,16 +54,72 @@ def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     return _init_scorer(use_fixtures)
 
 
+def normalize_ticker(raw: str) -> str:
+    return (raw or "").strip().upper()
+
+
+def assign_ticker_to_slot(slots: list[str], index: int, ticker: str) -> list[str]:
+    """Replace one comparison slot. Returns a new list; does not mutate `slots`."""
+    if not 0 <= index < len(slots):
+        raise IndexError(f"slot index {index} out of range")
+    symbol = normalize_ticker(ticker)
+    if not symbol:
+        raise ValueError("ticker is empty")
+    updated = list(slots)
+    updated[index] = symbol
+    return updated
+
+
 def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
-    return scorer.score(ticker.strip().upper())
+    return scorer.score(normalize_ticker(ticker))
 
 
-def _render_score_card(report: dict) -> None:
+def _score_slots(
+    scorer: TransparencyScorer, slots: list[str]
+) -> list[tuple[str, dict | None, str | None]]:
+    """Score each slot independently so one unknown ticker does not hide the row."""
+    results: list[tuple[str, dict | None, str | None]] = []
+    for raw in slots:
+        symbol = normalize_ticker(raw)
+        if not symbol:
+            results.append(("", None, "Empty slot."))
+            continue
+        try:
+            results.append((symbol, _score_one(scorer, symbol), None))
+        except ScoreError as exc:
+            results.append((symbol, None, str(exc)))
+        except Exception as exc:  # noqa: BLE001
+            results.append((symbol, None, f"Scoring failed: {exc}"))
+    return results
+
+
+def _ensure_slot_state() -> None:
+    if "slots" not in st.session_state:
+        st.session_state.slots = list(DEFAULT_SLOTS)
+    if "active_slot" not in st.session_state:
+        st.session_state.active_slot = 0
+    # Recover from a stale session that somehow lost a slot.
+    slots = list(st.session_state.slots)
+    if len(slots) != MAX_COMPARE_SLOTS:
+        padded = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
+        st.session_state.slots = padded
+    if not 0 <= int(st.session_state.active_slot) < MAX_COMPARE_SLOTS:
+        st.session_state.active_slot = 0
+
+
+def _place_in_slot(ticker: str, index: int) -> None:
+    st.session_state.slots = assign_ticker_to_slot(list(st.session_state.slots), index, ticker)
+    st.session_state.active_slot = index
+
+
+def _render_compare_card(report: dict, *, selected: bool = False) -> None:
     band = report["band"]
     color = BAND_COLORS.get(band, "#8B949E")
+    ring = "3px" if selected else "2px"
+    selected_attr = " selected" if selected else ""
     st.markdown(
         f"""
-        <div class="score-hero" style="border-color:{color}">
+        <div class="score-hero compact{selected_attr}" style="border-color:{color};border-width:{ring}">
           <div class="score-num">{report['score']:.1f}</div>
           <div class="score-meta">
             <div class="band" style="color:{color}">{report['band_label']}</div>
@@ -75,45 +133,61 @@ def _render_score_card(report: dict) -> None:
 
     if report.get("data_source") == "fixture":
         st.caption("Demo fixture data — not a live CoinMarketCap API response.")
+    else:
+        st.caption("Live CoinMarketCap data.")
 
     st.caption(
         "Backing / reserves / redemption use **issuer-name heuristics**, not audited attestations."
     )
 
-    cols = st.columns(5)
-    for col, key in zip(cols, WEIGHTS):
-        sub = report["subscores"][key]
-        meta = PILLARS[key]
-        with col:
-            st.metric(meta["label"], f"{sub:.0f}", help=f"Weight {WEIGHTS[key]:.0%}")
-            st.progress(min(max(sub / 100.0, 0.0), 1.0))
-
-    st.markdown("#### Pillar detail")
+    metric_bits = []
     for key in WEIGHTS:
         meta = PILLARS[key]
-        heuristic = key in {"backing", "reserves", "redemption"}
-        badge = " · heuristic" if heuristic else ""
-        with st.expander(
-            f"{meta['label']} — {report['subscores'][key]:.0f}/100 "
-            f"(weight {WEIGHTS[key]:.0%}){badge}",
-            expanded=False,
-        ):
-            st.write(meta["what"])
-            st.write(report["explanations"][key])
+        metric_bits.append(f"**{meta['label']}** {report['subscores'][key]:.0f}")
+    st.markdown(" · ".join(metric_bits))
 
-    st.markdown("#### Risk flags")
     flags = report.get("flags") or []
     if flags:
         for flag in flags:
             st.warning(flag)
     else:
-        st.success("No risk flags on this pass.")
+        st.caption("No risk flags on this pass.")
 
-    notes = report.get("notes") or []
-    if notes:
-        st.markdown("#### Notes")
-        for note in notes:
-            st.info(note)
+    with st.expander("Pillar detail", expanded=False):
+        for key in WEIGHTS:
+            meta = PILLARS[key]
+            heuristic = key in {"backing", "reserves", "redemption"}
+            badge = " · heuristic" if heuristic else ""
+            st.markdown(
+                f"**{meta['label']}** — {report['subscores'][key]:.0f}/100 "
+                f"(weight {WEIGHTS[key]:.0%}){badge}"
+            )
+            st.caption(meta["what"])
+            st.write(report["explanations"][key])
+
+        notes = report.get("notes") or []
+        if notes:
+            st.markdown("**Notes**")
+            for note in notes:
+                st.info(note)
+
+
+def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
+    ring = " selected" if selected else ""
+    st.markdown(
+        f"""
+        <div class="score-hero compact error{ring}">
+          <div class="score-num">—</div>
+          <div class="score-meta">
+            <div class="band" style="color:#E5484D">Unavailable</div>
+            <div class="issuer">{ticker or 'Empty slot'}</div>
+            <div class="summary">{message}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.error(message)
 
 
 st.markdown(
@@ -125,10 +199,19 @@ st.markdown(
         padding: 1.25rem 1.5rem; margin: 0.5rem 0 1.25rem;
         background: #161b22;
       }
+      .score-hero.compact {
+        flex-direction: column; align-items: flex-start; gap: 0.35rem;
+        padding: 0.85rem 1rem; margin: 0.25rem 0 0.75rem; min-height: 10.5rem;
+      }
+      .score-hero.compact.selected { box-shadow: 0 0 0 1px #3DDC97 inset; }
+      .score-hero.compact.error { border-color: #E5484D; }
       .score-num { font-size: 4rem; font-weight: 700; line-height: 1; }
+      .score-hero.compact .score-num { font-size: 2.35rem; }
       .band { font-size: 1.15rem; font-weight: 600; }
+      .score-hero.compact .band { font-size: 0.95rem; }
       .issuer { color: #8b949e; margin-top: 0.25rem; }
       .summary { margin-top: 0.35rem; }
+      .score-hero.compact .summary { font-size: 0.85rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -173,90 +256,95 @@ except Exception as exc:  # noqa: BLE001
     st.error(str(exc))
     st.stop()
 
-tab_score, tab_compare = st.tabs(["Score a ticker", "Compare 2–3 tickers"])
+_ensure_slot_state()
 
-with tab_score:
-    st.subheader("Search / score")
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        ticker = st.text_input(
-            "Ticker",
-            value="NVDA",
-            placeholder="NVDA, TSLA, AAPL, META…",
-            label_visibility="collapsed",
-        )
-    with c2:
-        go = st.button("Score", type="primary", use_container_width=True)
+st.subheader("Score / Compare")
+st.caption(
+    "Compact search assigns a ticker into one of the four slots. "
+    "All four compare side by side in one row."
+)
 
-    st.caption("Fixture catalog: " + ", ".join(FIXTURE_TICKERS))
-    quick = st.columns(len(FIXTURE_TICKERS))
-    picked = None
-    for col, sym in zip(quick, FIXTURE_TICKERS):
-        if col.button(sym, use_container_width=True):
-            picked = sym
-
-    target = (picked or (ticker if go or ticker else "")).strip().upper()
-    if target:
-        try:
-            report = _score_one(scorer, target)
-            _render_score_card(report)
-        except ScoreError as exc:
-            st.error(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Scoring failed: {exc}")
-
-with tab_compare:
-    st.subheader("Side-by-side")
-    default_compare = ["NVDA", "TSLA", "AAPL"]
-    option_pool = list(FIXTURE_TICKERS)
-    typed = (ticker or "").strip().upper()
-    if typed and typed not in option_pool:
-        option_pool.append(typed)
-    choices = st.multiselect(
-        "Pick 2 or 3 tickers",
-        options=option_pool,
-        default=default_compare,
-        max_selections=3,
+search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
+with search_col:
+    query = st.text_input(
+        "Ticker search",
+        placeholder="Search ticker…",
+        label_visibility="collapsed",
+        key="ticker_query",
     )
-    extra = st.text_input("Or type extra tickers (comma-separated)", value="")
-    if extra.strip():
-        for part in extra.split(","):
-            sym = part.strip().upper()
-            if sym and sym not in choices and len(choices) < 3:
-                choices.append(sym)
+with assign_col:
+    assign_clicked = st.button("Assign", type="primary", use_container_width=True)
 
-    if st.button("Compare", type="primary") or choices:
-        if len(choices) < 2:
-            st.info("Select at least two tickers to compare.")
+typed = normalize_ticker(query)
+if use_fixtures:
+    st.caption(
+        "Fixture catalog: "
+        + ", ".join(FIXTURE_TICKERS)
+        + ". Unknown tickers error in that slot."
+    )
+else:
+    st.caption("Live mode: any CMC-mapped ticker can fill a slot.")
+
+if assign_clicked:
+    if typed:
+        _place_in_slot(typed, int(st.session_state.active_slot))
+    else:
+        st.info("Type a ticker, then Assign — or click a slot to place it.")
+
+if typed:
+    if st.button(f"Use {typed}", key="use_typed_ticker"):
+        _place_in_slot(typed, int(st.session_state.active_slot))
+
+slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
+for index, symbol in enumerate(st.session_state.slots):
+    with slot_cols[index]:
+        selected = index == int(st.session_state.active_slot)
+        label = f"● {symbol}" if selected else symbol
+        if st.button(
+            label,
+            key=f"slot_{index}",
+            type="primary" if selected else "secondary",
+            use_container_width=True,
+        ):
+            if typed:
+                _place_in_slot(typed, index)
+            else:
+                st.session_state.active_slot = index
+            st.rerun()
+
+active = int(st.session_state.active_slot)
+active_symbol = st.session_state.slots[active]
+st.caption(
+    f"Selected slot {active + 1} · **{active_symbol}** — next search replaces this name."
+)
+
+results = _score_slots(scorer, list(st.session_state.slots))
+
+compare_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
+for col, (symbol, report, error), index in zip(
+    compare_cols, results, range(MAX_COMPARE_SLOTS)
+):
+    with col:
+        selected = index == int(st.session_state.active_slot)
+        if error or report is None:
+            _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
         else:
-            reports = []
-            errors = []
-            for sym in choices[:3]:
-                try:
-                    reports.append(_score_one(scorer, sym))
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{sym}: {exc}")
-            if errors:
-                for err in errors:
-                    st.error(err)
-            if reports:
-                cols = st.columns(len(reports))
-                for col, report in zip(cols, reports):
-                    with col:
-                        _render_score_card(report)
+            _render_compare_card(report, selected=selected)
 
-                rows = []
-                for report in reports:
-                    row = {
-                        "ticker": report["ticker"],
-                        "issuer": report["issuer"],
-                        "score": report["score"],
-                        "band": report["band"],
-                    }
-                    row.update(report["subscores"])
-                    rows.append(row)
-                st.markdown("#### Comparison table")
-                st.dataframe(rows, use_container_width=True, hide_index=True)
+ok_reports = [report for _symbol, report, error in results if report is not None and not error]
+if ok_reports:
+    rows = []
+    for report in ok_reports:
+        row = {
+            "ticker": report["ticker"],
+            "issuer": report["issuer"],
+            "score": report["score"],
+            "band": report["band"],
+        }
+        row.update(report["subscores"])
+        rows.append(row)
+    st.markdown("#### Comparison table")
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 st.divider()
 st.caption(DISCLAIMER)
