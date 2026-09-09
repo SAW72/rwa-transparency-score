@@ -1,0 +1,24 @@
+# Render Blueprint — fixture-mode Streamlit demo (no API key required).
+# https://render.com/docs/blueprint-spec
+#
+# Optional live mode: set CMC_API_KEY in the Render dashboard and
+# change RWA_USE_FIXTURES to "0". Never commit the key.
+
+services:
+  - type: web
+    name: rwa-transparency-score
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: >-
+      streamlit run app.py
+      --server.port $PORT
+      --server.address 0.0.0.0
+      --server.headless true
+    envVars:
+      - key: RWA_USE_FIXTURES
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: CMC_API_KEY
+        sync: false
