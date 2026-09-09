@@ -107,9 +107,11 @@ class TransparencyScorer:
         return rwa_id
 
     def _ensure_issuer_index(self) -> None:
-        """Walk the issuer directory once per session and cache details.
+        """Walk the issuer directory once per scorer and cache details.
 
         Live mode: 1 credit for the list + 1 credit per issuer detail, then reuse.
+        CMCClient also caches list + detail for the process lifetime, so a new
+        scorer sharing that client does not re-hit the API.
         """
         if self._issuer_index is not None:
             return

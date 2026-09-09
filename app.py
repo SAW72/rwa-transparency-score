@@ -30,10 +30,26 @@ BAND_COLORS = {
 
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 
+st.set_page_config(
+    page_title="RWA Transparency Score",
+    page_icon="◎",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 
 def _init_scorer(use_fixtures: bool) -> TransparencyScorer:
     client = create_client(use_fixtures_mode=use_fixtures)
     return TransparencyScorer(client)
+
+
+@st.cache_resource
+def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
+    """One client + scorer per process (and fixture/live mode).
+
+    Widget reruns must not rebuild CMCClient — that would re-hit issuers/list.
+    """
+    return _init_scorer(use_fixtures)
 
 
 def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
@@ -100,13 +116,6 @@ def _render_score_card(report: dict) -> None:
             st.info(note)
 
 
-st.set_page_config(
-    page_title="RWA Transparency Score",
-    page_icon="◎",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
 st.markdown(
     """
     <style>
@@ -143,7 +152,10 @@ with st.sidebar:
         if not os.getenv("CMC_API_KEY"):
             st.error("CMC_API_KEY is not set. Switch fixtures on, or add the key in the host env.")
         else:
-            st.success("Live mode: CMC_API_KEY is set. Issuer list is cached for this session.")
+            st.success(
+                "Live mode: CMC_API_KEY is set. Issuer directory is cached for this "
+                "process. Basic plan 429s are retried; wait a minute if it still fails."
+            )
 
     st.markdown("### Pillar weights")
     for key, weight in WEIGHTS.items():
@@ -153,20 +165,13 @@ with st.sidebar:
     st.markdown("### Disclaimer")
     st.write(DISCLAIMER)
 
-if "scorer_mode" not in st.session_state or st.session_state.scorer_mode != use_fixtures:
-    try:
-        st.session_state.scorer = _init_scorer(use_fixtures)
-        st.session_state.scorer_mode = use_fixtures
-        st.session_state.last_error = None
-    except Exception as exc:  # noqa: BLE001
-        st.session_state.scorer = None
-        st.session_state.last_error = str(exc)
-
-if st.session_state.get("last_error"):
-    st.error(st.session_state.last_error)
+try:
+    scorer = _cached_scorer(use_fixtures)
+    st.session_state.last_error = None
+except Exception as exc:  # noqa: BLE001
+    st.session_state.last_error = str(exc)
+    st.error(str(exc))
     st.stop()
-
-scorer: TransparencyScorer = st.session_state.scorer
 
 tab_score, tab_compare = st.tabs(["Score a ticker", "Compare 2–3 tickers"])
 

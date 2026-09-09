@@ -61,7 +61,11 @@ python -m rwa_score NVDA
 RWA_USE_FIXTURES=0 streamlit run app.py
 ```
 
-Get a free Basic key at [coinmarketcap.com/api](https://coinmarketcap.com/api/). The issuer directory is cached for the Streamlit / scorer session so repeat scores do not re-burn list+detail credits.
+Get a free Basic key at [coinmarketcap.com/api](https://coinmarketcap.com/api/).
+
+**Basic plan rate limits:** CMC Basic keys allow only a few HTTP requests per minute (`HTTP 429` / `error_code 1008`, *“You've exceeded your API Key's HTTP request rate limit. Rate limits reset every minute”*). The live client retries those with exponential backoff and jitter (honors `Retry-After`, waits ~60s total), then raises a clear error. Issuer `list` + per-issuer detail are cached for the process lifetime; map/info use a short TTL so Streamlit widget reruns do not re-fetch. The demo keeps one client/scorer via `@st.cache_resource`.
+
+If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://coinmarketcap.com/api/) unlocks a higher request rate (and more credits) than Basic.
 
 ## Architecture
 
@@ -77,7 +81,7 @@ Live data flow (CMC Basic):
 
 1. `GET /v5/real-world-assets/map` — ticker → `rwa_id` (0 credits)
 2. `GET /v5/real-world-assets/info` — issuer metadata + **SEC CIK**
-3. `GET /v5/real-world-assets/issuers/list` then `/issuers` — who mints the token, on-chain `crypto_id` (cached per session)
+3. `GET /v5/real-world-assets/issuers/list` then `/issuers` — who mints the token, on-chain `crypto_id` (cached for the process lifetime)
 4. `GET /v2/cryptocurrency/quotes/latest` — token 24h change for price integrity
 
 ## Tests

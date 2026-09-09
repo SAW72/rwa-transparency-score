@@ -10,10 +10,13 @@ Live endpoints used (Basic plan):
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+import random
+import time
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import requests
 from dotenv import load_dotenv
@@ -25,6 +28,15 @@ load_dotenv()
 BASE_URL = "https://pro-api.coinmarketcap.com"
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
+
+# CMC Basic: HTTP 429 and status.error_code 1008 share the same per-minute cap.
+RATE_LIMIT_HTTP = 429
+RATE_LIMIT_CMC_CODES = {1008, "1008"}
+DEFAULT_MAX_RETRIES = 4
+DEFAULT_MAX_WAIT_SECONDS = 60.0
+# Map / info can refresh; issuer directory is process-lifetime (no TTL).
+DEFAULT_MAP_TTL_SECONDS = 120.0
+DEFAULT_INFO_TTL_SECONDS = 120.0
 
 
 class CMCError(RuntimeError):
@@ -74,12 +86,91 @@ def create_client(
     return CMCClient(api_key=api_key)
 
 
+def _parse_retry_after(headers: dict[str, Any] | Any) -> float | None:
+    raw = None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except Exception:  # noqa: BLE001 — CaseInsensitiveDict / plain dict
+        raw = None
+    if raw is None or raw == "":
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cmc_error_code(payload: dict[str, Any] | None) -> Any:
+    if not payload:
+        return None
+    return (payload.get("status") or {}).get("error_code")
+
+
+def _is_rate_limited(status_code: int, payload: dict[str, Any] | None) -> bool:
+    if status_code == RATE_LIMIT_HTTP:
+        return True
+    return _cmc_error_code(payload) in RATE_LIMIT_CMC_CODES
+
+
+def _rate_limit_message(path: str, status_code: int, payload: dict[str, Any] | None) -> str:
+    code = _cmc_error_code(payload)
+    if code in (None, 0, "0"):
+        code = 1008 if status_code == RATE_LIMIT_HTTP else code
+    detail = ""
+    if payload:
+        detail = (payload.get("status") or {}).get("error_message") or ""
+    extra = f" {detail}" if detail else ""
+    return (
+        f"{path} hit CoinMarketCap's HTTP request rate limit "
+        f"(HTTP {status_code}, error_code {code}).{extra} "
+        "Basic plan limits reset every minute. Wait a minute and try again, "
+        "or use demo fixtures (RWA_USE_FIXTURES=1). "
+        "DoraHacks Startup unlocks a higher request rate."
+    )
+
+
+class _TTLCache:
+    """In-process cache. ``ttl=None`` means keep until process exit."""
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[float, Any]] = {}
+
+    def get(self, key: str, ttl: float | None) -> Any | None:
+        hit = self._store.get(key)
+        if hit is None:
+            return None
+        stamped, value = hit
+        if ttl is not None and (time.monotonic() - stamped) > ttl:
+            del self._store[key]
+            return None
+        return copy.deepcopy(value)
+
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = (time.monotonic(), copy.deepcopy(value))
+
+
 class CMCClient:
-    """Thin wrapper around the CoinMarketCap Pro API."""
+    """Thin wrapper around the CoinMarketCap Pro API.
+
+    Retries HTTP 429 and CMC error 1008 with exponential backoff + jitter.
+    Caches ``issuers/list`` and per-issuer detail for the process lifetime so
+    Streamlit reruns and a second ticker do not re-burn those calls. Map and
+    info use a short TTL (enough to absorb widget interactions).
+    """
 
     source = "live"
 
-    def __init__(self, api_key: str | None = None, session: requests.Session | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        session: requests.Session | None = None,
+        *,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
+        map_ttl: float | None = DEFAULT_MAP_TTL_SECONDS,
+        info_ttl: float | None = DEFAULT_INFO_TTL_SECONDS,
+        sleeper: Callable[[float], None] | None = None,
+    ) -> None:
         self.api_key = api_key or os.getenv("CMC_API_KEY", "")
         if not self.api_key:
             raise CMCError(
@@ -90,40 +181,106 @@ class CMCClient:
         self.session.headers.update(
             {"X-CMC_PRO_API_KEY": self.api_key, "Accept": "application/json"}
         )
+        self.max_retries = max_retries
+        self.max_wait_seconds = max_wait_seconds
+        self.map_ttl = map_ttl
+        self.info_ttl = info_ttl
+        self._sleep = sleeper or time.sleep
+        self._cache = _TTLCache()
+
+    def _backoff_delay(self, attempt: int, retry_after: float | None, remaining: float) -> float:
+        """Seconds to wait before the next try. ``attempt`` is 0 on the first retry."""
+        if retry_after is not None:
+            return min(retry_after, max(remaining, 0.0), self.max_wait_seconds)
+        base = min(2**attempt, self.max_wait_seconds)
+        jitter = random.uniform(0.0, max(base * 0.25, 0.05))
+        return min(base + jitter, max(remaining, 0.0), self.max_wait_seconds)
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        resp = self.session.get(f"{BASE_URL}{path}", params=params or {}, timeout=20)
-        if resp.status_code != 200:
-            raise CMCError(f"{path} -> HTTP {resp.status_code}: {resp.text[:400]}")
-        payload = resp.json()
-        status = payload.get("status") or {}
-        error_code = status.get("error_code")
-        if error_code not in (None, 0, "0"):
-            raise CMCError(
-                f"{path} -> CMC error {error_code}: {status.get('error_message') or payload}"
-            )
-        return payload
+        waited = 0.0
+        last_status = 0
+        last_payload: dict[str, Any] | None = None
+        last_text = ""
+
+        for attempt in range(self.max_retries + 1):
+            resp = self.session.get(f"{BASE_URL}{path}", params=params or {}, timeout=20)
+            last_status = resp.status_code
+            last_text = resp.text or ""
+            try:
+                last_payload = resp.json()
+            except ValueError:
+                last_payload = None
+
+            if _is_rate_limited(resp.status_code, last_payload):
+                remaining = self.max_wait_seconds - waited
+                can_retry = attempt < self.max_retries and remaining > 0
+                if can_retry:
+                    delay = self._backoff_delay(
+                        attempt, _parse_retry_after(resp.headers), remaining
+                    )
+                    if delay > 0:
+                        self._sleep(delay)
+                        waited += delay
+                    continue
+                raise CMCError(_rate_limit_message(path, resp.status_code, last_payload))
+
+            if resp.status_code != 200:
+                raise CMCError(f"{path} -> HTTP {resp.status_code}: {last_text[:400]}")
+            if last_payload is None:
+                raise CMCError(f"{path} -> HTTP {resp.status_code}: response was not JSON")
+            error_code = _cmc_error_code(last_payload)
+            if error_code not in (None, 0, "0"):
+                raise CMCError(
+                    f"{path} -> CMC error {error_code}: "
+                    f"{(last_payload.get('status') or {}).get('error_message') or last_payload}"
+                )
+            return last_payload
+
+        raise CMCError(_rate_limit_message(path, last_status, last_payload))
 
     def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Resolve a ticker to its rwa_id. Costs 0 credits on Basic."""
+        key = f"map:{(symbol or '').upper()}"
+        cached = self._cache.get(key, self.map_ttl)
+        if cached is not None:
+            return cached
         params: dict[str, Any] = {}
         if symbol:
             params["symbol"] = symbol
         data = self._get("/v5/real-world-assets/map", params)
-        return data.get("data", {}).get("rwa_assets", [])
+        assets = data.get("data", {}).get("rwa_assets", [])
+        self._cache.set(key, assets)
+        return copy.deepcopy(assets)
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
+        key = f"info:{int(rwa_id)}"
+        cached = self._cache.get(key, self.info_ttl)
+        if cached is not None:
+            return cached
         data = self._get("/v5/real-world-assets/info", {"rwa_id": rwa_id})
         assets = data.get("data", {}).get("rwa_assets", [])
-        return assets[0] if assets else {}
+        info = assets[0] if assets else {}
+        self._cache.set(key, info)
+        return copy.deepcopy(info)
 
     def issuers_list(self) -> list[dict[str, Any]]:
+        cached = self._cache.get("issuers_list", ttl=None)
+        if cached is not None:
+            return cached
         data = self._get("/v5/real-world-assets/issuers/list")
-        return data.get("data", {}).get("issuers", [])
+        issuers = data.get("data", {}).get("issuers", [])
+        self._cache.set("issuers_list", issuers)
+        return copy.deepcopy(issuers)
 
     def issuer(self, issuer_id: str) -> dict[str, Any]:
+        key = f"issuer:{issuer_id}"
+        cached = self._cache.get(key, ttl=None)
+        if cached is not None:
+            return cached
         data = self._get("/v5/real-world-assets/issuers", {"issuer_id": issuer_id})
-        return data.get("data", {})
+        detail = data.get("data", {})
+        self._cache.set(key, detail)
+        return copy.deepcopy(detail)
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
         data = self._get(
