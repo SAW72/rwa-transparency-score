@@ -20,10 +20,10 @@ This tool rates every tokenized stock on how honest its issuer actually is, usin
 
 ## Data flow (CMC Basic plan, free)
 
-1. `GET /v5/real-world-assets/map` — resolve ticker → `rwa_id` (0 credits)
-2. `GET /v5/real-world-assets/info` — issuer metadata, founding date, employees, exchange, **SEC CIK** (1 credit)
-3. `GET /v5/real-world-assets/issuers` — who mints the token, on-chain `crypto_id`
-4. `GET /v2/cryptocurrency/quotes/latest` — live token price, volume, % change
+1. `GET /v5/real-world-assets/map?symbol=NVDA` — resolve ticker → `rwa_id` (0 credits)
+2. `GET /v5/real-world-assets/info?id=<rwa_id>` — issuer metadata, founding date, employees, exchange, **SEC CIK** (1 credit / 250)
+3. `GET /v5/real-world-assets/issuers/list` then `GET /v5/real-world-assets/issuers?issuer_id=...` — who mints the token, on-chain `crypto_id` (1 credit each)
+4. `GET /v2/cryptocurrency/quotes/latest?id=<crypto_id>&convert=USD` — live token price, volume, % change
 
 ## Quick start
 
@@ -31,6 +31,7 @@ This tool rates every tokenized stock on how honest its issuer actually is, usin
 cp .env.example .env   # add your CMC_API_KEY
 pip install -r requirements.txt
 python -m rwa_score NVDA TSLA AAPL
+python -m rwa_score.demo
 ```
 
 ## Disclaimer

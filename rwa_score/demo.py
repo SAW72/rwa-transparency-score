@@ -6,7 +6,8 @@ Run:  python -m rwa_score.demo
 from .client import CMCClient
 from .scorer import TransparencyScorer
 
-DEMO_TICKERS = ["NVDA", "TSLA", "AAPL"]  # swap for real RWA symbols once mapped
+# Swap these for real RWA symbols once you've confirmed them via /v5/real-world-assets/map
+DEMO_TICKERS = ["NVDA", "TSLA", "AAPL"]
 
 
 def main() -> None:

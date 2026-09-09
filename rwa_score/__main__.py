@@ -30,8 +30,7 @@ def main(argv=None) -> int:
             if "error" in r:
                 print(f"{r['ticker']}: ERROR — {r['error']}")
                 continue
-            band = r["band"]
-            print(f"{r['ticker']:<6} score={r['score']:5.1f}  [{band}]  {r['summary']}")
+            print(f"{r['ticker']:<6} score={r['score']:5.1f}  [{r['band']}]  {r['summary']}")
             for flag in r.get("flags", []):
                 print(f"         ! {flag}")
     return 0

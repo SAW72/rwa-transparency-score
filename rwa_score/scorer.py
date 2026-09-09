@@ -1,13 +1,14 @@
 """Transparency scoring logic.
 
 Each pillar returns a 0–100 sub-score. The final score is a weighted average.
-The weights and thresholds are intentionally simple and documented so judges
-(and users) can see exactly why a token landed where it did.
+Weights and thresholds are documented so judges (and users) can see exactly
+why a token landed where it did.
 """
 
 from __future__ import annotations
 
 from .client import CMCClient
+from .issuer_registry import classify
 
 WEIGHTS = {
     "backing": 0.25,
@@ -16,13 +17,6 @@ WEIGHTS = {
     "price": 0.15,
     "disclosure": 0.15,
 }
-
-# Issuers known to hold real shares with a regulated custodian.
-FULLY_BACKED_ISSUERS = {"backed", "xstocks", "securitize", "ondo"}
-# Issuers that publish independent, on-chain proof of reserves.
-AUDITED_ISSUERS = {"backed", "ondo"}
-# Issuers that offer true redemption for the underlying share.
-REDEEMABLE_ISSUERS = {"backed", "xstocks", "securitize"}
 
 
 def _band(score: float) -> str:
@@ -39,11 +33,12 @@ class TransparencyScorer:
     def __init__(self, client: CMCClient) -> None:
         self.client = client
         self._map_cache: dict[str, int] | None = None
+        self._issuer_index: dict[int, str] | None = None
 
     def _resolve(self, ticker: str) -> int:
         if self._map_cache is None:
             self._map_cache = {
-                (a.get("symbol") or "").upper(): a["id"]
+                (a.get("symbol") or "").upper(): a["rwa_id"]
                 for a in self.client.rwa_map()
                 if a.get("symbol")
             }
@@ -52,26 +47,50 @@ class TransparencyScorer:
             raise KeyError(f"{ticker} not found in CMC RWA map")
         return rwa_id
 
+    def _issuer_name_for(self, rwa_id: int) -> str:
+        if self._issuer_index is None:
+            self._issuer_index = {}
+            for entry in self.client.issuers_list():
+                iid = entry.get("issuer_id")
+                if not iid:
+                    continue
+                detail = self.client.issuer(iid)
+                for tok in detail.get("tokens", []):
+                    if tok.get("rwa_id") is not None:
+                        self._issuer_index[tok["rwa_id"]] = detail.get("name", "")
+        return self._issuer_index.get(rwa_id, "")
+
     def score(self, ticker: str) -> dict:
         rwa_id = self._resolve(ticker)
         info = self.client.rwa_info(rwa_id)
-        issuer = (info.get("issuer") or {}).get("name", "").lower()
+        issuer_name = self._issuer_name_for(rwa_id) or info.get("issuer", {}).get("name", "")
+        flags = classify(issuer_name)
 
-        backing = 90 if any(k in issuer for k in FULLY_BACKED_ISSUERS) else 35
-        reserves = 90 if any(k in issuer for k in AUDITED_ISSUERS) else 30
-        redemption = 85 if any(k in issuer for k in REDEEMABLE_ISSUERS) else 25
+        backing = 90 if flags["backed"] else 35
+        reserves = 90 if flags["audited"] else 30
+        redemption = 85 if flags["redeemable"] else 25
 
-        # Price integrity: compare token vs. underlying last close if available.
+        # Price integrity: penalize wild 24h swings on the on-chain token.
         price_score = 60
+        crypto_id = None
         try:
-            quote = self.client.crypto_quote(ticker.upper())
-            q = quote[0]["quote"]["USD"] if isinstance(quote, list) else quote["quote"]["USD"]
-            pct = abs(q.get("percent_change_24h") or 0)
-            price_score = max(20, 100 - pct * 2)  # penalize wild 24h swings
+            for entry in self.client.issuers_list():
+                detail = self.client.issuer(entry.get("issuer_id", ""))
+                for tok in detail.get("tokens", []):
+                    if tok.get("rwa_id") == rwa_id:
+                        crypto_id = tok.get("crypto_id")
+                        break
+                if crypto_id:
+                    break
+            if crypto_id:
+                q = self.client.crypto_quote(crypto_id)
+                usd = q.get("quote", {}).get("USD", {})
+                pct = abs(usd.get("percent_change_24h") or 0)
+                price_score = max(20, 100 - pct * 2)
         except Exception:  # noqa: BLE001
             pass
 
-        disclosure = 80 if info.get("sec_cik") else 20
+        disclosure = 80 if info.get("cik") else 20
 
         subscores = {
             "backing": backing,
@@ -82,23 +101,23 @@ class TransparencyScorer:
         }
         final = sum(subscores[k] * WEIGHTS[k] for k in WEIGHTS)
 
-        flags = []
+        risk_flags = []
         if disclosure < 50:
-            flags.append("No verifiable SEC CIK — issuer identity not matchable to filings.")
+            risk_flags.append("No verifiable SEC CIK — issuer identity not matchable to filings.")
         if reserves < 50:
-            flags.append("No independent on-chain proof of reserves found.")
+            risk_flags.append("No independent on-chain proof of reserves found.")
         if redemption < 50:
-            flags.append("No redemption right — you can only sell the token, not claim the share.")
+            risk_flags.append("No redemption right — you can only sell the token, not claim the share.")
         if price_score < 50:
-            flags.append("Token price drifting hard from the underlying — possible thin liquidity.")
+            risk_flags.append("Token price drifting hard from the underlying — possible thin liquidity.")
 
         return {
             "ticker": ticker.upper(),
             "rwa_id": rwa_id,
-            "issuer": info.get("issuer", {}).get("name", "unknown"),
+            "issuer": issuer_name or "unknown",
             "score": round(final, 1),
             "band": _band(final),
             "subscores": {k: round(v, 1) for k, v in subscores.items()},
-            "flags": flags,
-            "summary": f"{info.get('issuer', {}).get('name', 'Unknown issuer')} — {len(flags)} risk flag(s).",
+            "flags": risk_flags,
+            "summary": f"{issuer_name or 'Unknown issuer'} — {len(risk_flags)} risk flag(s).",
         }
