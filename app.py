@@ -1,4 +1,4 @@
-"""Streamlit demo for the RWA Transparency Score.
+"""Streamlit demo for RAT Score (RWA Transparency Score).
 
 Launch (fixtures, no API key):
     RWA_USE_FIXTURES=1 streamlit run app.py
@@ -8,12 +8,23 @@ Render binds 0.0.0.0:$PORT via render.yaml.
 
 from __future__ import annotations
 
+import base64
 import os
+from pathlib import Path
 
 import streamlit as st
 
 from rwa_score.client import create_client, env_flag
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
+
+PAGE_TITLE = "RAT Score | RWA Transparency Score"
+BRAND_H1 = "RAT Score"
+BRAND_SUB = "RWA Transparency Score"
+TAGLINE = "Risk radar for tokenized stocks · CoinMarketCap Build-a-thon"
+
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+FAVICON_PATH = ASSETS_DIR / "favicon.png"
+MONOGRAM_PATH = ASSETS_DIR / "rat-icon-192.png"
 
 DISCLAIMER = (
     "This tool is for informational and hackathon demo purposes only. "
@@ -33,11 +44,22 @@ DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
 
 st.set_page_config(
-    page_title="RWA Transparency Score",
-    page_icon="◎",
+    page_title=PAGE_TITLE,
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH.is_file() else "◎",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _asset_data_uri(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    payload = base64.b64encode(path.read_bytes()).decode("ascii")
+    suffix = path.suffix.lower()
+    mime = {".png": "image/png", ".webp": "image/webp", ".svg": "image/svg+xml"}.get(
+        suffix, "image/png"
+    )
+    return f"data:{mime};base64,{payload}"
 
 
 def _init_scorer(use_fixtures: bool) -> TransparencyScorer:
@@ -193,12 +215,64 @@ def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> 
 st.markdown(
     """
     <style>
+      .rat-brand { margin: 0 0 0.35rem; }
+      .rat-brand-row { display: flex; align-items: center; gap: 0.75rem; }
+      .rat-chip {
+        width: 36px; height: 36px; flex: 0 0 36px;
+        border-radius: 10px; overflow: hidden;
+        border: 1px solid rgba(61, 220, 151, 0.35);
+        background: #161B22;
+      }
+      .rat-chip img { width: 36px; height: 36px; display: block; }
+      .rat-titles h1 {
+        margin: 0; padding: 0;
+        font-size: 2.05rem; font-weight: 700; line-height: 1.1;
+        color: #E6EDF3; letter-spacing: -0.02em;
+      }
+      .rat-sub {
+        margin: 0.2rem 0 0;
+        color: #8b949e;
+        font-size: 0.95rem;
+        font-weight: 500;
+      }
+      .rat-tagline {
+        margin: 0.55rem 0 0.15rem;
+        color: #8b949e;
+        font-size: 0.95rem;
+      }
+      .mode-chip {
+        display: inline-flex; align-items: center;
+        border: 1px solid #3DDC97;
+        color: #3DDC97;
+        background: transparent;
+        border-radius: 999px;
+        padding: 0.18rem 0.72rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
       .score-hero {
+        position: relative;
+        isolation: isolate;
+        overflow: hidden;
         display: flex; gap: 1.5rem; align-items: center;
         border: 2px solid #30363d; border-radius: 16px;
         padding: 1.25rem 1.5rem; margin: 0.5rem 0 1.25rem;
         background: #161b22;
       }
+      .score-hero::before {
+        content: "";
+        position: absolute;
+        inset: -35% -10% -35% -25%;
+        pointer-events: none;
+        z-index: 0;
+        background:
+          radial-gradient(circle at 28% 48%, transparent 16%, rgba(61,220,151,0.12) 17%, transparent 18%),
+          radial-gradient(circle at 28% 48%, transparent 30%, rgba(61,220,151,0.10) 31%, transparent 32%),
+          radial-gradient(circle at 28% 48%, transparent 44%, rgba(61,220,151,0.08) 45%, transparent 46%);
+      }
+      .score-hero > * { position: relative; z-index: 1; }
       .score-hero.compact {
         flex-direction: column; align-items: flex-start; gap: 0.35rem;
         padding: 0.85rem 1rem; margin: 0.25rem 0 0.75rem; min-height: 10.5rem;
@@ -217,8 +291,27 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("RWA Transparency Score")
-st.caption("Risk radar for tokenized stocks · CoinMarketCap Build-a-thon")
+_monogram_uri = _asset_data_uri(MONOGRAM_PATH) or _asset_data_uri(ASSETS_DIR / "rat-monogram.svg")
+_chip_html = (
+    f'<div class="rat-chip"><img src="{_monogram_uri}" alt="" width="36" height="36" /></div>'
+    if _monogram_uri
+    else '<div class="rat-chip" aria-hidden="true"></div>'
+)
+st.markdown(
+    f"""
+    <div class="rat-brand">
+      <div class="rat-brand-row">
+        {_chip_html}
+        <div class="rat-titles">
+          <h1>{BRAND_H1}</h1>
+          <p class="rat-sub">{BRAND_SUB}</p>
+        </div>
+      </div>
+      <p class="rat-tagline">{TAGLINE}</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 default_fixtures = env_flag("RWA_USE_FIXTURES") or not os.getenv("CMC_API_KEY")
 
@@ -247,6 +340,12 @@ with st.sidebar:
 
     st.markdown("### Disclaimer")
     st.write(DISCLAIMER)
+
+mode_label = "Fixture" if use_fixtures else "Live"
+st.markdown(
+    f'<div class="mode-chip" title="Data mode">{mode_label}</div>',
+    unsafe_allow_html=True,
+)
 
 try:
     scorer = _cached_scorer(use_fixtures)
