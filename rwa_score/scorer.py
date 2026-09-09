@@ -69,10 +69,10 @@ def band_code(score: float) -> str:
 def band_detail(score: float) -> str:
     code = band_code(score)
     details = {
-        "GREEN": "GREEN — claims match reality",
-        "YELLOW": "YELLOW — verify before trusting",
-        "ORANGE": "ORANGE — thin backing, high risk",
-        "RED": "RED — likely unbacked or opaque",
+        "GREEN": "GREEN — heuristic: stronger transparency signals (still verify)",
+        "YELLOW": "YELLOW — heuristic: mixed signals; verify before relying",
+        "ORANGE": "ORANGE — heuristic: weaker signals; elevated concern",
+        "RED": "RED — heuristic: opaque or thin signals (not a finding of fraud or illegality)",
     }
     return details[code]
 
