@@ -1,0 +1,356 @@
+{
+  "_comment": "Canned CoinMarketCap Pro API envelopes for offline / fixture mode. Shapes match the public RWA docs (map, info, issuers, quotes/latest).",
+  "rwa_map": {
+    "data": {
+      "rwa_assets": [
+        {
+          "name": "Nvidia Corp",
+          "symbol": "NVDA",
+          "slug": "nvidia",
+          "rwa_id": 2,
+          "asset_type": "stock",
+          "rwa_rank": 2,
+          "has_tokens": true,
+          "first_historical_data": "2003-09-07T04:00:00.000Z",
+          "last_historical_data": "2026-07-08T10:29:00.000Z"
+        },
+        {
+          "name": "Tesla Inc",
+          "symbol": "TSLA",
+          "slug": "tesla",
+          "rwa_id": 15,
+          "asset_type": "stock",
+          "rwa_rank": 8,
+          "has_tokens": true,
+          "first_historical_data": "2010-06-29T00:00:00.000Z",
+          "last_historical_data": "2026-07-08T10:29:00.000Z"
+        },
+        {
+          "name": "Apple Inc",
+          "symbol": "AAPL",
+          "slug": "apple",
+          "rwa_id": 18,
+          "asset_type": "stock",
+          "rwa_rank": 5,
+          "has_tokens": true,
+          "first_historical_data": "1980-12-12T00:00:00.000Z",
+          "last_historical_data": "2026-07-08T10:29:00.000Z"
+        }
+      ],
+      "total_size": 3,
+      "has_more": false
+    },
+    "status": {
+      "timestamp": "2026-09-09T00:00:00.000Z",
+      "error_code": 0,
+      "error_message": "",
+      "elapsed": 8,
+      "credit_count": 0,
+      "notice": "fixture"
+    }
+  },
+  "rwa_info": {
+    "2": {
+      "data": {
+        "rwa_assets": [
+          {
+            "name": "Nvidia Corp",
+            "symbol": "NVDA",
+            "slug": "nvidia",
+            "website": "https://www.nvidia.com",
+            "employees": 36000,
+            "founded": "1993-04-04",
+            "industry": "Semiconductors & Related Devices",
+            "cik": "0001045810",
+            "about": {
+              "description": "NVIDIA is a U.S.-based semiconductor and computing company specializing in GPUs, AI hardware, and high-performance computing.",
+              "logo": null,
+              "website": "https://www.nvidia.com",
+              "date_added": "2025-07-17T06:35:44.000Z"
+            },
+            "rwa_id": 2,
+            "asset_type": "stock",
+            "rwa_rank": 2,
+            "has_tokens": true,
+            "primary_exchange": "Nasdaq"
+          }
+        ]
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 10,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    },
+    "15": {
+      "data": {
+        "rwa_assets": [
+          {
+            "name": "Tesla Inc",
+            "symbol": "TSLA",
+            "slug": "tesla",
+            "website": "https://www.tesla.com",
+            "employees": 140473,
+            "founded": "2003-07-01",
+            "industry": "Motor Vehicles & Passenger Car Bodies",
+            "cik": "0001318605",
+            "about": {
+              "description": "Tesla designs and manufactures electric vehicles, energy storage, and solar products.",
+              "logo": null,
+              "website": "https://www.tesla.com",
+              "date_added": "2025-07-17T06:35:44.000Z"
+            },
+            "rwa_id": 15,
+            "asset_type": "stock",
+            "rwa_rank": 8,
+            "has_tokens": true,
+            "primary_exchange": "Nasdaq"
+          }
+        ]
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 10,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    },
+    "18": {
+      "data": {
+        "rwa_assets": [
+          {
+            "name": "Apple Inc",
+            "symbol": "AAPL",
+            "slug": "apple",
+            "website": "https://www.apple.com",
+            "employees": 164000,
+            "founded": "1976-04-01",
+            "industry": "Electronic Computers",
+            "cik": null,
+            "about": {
+              "description": "Fixture variant: company metadata present but SEC CIK omitted so judges can see the disclosure pillar fail.",
+              "logo": null,
+              "website": "https://www.apple.com",
+              "date_added": "2025-07-17T06:35:44.000Z"
+            },
+            "rwa_id": 18,
+            "asset_type": "stock",
+            "rwa_rank": 5,
+            "has_tokens": true,
+            "primary_exchange": "Nasdaq"
+          }
+        ]
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 10,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    }
+  },
+  "issuers_list": {
+    "data": {
+      "issuers": [
+        {
+          "name": "Backed Assets",
+          "website": "https://assets.backed.fi/",
+          "logo": null,
+          "issuer_id": "6878977dcbbf471de3366e85",
+          "num_tokens": 1
+        },
+        {
+          "name": "xStocks",
+          "website": "https://xstocks.fi/",
+          "logo": null,
+          "issuer_id": "69af7c7fef8bc60199c88622",
+          "num_tokens": 1
+        },
+        {
+          "name": "ThinWrap Labs",
+          "website": null,
+          "logo": null,
+          "issuer_id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+          "num_tokens": 1
+        }
+      ],
+      "total_size": 3,
+      "has_more": false
+    },
+    "status": {
+      "timestamp": "2026-09-09T00:00:00.000Z",
+      "error_code": 0,
+      "error_message": "",
+      "elapsed": 9,
+      "credit_count": 1,
+      "notice": "fixture"
+    }
+  },
+  "issuers": {
+    "6878977dcbbf471de3366e85": {
+      "data": {
+        "name": "Backed Assets",
+        "website": "https://assets.backed.fi/",
+        "logo": null,
+        "tokens": [
+          {
+            "name": "NVIDIA tokenized stock (Backed)",
+            "symbol": "NVDAX",
+            "crypto_id": 36992,
+            "rwa_id": 2
+          }
+        ],
+        "issuer_id": "6878977dcbbf471de3366e85",
+        "num_tokens": 1,
+        "total_size": 1,
+        "has_more": false
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 9,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    },
+    "69af7c7fef8bc60199c88622": {
+      "data": {
+        "name": "xStocks",
+        "website": "https://xstocks.fi/",
+        "logo": null,
+        "tokens": [
+          {
+            "name": "Tesla tokenized stock (xStock)",
+            "symbol": "TSLAX",
+            "crypto_id": 37001,
+            "rwa_id": 15
+          }
+        ],
+        "issuer_id": "69af7c7fef8bc60199c88622",
+        "num_tokens": 1,
+        "total_size": 1,
+        "has_more": false
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 9,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    },
+    "aaaaaaaaaaaaaaaaaaaaaaaa": {
+      "data": {
+        "name": "ThinWrap Labs",
+        "website": null,
+        "logo": null,
+        "tokens": [
+          {
+            "name": "Apple synthetic wrapper",
+            "symbol": "AAPLw",
+            "crypto_id": 37002,
+            "rwa_id": 18
+          }
+        ],
+        "issuer_id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "num_tokens": 1,
+        "total_size": 1,
+        "has_more": false
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 9,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    }
+  },
+  "quotes": {
+    "36992": {
+      "data": {
+        "36992": {
+          "id": 36992,
+          "name": "NVIDIA tokenized stock (Backed)",
+          "symbol": "NVDAX",
+          "quote": {
+            "USD": {
+              "price": 211.33,
+              "volume_24h": 8302814.85,
+              "percent_change_24h": 1.2,
+              "last_updated": "2026-07-15T10:45:05.000Z"
+            }
+          }
+        }
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 7,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    },
+    "37001": {
+      "data": {
+        "37001": {
+          "id": 37001,
+          "name": "Tesla tokenized stock (xStock)",
+          "symbol": "TSLAX",
+          "quote": {
+            "USD": {
+              "price": 248.1,
+              "volume_24h": 4201500.0,
+              "percent_change_24h": 6.4,
+              "last_updated": "2026-07-15T10:45:05.000Z"
+            }
+          }
+        }
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 7,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    },
+    "37002": {
+      "data": {
+        "37002": {
+          "id": 37002,
+          "name": "Apple synthetic wrapper",
+          "symbol": "AAPLw",
+          "quote": {
+            "USD": {
+              "price": 41.07,
+              "volume_24h": 18200.0,
+              "percent_change_24h": 37.5,
+              "last_updated": "2026-07-15T10:45:05.000Z"
+            }
+          }
+        }
+      },
+      "status": {
+        "timestamp": "2026-09-09T00:00:00.000Z",
+        "error_code": 0,
+        "error_message": "",
+        "elapsed": 7,
+        "credit_count": 1,
+        "notice": "fixture"
+      }
+    }
+  }
+}

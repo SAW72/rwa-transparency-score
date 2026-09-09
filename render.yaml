@@ -1,0 +1,18 @@
+# Render Blueprint — one web service, fixture mode by default (no secrets required).
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: rwa-transparency-score
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.3"
+      - key: USE_FIXTURES
+        value: "1"
+      # Optional. Set in the Render dashboard if you want live CMC data.
+      # Never put a real key in this file.
+      - key: CMC_API_KEY
+        sync: false

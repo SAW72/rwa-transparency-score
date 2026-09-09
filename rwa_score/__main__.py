@@ -2,7 +2,7 @@ import argparse
 import json
 import sys
 
-from .client import CMCClient
+from .client import create_client
 from .scorer import TransparencyScorer
 
 
@@ -10,22 +10,38 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Score tokenized stocks on issuer transparency.")
     parser.add_argument("tickers", nargs="+", help="Tokenized stock tickers, e.g. NVDA TSLA")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    parser.add_argument(
+        "--fixtures",
+        action="store_true",
+        help="Use canned CMC responses (no API key, no network)",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Force the live CoinMarketCap API (requires CMC_API_KEY)",
+    )
     args = parser.parse_args(argv)
 
-    client = CMCClient()
+    if args.fixtures and args.live:
+        parser.error("use either --fixtures or --live, not both")
+
+    use_fixtures: bool | None
+    if args.fixtures:
+        use_fixtures = True
+    elif args.live:
+        use_fixtures = False
+    else:
+        use_fixtures = None
+
+    client = create_client(use_fixtures=use_fixtures)
     scorer = TransparencyScorer(client)
 
-    results = []
-    for ticker in args.tickers:
-        try:
-            report = scorer.score(ticker)
-            results.append(report)
-        except Exception as exc:  # noqa: BLE001 — surface per-ticker errors, keep going
-            results.append({"ticker": ticker, "error": str(exc)})
+    results = scorer.score_many(args.tickers)
 
     if args.json:
         print(json.dumps(results, indent=2))
     else:
+        print(f"source={getattr(client, 'source', 'unknown')}")
         for r in results:
             if "error" in r:
                 print(f"{r['ticker']}: ERROR — {r['error']}")
