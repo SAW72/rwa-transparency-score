@@ -1,4 +1,4 @@
-"""RWA Transparency Score — risk radar for tokenized stocks."""
+"""RAT Score (RWA Transparency Score) — risk radar for tokenized stocks."""
 
 from .client import CMCClient, CMCError, FixtureClient, create_client, use_fixtures
 from .scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer, band_code
