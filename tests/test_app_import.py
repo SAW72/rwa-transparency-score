@@ -45,6 +45,7 @@ def test_brand_assets_exist() -> None:
     assert demo_app.MONOGRAM_PATH.is_file()
     assert demo_app.MONOGRAM_PATH.name == "rat-monogram.png"
     assert (demo_app.ASSETS_DIR / "rat-icon-192.png").is_file()
+    assert (demo_app.ASSETS_DIR / "rat-monogram-on-dark.png").is_file()
     assert (demo_app.ASSETS_DIR / "rat-monogram.svg").is_file()
     uri = demo_app._asset_data_uri(demo_app.MONOGRAM_PATH)
     assert uri is not None and uri.startswith("data:image/png;base64,")
