@@ -171,6 +171,17 @@ def por_score_from_ratio(ratio: float) -> float:
     return 30.0
 
 
+# Live Polygon bToken magnitudes (bIB01 ≈ 80/4442, bNVDA ≈ 26/5385) are
+# ~0.02 — same-chain totalSupply is not a verified circulating figure.
+MIN_PLAUSIBLE_POR_RATIO = 0.95
+RESERVES_ONLY_POR_SCORE = 90.0
+
+
+def por_ratio_is_plausible(ratio: float) -> bool:
+    """True only when reserves and circulating look like the same unit of account."""
+    return ratio >= MIN_PLAUSIBLE_POR_RATIO
+
+
 class BackedVerifier:
     """Chainlink Proof of Reserve (on-chain AggregatorV3) for Backed / xStocks."""
 
@@ -242,43 +253,40 @@ class BackedVerifier:
 
         reserves = reading.reserves
         circulating = reading.circulating
-        if reserves < 0:
+        if reserves <= 0:
             return heuristic_result(
                 pillar,
                 issuer_name,
                 reason=f"Chainlink PoR reserves for {ticker} were {reserves}.",
-                error="reserves < 0",
+                error="reserves <= 0",
             )
 
+        # Default: reserves-only. Same-chain ERC-20 totalSupply is multi-chain /
+        # units-unverified (live bIB01 ≈ 80/4442, bNVDA ≈ 26/5385). Never treat
+        # that ~0.02 figure as a clean undercollateralized on-chain PoR hit.
         ratio: float | None = None
+        used_ratio = False
         if circulating is not None and circulating > 0:
             ratio = reserves / circulating
-            score = por_score_from_ratio(ratio)
-            ratio_bit = (
-                f"reserves={reserves} {feed.unit} / circulatingSupply={circulating} "
-                f"→ collateralization_ratio={ratio:.6f} (score {score:.0f})"
-            )
-        elif circulating is not None:
-            return heuristic_result(
-                pillar,
-                issuer_name,
-                reason=f"On-chain circulatingSupply for {ticker} was {circulating}.",
-                error="circulatingSupply <= 0",
-            )
-        else:
-            # Oracle published a reserve balance; token supply was not readable
-            # on this chain (multi-chain issuance). Still Chainlink-verified.
-            if reserves <= 0:
-                return heuristic_result(
-                    pillar,
-                    issuer_name,
-                    reason=f"Chainlink PoR reserves for {ticker} were {reserves}.",
-                    error="reserves <= 0 and no circulating supply",
+            if por_ratio_is_plausible(ratio):
+                score = por_score_from_ratio(ratio)
+                used_ratio = True
+                ratio_bit = (
+                    f"reserves={reserves} {feed.unit} / circulatingSupply={circulating} "
+                    f"→ collateralization_ratio={ratio:.6f} (score {score:.0f})"
                 )
-            score = 90.0
+            else:
+                score = RESERVES_ONLY_POR_SCORE
+                ratio_bit = (
+                    f"reserves={reserves} {feed.unit}; ignored implausible "
+                    f"collateralization_ratio={ratio:.6f} "
+                    f"(supply multi-chain or units unverified; score {score:.0f})"
+                )
+        else:
+            score = RESERVES_ONLY_POR_SCORE
             ratio_bit = (
-                f"reserves={reserves} {feed.unit} (circulating supply not readable "
-                f"on {feed.chain}; score {score:.0f})"
+                f"reserves={reserves} {feed.unit} (reserves-only; same-chain "
+                f"totalSupply not used for ratio; score {score:.0f})"
             )
 
         evidence = (
@@ -291,6 +299,10 @@ class BackedVerifier:
             f"evidence source: Chainlink PoR {feed.proxy} on {feed.chain}",
             f"Chainlink SmartData: {feed.docs}",
         ]
+        if not used_ratio:
+            notes.append(
+                "Reserves-only score: circulating supply not proven same-unit / global."
+            )
         return VerificationResult(
             score=score,
             level=VerificationLevel.ON_CHAIN_POR,
@@ -304,7 +316,8 @@ class BackedVerifier:
                 "proxy": feed.proxy,
                 "reserves": reserves,
                 "circulating_supply": circulating,
-                "collateralization_ratio": ratio,
+                "collateralization_ratio": ratio if used_ratio else None,
+                "ratio_ignored": bool(ratio is not None and not used_ratio),
                 "round_id": reading.round_id,
                 "updated_at": reading.updated_at,
                 "rpc_url": reading.rpc_url,

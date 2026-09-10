@@ -61,8 +61,13 @@ class PorFeed:
     aliases: tuple[str, ...]
 
 
+# Same-chain ERC-20 totalSupply is NOT a proven global circulating figure
+# (multi-chain issuance + unit mismatch). Do not use it for a ratio until
+# a verified supply feed exists. Catalog addresses stay for a future upgrade.
+USE_TOKEN_SUPPLY_FOR_RATIO = False
+
 # Public Backed Finance PoR proxies on Polygon (Chainlink SmartData directory).
-# token_address is the ERC-20 Backed uses across EVM chains when known.
+# token_address is documented only — not used for scoring while the flag is off.
 BACKED_POR_FEEDS: tuple[PorFeed, ...] = (
     PorFeed(
         symbol="bNVDA",
@@ -310,7 +315,7 @@ class ChainlinkPorClient:
         if round_data.updated_at <= 0:
             raise RuntimeError(f"Chainlink PoR {feed.symbol} updatedAt was {round_data.updated_at}")
         reserves = scale_answer(round_data.answer, feed.decimals)
-        circulating = self.token_total_supply(feed)
+        circulating = self.token_total_supply(feed) if USE_TOKEN_SUPPLY_FOR_RATIO else None
         return PorReading(
             feed=feed,
             reserves=reserves,

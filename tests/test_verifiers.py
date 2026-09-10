@@ -10,17 +10,20 @@ import pytest
 from rwa_score.chainlink_por import (
     BACKED_POR_FEEDS,
     LATEST_ROUND_DATA_SELECTOR,
-    TOTAL_SUPPLY_SELECTOR,
+    USE_TOKEN_SUPPLY_FOR_RATIO,
+    PorReading,
     decode_latest_round,
     resolve_por_feed,
     scale_answer,
 )
 from rwa_score.verifiers import (
     DINARI_DSHARES_URL,
+    RESERVES_ONLY_POR_SCORE,
     BackedVerifier,
     DinariVerifier,
     RobinhoodVerifier,
     VerificationLevel,
+    por_ratio_is_plausible,
     por_score_from_ratio,
     resolve_verifier_id,
 )
@@ -44,10 +47,6 @@ def encode_latest_round(
         encode_uint256(n)
         for n in (round_id, answer, started_at, updated_at, answered_in_round)
     )
-
-
-def encode_uint(value: int) -> str:
-    return "0x" + encode_uint256(value)
 
 
 class FakeResponse:
@@ -117,15 +116,20 @@ class FakeRpcSession:
         return FakeResponse(200, {"jsonrpc": "2.0", "id": 1, "result": self._results[key]})
 
 
-def _bnvda_rpc(*, reserves: int = 1000, circulating: int = 1000) -> FakeRpcSession:
+def _bnvda_rpc(*, reserves: float = 1000) -> FakeRpcSession:
     feed = resolve_por_feed("NVDA")
     assert feed is not None
     return FakeRpcSession(
-        {
-            feed.proxy.lower(): encode_latest_round(answer=reserves * 10**feed.decimals),
-            (feed.token_address or "").lower(): encode_uint(circulating * 10**feed.token_decimals),
-        }
+        {feed.proxy.lower(): encode_latest_round(answer=int(reserves * 10**feed.decimals))}
     )
+
+
+class _StubPorClient:
+    def __init__(self, reading: PorReading) -> None:
+        self.reading = reading
+
+    def read(self, ticker: str, *, feeds=None) -> PorReading:
+        return self.reading
 
 
 @pytest.mark.parametrize(
@@ -153,6 +157,7 @@ def test_resolve_por_feed_aliases() -> None:
     assert resolve_por_feed("bNVDA") == feed
     assert resolve_por_feed("AAPL") is None
     assert resolve_por_feed("TSLA") is None
+    assert resolve_por_feed("TSLAx") is None
 
 
 def test_decode_latest_round_and_scale() -> None:
@@ -164,19 +169,20 @@ def test_decode_latest_round_and_scale() -> None:
     assert scale_answer(decoded.answer, 8) == 1000.0
 
 
-def test_backed_verifier_high_ratio() -> None:
-    session = _bnvda_rpc(reserves=1000, circulating=1000)
+def test_backed_verifier_published_feed_is_reserves_only() -> None:
+    assert USE_TOKEN_SUPPLY_FOR_RATIO is False
+    session = _bnvda_rpc(reserves=1000)
     v = BackedVerifier(session=session, cache_ttl=3600)
     result = v.verify_reserves(ticker="NVDA", issuer_name="Backed Finance")
     assert result.ok is True
     assert result.level == VerificationLevel.ON_CHAIN_POR
     assert result.source == "chainlink_por"
-    assert result.score == 95.0
+    assert result.score == RESERVES_ONLY_POR_SCORE
     assert "Chainlink PoR" in result.evidence
-    assert "collateralization_ratio" in result.evidence
-    assert result.meta["collateralization_ratio"] == pytest.approx(1.0)
+    assert "reserves-only" in result.evidence
+    assert result.meta["collateralization_ratio"] is None
     assert result.meta["symbol"] == "bNVDA"
-    assert any("Chainlink" in n for n in result.notes)
+    assert any("Reserves-only" in n for n in result.notes)
 
 
 def test_backed_verifier_fallback_on_rpc_error() -> None:
@@ -198,6 +204,9 @@ def test_backed_verifier_fallback_when_no_feed() -> None:
     assert result.error is None
     assert "No published Chainlink PoR feed" in result.evidence
     assert any("heuristic fallback" in n for n in result.notes)
+    tsla = v.verify_reserves(ticker="TSLAx", issuer_name="xStocks")
+    assert tsla.source == "heuristic_fallback"
+    assert "No published Chainlink PoR feed" in tsla.evidence
 
 
 def test_backed_verifier_caches_for_one_hour() -> None:
@@ -205,10 +214,41 @@ def test_backed_verifier_caches_for_one_hour() -> None:
     v = BackedVerifier(session=session, cache_ttl=3600)
     first = v.verify_reserves(ticker="NVDA", issuer_name="xStocks")
     second = v.verify_reserves(ticker="NVDA", issuer_name="xStocks")
-    assert first.score == second.score == 95.0
-    # latestRoundData + optional totalSupply, once (cached on the second call).
-    assert len(session.calls) == 2
-    assert all(LATEST_ROUND_DATA_SELECTOR in data or TOTAL_SUPPLY_SELECTOR in data for _, _, data in session.calls)
+    assert first.score == second.score == RESERVES_ONLY_POR_SCORE
+    assert len(session.calls) == 1
+    assert session.calls[0][2] == LATEST_ROUND_DATA_SELECTOR
+
+
+def test_implausible_live_por_magnitudes_are_not_scored_as_undercollateralized() -> None:
+    """Live Polygon numbers must not become ON_CHAIN_POR score 30 / ok=True."""
+    cases = (
+        ("bIB01", 80.0, 4442.0),
+        ("bNVDA", 26.0, 5385.0),
+    )
+    for symbol, reserves, circulating in cases:
+        feed = resolve_por_feed(symbol)
+        assert feed is not None
+        ratio = reserves / circulating
+        assert not por_ratio_is_plausible(ratio)
+        assert por_score_from_ratio(ratio) == 30.0
+        reading = PorReading(
+            feed=feed,
+            reserves=reserves,
+            circulating=circulating,
+            round_id=1,
+            updated_at=1_700_000_000,
+            rpc_url="https://rpc.example.test",
+        )
+        v = BackedVerifier(client=_StubPorClient(reading))
+        result = v.verify_reserves(ticker=symbol, issuer_name="Backed Finance")
+        assert result.ok is True
+        assert result.level == VerificationLevel.ON_CHAIN_POR
+        assert result.source == "chainlink_por"
+        assert result.score == RESERVES_ONLY_POR_SCORE
+        assert result.score != 30.0
+        assert result.meta["ratio_ignored"] is True
+        assert result.meta["collateralization_ratio"] is None
+        assert "implausible" in result.evidence
 
 
 def test_backed_verifier_reserves_only_when_supply_missing() -> None:

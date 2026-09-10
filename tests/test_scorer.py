@@ -189,7 +189,7 @@ def test_backed_live_por_scores_reserves_higher_than_unknown(monkeypatch) -> Non
     assert backed_report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
     assert backed_report["verification"]["reserves"]["source"] == "chainlink_por"
     assert "Chainlink PoR" in backed_report["verification"]["reserves"]["evidence"]
-    assert backed_report["subscores"]["reserves"] >= 95.0
+    assert backed_report["subscores"]["reserves"] >= 90.0
     assert unknown_report["verification"]["reserves"]["source"] == "heuristic_fallback"
     assert "heuristic fallback" in unknown_report["explanations"]["reserves"].lower()
     assert backed_report["subscores"]["reserves"] > unknown_report["subscores"]["reserves"]
