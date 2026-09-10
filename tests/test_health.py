@@ -18,6 +18,21 @@ from tests.test_verifiers import FakeResponse, encode_latest_round
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_render_yaml_share_secrets_are_not_synced() -> None:
+    text = (ROOT / "render.yaml").read_text(encoding="utf-8")
+    for key in (
+        "SCORE_CARD_SIGNING_SECRET",
+        "X_API_KEY",
+        "X_API_SECRET",
+        "X_ACCESS_TOKEN",
+        "X_ACCESS_TOKEN_SECRET",
+    ):
+        assert f"- key: {key}" in text
+        idx = text.index(f"- key: {key}")
+        following = text[idx : idx + 80]
+        assert "sync: false" in following
+
+
 def test_render_yaml_fixtures_flag_is_live() -> None:
     text = (ROOT / "render.yaml").read_text(encoding="utf-8")
     lines = text.splitlines()

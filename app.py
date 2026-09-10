@@ -20,8 +20,10 @@ import streamlit as st
 from rwa_score.client import create_client, env_flag
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
+from rwa_score.score_card import share_score_card
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
 from rwa_score.verifiers import VerificationLevel
+from rwa_score.x_client import x_credentials_ready
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
 # Per-symbol wall-clock cache for "Why this score?" — process-local dict.
@@ -234,7 +236,41 @@ def _error_card_html(ticker: str, message: str, *, selected: bool = False) -> st
         """
 
 
-def _render_compare_card(report: dict, *, selected: bool = False) -> None:
+def _render_share_controls(report: dict, *, slot_index: int) -> None:
+    """User-triggered signed PNG + optional X post. Never runs on page load."""
+    ticker = str(report.get("ticker") or "UNK")
+    state_key = f"share_card_{slot_index}_{ticker}"
+    if st.button("Share score card", key=f"share_btn_{slot_index}_{ticker}"):
+        try:
+            st.session_state[state_key] = share_score_card(report)
+        except Exception as exc:  # noqa: BLE001 — card UI must stay up
+            st.session_state[state_key] = None
+            st.error(f"Could not build score card: {exc}")
+            return
+    if not x_credentials_ready():
+        st.caption("X credentials not set — share still builds a downloadable PNG.")
+    bundle = st.session_state.get(state_key)
+    if bundle is None:
+        return
+    if bundle.png_bytes:
+        st.image(bundle.png_bytes, use_container_width=True)
+        st.download_button(
+            "Download PNG",
+            data=bundle.png_bytes,
+            file_name=bundle.filename,
+            mime="image/png",
+            key=f"share_dl_{slot_index}_{ticker}",
+        )
+    st.caption(f"Signature fingerprint: `{bundle.fingerprint}`")
+    if bundle.x_posted:
+        st.success(bundle.x_message)
+    elif bundle.x_message:
+        st.info(bundle.x_message)
+
+
+def _render_compare_card(
+    report: dict, *, selected: bool = False, slot_index: int = 0
+) -> None:
     st.markdown(
         _score_card_html(report, selected=selected),
         unsafe_allow_html=True,
@@ -275,6 +311,8 @@ def _render_compare_card(report: dict, *, selected: bool = False) -> None:
             st.warning(flag)
     else:
         st.caption("No risk flags on this pass.")
+
+    _render_share_controls(report, slot_index=slot_index)
 
     st.markdown("**Why this score?**")
     st.write(_cached_explanation(report))
@@ -539,7 +577,7 @@ for col, (symbol, report, error), index in zip(
         if error or report is None:
             _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
         else:
-            _render_compare_card(report, selected=selected)
+            _render_compare_card(report, selected=selected, slot_index=index)
 
 ok_reports = [report for _symbol, report, error in results if report is not None and not error]
 if ok_reports:
