@@ -3,7 +3,8 @@
 Launch (fixtures, no API key):
     RWA_USE_FIXTURES=1 streamlit run app.py
 
-Render binds 0.0.0.0:$PORT via render.yaml.
+Render binds 0.0.0.0:$PORT via render.yaml and starts with
+``python -m rwa_score.health`` so GET /health is registered before the SPA.
 """
 
 from __future__ import annotations
@@ -16,8 +17,11 @@ from pathlib import Path
 import streamlit as st
 
 from rwa_score.client import create_client, env_flag
+from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
 from rwa_score.verifiers import VerificationLevel
+
+install_health_route()
 
 PAGE_TITLE = "RAT Score | RWA Transparency Score"
 BRAND_H1 = "RAT Score"
@@ -83,6 +87,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+serve_health_if_requested()
 
 
 def _asset_data_uri(path: Path) -> str | None:
