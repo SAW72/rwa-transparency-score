@@ -11,6 +11,8 @@ from typing import Any
 
 import requests
 
+from .scorer import WEIGHTS
+
 XAI_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 XAI_MODEL = "grok-4.1-fast"
 XAI_MAX_TOKENS = 300
@@ -48,7 +50,7 @@ def build_explain_prompt(result: dict[str, Any]) -> str:
         f"Issuer note: {note}",
         "Pillars:",
     ]
-    for pillar in ("backing", "reserves", "redemption", "price", "disclosure"):
+    for pillar in WEIGHTS:
         why = explanations.get(pillar) or ""
         block = verification.get(pillar) or {}
         evidence = block.get("evidence") or ""
@@ -81,7 +83,7 @@ def fallback_explanation(result: dict[str, Any]) -> str:
         f"{ticker} scores {score} ({band}).",
         note,
     ]
-    for pillar in ("backing", "reserves", "redemption", "price", "disclosure"):
+    for pillar in WEIGHTS:
         block = verification.get(pillar) or {}
         evidence = block.get("evidence") or ""
         why = explanations.get(pillar) or ""

@@ -238,5 +238,327 @@
         }
       }
     }
+  },
+  "market_pairs": {
+    "2": {
+      "rwa_id": 2,
+      "name": "Nvidia Corp",
+      "symbol": "NVDA",
+      "num_market_pairs": 3,
+      "total_size": 3,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "market_id": 99001,
+          "market_pair": "NVDAX/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 36992,
+            "symbol": "NVDAx",
+            "exchange_symbol": "NVDAX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 118.45,
+              "volume_24h": 4200000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "market_id": 99002,
+          "market_pair": "NVDAon/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 37001,
+            "symbol": "NVDAon",
+            "exchange_symbol": "NVDAON",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 118.55,
+              "volume_24h": 1900000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "exchange": {"exchange_id": 311, "name": "Gate.io", "slug": "gate-io"},
+          "market_id": 99003,
+          "market_pair": "NVDAxst/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 37002,
+            "symbol": "NVDAxst",
+            "exchange_symbol": "NVDAXST",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 118.70,
+              "volume_24h": 1500000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "15": {
+      "rwa_id": 15,
+      "name": "Tesla Inc",
+      "symbol": "TSLA",
+      "num_market_pairs": 2,
+      "total_size": 2,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {"exchange_id": 890, "name": "ThinDEX Demo", "slug": "thindex-demo"},
+          "market_id": 99101,
+          "market_pair": "TSLAn/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90015,
+            "symbol": "TSLAn",
+            "exchange_symbol": "TSLAN",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 241.0,
+              "volume_24h": 12000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "exchange": {"exchange_id": 891, "name": "ShadowVault Demo", "slug": "shadowvault-demo"},
+          "market_id": 99102,
+          "market_pair": "TSLAx/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90016,
+            "symbol": "TSLAx",
+            "exchange_symbol": "TSLAX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 198.0,
+              "volume_24h": 8000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "16": {
+      "rwa_id": 16,
+      "name": "Apple Inc",
+      "symbol": "AAPL",
+      "num_market_pairs": 3,
+      "total_size": 3,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "market_id": 99201,
+          "market_pair": "AAPLx/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 36993,
+            "symbol": "AAPLx",
+            "exchange_symbol": "AAPLX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 226.1,
+              "volume_24h": 1800000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "market_id": 99202,
+          "market_pair": "AAPLb/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 37011,
+            "symbol": "AAPLb",
+            "exchange_symbol": "AAPLB",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 230.0,
+              "volume_24h": 900000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "exchange": {"exchange_id": 544, "name": "Dinari", "slug": "dinari"},
+          "market_id": 99203,
+          "market_pair": "AAPLd/USDC",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 37012,
+            "symbol": "AAPLd",
+            "exchange_symbol": "AAPLD",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 3408,
+            "symbol": "USDC",
+            "exchange_symbol": "USDC",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 224.5,
+              "volume_24h": 1100000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "18": {
+      "rwa_id": 18,
+      "name": "Meta Platforms Inc",
+      "symbol": "META",
+      "num_market_pairs": 2,
+      "total_size": 2,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "market_id": 99301,
+          "market_pair": "METAx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 36994,
+            "symbol": "METAx",
+            "exchange_symbol": "METAX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 512.2,
+              "volume_24h": 2600000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        },
+        {
+          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "market_id": 99302,
+          "market_pair": "METAxst/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 37021,
+            "symbol": "METAxst",
+            "exchange_symbol": "METAXST",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 514.0,
+              "volume_24h": 1400000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    }
   }
 }

@@ -17,7 +17,7 @@ from typing import Any
 
 import requests
 
-from .client import RWAClient
+from .client import RWAClient, parse_market_pairs_payload
 from .issuer_registry import HEURISTIC_NOTE, classify, issuer_note
 from .verifiers import (
     VerificationLevel,
@@ -29,11 +29,12 @@ from .verifiers import (
 )
 
 WEIGHTS: dict[str, float] = {
-    "backing": 0.25,
-    "reserves": 0.25,
-    "redemption": 0.20,
+    "backing": 0.20,
+    "reserves": 0.20,
+    "redemption": 0.15,
     "price": 0.15,
     "disclosure": 0.15,
+    "basis": 0.15,
 }
 
 PILLARS: dict[str, dict[str, str]] = {
@@ -57,12 +58,21 @@ PILLARS: dict[str, dict[str, str]] = {
         "label": "Disclosure",
         "what": "Matchable SEC CIK on the RWA info record vs. missing.",
     },
+    "basis": {
+        "label": "Cross-issuer basis",
+        "what": "Same underlying ticker, different wrapper prices — spread is wrapper risk.",
+    },
 }
 
 # Conservative defaults when a live field is missing — never pretend we measured it.
 DEFAULT_PRICE_SCORE = 50.0
 MISSING_CRYPTO_PRICE_SCORE = 45.0
 QUOTE_ERROR_PRICE_SCORE = 50.0
+MISSING_BASIS_SCORE = 50.0
+SINGLE_WRAPPER_BASIS_SCORE = 55.0
+BASIS_ERROR_SCORE = 50.0
+BASIS_SCORE_FLOOR = 15.0
+BASIS_SPREAD_PENALTY = 10.0
 
 
 class ScoreError(RuntimeError):
@@ -93,6 +103,130 @@ def band_detail(score: float) -> str:
 def _band(score: float) -> str:
     """Backward-compatible full band string."""
     return band_detail(score)
+
+
+def pair_usd_price(pair: dict[str, Any]) -> float | None:
+    """Best USD last price on a CMC market-pair row."""
+    for block_key in ("quotes", "exchange_reported_quotes"):
+        for quote in pair.get(block_key) or []:
+            if not isinstance(quote, dict):
+                continue
+            if (quote.get("symbol") or "").upper() != "USD":
+                continue
+            raw = quote.get("price")
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+    usd = (pair.get("quote") or {}).get("USD") or {}
+    raw = usd.get("price")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def pair_usd_volume(pair: dict[str, Any]) -> float:
+    """24h USD volume on a CMC market-pair row, or 0 if missing."""
+    for quote in pair.get("quotes") or []:
+        if not isinstance(quote, dict):
+            continue
+        if (quote.get("symbol") or "").upper() != "USD":
+            continue
+        raw = quote.get("volume_24h")
+        if raw is None:
+            continue
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def group_wrapper_quotes(pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse exchange rows into one quote per wrapper ``crypto_id``.
+
+    Same wrapper on two venues is one issuer product. Different ``crypto_id``
+    values are different wrappers (xStocks vs Ondo vs Dinari). Price is a
+    volume-weighted average when 24h volume is present, else a simple mean.
+    """
+    buckets: dict[int, dict[str, Any]] = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        base = pair.get("market_pair_base") or {}
+        raw_id = base.get("crypto_id")
+        if raw_id is None:
+            continue
+        try:
+            crypto_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        price = pair_usd_price(pair)
+        if price is None or price <= 0:
+            continue
+        volume = pair_usd_volume(pair)
+        bucket = buckets.setdefault(
+            crypto_id,
+            {
+                "crypto_id": crypto_id,
+                "symbol": (base.get("symbol") or "").strip() or f"id:{crypto_id}",
+                "prices": [],
+                "volumes": [],
+            },
+        )
+        if not bucket.get("symbol") or str(bucket["symbol"]).startswith("id:"):
+            symbol = (base.get("symbol") or "").strip()
+            if symbol:
+                bucket["symbol"] = symbol
+        bucket["prices"].append(price)
+        bucket["volumes"].append(volume)
+
+    wrappers: list[dict[str, Any]] = []
+    for bucket in buckets.values():
+        prices: list[float] = bucket["prices"]
+        volumes: list[float] = bucket["volumes"]
+        weighted = sum(p * v for p, v in zip(prices, volumes))
+        total_vol = sum(volumes)
+        if total_vol > 0:
+            representative = weighted / total_vol
+        else:
+            representative = sum(prices) / len(prices)
+        wrappers.append(
+            {
+                "crypto_id": bucket["crypto_id"],
+                "symbol": bucket["symbol"],
+                "price": representative,
+                "volume_24h": total_vol,
+                "venues": len(prices),
+            }
+        )
+    wrappers.sort(key=lambda row: (row["price"], row["crypto_id"]))
+    return wrappers
+
+
+def percent_spread(prices: list[float]) -> float | None:
+    """``(max − min) / mid × 100``. ``None`` unless two or more positive prices."""
+    clean = [float(p) for p in prices if p is not None and float(p) > 0]
+    if len(clean) < 2:
+        return None
+    low, high = min(clean), max(clean)
+    mid = (low + high) / 2.0
+    if mid <= 0:
+        return None
+    return (high - low) / mid * 100.0
+
+
+def basis_score_from_spread(pct_spread: float) -> float:
+    """Map a wrapper percent-spread onto 0–100.
+
+    ``score = max(15, 100 − |spread| × 10)`` so 0.5% → 95, 5% → 50, ≥8.5% → 15.
+    """
+    return max(BASIS_SCORE_FLOOR, 100.0 - abs(float(pct_spread)) * BASIS_SPREAD_PENALTY)
 
 
 def _append_verification_notes(
@@ -247,6 +381,126 @@ class TransparencyScorer:
             meta,
             flags,
             f"24h change {float(raw_pct):+.2f}%; score = max(20, 100 − |Δ| × 2) = {score:.1f}.",
+        )
+
+    def _issuer_by_crypto_id(self) -> dict[int, str]:
+        """crypto_id → issuer name from the already-built issuer index."""
+        self._ensure_issuer_index()
+        names: dict[int, str] = {}
+        for row in (self._issuer_index or {}).values():
+            crypto_id = row.get("crypto_id")
+            if crypto_id is None:
+                continue
+            try:
+                names[int(crypto_id)] = str(row.get("issuer_name") or "")
+            except (TypeError, ValueError):
+                continue
+        return names
+
+    def _basis_score(self, rwa_id: int) -> tuple[float, dict[str, Any], list[str], str]:
+        """Cross-issuer wrapper spread. Never swallow fetch errors silently."""
+        flags: list[str] = []
+        empty_meta: dict[str, Any] = {
+            "available": False,
+            "wrapper_count": 0,
+            "percent_spread": None,
+            "min_price": None,
+            "max_price": None,
+            "wrappers": [],
+        }
+        try:
+            raw = self.client.market_pairs(rwa_id=rwa_id)
+        except Exception as exc:  # noqa: BLE001 — record, do not hide
+            flags.append(f"Market-pairs lookup failed: {exc}")
+            return (
+                BASIS_ERROR_SCORE,
+                empty_meta,
+                flags,
+                f"Market-pairs endpoint error; assigned the error default "
+                f"({BASIS_ERROR_SCORE:.0f}).",
+            )
+
+        payload = parse_market_pairs_payload(raw)
+        wrappers = group_wrapper_quotes(payload.get("market_pairs") or [])
+        issuer_names = self._issuer_by_crypto_id()
+        for wrapper in wrappers:
+            wrapper["issuer"] = issuer_names.get(int(wrapper["crypto_id"])) or ""
+
+        if not wrappers:
+            flags.append(
+                "No priced wrapper tokens on CMC market-pairs — cross-issuer basis unverified."
+            )
+            return (
+                MISSING_BASIS_SCORE,
+                empty_meta,
+                flags,
+                "No wrapper USD prices in market-pairs; assigned the missing-pairs default "
+                f"({MISSING_BASIS_SCORE:.0f}).",
+            )
+
+        if len(wrappers) == 1:
+            only = wrappers[0]
+            flags.append(
+                "Only one wrapper token on CMC market-pairs — cannot compare issuers."
+            )
+            meta = {
+                "available": False,
+                "wrapper_count": 1,
+                "percent_spread": None,
+                "min_price": only["price"],
+                "max_price": only["price"],
+                "wrappers": wrappers,
+            }
+            return (
+                SINGLE_WRAPPER_BASIS_SCORE,
+                meta,
+                flags,
+                f"Single wrapper {only['symbol']} at {only['price']:.4f}; "
+                f"assigned the single-wrapper default ({SINGLE_WRAPPER_BASIS_SCORE:.0f}).",
+            )
+
+        prices = [float(w["price"]) for w in wrappers]
+        spread = percent_spread(prices)
+        if spread is None:
+            flags.append("Could not compute a wrapper percent-spread from market-pairs.")
+            return (
+                MISSING_BASIS_SCORE,
+                {
+                    "available": False,
+                    "wrapper_count": len(wrappers),
+                    "percent_spread": None,
+                    "min_price": min(prices) if prices else None,
+                    "max_price": max(prices) if prices else None,
+                    "wrappers": wrappers,
+                },
+                flags,
+                f"Invalid spread inputs; assigned the missing default ({MISSING_BASIS_SCORE:.0f}).",
+            )
+
+        score = basis_score_from_spread(spread)
+        low, high = min(wrappers, key=lambda w: w["price"]), max(
+            wrappers, key=lambda w: w["price"]
+        )
+        meta = {
+            "available": True,
+            "wrapper_count": len(wrappers),
+            "percent_spread": spread,
+            "min_price": low["price"],
+            "max_price": high["price"],
+            "wrappers": wrappers,
+        }
+        cheap = f"{low['symbol']} {low['price']:.4f}"
+        dear = f"{high['symbol']} {high['price']:.4f}"
+        return (
+            score,
+            meta,
+            flags,
+            (
+                f"{len(wrappers)} wrappers; spread {spread:.2f}% "
+                f"({cheap} vs {dear}); "
+                f"score = max({BASIS_SCORE_FLOOR:.0f}, 100 − |spread| × "
+                f"{BASIS_SPREAD_PENALTY:.0f}) = {score:.1f}."
+            ),
         )
 
     def _heuristic_redemption(self, issuer_name: str) -> VerificationResult:
@@ -428,12 +682,41 @@ class TransparencyScorer:
             disclosure_v,
         )
 
+        basis_score, basis_meta, basis_flags, basis_why = self._basis_score(rwa_id)
+        cheap = basis_meta.get("min_price")
+        dear = basis_meta.get("max_price")
+        spread_pct = basis_meta.get("percent_spread")
+        if basis_meta.get("available"):
+            basis_evidence = (
+                f"CMC market-pairs: {basis_meta.get('wrapper_count')} wrappers; "
+                f"spread {spread_pct:.2f}% "
+                f"(low {cheap}, high {dear})."
+            )
+        elif basis_meta.get("wrapper_count") == 1:
+            only = (basis_meta.get("wrappers") or [{}])[0]
+            basis_evidence = (
+                f"CMC market-pairs: single wrapper "
+                f"{only.get('symbol') or 'unknown'} — no cross-issuer compare."
+            )
+        else:
+            basis_evidence = "CMC market-pairs unavailable — self-reported gap."
+        basis_v = VerificationResult(
+            score=basis_score,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence=basis_evidence,
+            source="cmc_market_pairs",
+            notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
+            ok=bool(basis_meta.get("available")),
+        )
+        basis_why = _append_verification_notes(basis_why, basis_v)
+
         subscores = {
             "backing": backing,
             "reserves": reserves,
             "redemption": redemption,
             "price": price_score,
             "disclosure": disclosure,
+            "basis": basis_score,
         }
         final = sum(subscores[k] * WEIGHTS[k] for k in WEIGHTS)
 
@@ -448,7 +731,12 @@ class TransparencyScorer:
             )
         if price_score < 50:
             risk_flags.append("Token price drifting hard from the underlying — possible thin liquidity.")
+        if basis_score < 50:
+            risk_flags.append(
+                "Wide cross-issuer wrapper spread — same ticker, different prices (CMC market-pairs)."
+            )
         risk_flags.extend(price_flags)
+        risk_flags.extend(basis_flags)
 
         # Never silently drop a failed verifier — promote errors into flags.
         for pillar_key, result in (
@@ -485,6 +773,7 @@ class TransparencyScorer:
             "redemption": redemption_why,
             "price": price_why,
             "disclosure": disclosure_why,
+            "basis": basis_why,
         }
 
         verification = {
@@ -493,6 +782,7 @@ class TransparencyScorer:
             "redemption": redemption_v.as_dict(),
             "price": price_v.as_dict(),
             "disclosure": disclosure_v.as_dict(),
+            "basis": basis_v.as_dict(),
         }
 
         return {
@@ -512,6 +802,7 @@ class TransparencyScorer:
             "heuristics": {**flags, "source": "issuer_registry", "labeled": True},
             "data_source": source,
             "price": price_meta,
+            "basis": basis_meta,
             "cik": cik,
             "issuer_note": issuer_note(issuer_name),
             "summary": f"{issuer_name or 'Unknown issuer'} — {len(risk_flags)} risk flag(s).",

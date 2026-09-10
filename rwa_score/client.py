@@ -1,11 +1,12 @@
 """CoinMarketCap Pro API client plus an offline fixture client.
 
 Live endpoints used (Basic plan):
-  - GET /v5/real-world-assets/map            -> rwa_id (0 credits)
-  - GET /v5/real-world-assets/info           -> metadata incl. CIK (1 credit / 250)
-  - GET /v5/real-world-assets/issuers/list   -> issuer directory (1 credit)
-  - GET /v5/real-world-assets/issuers        -> single issuer + tokens (1 credit)
-  - GET /v2/cryptocurrency/quotes/latest     -> token price/volume
+  - GET /v5/real-world-assets/map                -> rwa_id (0 credits)
+  - GET /v5/real-world-assets/info               -> metadata incl. CIK (1 credit / 250)
+  - GET /v5/real-world-assets/issuers/list       -> issuer directory (1 credit)
+  - GET /v5/real-world-assets/issuers            -> single issuer + tokens (1 credit)
+  - GET /v5/real-world-assets/market-pairs/list  -> wrapper markets for one RWA
+  - GET /v2/cryptocurrency/quotes/latest         -> token price/volume
 """
 
 from __future__ import annotations
@@ -34,9 +35,11 @@ RATE_LIMIT_HTTP = 429
 RATE_LIMIT_CMC_CODES = {1008, "1008"}
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_MAX_WAIT_SECONDS = 60.0
-# Map / info can refresh; issuer directory is process-lifetime (no TTL).
+# Map / info / market-pairs can refresh; issuer directory is process-lifetime (no TTL).
 DEFAULT_MAP_TTL_SECONDS = 120.0
 DEFAULT_INFO_TTL_SECONDS = 120.0
+DEFAULT_PAIRS_TTL_SECONDS = 120.0
+DEFAULT_MARKET_PAIRS_LIMIT = 100
 
 
 class CMCError(RuntimeError):
@@ -57,6 +60,13 @@ class RWAClient(Protocol):
     def issuer(self, issuer_id: str) -> dict[str, Any]: ...
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]: ...
+
+    def market_pairs(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]: ...
 
 
 def env_flag(name: str) -> bool:
@@ -104,6 +114,38 @@ def _cmc_error_code(payload: dict[str, Any] | None) -> Any:
     if not payload:
         return None
     return (payload.get("status") or {}).get("error_code")
+
+
+def parse_market_pairs_payload(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize a CMC (or fixture) market-pairs ``data`` object.
+
+    Live shape: ``{rwa_id, name, symbol, num_market_pairs, market_pairs, ...}``.
+    Missing or empty input becomes an empty-but-valid structure so callers
+    never have to special-case ``None``.
+    """
+    payload = data if isinstance(data, dict) else {}
+    pairs = payload.get("market_pairs")
+    if not isinstance(pairs, list):
+        pairs = []
+    rwa_id = payload.get("rwa_id")
+    try:
+        rwa_id_out = int(rwa_id) if rwa_id is not None else None
+    except (TypeError, ValueError):
+        rwa_id_out = None
+    raw_count = payload.get("num_market_pairs")
+    try:
+        num_pairs = int(raw_count) if raw_count is not None else len(pairs)
+    except (TypeError, ValueError):
+        num_pairs = len(pairs)
+    return {
+        "rwa_id": rwa_id_out,
+        "name": payload.get("name") or "",
+        "symbol": (payload.get("symbol") or "").upper(),
+        "num_market_pairs": num_pairs,
+        "market_pairs": list(pairs),
+        "total_size": payload.get("total_size", num_pairs),
+        "has_more": bool(payload.get("has_more")),
+    }
 
 
 def _is_rate_limited(status_code: int, payload: dict[str, Any] | None) -> bool:
@@ -169,6 +211,7 @@ class CMCClient:
         max_wait_seconds: float = DEFAULT_MAX_WAIT_SECONDS,
         map_ttl: float | None = DEFAULT_MAP_TTL_SECONDS,
         info_ttl: float | None = DEFAULT_INFO_TTL_SECONDS,
+        pairs_ttl: float | None = DEFAULT_PAIRS_TTL_SECONDS,
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("CMC_API_KEY", "")
@@ -185,6 +228,7 @@ class CMCClient:
         self.max_wait_seconds = max_wait_seconds
         self.map_ttl = map_ttl
         self.info_ttl = info_ttl
+        self.pairs_ttl = pairs_ttl
         self._sleep = sleeper or time.sleep
         self._cache = _TTLCache()
 
@@ -289,6 +333,41 @@ class CMCClient:
         )
         return data.get("data", {}).get(str(crypto_id), {})
 
+    def market_pairs(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        """List markets CMC tracks for one RWA's underlying wrapper tokens.
+
+        Requires exactly one of ``rwa_id`` or ``symbol``. Cached on a short TTL
+        so Streamlit widget reruns do not re-burn the Basic-plan credit.
+        """
+        if rwa_id is None and not symbol:
+            raise CMCError("market_pairs requires rwa_id or symbol")
+        if rwa_id is not None and symbol:
+            raise CMCError("market_pairs accepts only one of rwa_id or symbol")
+        if rwa_id is not None:
+            key = f"pairs:id:{int(rwa_id)}"
+            params: dict[str, Any] = {
+                "rwa_id": int(rwa_id),
+                "limit": DEFAULT_MARKET_PAIRS_LIMIT,
+            }
+        else:
+            key = f"pairs:sym:{(symbol or '').upper()}"
+            params = {
+                "symbol": (symbol or "").upper(),
+                "limit": DEFAULT_MARKET_PAIRS_LIMIT,
+            }
+        cached = self._cache.get(key, self.pairs_ttl)
+        if cached is not None:
+            return cached
+        data = self._get("/v5/real-world-assets/market-pairs/list", params)
+        parsed = parse_market_pairs_payload(data.get("data") or {})
+        self._cache.set(key, parsed)
+        return copy.deepcopy(parsed)
+
 
 class FixtureClient:
     """Offline client that serves bundled demo JSON. Never calls CMC."""
@@ -333,3 +412,20 @@ class FixtureClient:
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
         quotes = self._data.get("quotes") or {}
         return dict(quotes.get(str(crypto_id)) or {})
+
+    def market_pairs(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        catalog = self._data.get("market_pairs") or {}
+        if rwa_id is not None:
+            return parse_market_pairs_payload(catalog.get(str(int(rwa_id))) or {})
+        if not symbol:
+            return parse_market_pairs_payload({})
+        wanted = symbol.strip().upper()
+        for payload in catalog.values():
+            if isinstance(payload, dict) and (payload.get("symbol") or "").upper() == wanted:
+                return parse_market_pairs_payload(payload)
+        return parse_market_pairs_payload({})

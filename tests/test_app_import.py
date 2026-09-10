@@ -9,7 +9,7 @@ from tests.conftest import RecordingClient
 README_ONELINER = (
     "RAT Score (RWA Transparency Score) — an AI-assisted risk radar for tokenized stocks. "
     "Rates issuers 0–100 on backing, proof of reserves, redemption, price integrity, "
-    "and disclosure using CoinMarketCap’s RWA API."
+    "disclosure, and cross-issuer basis using CoinMarketCap’s RWA API."
 )
 
 EXPECTED_DISCLAIMER = (
@@ -197,3 +197,32 @@ def test_error_card_escapes_html() -> None:
     assert "<script>" not in markup
     assert "&lt;b&gt;NVDA&lt;/b&gt;" in markup
     assert "&lt;script&gt;" in markup
+
+
+def test_ui_surfaces_sixth_pillar_badge(fixture_scorer) -> None:
+    import app as demo_app
+    from rwa_score.scorer import PILLARS, WEIGHTS
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "Cross-issuer basis" in source
+    assert "self-reported CMC market-pairs" in source
+    assert "basis" in WEIGHTS
+    assert PILLARS["basis"]["label"] == "Cross-issuer basis"
+
+    report = fixture_scorer.score("NVDA")
+    badge, evidence = demo_app._verification_badge_label("basis", report)
+    assert "self-reported" in badge
+    assert "CMC market-pairs" in evidence
+    results = demo_app._score_slots(fixture_scorer, ["NVDA", "TSLA", "AAPL", "META"])
+    assert all(row[1] is not None for row in results)
+    assert all("basis" in row[1]["subscores"] for row in results)
+
+
+def test_readme_documents_basis_weight_table() -> None:
+    text = Path("README.md").read_text(encoding="utf-8")
+    assert "Cross-issuer basis" in text
+    assert "| Cross-issuer basis |" in text
+    assert "20%" in text
+    assert "15%" in text
+    assert "market-pairs" in text
+    assert "Weights sum to **100%**" in text
