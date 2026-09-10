@@ -8,12 +8,21 @@ import {DeploySepolia} from "../script/DeploySepolia.s.sol";
 contract ScoreAttestationTest is Test {
     ScoreAttestation internal attestor;
     address internal attester = address(0xA11CE);
+    address internal stranger = address(0xB0B);
     bytes32 internal sampleHash = keccak256("payload");
 
     function setUp() public {
         attestor = new ScoreAttestation(0.001 ether);
         vm.deal(address(this), 1 ether);
         vm.deal(attester, 1 ether);
+        vm.deal(stranger, 1 ether);
+    }
+
+    function test_deployerIsOwnerAndInitialAttester() public view {
+        assertEq(attestor.owner(), address(this));
+        assertTrue(attestor.isAttester(address(this)));
+        assertTrue(attestor.authorized(address(this)));
+        assertFalse(attestor.authorized(stranger));
     }
 
     function test_attestStoresHashNotScore() public {
@@ -36,11 +45,66 @@ contract ScoreAttestationTest is Test {
     }
 
     function test_attestRecordsMsgSenderNotCalldata() public {
+        attestor.setAttester(attester, true);
         vm.prank(attester);
         attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
         ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
         assertEq(rec.attester, attester);
         assertTrue(rec.attester != address(this));
+    }
+
+    function test_strangerCannotAttestEvenWithFee() public {
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotAttester.selector);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
+        assertFalse(attestor.attested(sampleHash));
+    }
+
+    function test_strangerCannotFrontRunOfficialHash() public {
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotAttester.selector);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+        // Official attester can still lock the same digest.
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
+        assertTrue(attestor.attested(sampleHash));
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attester, address(this));
+    }
+
+    function test_allowlistedAttesterCanAttest() public {
+        attestor.setAttester(attester, true);
+        assertTrue(attestor.authorized(attester));
+        vm.prank(attester);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 99);
+        assertTrue(attestor.attested(sampleHash));
+    }
+
+    function test_revokedAttesterCannotAttest() public {
+        attestor.setAttester(attester, true);
+        attestor.setAttester(attester, false);
+        assertFalse(attestor.authorized(attester));
+        vm.prank(attester);
+        vm.expectRevert(ScoreAttestation.NotAttester.selector);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+    }
+
+    function test_ownerRemainsAuthorizedIfRemovedFromMap() public {
+        attestor.setAttester(address(this), false);
+        assertFalse(attestor.isAttester(address(this)));
+        assertTrue(attestor.authorized(address(this)));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+        assertTrue(attestor.attested(sampleHash));
+    }
+
+    function test_nonOwnerCannotSetAttester() public {
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.setAttester(stranger, true);
+    }
+
+    function test_setAttesterRejectsZero() public {
+        vm.expectRevert(ScoreAttestation.ZeroAttester.selector);
+        attestor.setAttester(address(0), true);
     }
 
     function test_verifyRejectsWrongTicker() public {
@@ -124,10 +188,23 @@ contract ScoreAttestationTest is Test {
         assertTrue(address(deployed).code.length > 0);
         assertEq(deployed.attestationFee(), 0.001 ether);
         assertTrue(deployed.owner() != address(0));
+        assertTrue(deployed.authorized(deployed.owner()));
+        assertTrue(deployed.isAttester(deployed.owner()));
+    }
+
+    function test_deployScriptAllowlistsExtraAttester() public {
+        vm.chainId(84532);
+        vm.setEnv("ATTESTER_ADDRESS", vm.toString(attester));
+        DeploySepolia script = new DeploySepolia();
+        ScoreAttestation deployed = script.run();
+        assertTrue(deployed.authorized(attester));
+        assertTrue(deployed.isAttester(attester));
+        vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
     }
 
     function test_defaultFeeWhenConstructorZero() public {
         ScoreAttestation zero = new ScoreAttestation(0);
         assertEq(zero.attestationFee(), 0.001 ether);
+        assertTrue(zero.authorized(address(this)));
     }
 }

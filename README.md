@@ -195,13 +195,13 @@ curl -sS -H "X-API-Key: $KEY" http://127.0.0.1:8000/v1/score/NVDA
 
 ### Webhooks
 
-`POST /v1/webhooks` with `{"url": "https://…", "trigger": "band_cross"}` or `"below_orange"` (new band is RED). URLs must be **https** to a public host — localhost, RFC1918, link-local, and `169.254.169.254` are rejected.
+`POST /v1/webhooks` with `{"url": "https://…", "trigger": "band_cross"}` or `"below_orange"` (new band is RED). URLs must be **https** to a public host — localhost, RFC1918, link-local, and `169.254.169.254` are rejected. Delivery **does not follow HTTP redirects** (an allowlisted host must not bounce to a private IP).
 
-**v1 delivery:** synchronous HTTP POST in the **same scoring cycle** as the request that observed the crossing (`GET /v1/score`, compare, watchlist). First observation of a ticker is stored and does not fire. The same check runs for every saved watchlist ticker when you run `python -m rwa_score.api.poll` (cron / background worker). Body is HMAC-SHA256 signed (`X-RAT-Signature: sha256=…`) with the webhook secret.
+**v1 delivery:** synchronous HTTP POST in the **same scoring cycle** as the request that observed the crossing (`GET /v1/score`, compare, watchlist). First observation of a ticker **for that API key** is stored and does not fire. Band-crossing state (`last_bands`) and webhook fan-out are **per tenant** — a score authenticated with key A never fires key B's webhooks. The same per-key check runs for every saved watchlist row when you run `python -m rwa_score.api.poll` (cron / background worker). Body is HMAC-SHA256 signed (`X-RAT-Signature: sha256=…`) with the webhook secret.
 
 ### On-chain attestation (Base Sepolia)
 
-`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` — attester is `msg.sender`, not calldata. See [`contracts/README.md`](contracts/README.md). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held.
+`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held.
 
 ```bash
 RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures

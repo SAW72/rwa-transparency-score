@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 from rwa_score.api.app import BREAKDOWN_KEYS, create_app
 from rwa_score.api.settings import ApiSettings
 from rwa_score.api.store import Store
+from rwa_score.api.webhooks import notify_crossings
 from rwa_score.scorer import ScoreError, TransparencyScorer
 
 
@@ -275,6 +277,144 @@ def test_webhook_fires_on_band_cross_same_cycle(tmp_path: Path) -> None:
     history = client.get("/v1/history/NVDA", headers=_headers(raw))
     assert history.status_code == 200
     assert len(history.json()["history"]) == 2
+
+
+def test_score_under_key_a_never_fires_key_b_webhook(tmp_path: Path) -> None:
+    posted: list[str] = []
+
+    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
+        posted.append(url)
+        return 200, True
+
+    scorer = SequenceScorer(
+        [
+            _minimal_report("NVDA", 80.0, "GREEN"),
+            _minimal_report("NVDA", 20.0, "RED"),
+        ]
+    )
+    client, store = _client(tmp_path, scorer, poster=poster)
+    key_a = store.create_key(name="tenant-a", tier="paid")
+    key_b = store.create_key(name="tenant-b", tier="paid")
+    rec_a = store.lookup_key(key_a)
+    rec_b = store.lookup_key(key_b)
+    assert rec_a is not None and rec_b is not None
+
+    created = client.post(
+        "/v1/webhooks",
+        headers=_headers(key_b),
+        json={"url": "https://b.example.test/hook", "secret": "b", "trigger": "band_cross"},
+    )
+    assert created.status_code == 200
+    assert client.get("/v1/score/NVDA", headers=_headers(key_b)).status_code == 200
+    assert posted == []
+    assert store.get_last_band(rec_b.id, "NVDA") == ("GREEN", 80.0)
+
+    posted.clear()
+    assert client.get("/v1/score/NVDA", headers=_headers(key_a)).status_code == 200
+    assert posted == []
+    assert store.get_last_band(rec_a.id, "NVDA") == ("RED", 20.0)
+    assert store.get_last_band(rec_b.id, "NVDA") == ("GREEN", 80.0)
+
+
+def test_last_bands_and_webhooks_isolated_per_tenant(tmp_path: Path) -> None:
+    posted: list[tuple[str, str]] = []
+
+    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
+        posted.append((url, json.loads(body)["event"]))
+        return 204, True
+
+    scorer = SequenceScorer(
+        [
+            _minimal_report("NVDA", 80.0, "GREEN"),
+            _minimal_report("NVDA", 20.0, "RED"),
+            _minimal_report("NVDA", 80.0, "GREEN"),
+            _minimal_report("NVDA", 20.0, "RED"),
+        ]
+    )
+    client, store = _client(tmp_path, scorer, poster=poster)
+    key_a = store.create_key(name="tenant-a", tier="paid")
+    key_b = store.create_key(name="tenant-b", tier="paid")
+    rec_a = store.lookup_key(key_a)
+    rec_b = store.lookup_key(key_b)
+    assert rec_a is not None and rec_b is not None
+
+    assert client.post(
+        "/v1/webhooks",
+        headers=_headers(key_a),
+        json={"url": "https://a.example.test/hook", "secret": "a", "trigger": "band_cross"},
+    ).status_code == 200
+    assert client.post(
+        "/v1/webhooks",
+        headers=_headers(key_b),
+        json={"url": "https://b.example.test/hook", "secret": "b", "trigger": "band_cross"},
+    ).status_code == 200
+
+    assert client.get("/v1/score/NVDA", headers=_headers(key_a)).status_code == 200
+    assert posted == []
+    assert client.get("/v1/score/NVDA", headers=_headers(key_a)).status_code == 200
+    assert posted == [("https://a.example.test/hook", "band_cross")]
+
+    posted.clear()
+    assert client.get("/v1/score/NVDA", headers=_headers(key_b)).status_code == 200
+    assert posted == []
+    assert store.get_last_band(rec_b.id, "NVDA") == ("GREEN", 80.0)
+    assert client.get("/v1/score/NVDA", headers=_headers(key_b)).status_code == 200
+    assert posted == [("https://b.example.test/hook", "band_cross")]
+    assert store.get_last_band(rec_a.id, "NVDA") == ("RED", 20.0)
+    assert store.get_last_band(rec_b.id, "NVDA") == ("RED", 20.0)
+
+
+def test_notify_crossings_never_reads_other_tenant_hooks(tmp_path: Path) -> None:
+    store = Store(tmp_path / "iso.sqlite")
+    raw_a = store.create_key(name="a", tier="paid")
+    raw_b = store.create_key(name="b", tier="paid")
+    key_a = store.lookup_key(raw_a)
+    key_b = store.lookup_key(raw_b)
+    assert key_a is not None and key_b is not None
+    store.add_webhook(key_a.id, url="https://a.example.test/h", secret="a")
+    store.add_webhook(key_b.id, url="https://b.example.test/h", secret="b")
+    store.set_last_band(key_a.id, "NVDA", "GREEN", 80.0)
+    store.set_last_band(key_b.id, "NVDA", "GREEN", 80.0)
+    posted: list[str] = []
+
+    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
+        posted.append(url)
+        return 200, True
+
+    report = _minimal_report("NVDA", 20.0, "RED")
+    report["attestation"] = {"score_hash": "0xabc"}
+    deliveries = notify_crossings(store, report, key_id=key_a.id, poster=poster)
+    assert [d["ok"] for d in deliveries] == [True]
+    assert posted == ["https://a.example.test/h"]
+    assert store.get_last_band(key_b.id, "NVDA") == ("GREEN", 80.0)
+    store.close()
+
+
+def test_last_bands_migrates_off_unscoped_schema(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.sqlite"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE last_bands (
+            ticker TEXT PRIMARY KEY,
+            band TEXT NOT NULL,
+            score REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO last_bands VALUES ('NVDA', 'GREEN', 80.0, 1.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db)
+    raw = store.create_key(name="tenant", tier="paid")
+    rec = store.lookup_key(raw)
+    assert rec is not None
+    assert store.get_last_band(rec.id, "NVDA") is None
+    store.set_last_band(rec.id, "NVDA", "YELLOW", 60.0)
+    assert store.get_last_band(rec.id, "NVDA") == ("YELLOW", 60.0)
+    store.close()
 
 
 def test_below_orange_trigger_skips_yellow_to_orange(tmp_path: Path) -> None:

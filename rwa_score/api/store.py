@@ -60,10 +60,12 @@ CREATE TABLE IF NOT EXISTS webhooks (
 );
 
 CREATE TABLE IF NOT EXISTS last_bands (
-    ticker TEXT PRIMARY KEY,
+    key_id INTEGER NOT NULL REFERENCES api_keys(id),
+    ticker TEXT NOT NULL,
     band TEXT NOT NULL,
     score REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (key_id, ticker)
 );
 
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -163,7 +165,29 @@ class Store:
     def _init(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_last_bands()
             self._conn.commit()
+
+    def _migrate_last_bands(self) -> None:
+        """Scope band-crossing state per API key. Drop unattributable legacy rows."""
+        info = self._conn.execute("PRAGMA table_info(last_bands)").fetchall()
+        names = {row["name"] for row in info}
+        if "key_id" in names:
+            return
+        self._conn.execute("ALTER TABLE last_bands RENAME TO last_bands_pre_tenant")
+        self._conn.execute(
+            """
+            CREATE TABLE last_bands (
+                key_id INTEGER NOT NULL REFERENCES api_keys(id),
+                ticker TEXT NOT NULL,
+                band TEXT NOT NULL,
+                score REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (key_id, ticker)
+            )
+            """
+        )
+        self._conn.execute("DROP TABLE last_bands_pre_tenant")
 
     def close(self) -> None:
         with self._lock:
@@ -331,23 +355,24 @@ class Store:
             for r in rows
         ]
 
-    def get_last_band(self, ticker: str) -> tuple[str, float] | None:
+    def get_last_band(self, key_id: int, ticker: str) -> tuple[str, float] | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT band, score FROM last_bands WHERE ticker = ?",
-                (ticker.upper(),),
+                "SELECT band, score FROM last_bands WHERE key_id = ? AND ticker = ?",
+                (key_id, ticker.upper()),
             ).fetchone()
         if row is None:
             return None
         return str(row["band"]), float(row["score"])
 
-    def set_last_band(self, ticker: str, band: str, score: float) -> None:
+    def set_last_band(self, key_id: int, ticker: str, band: str, score: float) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO last_bands (ticker, band, score, updated_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(ticker) DO UPDATE SET band = excluded.band, "
+                "INSERT INTO last_bands (key_id, ticker, band, score, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(key_id, ticker) DO UPDATE SET band = excluded.band, "
                 "score = excluded.score, updated_at = excluded.updated_at",
-                (ticker.upper(), band, score, time.time()),
+                (key_id, ticker.upper(), band, score, time.time()),
             )
             self._conn.commit()
 
@@ -397,6 +422,14 @@ class Store:
             ).fetchall()
         return [r["ticker"] for r in rows]
 
+    def watchlist_entries(self) -> list[tuple[int, str]]:
+        """Per-tenant watchlist rows so poll can isolate last_bands / webhooks."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key_id, ticker FROM watchlist_items ORDER BY key_id, ticker"
+            ).fetchall()
+        return [(int(r["key_id"]), str(r["ticker"])) for r in rows]
+
     def add_webhook(
         self,
         key_id: int,
@@ -444,10 +477,11 @@ class Store:
             self._conn.commit()
             return cur.rowcount > 0
 
-    def active_webhooks(self) -> list[Webhook]:
+    def active_webhooks(self, key_id: int) -> list[Webhook]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM webhooks WHERE active = 1"
+                "SELECT * FROM webhooks WHERE active = 1 AND key_id = ? ORDER BY id",
+                (key_id,),
             ).fetchall()
         return [_hook_from_row(r) for r in rows]
 

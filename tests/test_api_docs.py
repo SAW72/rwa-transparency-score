@@ -32,6 +32,22 @@ def test_attest_uses_msg_sender_not_calldata() -> None:
     assert "uint256 timestamp" in block
     assert "address attester" not in block
     assert "address attester = msg.sender" in src
+    assert "NotAttester" in src
+    assert "isAttester" in src
+    assert "function authorized" in src
+
+
+def test_webhook_poster_disables_redirects() -> None:
+    src = (ROOT / "rwa_score/api/webhooks.py").read_text(encoding="utf-8")
+    assert "allow_redirects=False" in src
+
+
+def test_readme_documents_tenant_scoped_webhooks() -> None:
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "per tenant" in text
+    assert "never fires key B" in text
+    assert "does not follow HTTP redirects" in text
+    assert "authorized attester" in text
 
 
 def test_deploy_script_holds_mainnet() -> None:

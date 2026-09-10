@@ -4,6 +4,8 @@ Solidity contract that stores a **hash of a score payload**, a ticker, a timesta
 
 Anyone who cited a RAT Score can re-hash the payload and call `verify(scoreHash, ticker)`. If the hash is missing or the ticker does not match, the cited breakdown was edited or was never attested.
 
+`attest` is **not permissionless**. Only the contract **owner** or an **allowlisted attester** (a relayer or API-held key added via `setAttester`) can lock a hash. A stranger who pays `attestationFee` cannot occupy a digest or front-run an official payload. `AlreadyAttested` still prevents a second official lock of the same hash; it does not let random payers brick official hashes.
+
 ## Networks
 
 | Network | Chain ID | This repo |
@@ -42,6 +44,7 @@ cd contracts
 export BASE_SEPOLIA_RPC_URL=https://sepolia.base.org   # or your provider
 export PRIVATE_KEY=          # funded Sepolia key — env only
 # optional: ATTESTATION_FEE_WEI=1000000000000000  (0.001 ETH)
+# optional: ATTESTER_ADDRESS=0x...   # extra allowlisted relayer / API-held key
 
 forge script script/DeploySepolia.s.sol:DeploySepolia \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
@@ -68,8 +71,10 @@ RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures --json
 # → score_hash 0x…
 ```
 
-2. Submit **only that hash** (plus ticker / timestamp). The attester is always
-   the broadcasting `msg.sender` — there is no attester argument to spoof.
+2. Submit **only that hash** (plus ticker / timestamp) from an **authorized**
+   key (deployer/owner or an address the owner passed to `setAttester`). The
+   attester is always the broadcasting `msg.sender` — there is no attester
+   argument to spoof. A stranger paying the fee cannot lock the hash.
 
 ```bash
 cd contracts

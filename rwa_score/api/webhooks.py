@@ -2,8 +2,14 @@
 
 v1 behavior: fire in the same scoring cycle as the request that observed the
 new band (``GET /v1/score``, compare, watchlist) or ``python -m rwa_score.api.poll``.
-POSTs are synchronous with a short timeout. First observation of a ticker is
-stored and does not fire (no prior band to cross).
+POSTs are synchronous with a short timeout. First observation of a ticker
+**for that API key** is stored and does not fire (no prior band to cross).
+
+Band-crossing state and delivery are scoped per API key. A score under key A
+never reads key B's last band and never POSTs key B's webhooks.
+
+Delivery does not follow HTTP redirects (SSRF: an allowlisted host must not
+bounce to localhost / metadata / RFC1918).
 """
 
 from __future__ import annotations
@@ -99,7 +105,14 @@ def sign_body(secret: str, body: str) -> str:
 def default_poster(url: str, body: str, headers: dict[str, str], *, timeout: float = 5.0) -> tuple[int, bool]:
     try:
         assert_public_https_url(url)
-        resp = requests.post(url, data=body.encode("utf-8"), headers=headers, timeout=timeout)
+        # Never follow redirects — the allowlist is only valid for this URL.
+        resp = requests.post(
+            url,
+            data=body.encode("utf-8"),
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        )
         code = int(resp.status_code)
         return code, 200 <= code < 300
     except Exception:  # noqa: BLE001 — delivery failure is recorded, not raised
@@ -121,22 +134,25 @@ def notify_crossings(
     store: Store,
     report: dict[str, Any],
     *,
+    key_id: int,
     poster: DeliverFn | None = None,
     timeout: float = 5.0,
 ) -> list[dict[str, Any]]:
-    """Compare to last stored band, persist the new one, fire matching hooks."""
+    """Compare to this tenant's last band, persist the new one, fire that key's hooks."""
     ticker = str(report["ticker"]).upper()
     new_band = str(report["band"])
-    prev = store.get_last_band(ticker)
+    prev = store.get_last_band(key_id, ticker)
     old_band = prev[0] if prev else None
-    store.set_last_band(ticker, new_band, float(report["score"]))
+    store.set_last_band(key_id, ticker, new_band, float(report["score"]))
     events = crossing_events(old_band, new_band)
     if not events or old_band is None:
         return []
 
     send = poster or (lambda url, body, headers: default_poster(url, body, headers, timeout=timeout))
     deliveries: list[dict[str, Any]] = []
-    for hook in store.active_webhooks():
+    for hook in store.active_webhooks(key_id):
+        if hook.key_id != key_id:
+            continue
         if hook.ticker and hook.ticker != ticker:
             continue
         matched = [e for e in events if hook.trigger == e or hook.trigger == "band_cross"]
@@ -169,6 +185,7 @@ def apply_score_side_effects(
     store: Store,
     report: dict[str, Any],
     *,
+    key_id: int,
     poster: DeliverFn | None = None,
     timeout: float = 5.0,
 ) -> None:
@@ -182,4 +199,4 @@ def apply_score_side_effects(
         payload_json=history_json(report),
         payload_hash=digest,
     )
-    notify_crossings(store, report, poster=poster, timeout=timeout)
+    notify_crossings(store, report, key_id=key_id, poster=poster, timeout=timeout)
