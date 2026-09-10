@@ -26,3 +26,5 @@ services:
         value: "1"
       - key: CMC_API_KEY
         sync: false
+      - key: XAI_API_KEY
+        sync: false

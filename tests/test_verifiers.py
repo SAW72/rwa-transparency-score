@@ -12,6 +12,7 @@ from rwa_score.verifiers import (
     DINARI_DSHARES_URL,
     BackedVerifier,
     DinariVerifier,
+    RobinhoodVerifier,
     VerificationLevel,
     por_score_from_ratio,
     resolve_verifier_id,
@@ -78,6 +79,8 @@ def test_resolve_verifier_keywords() -> None:
     assert resolve_verifier_id("Backed Finance") == "backed"
     assert resolve_verifier_id("xStocks") == "backed"
     assert resolve_verifier_id("Dinari Securities") == "dinari"
+    assert resolve_verifier_id("Robinhood") == "robinhood"
+    assert resolve_verifier_id("Robinhood Assets") == "robinhood"
     assert resolve_verifier_id("NoteVault Demo Issuer") is None
 
 
@@ -174,3 +177,23 @@ def test_resolve_rejects_adversarial_backed_names() -> None:
     assert resolve_verifier_id("Backed Finance") == "backed"
     assert resolve_verifier_id("xStocks") == "backed"
     assert resolve_verifier_id("Dinari") == "dinari"
+    assert resolve_verifier_id("Robinhood") == "robinhood"
+    assert resolve_verifier_id("Anti-Robinhood") is None
+    assert resolve_verifier_id("robinhoodie") is None
+
+
+def test_robinhood_verifier_self_reported_scores() -> None:
+    v = RobinhoodVerifier()
+    backing = v.verify_backing(ticker="AAPL", issuer_name="Robinhood")
+    reserves = v.verify_reserves(ticker="AAPL", issuer_name="Robinhood")
+    redemption = v.verify_redemption(ticker="AAPL", issuer_name="Robinhood")
+    assert backing.score == 55.0
+    assert reserves.score == 40.0
+    assert redemption.score == 35.0
+    assert backing.level == VerificationLevel.SELF_REPORTED
+    assert reserves.level == VerificationLevel.SELF_REPORTED
+    assert redemption.level == VerificationLevel.SELF_REPORTED
+    assert backing.evidence == "Robinhood 1:1 claim, no public PoR"
+    assert reserves.evidence == "no independent attestation"
+    assert redemption.evidence == "debt wrapper, creditor claim only"
+    assert backing.ok and reserves.ok and redemption.ok

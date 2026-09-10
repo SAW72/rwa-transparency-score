@@ -4,8 +4,10 @@ from rwa_score.issuer_registry import (
     AUDITED,
     FULLY_BACKED,
     HEURISTIC_NOTE,
+    ISSUER_NOTES,
     REDEEMABLE,
     classify,
+    issuer_note,
 )
 
 
@@ -34,6 +36,28 @@ def test_allowlist_omits_bare_backed() -> None:
     assert "backed" not in FULLY_BACKED
     assert "backed" not in AUDITED
     assert "backed" not in REDEEMABLE
+
+
+def test_robinhood_not_on_allowlists() -> None:
+    assert "robinhood" not in FULLY_BACKED
+    assert "robinhood" not in AUDITED
+    assert "robinhood" not in REDEEMABLE
+    assert classify("Robinhood") == {"backed": False, "audited": False, "redeemable": False}
+    assert classify("Robinhood Assets") == {"backed": False, "audited": False, "redeemable": False}
+
+
+def test_issuer_note_equity_vs_debt() -> None:
+    rh = issuer_note("Robinhood")
+    assert rh is not None
+    assert "debt" in rh.lower()
+    assert "creditor" in rh.lower()
+    assert "Robinhood Assets Jersey" in rh
+    assert issuer_note("Backed Finance") is not None
+    assert issuer_note("Dinari") is not None
+    assert issuer_note("Ondo") is not None
+    assert issuer_note("NoteVault Demo Issuer") is None
+    assert issuer_note("Anti-Robinhood") is None
+    assert "robinhood" in ISSUER_NOTES
 
 
 @pytest.mark.parametrize(
