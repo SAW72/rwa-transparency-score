@@ -193,6 +193,9 @@ def test_share_score_card_is_button_gated() -> None:
     assert button_idx < call_idx
     # Must not fire a share on import / page load.
     assert "share_score_card(" not in source.split("def _render_share_controls")[0]
+    # Streamlit 1.39 image API — use_container_width crashes st.image.
+    assert "st.image(bundle.png_bytes, use_container_width=" not in source
+    assert "st.image(bundle.png_bytes, use_column_width=True)" in source
 
 
 def test_score_card_escapes_html() -> None:

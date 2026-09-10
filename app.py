@@ -253,7 +253,13 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
     if bundle is None:
         return
     if bundle.png_bytes:
-        st.image(bundle.png_bytes, use_container_width=True)
+        try:
+            # Streamlit 1.39: st.image uses use_column_width, not use_container_width.
+            st.image(bundle.png_bytes, use_column_width=True)
+        except TypeError:
+            st.image(bundle.png_bytes)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not preview score card: {exc}")
         st.download_button(
             "Download PNG",
             data=bundle.png_bytes,
