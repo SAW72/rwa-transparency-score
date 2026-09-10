@@ -84,6 +84,18 @@ def test_readme_disclaimer_and_problem_blurb() -> None:
     assert "how honest its issuer looks" not in text
 
 
+def test_readme_chainlink_por_coverage_for_judges() -> None:
+    text = Path("README.md").read_text(encoding="utf-8")
+    assert "Do not expect every ticker to hit the oracle" in text
+    assert "bTokens on Polygon only" in text
+    assert "no published Chainlink PoR / SmartData aggregator yet" in text
+    assert "That is expected, not a bug" in text
+    assert "Next upgrade:" in text
+    assert "no on-chain Chainlink PoR / SmartData proxy addresses for the xStocks line" in text
+    assert "Reserves-only score 90" in text
+    assert "must not be scored as undercollateralized PoR" in text
+
+
 def test_app_reuses_scorer_via_cache_resource() -> None:
     import app as demo_app
 
