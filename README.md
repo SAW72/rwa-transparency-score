@@ -71,6 +71,25 @@ The Streamlit app caches explanations **24 hours per symbol** in a process-local
 
 Set `XAI_API_KEY` in `.env` locally or in the **Render dashboard** (`sync: false` in `render.yaml`, same pattern as `CMC_API_KEY`). Never commit the key.
 
+### Shareable score card (X)
+
+Each compare card has a **Share score card** button. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding) and offers a download. If X credentials are configured it also posts that image to X via API v2. If they are missing, the PNG still downloads and the UI says the X post was skipped. Generation or X failures never crash the demo.
+
+**Signing.** `SCORE_CARD_SIGNING_SECRET` HMAC-SHA256-signs canonical JSON of `{ticker, score, band, subscores, timestamp}`. The first 16 hex characters (the fingerprint) are printed on the image and in the caption so others can verify. No secret → card is labeled `UNSIGNED`. Never commit the secret. Store it in the **Render dashboard** (`sync: false`) or **Bitwarden**.
+
+**X credentials** (OAuth 1.0a user context; all four required to post):
+
+| Variable | Also accepted |
+|---|---|
+| `X_API_KEY` | `TWITTER_API_KEY`, `TWITTER_CONSUMER_KEY` |
+| `X_API_SECRET` | `TWITTER_API_SECRET`, `TWITTER_CONSUMER_SECRET` |
+| `X_ACCESS_TOKEN` | `TWITTER_ACCESS_TOKEN` |
+| `X_ACCESS_TOKEN_SECRET` | `TWITTER_ACCESS_TOKEN_SECRET` |
+
+Set them in the Render dashboard (`sync: false`) or Bitwarden. Never commit them. Posting uses the app account — click Share only when you intend to publish. This is a user-triggered share, not a hunter or auto-poster.
+
+Caption includes the fingerprint and **Not financial advice**. MIT core stays open.
+
 ### Heuristic fallback disclaimer
 
 If a live verifier errors, times out, or is skipped (fixture/offline mode), the pillar **falls back to issuer-name heuristics** and is explicitly labeled **heuristic fallback**. The same label applies when a Backed / xStocks ticker has **no published Chainlink PoR feed** (most xStocks symbols) — that is expected coverage, not a failed probe. Failed verifiers are never dropped silently — the error is recorded in notes/flags. Heuristics are **not** audited attestations.
@@ -107,12 +126,14 @@ If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://c
 ## Architecture
 
 ```
-app.py                 Streamlit demo (search, pillars, verification badges, compare, AI explainer)
+app.py                 Streamlit demo (search, pillars, verification badges, compare, AI explainer, share card)
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
 rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
 rwa_score/chainlink_por.py  Chainlink AggregatorV3 PoR reader (JSON-RPC eth_call, requests only)
 rwa_score/verifiers.py Backed Chainlink PoR + Dinari scrapers + Robinhood debt-wrapper scores
 rwa_score/explainer.py xAI Grok “Why this score?” with templated fallback
+rwa_score/score_card.py Signed timestamped PNG (Pillow) + HMAC-SHA256 fingerprint
+rwa_score/x_client.py  X API v2 media + tweet (OAuth 1.0a); skip if credentials missing
 rwa_score/issuer_registry.py   Name-match heuristics + ISSUER_NOTES (equity vs debt)
 rwa_score/fixtures/    Demo JSON shaped like CMC RWA responses
 rwa_score/api/         Paid REST output layer (keys, quotas, history, webhooks, score hash)
@@ -210,7 +231,7 @@ CI runs both. No real API key or wallet is required.
 
 **Render must stay at `RWA_USE_FIXTURES=0`.** That default lives in `render.yaml`. Flipping the variable in the Render dashboard alone is **not** enough: the next blueprint sync / redeploy re-applies `render.yaml` and overwrites the dashboard value.
 
-`CMC_API_KEY` and `XAI_API_KEY` stay `sync: false`. Set them in the Render dashboard for live CMC and the AI explainer — never commit the keys. The explainer falls back to a template when `XAI_API_KEY` is unset.
+`CMC_API_KEY`, `XAI_API_KEY`, `SCORE_CARD_SIGNING_SECRET`, and the four `X_*` keys stay `sync: false`. Set them in the Render dashboard (or Bitwarden) — never commit the keys. The explainer falls back to a template when `XAI_API_KEY` is unset. Share still downloads a PNG when the signing secret or X tokens are unset.
 
 Optional RPC overrides (no keys): `POLYGON_RPC_URL`, `BASE_RPC_URL`, `ETH_RPC_URL`. When unset, the verifier uses public no-key endpoints (Polygon `publicnode` / `polygon-rpc.com`, Base `mainnet.base.org`, Ethereum `cloudflare-eth.com`). Paid or key-gated RPC URLs must stay in the dashboard — never commit them.
 
@@ -222,6 +243,8 @@ Start: python -m rwa_score.health --server.port $PORT --server.address 0.0.0.0 -
 Env: RWA_USE_FIXTURES=0   (keep this; do not set 1 on Render)
 Dashboard secrets: CMC_API_KEY, XAI_API_KEY (optional; templated fallback if unset)
 Optional RPC: POLYGON_RPC_URL, BASE_RPC_URL, ETH_RPC_URL (public fallbacks if unset)
+Optional share: SCORE_CARD_SIGNING_SECRET, X_API_KEY, X_API_SECRET,
+X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET (PNG still downloads if unset)
 ```
 
 Confirm live mode (no fixture overwrite, verifiers enabled) with:
