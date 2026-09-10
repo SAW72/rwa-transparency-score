@@ -1,0 +1,128 @@
+"""Band-crossing detection and webhook delivery.
+
+v1 behavior: fire in the same scoring cycle as the request that observed the
+new band (``GET /v1/score``, compare, watchlist) or ``python -m rwa_score.api.poll``.
+POSTs are synchronous with a short timeout. First observation of a ticker is
+stored and does not fire (no prior band to cross).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+from typing import Any, Callable
+
+import requests
+
+from .store import Store
+
+BAND_RANK = {"GREEN": 3, "YELLOW": 2, "ORANGE": 1, "RED": 0}
+
+DeliverFn = Callable[[str, str, dict[str, str]], tuple[int, bool]]
+
+
+def dropped_below_orange(new_band: str) -> bool:
+    return BAND_RANK.get(new_band, 0) < BAND_RANK["ORANGE"]
+
+
+def crossing_events(old_band: str | None, new_band: str) -> list[str]:
+    if old_band is None or old_band == new_band:
+        return []
+    events = ["band_cross"]
+    if dropped_below_orange(new_band):
+        events.append("below_orange")
+    return events
+
+
+def sign_body(secret: str, body: str) -> str:
+    digest = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"sha256={digest}"
+
+
+def default_poster(url: str, body: str, headers: dict[str, str], *, timeout: float = 5.0) -> tuple[int, bool]:
+    try:
+        resp = requests.post(url, data=body.encode("utf-8"), headers=headers, timeout=timeout)
+        code = int(resp.status_code)
+        return code, 200 <= code < 300
+    except Exception:  # noqa: BLE001 — delivery failure is recorded, not raised
+        return 0, False
+
+
+def _payload(report: dict[str, Any], *, old_band: str, event: str) -> dict[str, Any]:
+    return {
+        "event": event,
+        "ticker": report["ticker"],
+        "from_band": old_band,
+        "to_band": report["band"],
+        "score": report["score"],
+        "score_hash": report.get("attestation", {}).get("score_hash"),
+    }
+
+
+def notify_crossings(
+    store: Store,
+    report: dict[str, Any],
+    *,
+    poster: DeliverFn | None = None,
+    timeout: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Compare to last stored band, persist the new one, fire matching hooks."""
+    ticker = str(report["ticker"]).upper()
+    new_band = str(report["band"])
+    prev = store.get_last_band(ticker)
+    old_band = prev[0] if prev else None
+    store.set_last_band(ticker, new_band, float(report["score"]))
+    events = crossing_events(old_band, new_band)
+    if not events or old_band is None:
+        return []
+
+    send = poster or (lambda url, body, headers: default_poster(url, body, headers, timeout=timeout))
+    deliveries: list[dict[str, Any]] = []
+    for hook in store.active_webhooks():
+        if hook.ticker and hook.ticker != ticker:
+            continue
+        matched = [e for e in events if hook.trigger == e or hook.trigger == "band_cross"]
+        if hook.trigger == "below_orange" and "below_orange" not in events:
+            continue
+        if not matched:
+            continue
+        event = matched[0]
+        body_obj = _payload(report, old_band=old_band, event=event)
+        body = json.dumps(body_obj, sort_keys=True, separators=(",", ":"))
+        headers = {
+            "Content-Type": "application/json",
+            "X-RAT-Signature": sign_body(hook.secret, body),
+        }
+        status, ok = send(hook.url, body, headers)
+        store.record_delivery(
+            webhook_id=hook.id,
+            ticker=ticker,
+            event=event,
+            status_code=status,
+            ok=ok,
+        )
+        deliveries.append(
+            {"webhook_id": hook.id, "event": event, "status_code": status, "ok": ok}
+        )
+    return deliveries
+
+
+def apply_score_side_effects(
+    store: Store,
+    report: dict[str, Any],
+    *,
+    poster: DeliverFn | None = None,
+    timeout: float = 5.0,
+) -> None:
+    from .attest import history_json, score_hash
+
+    digest = score_hash(report)
+    store.record_history(
+        ticker=report["ticker"],
+        score=float(report["score"]),
+        band=str(report["band"]),
+        payload_json=history_json(report),
+        payload_hash=digest,
+    )
+    notify_crossings(store, report, poster=poster, timeout=timeout)

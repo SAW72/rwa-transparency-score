@@ -14,3 +14,10 @@ dist/
 build/
 .idea/
 .vscode/
+data/
+*.sqlite
+*.sqlite3
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
