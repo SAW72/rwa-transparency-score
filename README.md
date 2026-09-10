@@ -45,7 +45,17 @@ Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** bel
 
 | Source | Endpoint | How we use it |
 |---|---|---|
-| Backed / xStocks via **Chainlink Proof of Reserve** | On-chain `AggregatorV3Interface.latestRoundData()` at the public SmartData proxy ([feed addresses](https://docs.chain.link/data-feeds/smartdata/addresses)). Backed currently publishes these on **Polygon** (e.g. bNVDA `0x0fB2beD999da86Cb1Fdd97E746600A96141EeA09`, bIB01 `0xad4395fc414Fc1575A7a38C20B0Bfdbdb09ee41A`). | `eth_call` via `POLYGON_RPC_URL` (or `BASE_RPC_URL` / `ETH_RPC_URL` when a feed lives there). `collateralization_ratio = reserves / circulatingSupply` when the token `totalSupply` is readable on the same chain (≥0.999→95, ≥0.99→80, ≥0.95→60, else 30). Reserves-only (supply unread) scores **90**. Cached 1 hour. Badge: **on-chain PoR**. Tickers without a published feed (most xStocks symbols) stay on the labeled **heuristic fallback**. |
+| Backed **bTokens** via **Chainlink Proof of Reserve** | On-chain `AggregatorV3Interface.latestRoundData()` at the public SmartData proxy ([feed addresses](https://docs.chain.link/data-feeds/smartdata/addresses)). **Polygon only today** — see coverage note below. | `eth_call` via `POLYGON_RPC_URL` (or `BASE_RPC_URL` / `ETH_RPC_URL` when a feed lives there). `collateralization_ratio = reserves / circulatingSupply` when the token `totalSupply` is readable on the same chain (≥0.999→95, ≥0.99→80, ≥0.95→60, else 30). Reserves-only (supply unread) scores **90**. Cached 1 hour. Badge: **on-chain PoR**. |
+
+### Chainlink PoR coverage (judges)
+
+**Do not expect every ticker to hit the oracle.**
+
+Chainlink Proof of Reserve currently covers Backed **bTokens on Polygon only**. The wired feeds in `rwa_score/chainlink_por.py` are **bNVDA**, **bIB01**, **bCSPX**, **bC3M**, and **bIBTA** (aliases such as `NVDA` / `NVDAx` map to bNVDA).
+
+Most **xStocks** symbols (`TSLAx`, `AAPLx`, `METAx`, …) have **no published Chainlink PoR / SmartData aggregator yet**. Live backing/reserves for those names use the labeled **heuristic fallback**. That is expected, not a bug.
+
+**Next upgrade:** no on-chain Chainlink PoR / SmartData proxy addresses for the xStocks line were found in the [SmartData directory](https://docs.chain.link/data-feeds/smartdata/addresses), the public reference-data catalogs (Ethereum / Polygon / other listed networks), or xStocks public oracle docs. xStocks today exposes REST PoR (`GET /public/proof-of-reserves/{symbol}`) and Chainlink **price** Data Streams (pull-based; no aggregator address). Alliance copy says they are adopting Chainlink PoR — when a SmartData proxy ships, add it to `BACKED_POR_FEEDS`.
 | Dinari dShares page | `https://dinari.com/dshares` | Scrape for Big-4 / audit firm, Alpaca custody, and a **1:1** claim. Score 85 when all three are present. Badge: **attested** — labeled **attestation pending** (no signed report URL yet). |
 | Robinhood tokenized stocks | CMC issuer name `"Robinhood"` (no public PoR URL) | Static self-reported scores: backing **55**, reserves **40**, redemption **35**. Badge: **self-reported**. These tokens are **debt securities** — holders are creditors of Robinhood Assets Jersey, not shareholders of AAPL/NVDA/TSLA/META. Self-reported 1:1, no public proof of reserves. A low/orange score is expected; the bug this verifier fixes is missing-issuer heuristic fallback (~47) with the wrong label. |
 
@@ -63,7 +73,7 @@ Set `XAI_API_KEY` in `.env` locally or in the **Render dashboard** (`sync: false
 
 ### Heuristic fallback disclaimer
 
-If a live verifier errors, times out, or is skipped (fixture/offline mode), the pillar **falls back to issuer-name heuristics** and is explicitly labeled **heuristic fallback**. Failed verifiers are never dropped silently — the error is recorded in notes/flags. Heuristics are **not** audited attestations.
+If a live verifier errors, times out, or is skipped (fixture/offline mode), the pillar **falls back to issuer-name heuristics** and is explicitly labeled **heuristic fallback**. The same label applies when a Backed / xStocks ticker has **no published Chainlink PoR feed** (most xStocks symbols) — that is expected coverage, not a failed probe. Failed verifiers are never dropped silently — the error is recorded in notes/flags. Heuristics are **not** audited attestations.
 
 ## How to run
 
@@ -160,7 +170,7 @@ Expected when Render is live:
 {"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "2026-09-10T01:13:00Z"}
 ```
 
-`backed_feed` is `"ok"` if the canonical Backed Chainlink PoR feed (bIB01 on Polygon) answers `latestRoundData` over JSON-RPC, otherwise `"down"`. The handler always returns JSON — a down feed does not crash `/health` and does not change the health JSON shape. Local demos can still run `RWA_USE_FIXTURES=1 streamlit run app.py`. For a process-start `/health` route locally, use the same launcher as Render: `python -m rwa_score.health`.
+`backed_feed` is `"ok"` if the canonical Backed Chainlink PoR feed (bIB01 **bToken** on Polygon) answers `latestRoundData` over JSON-RPC, otherwise `"down"`. This probe does **not** mean every scored ticker has an oracle feed — xStocks symbols without a published proxy still score via **heuristic fallback**. The handler always returns JSON — a down feed does not crash `/health` and does not change the health JSON shape. Local demos can still run `RWA_USE_FIXTURES=1 streamlit run app.py`. For a process-start `/health` route locally, use the same launcher as Render: `python -m rwa_score.health`.
 
 **Streamlit Community Cloud:** deploy `app.py` from the repo root. Secrets: leave `CMC_API_KEY` empty and set `RWA_USE_FIXTURES=1`, or add a key and set `RWA_USE_FIXTURES=0` for live mode.
 
