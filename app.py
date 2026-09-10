@@ -8,6 +8,7 @@ Render binds 0.0.0.0:$PORT via render.yaml.
 
 from __future__ import annotations
 
+import html
 import os
 
 import streamlit as st
@@ -16,9 +17,18 @@ from rwa_score.client import create_client, env_flag
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
 
 DISCLAIMER = (
-    "This tool is for informational and hackathon demo purposes only. "
-    "It is **not financial advice**, not an offer to buy or sell securities, "
-    "and not a substitute for issuer filings or independent due diligence."
+    "Informational and educational hackathon demo only. Not financial, investment, "
+    "legal, or tax advice. Not an offer, solicitation, or recommendation to buy, "
+    "sell, or hold any security, digital asset, tokenized stock, or other instrument. "
+    "Scores are automated heuristics (including issuer-name matching) plus third-party "
+    "CoinMarketCap data or bundled demo fixtures — not audited attestations, not legal "
+    "or audit opinions, and not a substitute for issuer filings, prospectuses, offering "
+    "documents, or your own independent research. Data may be incomplete, delayed, "
+    "inaccurate, or outdated. Nothing here guarantees accuracy, completeness, or fitness "
+    "for any purpose. Past or present scores are not indicative of future results. This "
+    "demo is not provided by a broker-dealer, exchange, ATS, funding portal, or registered "
+    "investment adviser, and it does not create any advisory or fiduciary relationship. "
+    "Do your own research. Use at your own risk."
 )
 
 BAND_COLORS = {
@@ -112,22 +122,48 @@ def _place_in_slot(ticker: str, index: int) -> None:
     st.session_state.active_slot = index
 
 
-def _render_compare_card(report: dict, *, selected: bool = False) -> None:
+def _score_card_html(report: dict, *, selected: bool = False) -> str:
+    """Build the compact score card. Dynamic fields are HTML-escaped."""
     band = report["band"]
     color = BAND_COLORS.get(band, "#8B949E")
     ring = "3px" if selected else "2px"
     selected_attr = " selected" if selected else ""
-    st.markdown(
-        f"""
+    ticker = html.escape(str(report["ticker"]))
+    issuer = html.escape(str(report["issuer"]))
+    summary = html.escape(str(report["summary"]))
+    band_label = html.escape(str(report["band_label"]))
+    return f"""
         <div class="score-hero compact{selected_attr}" style="border-color:{color};border-width:{ring}">
           <div class="score-num">{report['score']:.1f}</div>
           <div class="score-meta">
-            <div class="band" style="color:{color}">{report['band_label']}</div>
-            <div class="issuer">{report['ticker']} · {report['issuer']}</div>
-            <div class="summary">{report['summary']}</div>
+            <div class="band" style="color:{color}">{band_label}</div>
+            <div class="issuer">{ticker} · {issuer}</div>
+            <div class="summary">{summary}</div>
           </div>
         </div>
-        """,
+        """
+
+
+def _error_card_html(ticker: str, message: str, *, selected: bool = False) -> str:
+    """Build the unavailable-slot card. Dynamic fields are HTML-escaped."""
+    ring = " selected" if selected else ""
+    safe_ticker = html.escape(ticker or "Empty slot")
+    safe_message = html.escape(message)
+    return f"""
+        <div class="score-hero compact error{ring}">
+          <div class="score-num">—</div>
+          <div class="score-meta">
+            <div class="band" style="color:#E5484D">Unavailable</div>
+            <div class="issuer">{safe_ticker}</div>
+            <div class="summary">{safe_message}</div>
+          </div>
+        </div>
+        """
+
+
+def _render_compare_card(report: dict, *, selected: bool = False) -> None:
+    st.markdown(
+        _score_card_html(report, selected=selected),
         unsafe_allow_html=True,
     )
 
@@ -173,18 +209,8 @@ def _render_compare_card(report: dict, *, selected: bool = False) -> None:
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
-    ring = " selected" if selected else ""
     st.markdown(
-        f"""
-        <div class="score-hero compact error{ring}">
-          <div class="score-num">—</div>
-          <div class="score-meta">
-            <div class="band" style="color:#E5484D">Unavailable</div>
-            <div class="issuer">{ticker or 'Empty slot'}</div>
-            <div class="summary">{message}</div>
-          </div>
-        </div>
-        """,
+        _error_card_html(ticker, message, selected=selected),
         unsafe_allow_html=True,
     )
     st.error(message)
