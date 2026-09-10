@@ -1,6 +1,6 @@
 # RAT Score
 
-RAT Score (RWA Transparency Score) — an AI-assisted risk radar for tokenized stocks. Rates issuers 0–100 on backing, proof of reserves, redemption, price integrity, and disclosure using CoinMarketCap’s RWA API.
+RAT Score (RWA Transparency Score) — an AI-assisted risk radar for tokenized stocks. Rates issuers 0–100 on backing, proof of reserves, redemption, price integrity, disclosure, and cross-issuer basis using CoinMarketCap’s RWA API.
 
 Judges: one command, no API key.
 
@@ -28,11 +28,16 @@ This tool rates a tokenized stock on how its public CMC/issuer signals look unde
 
 | Pillar | What it checks | Weight | Verification |
 |---|---|---|---|
-| Backing model | Real shares with a regulated custodian vs. a thin debt note | 25% | on-chain PoR / attested when a verifier is registered; else **heuristic fallback** |
-| Proof of reserves | Independent PoR or attestation vs. a promise | 25% | on-chain PoR (Backed/xStocks) or attested (Dinari); else **heuristic fallback** |
-| Redemption rights | Redeemable for the underlying share vs. sell-only | 20% | Robinhood verifier when registered; else heuristic (TODO live hook for Backed/Dinari) |
+| Backing model | Real shares with a regulated custodian vs. a thin debt note | 20% | on-chain PoR / attested when a verifier is registered; else **heuristic fallback** |
+| Proof of reserves | Independent PoR or attestation vs. a promise | 20% | on-chain PoR (Backed/xStocks) or attested (Dinari); else **heuristic fallback** |
+| Redemption rights | Redeemable for the underlying share vs. sell-only | 15% | Robinhood verifier when registered; else heuristic (TODO live hook for Backed/Dinari) |
 | Price integrity | Token 24h drift stays contained | 15% | self-reported (CMC quote) |
 | Disclosure | Real, matchable SEC CIK vs. missing | 15% | self-reported (CMC RWA info) |
+| Cross-issuer basis | Same underlying ticker, different wrapper prices (xStocks / Ondo / Dinari / …) | 15% | self-reported (CMC RWA market-pairs) |
+
+Weights sum to **100%**. The sixth pillar took 5 points each from backing, reserves, and redemption (25/25/20 → 20/20/15). Price and disclosure stay at 15%. Heuristic and attestation paths for the first five pillars are unchanged.
+
+**Basis math:** group CMC market-pairs by wrapper `crypto_id` (one product across venues), take a volume-weighted USD price per wrapper, then `spread% = (max − min) / mid × 100`. Score is `max(15, 100 − |spread%| × 10)` so a 0.5% gap → 95, 5% → 50, ≥8.5% → 15. One wrapper or a missing pairs payload is labeled unverified (defaults 55 / 50) — never treated as a measured tight market.
 
 Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** below 25.
 
@@ -73,7 +78,7 @@ RWA_USE_FIXTURES=1 streamlit run app.py
 python -m rwa_score --fixtures NVDA TSLA AAPL
 ```
 
-Fixture catalog: `NVDA` (solid / Backed Finance), `AAPL` (mid / xStocks), `TSLA` (thin wrapper), `META` (Ondo).
+Fixture catalog: `NVDA` (solid / Backed Finance, tight wrapper spread), `AAPL` (mid / xStocks, moderate spread), `TSLA` (thin wrapper, wide cross-issuer gap), `META` (Ondo, tight spread). Demo `market_pairs` samples live next to the other CMC-shaped fixtures so offline judging still scores the sixth pillar.
 
 ### Live CMC
 
@@ -107,6 +112,7 @@ Live data flow (CMC Basic):
 2. `GET /v5/real-world-assets/info` — issuer metadata + **SEC CIK**
 3. `GET /v5/real-world-assets/issuers/list` then `/issuers` — who mints the token, on-chain `crypto_id` (cached for the process lifetime)
 4. `GET /v2/cryptocurrency/quotes/latest` — token 24h change for price integrity
+5. `GET /v5/real-world-assets/market-pairs/list` — wrapper venues/prices for the **cross-issuer basis** pillar (short TTL cache; first page, `limit=100`)
 
 ## Tests
 

@@ -13,6 +13,7 @@ from rwa_score.client import (
     FixtureClient,
     create_client,
     env_flag,
+    parse_market_pairs_payload,
     use_fixtures,
 )
 from rwa_score.fixtures import DEMO_FIXTURE_PATH
@@ -100,6 +101,9 @@ def test_fixture_client_requires_no_api_key(monkeypatch: pytest.MonkeyPatch) -> 
     assert backed["name"] == "Backed Finance"
     quote = client.crypto_quote(36992)
     assert "USD" in quote["quote"]
+    nvda_pairs = client.market_pairs(rwa_id=2)
+    assert nvda_pairs["symbol"] == "NVDA"
+    assert len(nvda_pairs["market_pairs"]) >= 2
 
 
 def test_fixture_map_filters_symbol() -> None:
@@ -241,8 +245,24 @@ def test_issuer_list_called_once_across_multiple_scores() -> None:
                 }
             ),
             cmc_ok({"99": {"quote": {"USD": {"percent_change_24h": 1.0, "price": 10.0}}}}),
+            cmc_ok(
+                {
+                    "rwa_id": 2,
+                    "symbol": "NVDA",
+                    "num_market_pairs": 0,
+                    "market_pairs": [],
+                }
+            ),
             cmc_ok({"rwa_assets": [{"symbol": "AAPL", "rwa_id": 3, "cik": "0000320193"}]}),
             cmc_ok({"100": {"quote": {"USD": {"percent_change_24h": 2.0, "price": 20.0}}}}),
+            cmc_ok(
+                {
+                    "rwa_id": 3,
+                    "symbol": "AAPL",
+                    "num_market_pairs": 0,
+                    "market_pairs": [],
+                }
+            ),
         ]
     )
     client = _live(session)
@@ -255,6 +275,8 @@ def test_issuer_list_called_once_across_multiple_scores() -> None:
     assert paths.count("/v5/real-world-assets/issuers") == 1
     assert paths.count("/v5/real-world-assets/map") == 1
     assert paths.count("/v5/real-world-assets/info") == 2
+    assert paths.count("/v5/real-world-assets/market-pairs/list") == 2
+    assert "basis" in nvda["subscores"]
 
 
 def test_info_cache_short_ttl_expires(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,3 +295,79 @@ def test_info_cache_short_ttl_expires(monkeypatch: pytest.MonkeyPatch) -> None:
     clock["t"] = 110.1
     assert client.rwa_info(2)["cik"] == "second"
     assert session.paths().count("/v5/real-world-assets/info") == 2
+
+
+def test_parse_market_pairs_payload_normalizes_empty() -> None:
+    parsed = parse_market_pairs_payload(None)
+    assert parsed["market_pairs"] == []
+    assert parsed["num_market_pairs"] == 0
+    assert parsed["symbol"] == ""
+    assert parsed["rwa_id"] is None
+
+
+def test_parse_market_pairs_payload_keeps_rows() -> None:
+    parsed = parse_market_pairs_payload(
+        {
+            "rwa_id": "2",
+            "symbol": "nvda",
+            "num_market_pairs": "3",
+            "market_pairs": [{"market_id": 1}, {"market_id": 2}],
+            "has_more": True,
+        }
+    )
+    assert parsed["rwa_id"] == 2
+    assert parsed["symbol"] == "NVDA"
+    assert parsed["num_market_pairs"] == 3
+    assert len(parsed["market_pairs"]) == 2
+    assert parsed["has_more"] is True
+
+
+def test_live_market_pairs_requires_one_identifier() -> None:
+    session = FakeSession([])
+    client = _live(session)
+    with pytest.raises(CMCError, match="rwa_id or symbol"):
+        client.market_pairs()
+    with pytest.raises(CMCError, match="only one"):
+        client.market_pairs(rwa_id=2, symbol="NVDA")
+    assert session.calls == []
+
+
+def test_live_market_pairs_fetches_and_caches() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "rwa_id": 2,
+                    "name": "NVIDIA",
+                    "symbol": "NVDA",
+                    "num_market_pairs": 1,
+                    "market_pairs": [
+                        {
+                            "market_pair": "NVDAX/USDT",
+                            "market_pair_base": {"crypto_id": 36992, "symbol": "NVDAx"},
+                            "quotes": [{"symbol": "USD", "price": 118.45}],
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+    client = _live(session)
+    first = client.market_pairs(rwa_id=2)
+    second = client.market_pairs(rwa_id=2)
+    assert first == second
+    assert first["symbol"] == "NVDA"
+    assert first["market_pairs"][0]["market_pair"] == "NVDAX/USDT"
+    assert session.paths() == ["/v5/real-world-assets/market-pairs/list"]
+    assert session.calls[0][1]["rwa_id"] == 2
+
+
+def test_fixture_market_pairs_by_symbol() -> None:
+    client = FixtureClient()
+    by_id = client.market_pairs(rwa_id=16)
+    by_symbol = client.market_pairs(symbol="aapl")
+    assert by_id["rwa_id"] == 16
+    assert by_symbol["symbol"] == "AAPL"
+    assert len(by_id["market_pairs"]) == 3
+    unknown = client.market_pairs(symbol="ZZZZ")
+    assert unknown["market_pairs"] == []

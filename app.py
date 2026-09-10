@@ -250,6 +250,19 @@ def _render_compare_card(report: dict, *, selected: bool = False) -> None:
         "attestation/PoR is unavailable — labeled **heuristic fallback**, not audited attestations."
     )
 
+    basis_meta = report.get("basis") or {}
+    if basis_meta.get("available"):
+        spread = basis_meta.get("percent_spread")
+        count = basis_meta.get("wrapper_count")
+        st.caption(
+            f"Cross-issuer basis: **{spread:.2f}%** spread across {count} wrappers "
+            "(self-reported CMC market-pairs)."
+        )
+    elif basis_meta.get("wrapper_count") == 1:
+        st.caption(
+            "Cross-issuer basis: only one wrapper on CMC market-pairs — no issuer compare."
+        )
+
     metric_bits = []
     for key in WEIGHTS:
         meta = PILLARS[key]

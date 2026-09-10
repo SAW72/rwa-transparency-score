@@ -32,6 +32,8 @@ class RecordingClient:
         issuer_details: dict[str, dict[str, Any]] | None = None,
         quotes: dict[int, dict[str, Any]] | None = None,
         quote_error: Exception | None = None,
+        market_pairs: dict[int | str, dict[str, Any]] | None = None,
+        market_pairs_error: Exception | None = None,
     ) -> None:
         self.assets = assets or [
             {"symbol": "NVDA", "rwa_id": 2},
@@ -50,7 +52,16 @@ class RecordingClient:
             99: {"quote": {"USD": {"percent_change_24h": 1.0, "price": 100.0}}},
         }
         self.quote_error = quote_error
-        self.calls = {"rwa_map": 0, "rwa_info": 0, "issuers_list": 0, "issuer": 0, "crypto_quote": 0}
+        self.pairs = market_pairs or {}
+        self.market_pairs_error = market_pairs_error
+        self.calls = {
+            "rwa_map": 0,
+            "rwa_info": 0,
+            "issuers_list": 0,
+            "issuer": 0,
+            "crypto_quote": 0,
+            "market_pairs": 0,
+        }
 
     def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
         self.calls["rwa_map"] += 1
@@ -73,6 +84,27 @@ class RecordingClient:
         if self.quote_error:
             raise self.quote_error
         return dict(self.quotes.get(crypto_id) or {})
+
+    def market_pairs(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        self.calls["market_pairs"] += 1
+        if self.market_pairs_error:
+            raise self.market_pairs_error
+        if rwa_id is not None:
+            hit = self.pairs.get(int(rwa_id))
+            if hit is None:
+                hit = self.pairs.get(str(int(rwa_id)))
+            return dict(hit or {})
+        if symbol:
+            wanted = symbol.strip().upper()
+            for payload in self.pairs.values():
+                if (payload.get("symbol") or "").upper() == wanted:
+                    return dict(payload)
+        return {}
 
 
 @pytest.fixture

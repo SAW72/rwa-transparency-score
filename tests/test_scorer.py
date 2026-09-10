@@ -16,6 +16,13 @@ from tests.conftest import RecordingClient
 def test_weights_sum_to_one() -> None:
     assert abs(sum(WEIGHTS.values()) - 1.0) < 1e-9
     assert set(WEIGHTS) == set(PILLARS)
+    assert "basis" in WEIGHTS
+    assert abs(WEIGHTS["basis"] - 0.15) < 1e-9
+    assert WEIGHTS["backing"] == 0.20
+    assert WEIGHTS["reserves"] == 0.20
+    assert WEIGHTS["redemption"] == 0.15
+    assert WEIGHTS["price"] == 0.15
+    assert WEIGHTS["disclosure"] == 0.15
 
 
 @pytest.mark.parametrize(
@@ -52,6 +59,9 @@ def test_fixture_nvda_is_green(fixture_scorer: TransparencyScorer) -> None:
     assert any("fixture" in n.lower() or "DEMO FIXTURE" in n for n in report["notes"])
     assert "backing" in report["explanations"]
     assert "heuristic" in report["explanations"]["backing"].lower()
+    assert "basis" in report["subscores"]
+    assert report["verification"]["basis"]["source"] == "cmc_market_pairs"
+    assert report["basis"]["available"] is True
 
 
 def test_fixture_tsla_is_thin_wrapper(fixture_scorer: TransparencyScorer) -> None:
@@ -239,10 +249,20 @@ def test_robinhood_live_path_uses_verifier_not_heuristic() -> None:
     assert report["issuer_note"]
     assert "debt" in report["issuer_note"].lower()
     assert "Robinhood Assets Jersey" in report["issuer_note"]
-    # 55*0.25 + 40*0.25 + 35*0.20 + price + disclosure — low/mid is expected.
-    expected = round(55 * 0.25 + 40 * 0.25 + 35 * 0.20 + report["subscores"]["price"] * 0.15 + report["subscores"]["disclosure"] * 0.15, 1)
+    # 55*0.20 + 40*0.20 + 35*0.15 + price + disclosure + basis — low/mid is expected.
+    expected = round(
+        55 * 0.20
+        + 40 * 0.20
+        + 35 * 0.15
+        + report["subscores"]["price"] * 0.15
+        + report["subscores"]["disclosure"] * 0.15
+        + report["subscores"]["basis"] * 0.15,
+        1,
+    )
     assert report["score"] == expected
     assert report["band"] in {"YELLOW", "ORANGE"}
+    assert "basis" in report["subscores"]
+    assert report["verification"]["basis"]["source"] == "cmc_market_pairs"
 
 
 def test_backed_keeps_heuristic_redemption() -> None:
