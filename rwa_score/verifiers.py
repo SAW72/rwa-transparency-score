@@ -1,7 +1,7 @@
 """Attestation / proof-of-reserves verifiers for transparency pillars.
 
 Live sources (no paid APIs, ``requests`` only):
-  - Backed / xStocks public PoR JSON
+  - Backed / xStocks via Chainlink Proof of Reserve (on-chain AggregatorV3)
   - Dinari dShares marketing page scrape (attestation pending — no signed URL yet)
 
 Failed verifiers never fail silently: the scorer must surface the error and
@@ -18,9 +18,15 @@ from typing import Any, Protocol
 
 import requests
 
+from .chainlink_por import (
+    CHAINLINK_SMARTDATA_DOCS,
+    ChainlinkPorClient,
+    PorFeed,
+    PorReading,
+    resolve_por_feed,
+)
 from .issuer_registry import HEURISTIC_NOTE, classify
 
-BACKED_POR_URL = "https://api.xstocks.fi/api/v2/public/proof-of-reserves/{symbol}"
 DINARI_DSHARES_URL = "https://dinari.com/dshares"
 
 CACHE_TTL_SECONDS = 3600.0
@@ -165,32 +171,8 @@ def por_score_from_ratio(ratio: float) -> float:
     return 30.0
 
 
-def _normalize_por_symbol(ticker: str) -> list[str]:
-    """xStocks PoR symbols are case-sensitive (``AAPLx``, not ``AAPLX``).
-
-    Try the raw ticker, uppercase, and the ``{TICKER}x`` form used by the API.
-    """
-    raw = (ticker or "").strip()
-    if not raw:
-        return []
-    candidates: list[str] = []
-
-    def add(symbol: str) -> None:
-        if symbol and symbol not in candidates:
-            candidates.append(symbol)
-
-    add(raw)
-    add(raw.upper())
-    add(raw.lower())
-    if len(raw) > 1 and raw[-1].lower() == "x":
-        add(raw[:-1].upper() + "x")
-    else:
-        add(raw.upper() + "x")
-    return candidates
-
-
 class BackedVerifier:
-    """Public xStocks / Backed proof-of-reserves JSON (no auth)."""
+    """Chainlink Proof of Reserve (on-chain AggregatorV3) for Backed / xStocks."""
 
     name = "backed"
 
@@ -200,49 +182,35 @@ class BackedVerifier:
         *,
         cache_ttl: float = CACHE_TTL_SECONDS,
         timeout: float = REQUEST_TIMEOUT,
+        client: ChainlinkPorClient | None = None,
+        feeds: tuple[PorFeed, ...] | None = None,
     ) -> None:
         self.session = session or requests.Session()
         self.cache_ttl = cache_ttl
         self.timeout = timeout
-        # symbol -> (monotonic_ts, payload_or_exc_marker)
+        self.feeds = feeds
+        self.client = client or ChainlinkPorClient(session=self.session, timeout=timeout)
+        # ticker -> (monotonic_ts, reading_or_exc)
         self._cache: dict[str, tuple[float, Any]] = {}
 
-    def _get_por(self, symbol: str) -> dict[str, Any]:
+    def _read_por(self, ticker: str) -> PorReading:
+        key = (ticker or "").strip().upper()
         now = time.monotonic()
-        hit = self._cache.get(symbol)
+        hit = self._cache.get(key)
         if hit is not None and (now - hit[0]) <= self.cache_ttl:
             cached = hit[1]
             if isinstance(cached, Exception):
                 raise cached
-            return dict(cached)
+            return cached
 
-        url = BACKED_POR_URL.format(symbol=symbol)
         try:
-            resp = self.session.get(url, timeout=self.timeout)
-            if resp.status_code != 200:
-                exc = RuntimeError(f"PoR HTTP {resp.status_code} for {symbol}: {resp.text[:200]}")
-                self._cache[symbol] = (now, exc)
-                raise exc
-            payload = resp.json()
-            if not isinstance(payload, dict):
-                exc = RuntimeError(f"PoR payload for {symbol} was not a JSON object")
-                self._cache[symbol] = (now, exc)
-                raise exc
-            self._cache[symbol] = (now, payload)
-            return dict(payload)
+            reading = self.client.read(ticker, feeds=self.feeds)
+            self._cache[key] = (now, reading)
+            return reading
         except Exception as exc:  # noqa: BLE001 — cache + re-raise for fallback path
-            if symbol not in self._cache or not isinstance(self._cache[symbol][1], Exception):
-                self._cache[symbol] = (now, exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
-            raise
-
-    def _fetch_first_por(self, ticker: str) -> tuple[str, dict[str, Any]]:
-        errors: list[str] = []
-        for symbol in _normalize_por_symbol(ticker):
-            try:
-                return symbol, self._get_por(symbol)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{symbol}: {exc}")
-        raise RuntimeError("; ".join(errors) if errors else f"No PoR symbol candidates for {ticker}")
+            wrapped = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            self._cache[key] = (now, wrapped)
+            raise wrapped
 
     def _from_por(
         self,
@@ -251,68 +219,96 @@ class BackedVerifier:
         issuer_name: str,
         pillar: str,
     ) -> VerificationResult:
+        feed = resolve_por_feed(ticker, self.feeds)
+        if feed is None:
+            return heuristic_result(
+                pillar,
+                issuer_name,
+                reason=(
+                    f"No published Chainlink PoR feed for {ticker}. "
+                    "Backed / xStocks assets without a SmartData proxy stay on the name list."
+                ),
+            )
+
         try:
-            symbol, payload = self._fetch_first_por(ticker)
+            reading = self._read_por(ticker)
         except Exception as exc:  # noqa: BLE001 — never silent
             return heuristic_result(
                 pillar,
                 issuer_name,
-                reason=f"Backed PoR call failed for {ticker}.",
+                reason=f"Chainlink PoR call failed for {ticker} ({feed.symbol} on {feed.chain}).",
                 error=str(exc),
             )
 
-        try:
-            shares_held = float(payload.get("sharesHeld"))
-            circulating = float(payload.get("circulatingSupply"))
-        except (TypeError, ValueError) as exc:
+        reserves = reading.reserves
+        circulating = reading.circulating
+        if reserves < 0:
             return heuristic_result(
                 pillar,
                 issuer_name,
-                reason=f"Backed PoR payload for {ticker} missing numeric fields.",
-                error=str(exc),
+                reason=f"Chainlink PoR reserves for {ticker} were {reserves}.",
+                error="reserves < 0",
             )
-        if circulating <= 0:
+
+        ratio: float | None = None
+        if circulating is not None and circulating > 0:
+            ratio = reserves / circulating
+            score = por_score_from_ratio(ratio)
+            ratio_bit = (
+                f"reserves={reserves} {feed.unit} / circulatingSupply={circulating} "
+                f"→ collateralization_ratio={ratio:.6f} (score {score:.0f})"
+            )
+        elif circulating is not None:
             return heuristic_result(
                 pillar,
                 issuer_name,
-                reason=f"Backed PoR circulatingSupply was {circulating}.",
+                reason=f"On-chain circulatingSupply for {ticker} was {circulating}.",
                 error="circulatingSupply <= 0",
             )
+        else:
+            # Oracle published a reserve balance; token supply was not readable
+            # on this chain (multi-chain issuance). Still Chainlink-verified.
+            if reserves <= 0:
+                return heuristic_result(
+                    pillar,
+                    issuer_name,
+                    reason=f"Chainlink PoR reserves for {ticker} were {reserves}.",
+                    error="reserves <= 0 and no circulating supply",
+                )
+            score = 90.0
+            ratio_bit = (
+                f"reserves={reserves} {feed.unit} (circulating supply not readable "
+                f"on {feed.chain}; score {score:.0f})"
+            )
 
-        ratio = shares_held / circulating
-        score = por_score_from_ratio(ratio)
-        holdings = payload.get("holdings") or []
-        providers = sorted(
-            {
-                str(h.get("provider"))
-                for h in holdings
-                if isinstance(h, dict) and h.get("provider")
-            }
-        )
         evidence = (
-            f"api.xstocks.fi PoR {symbol}: sharesHeld={shares_held} / "
-            f"circulatingSupply={circulating} → collateralization_ratio={ratio:.6f} "
-            f"(score {score:.0f})"
-            + (f"; custodians={', '.join(providers)}" if providers else "")
+            f"Chainlink PoR {feed.symbol} on {feed.chain} ({feed.proxy}): {ratio_bit}. "
+            f"Oracle-verified reserves via AggregatorV3 latestRoundData "
+            f"(docs: {CHAINLINK_SMARTDATA_DOCS})"
         )
         notes = [
             f"verification={VerificationLevel.ON_CHAIN_POR.value}",
-            f"evidence source: {BACKED_POR_URL.format(symbol=symbol)}",
+            f"evidence source: Chainlink PoR {feed.proxy} on {feed.chain}",
+            f"Chainlink SmartData: {feed.docs}",
         ]
         return VerificationResult(
             score=score,
             level=VerificationLevel.ON_CHAIN_POR,
             evidence=evidence,
-            source="backed_por",
+            source="chainlink_por",
             notes=notes,
             ok=True,
             meta={
-                "symbol": symbol,
-                "shares_held": shares_held,
+                "symbol": feed.symbol,
+                "chain": feed.chain,
+                "proxy": feed.proxy,
+                "reserves": reserves,
                 "circulating_supply": circulating,
                 "collateralization_ratio": ratio,
-                "providers": providers,
-                "timestamp": payload.get("timestamp"),
+                "round_id": reading.round_id,
+                "updated_at": reading.updated_at,
+                "rpc_url": reading.rpc_url,
+                "unit": feed.unit,
             },
         )
 
@@ -323,7 +319,7 @@ class BackedVerifier:
         if result.ok and result.level == VerificationLevel.ON_CHAIN_POR:
             # Cap backing slightly below reserves when ratio is excellent — still high.
             result.score = min(result.score, 92.0)
-            result.notes.append("Backing corroborated by on-chain PoR collateralization.")
+            result.notes.append("Backing corroborated by Chainlink PoR collateralization.")
         return result
 
     def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult:

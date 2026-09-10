@@ -152,26 +152,9 @@ def test_map_failure_is_not_silent() -> None:
         TransparencyScorer(BrokenMap()).score("NVDA")
 
 def test_backed_live_por_scores_reserves_higher_than_unknown(monkeypatch) -> None:
-    """Backed issuer with mocked on-chain PoR outscores an unknown issuer on reserves."""
-    from rwa_score.verifiers import BackedVerifier, VerificationLevel, build_default_verifiers
-
-    class PorSession:
-        def get(self, url, timeout=None, headers=None):
-            class Resp:
-                status_code = 200
-                text = "{}"
-
-                def json(self):
-                    return {
-                        "symbol": "NVDAx",
-                        "sharesHeld": "1000",
-                        "circulatingSupply": "1000",
-                        "holdings": [{"provider": "Alpaca"}],
-                    }
-
-            if "proof-of-reserves" in url:
-                return Resp()
-            raise AssertionError(url)
+    """Backed issuer with mocked Chainlink PoR outscores an unknown issuer on reserves."""
+    from rwa_score.verifiers import VerificationLevel, build_default_verifiers
+    from tests.test_verifiers import _bnvda_rpc
 
     backed_client = RecordingClient(
         assets=[{"symbol": "NVDA", "rwa_id": 2}],
@@ -194,7 +177,7 @@ def test_backed_live_por_scores_reserves_higher_than_unknown(monkeypatch) -> Non
         quotes={99: {"quote": {"USD": {"percent_change_24h": 1.0, "price": 10.0}}}},
     )
 
-    session = PorSession()
+    session = _bnvda_rpc()
     verifiers = build_default_verifiers(session=session)
     backed_report = TransparencyScorer(
         backed_client, verifiers=verifiers, use_live_verifiers=True
@@ -204,6 +187,8 @@ def test_backed_live_por_scores_reserves_higher_than_unknown(monkeypatch) -> Non
     ).score("TSLA")
 
     assert backed_report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert backed_report["verification"]["reserves"]["source"] == "chainlink_por"
+    assert "Chainlink PoR" in backed_report["verification"]["reserves"]["evidence"]
     assert backed_report["subscores"]["reserves"] >= 95.0
     assert unknown_report["verification"]["reserves"]["source"] == "heuristic_fallback"
     assert "heuristic fallback" in unknown_report["explanations"]["reserves"].lower()
@@ -267,27 +252,10 @@ def test_robinhood_live_path_uses_verifier_not_heuristic() -> None:
 
 def test_backed_keeps_heuristic_redemption() -> None:
     from rwa_score.verifiers import BackedVerifier, VerificationLevel
-
-    class PorSession:
-        def get(self, url, timeout=None, headers=None):
-            class Resp:
-                status_code = 200
-                text = "{}"
-
-                def json(self):
-                    return {
-                        "symbol": "NVDAx",
-                        "sharesHeld": "1000",
-                        "circulatingSupply": "1000",
-                        "holdings": [{"provider": "Alpaca"}],
-                    }
-
-            if "proof-of-reserves" in url:
-                return Resp()
-            raise AssertionError(url)
+    from tests.test_verifiers import _bnvda_rpc
 
     client = RecordingClient()
-    verifiers = {"backed": BackedVerifier(session=PorSession())}
+    verifiers = {"backed": BackedVerifier(session=_bnvda_rpc())}
     report = TransparencyScorer(client, verifiers=verifiers, use_live_verifiers=True).score("NVDA")
     assert report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
     assert report["verification"]["redemption"]["source"] == "heuristic_fallback"
@@ -296,13 +264,10 @@ def test_backed_keeps_heuristic_redemption() -> None:
 
 def test_failed_verifier_is_not_silently_dropped() -> None:
     from rwa_score.verifiers import BackedVerifier
-
-    class BoomSession:
-        def get(self, url, timeout=None, headers=None):
-            raise RuntimeError("network down")
+    from tests.test_verifiers import FakeRpcSession
 
     client = RecordingClient()
-    verifiers = {"backed": BackedVerifier(session=BoomSession())}
+    verifiers = {"backed": BackedVerifier(session=FakeRpcSession(RuntimeError("network down")))}
     report = TransparencyScorer(client, verifiers=verifiers, use_live_verifiers=True).score("NVDA")
     assert any("verifier failure" in f.lower() or "network down" in f.lower() for f in report["flags"])
     assert any("heuristic fallback" in n.lower() for n in report["notes"])

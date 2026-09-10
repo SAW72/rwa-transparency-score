@@ -14,21 +14,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import requests
-
+from .chainlink_por import HEALTH_POR_FEED, probe_chainlink_por, rpc_urls_for_chain
 from .client import use_fixtures
-from .verifiers import BACKED_POR_URL
 
-HEALTH_POR_SYMBOL = "AAPLx"
+HEALTH_POR_SYMBOL = HEALTH_POR_FEED.symbol
 HEALTH_TIMEOUT_SECONDS = 2.0
 HEALTH_PATH = "/health"
 
 GetFn = Callable[..., Any]
+PostFn = Callable[..., Any]
 
 
-def backed_feed_url(symbol: str = HEALTH_POR_SYMBOL) -> str:
-    """Same xStocks PoR URL template as ``rwa_score.verifiers.BACKED_POR_URL``."""
-    return BACKED_POR_URL.format(symbol=symbol)
+def backed_feed_url() -> str:
+    """Primary RPC URL used to probe the canonical Backed Chainlink PoR feed."""
+    urls = rpc_urls_for_chain(HEALTH_POR_FEED.chain)
+    return urls[0] if urls else ""
 
 
 def utc_timestamp(now: datetime | None = None) -> str:
@@ -43,13 +43,17 @@ def utc_timestamp(now: datetime | None = None) -> str:
 def probe_backed_feed(
     *,
     getter: GetFn | None = None,
+    poster: PostFn | None = None,
     timeout: float = HEALTH_TIMEOUT_SECONDS,
 ) -> str:
-    """Lightweight reachability check. Returns ``ok`` or ``down``. Never raises."""
-    get = getter or requests.get
+    """Chainlink PoR reachability. Returns ``ok`` or ``down``. Never raises.
+
+    ``poster`` is a ``requests.post``-compatible callable. ``getter`` is accepted
+    for older callers and ignored — the probe is JSON-RPC POST only.
+    """
+    _ = getter
     try:
-        resp = get(backed_feed_url(), timeout=timeout)
-        if 200 <= int(getattr(resp, "status_code", 0)) < 300:
+        if probe_chainlink_por(poster=poster, timeout=timeout):
             return "ok"
     except Exception:  # noqa: BLE001 — health must stay up if the feed is down
         pass
@@ -59,12 +63,13 @@ def probe_backed_feed(
 def build_health_payload(
     *,
     getter: GetFn | None = None,
+    poster: PostFn | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """JSON body for ``GET /health``. Does not run scoring."""
     fixtures = use_fixtures()
     try:
-        backed = probe_backed_feed(getter=getter)
+        backed = probe_backed_feed(getter=getter, poster=poster)
     except Exception:  # noqa: BLE001
         backed = "down"
     return {

@@ -1,4 +1,4 @@
-"""Unit tests for attestation / PoR verifiers (mocked HTTP)."""
+"""Unit tests for attestation / PoR verifiers (mocked HTTP / JSON-RPC)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,15 @@ from typing import Any
 
 import pytest
 
+from rwa_score.chainlink_por import (
+    BACKED_POR_FEEDS,
+    LATEST_ROUND_DATA_SELECTOR,
+    TOTAL_SUPPLY_SELECTOR,
+    decode_latest_round,
+    resolve_por_feed,
+    scale_answer,
+)
 from rwa_score.verifiers import (
-    BACKED_POR_URL,
     DINARI_DSHARES_URL,
     BackedVerifier,
     DinariVerifier,
@@ -17,6 +24,30 @@ from rwa_score.verifiers import (
     por_score_from_ratio,
     resolve_verifier_id,
 )
+
+
+def encode_uint256(value: int) -> str:
+    if value < 0:
+        value = (1 << 256) + value
+    return f"{value:064x}"
+
+
+def encode_latest_round(
+    *,
+    round_id: int = 7,
+    answer: int,
+    started_at: int = 1,
+    updated_at: int = 1_700_000_000,
+    answered_in_round: int = 7,
+) -> str:
+    return "0x" + "".join(
+        encode_uint256(n)
+        for n in (round_id, answer, started_at, updated_at, answered_in_round)
+    )
+
+
+def encode_uint(value: int) -> str:
+    return "0x" + encode_uint256(value)
 
 
 class FakeResponse:
@@ -51,11 +82,9 @@ class FakeSession:
         if self._by_url:
             if url in self._by_url:
                 return self._by_url[url]
-            # Case-sensitive exact first, then case-insensitive path match.
             lower = url.lower()
             for key, resp in self._by_url.items():
                 if lower == key.lower() or lower.endswith(key.lower().rsplit("/", 1)[-1]):
-                    # Prefer exact case when multiple keys share a suffix.
                     if url.rsplit("/", 1)[-1] == key.rsplit("/", 1)[-1]:
                         return resp
             for key, resp in self._by_url.items():
@@ -65,6 +94,38 @@ class FakeSession:
         if not self._queue:
             raise AssertionError(f"no queued response for {url}")
         return self._queue.pop(0)
+
+
+class FakeRpcSession:
+    """JSON-RPC ``eth_call`` mock keyed by contract ``to`` address."""
+
+    def __init__(self, results: dict[str, str] | Exception) -> None:
+        self._results = results
+        self.calls: list[tuple[str, str, str]] = []
+
+    def post(self, url: str, json: dict | None = None, timeout: float | None = None, headers: dict | None = None):
+        payload = json or {}
+        params = (payload.get("params") or [{}])[0]
+        to = str(params.get("to") or "")
+        data = str(params.get("data") or "")
+        self.calls.append((url, to, data))
+        if isinstance(self._results, Exception):
+            raise self._results
+        key = to.lower()
+        if key not in self._results:
+            raise AssertionError(f"unexpected eth_call to {to} data={data}")
+        return FakeResponse(200, {"jsonrpc": "2.0", "id": 1, "result": self._results[key]})
+
+
+def _bnvda_rpc(*, reserves: int = 1000, circulating: int = 1000) -> FakeRpcSession:
+    feed = resolve_por_feed("NVDA")
+    assert feed is not None
+    return FakeRpcSession(
+        {
+            feed.proxy.lower(): encode_latest_round(answer=reserves * 10**feed.decimals),
+            (feed.token_address or "").lower(): encode_uint(circulating * 10**feed.token_decimals),
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -84,38 +145,44 @@ def test_resolve_verifier_keywords() -> None:
     assert resolve_verifier_id("NoteVault Demo Issuer") is None
 
 
+def test_resolve_por_feed_aliases() -> None:
+    feed = resolve_por_feed("NVDA")
+    assert feed is not None
+    assert feed.symbol == "bNVDA"
+    assert resolve_por_feed("NVDAx") == feed
+    assert resolve_por_feed("bNVDA") == feed
+    assert resolve_por_feed("AAPL") is None
+    assert resolve_por_feed("TSLA") is None
+
+
+def test_decode_latest_round_and_scale() -> None:
+    raw = encode_latest_round(round_id=3, answer=1_000 * 10**8, updated_at=99)
+    decoded = decode_latest_round(raw)
+    assert decoded.round_id == 3
+    assert decoded.answer == 1_000 * 10**8
+    assert decoded.updated_at == 99
+    assert scale_answer(decoded.answer, 8) == 1000.0
+
+
 def test_backed_verifier_high_ratio() -> None:
-    payload = {
-        "symbol": "NVDAx",
-        "sharesHeld": "1000",
-        "circulatingSupply": "1000",
-        "holdings": [{"provider": "Alpaca", "quantity": "1000", "symbol": "NVDA"}],
-    }
-    # ticker NVDA -> tries NVDA, nvda, then NVDAx (API is case-sensitive)
-    session = FakeSession(
-        {
-            BACKED_POR_URL.format(symbol="NVDA"): FakeResponse(404, text="missing"),
-            BACKED_POR_URL.format(symbol="NVDAx"): FakeResponse(200, payload),
-        }
-    )
+    session = _bnvda_rpc(reserves=1000, circulating=1000)
     v = BackedVerifier(session=session, cache_ttl=3600)
     result = v.verify_reserves(ticker="NVDA", issuer_name="Backed Finance")
     assert result.ok is True
     assert result.level == VerificationLevel.ON_CHAIN_POR
+    assert result.source == "chainlink_por"
     assert result.score == 95.0
+    assert "Chainlink PoR" in result.evidence
     assert "collateralization_ratio" in result.evidence
     assert result.meta["collateralization_ratio"] == pytest.approx(1.0)
+    assert result.meta["symbol"] == "bNVDA"
+    assert any("Chainlink" in n for n in result.notes)
 
 
-def test_backed_verifier_fallback_on_http_error() -> None:
-    session = FakeSession(
-        {
-            BACKED_POR_URL.format(symbol="TSLA"): FakeResponse(500, text="boom"),
-            BACKED_POR_URL.format(symbol="TSLAx"): FakeResponse(500, text="boom"),
-        }
-    )
+def test_backed_verifier_fallback_on_rpc_error() -> None:
+    session = FakeRpcSession(RuntimeError("rpc timeout"))
     v = BackedVerifier(session=session)
-    result = v.verify_reserves(ticker="TSLA", issuer_name="Backed Finance")
+    result = v.verify_reserves(ticker="NVDA", issuer_name="Backed Finance")
     assert result.level == VerificationLevel.SELF_REPORTED
     assert result.source == "heuristic_fallback"
     assert any("heuristic fallback" in n for n in result.notes)
@@ -123,20 +190,40 @@ def test_backed_verifier_fallback_on_http_error() -> None:
     assert result.score == 90.0  # Backed Finance is on AUDITED list
 
 
+def test_backed_verifier_fallback_when_no_feed() -> None:
+    v = BackedVerifier(session=FakeRpcSession({}))
+    result = v.verify_reserves(ticker="AAPL", issuer_name="xStocks")
+    assert result.source == "heuristic_fallback"
+    assert result.ok is True
+    assert result.error is None
+    assert "No published Chainlink PoR feed" in result.evidence
+    assert any("heuristic fallback" in n for n in result.notes)
+
+
 def test_backed_verifier_caches_for_one_hour() -> None:
-    payload = {
-        "symbol": "AAPLx",
-        "sharesHeld": "100",
-        "circulatingSupply": "100",
-        "holdings": [],
-    }
-    url = BACKED_POR_URL.format(symbol="AAPLx")
-    session = FakeSession({url: FakeResponse(200, payload)})
+    session = _bnvda_rpc()
     v = BackedVerifier(session=session, cache_ttl=3600)
-    first = v.verify_reserves(ticker="AAPLx", issuer_name="xStocks")
-    second = v.verify_reserves(ticker="AAPLx", issuer_name="xStocks")
+    first = v.verify_reserves(ticker="NVDA", issuer_name="xStocks")
+    second = v.verify_reserves(ticker="NVDA", issuer_name="xStocks")
     assert first.score == second.score == 95.0
-    assert session.calls == [url]
+    # latestRoundData + optional totalSupply, once (cached on the second call).
+    assert len(session.calls) == 2
+    assert all(LATEST_ROUND_DATA_SELECTOR in data or TOTAL_SUPPLY_SELECTOR in data for _, _, data in session.calls)
+
+
+def test_backed_verifier_reserves_only_when_supply_missing() -> None:
+    feed = resolve_por_feed("CSPX")
+    assert feed is not None
+    session = FakeRpcSession(
+        {feed.proxy.lower(): encode_latest_round(answer=500 * 10**feed.decimals)}
+    )
+    v = BackedVerifier(session=session)
+    result = v.verify_reserves(ticker="CSPX", issuer_name="Backed Finance")
+    assert result.ok is True
+    assert result.level == VerificationLevel.ON_CHAIN_POR
+    assert result.score == 90.0
+    assert result.meta["circulating_supply"] is None
+    assert "Chainlink PoR" in result.evidence
 
 
 def test_dinari_verifier_attestation_pending() -> None:
@@ -197,3 +284,11 @@ def test_robinhood_verifier_self_reported_scores() -> None:
     assert reserves.evidence == "no independent attestation"
     assert redemption.evidence == "debt wrapper, creditor claim only"
     assert backing.ok and reserves.ok and redemption.ok
+
+
+def test_backed_feeds_are_public_polygon_proxies() -> None:
+    assert {f.symbol for f in BACKED_POR_FEEDS} >= {"bNVDA", "bIB01", "bCSPX"}
+    for feed in BACKED_POR_FEEDS:
+        assert feed.chain == "polygon"
+        assert feed.proxy.startswith("0x")
+        assert len(feed.proxy) == 42
