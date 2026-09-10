@@ -115,6 +115,9 @@ rwa_score/verifiers.py Backed Chainlink PoR + Dinari scrapers + Robinhood debt-w
 rwa_score/explainer.py xAI Grok “Why this score?” with templated fallback
 rwa_score/issuer_registry.py   Name-match heuristics + ISSUER_NOTES (equity vs debt)
 rwa_score/fixtures/    Demo JSON shaped like CMC RWA responses
+rwa_score/api/         Paid REST output layer (keys, quotas, history, webhooks, score hash)
+contracts/             ScoreAttestation.sol — Base Sepolia hash attestation (Foundry)
+scripts/verify_attestation.py   Re-hash a live score and optionally read the chain
 ```
 
 Live data flow (CMC Basic):
@@ -125,13 +128,76 @@ Live data flow (CMC Basic):
 4. `GET /v2/cryptocurrency/quotes/latest` — token 24h change for price integrity
 5. `GET /v5/real-world-assets/market-pairs/list` — wrapper venues/prices for the **cross-issuer basis** pillar (short TTL cache; first page, `limit=100`)
 
+## Paid API (verdict + history + attestation)
+
+The scoring engine, verifiers, and fixtures stay **MIT-open**. What you pay for is authenticated access, score history, webhooks, and an optional on-chain **hash** of the breakdown (never the raw score on-chain).
+
+| Tier | Price | Quota | Includes |
+|---|---|---|---|
+| Free | $0 | 50 calls / rolling 24h (sliding window) | Current score, compare, watchlist |
+| Paid | $20–$50 / mo | Unlimited | History, webhooks, attestation hash |
+
+### Get an API key
+
+Self-host (prints the secret once; the DB stores only a SHA-256 hash):
+
+```bash
+python -m rwa_score.api.keys create --name "my-app" --tier free
+python -m rwa_score.api.keys create --name "desk" --tier paid
+```
+
+Hosted keys: open a GitHub issue on this repo or contact [@SAW72](https://github.com/SAW72). Send the key as `X-API-Key` or `Authorization: Bearer`. Never commit it.
+
+Optional bootstrap on process start (env only): `RWA_API_BOOTSTRAP_KEY` + `RWA_API_BOOTSTRAP_TIER=paid`.
+
+### Run the API
+
+Binds `0.0.0.0:$PORT` (default `8000`). Reuses `TransparencyScorer` / `create_client` so numbers match the Streamlit UI byte-for-byte on the breakdown.
+
+```bash
+pip install -r requirements.txt
+python -m rwa_score.api.keys create --name local --tier paid
+RWA_USE_FIXTURES=1 python -m rwa_score.api
+curl -sS -H "X-API-Key: $KEY" http://127.0.0.1:8000/v1/score/NVDA
+```
+
+| Method | Path | Who |
+|---|---|---|
+| GET | `/v1/score/{ticker}` | free + paid |
+| GET | `/v1/compare?tickers=a,b,c` | free + paid |
+| GET / PUT / POST / DELETE | `/v1/watchlist` | free + paid |
+| GET | `/v1/history/{ticker}` | paid |
+| POST / GET / DELETE | `/v1/webhooks` | paid |
+| GET | `/v1/attest/{ticker}` | paid |
+| GET | `/v1/me` | free + paid |
+| GET | `/health` | open |
+
+### Webhooks
+
+`POST /v1/webhooks` with `{"url": "https://…", "trigger": "band_cross"}` or `"below_orange"` (new band is RED). URLs must be **https** to a public host — localhost, RFC1918, link-local, and `169.254.169.254` are rejected.
+
+**v1 delivery:** synchronous HTTP POST in the **same scoring cycle** as the request that observed the crossing (`GET /v1/score`, compare, watchlist). First observation of a ticker is stored and does not fire. The same check runs for every saved watchlist ticker when you run `python -m rwa_score.api.poll` (cron / background worker). Body is HMAC-SHA256 signed (`X-RAT-Signature: sha256=…`) with the webhook secret.
+
+### On-chain attestation (Base Sepolia)
+
+`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` — attester is `msg.sender`, not calldata. See [`contracts/README.md`](contracts/README.md). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held.
+
+```bash
+RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures
+```
+
+Pass `--contract` and `--rpc-url` (or `RWA_ATTESTATION_CONTRACT` / `BASE_SEPOLIA_RPC_URL`) to read the chain. The client never needs a private key.
+
+SQLite (`RWA_API_DB_PATH`, default `data/rat_api.sqlite`) is v1. Render’s filesystem is ephemeral — use a disk or Postgres before relying on keys in production.
+
 ## Tests
 
 ```bash
 pytest -q
+cd contracts && forge install foundry-rs/forge-std --no-commit && forge test -vv
 ```
 
-CI runs the same command. No real API key is required.
+CI runs both. No real API key or wallet is required.
 
 ## Deploy
 

@@ -19,3 +19,17 @@ jobs:
         run: pytest -q
         env:
           RWA_USE_FIXTURES: "1"
+
+  contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Install forge-std
+        run: forge install foundry-rs/forge-std --no-commit
+      - name: Test
+        run: forge test -vv
