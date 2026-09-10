@@ -106,15 +106,41 @@ CI runs the same command. No real API key is required.
 
 ## Deploy
 
-**Render (blueprint):** `render.yaml` starts Streamlit on `0.0.0.0:$PORT` with `RWA_USE_FIXTURES=1`. `CMC_API_KEY` is optional and must be set in the dashboard if you want live mode — never commit it.
+### `RWA_USE_FIXTURES`
+
+| Value | Mode |
+|---|---|
+| `0` | Live path: CMC (needs `CMC_API_KEY`) plus Chainlink / xStocks PoR verifiers |
+| `1` | Offline demo fixtures only — no live CMC, no live attestation |
+
+**Render must stay at `RWA_USE_FIXTURES=0`.** That default lives in `render.yaml`. Flipping the variable in the Render dashboard alone is **not** enough: the next blueprint sync / redeploy re-applies `render.yaml` and overwrites the dashboard value.
+
+`CMC_API_KEY` stays `sync: false`. Set it in the Render dashboard for live CMC — never commit the key.
+
+**Render (blueprint):** `render.yaml` starts via `python -m rwa_score.health` on `0.0.0.0:$PORT` so `GET /health` is registered before Streamlit's SPA catch-all.
 
 ```text
 New Web Service → this repo → Build: pip install -r requirements.txt
-Start: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
-Env: RWA_USE_FIXTURES=1
+Start: python -m rwa_score.health --server.port $PORT --server.address 0.0.0.0 --server.headless true
+Env: RWA_USE_FIXTURES=0   (keep this; do not set 1 on Render)
+Dashboard secret: CMC_API_KEY
 ```
 
-**Streamlit Community Cloud:** deploy `app.py` from the repo root. Secrets: leave `CMC_API_KEY` empty and set `RWA_USE_FIXTURES=1`, or add a key for live mode.
+Confirm live mode (no fixture overwrite, verifiers enabled) with:
+
+```bash
+curl -sS https://rwa-transparency-score.onrender.com/health
+```
+
+Expected when Render is live:
+
+```json
+{"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "2026-09-10T01:13:00Z"}
+```
+
+`backed_feed` is `"ok"` if the xStocks PoR endpoint is reachable (2xx), otherwise `"down"`. The handler always returns JSON — a down feed does not crash `/health`. Local demos can still run `RWA_USE_FIXTURES=1 streamlit run app.py`. For a process-start `/health` route locally, use the same launcher as Render: `python -m rwa_score.health`.
+
+**Streamlit Community Cloud:** deploy `app.py` from the repo root. Secrets: leave `CMC_API_KEY` empty and set `RWA_USE_FIXTURES=1`, or add a key and set `RWA_USE_FIXTURES=0` for live mode.
 
 This repo is **deploy-config ready**. A public URL appears only after you connect the repo to Render or Streamlit Cloud.
 

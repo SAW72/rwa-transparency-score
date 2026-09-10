@@ -1,8 +1,11 @@
-# Render Blueprint — fixture-mode Streamlit demo (no API key required).
+# Render Blueprint — live verification (RWA_USE_FIXTURES=0).
 # https://render.com/docs/blueprint-spec
 #
-# Optional live mode: set CMC_API_KEY in the Render dashboard and
-# change RWA_USE_FIXTURES to "0". Never commit the key.
+# Render must stay at RWA_USE_FIXTURES=0 so live Chainlink / xStocks PoR
+# checks run. Blueprint sync re-applies this file and will overwrite a
+# dashboard-only toggle. CMC_API_KEY must be set in the Render dashboard
+# (sync: false) for live CMC. Never commit the key. Local demos can still
+# set RWA_USE_FIXTURES=1.
 
 services:
   - type: web
@@ -11,13 +14,14 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: >-
-      streamlit run app.py
+      python -m rwa_score.health
       --server.port $PORT
       --server.address 0.0.0.0
       --server.headless true
     envVars:
+      # 0 = live Chainlink PoR feeds; 1 = offline demo fixtures only
       - key: RWA_USE_FIXTURES
-        value: "1"
+        value: "0"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: CMC_API_KEY
