@@ -12,6 +12,21 @@ README_ONELINER = (
     "and disclosure using CoinMarketCap’s RWA API."
 )
 
+EXPECTED_DISCLAIMER = (
+    "Informational and educational hackathon demo only. Not financial, investment, "
+    "legal, or tax advice. Not an offer, solicitation, or recommendation to buy, "
+    "sell, or hold any security, digital asset, tokenized stock, or other instrument. "
+    "Scores are automated heuristics (including issuer-name matching) plus third-party "
+    "CoinMarketCap data or bundled demo fixtures — not audited attestations, not legal "
+    "or audit opinions, and not a substitute for issuer filings, prospectuses, offering "
+    "documents, or your own independent research. Data may be incomplete, delayed, "
+    "inaccurate, or outdated. Nothing here guarantees accuracy, completeness, or fitness "
+    "for any purpose. Past or present scores are not indicative of future results. This "
+    "demo is not provided by a broker-dealer, exchange, ATS, funding portal, or registered "
+    "investment adviser, and it does not create any advisory or fiduciary relationship. "
+    "Do your own research. Use at your own risk."
+)
+
 
 def test_brand_copy_replaces_old_page_title() -> None:
     import app as demo_app
@@ -58,8 +73,15 @@ def test_app_module_exports_helpers() -> None:
     assert demo_app.DEFAULT_SLOTS == ["NVDA", "TSLA", "AAPL", "META"]
     assert demo_app.MAX_COMPARE_SLOTS == 4
     assert demo_app.DEFAULT_SLOTS == demo_app.FIXTURE_TICKERS
-    assert "financial advice" in demo_app.DISCLAIMER.lower()
+    assert demo_app.DISCLAIMER == EXPECTED_DISCLAIMER
     assert set(demo_app.BAND_COLORS) == {"GREEN", "YELLOW", "ORANGE", "RED"}
+
+
+def test_readme_disclaimer_and_problem_blurb() -> None:
+    text = Path("README.md").read_text(encoding="utf-8")
+    assert EXPECTED_DISCLAIMER in text
+    assert "how its public CMC/issuer signals look under our published heuristics" in text
+    assert "how honest its issuer looks" not in text
 
 
 def test_app_reuses_scorer_via_cache_resource() -> None:
@@ -121,3 +143,34 @@ def test_score_slots_accepts_any_mapped_ticker() -> None:
     assert results[0][0] == "MSFT"
     assert results[0][1] is not None
     assert results[0][1]["ticker"] == "MSFT"
+
+
+def test_score_card_escapes_html() -> None:
+    import app as demo_app
+
+    markup = demo_app._score_card_html(
+        {
+            "score": 80.0,
+            "band": "GREEN",
+            "band_label": "GREEN — heuristic: stronger transparency signals (still verify)",
+            "ticker": "<script>alert(1)</script>",
+            "issuer": "x<y>&z",
+            "summary": 'hi & bye <img src=x onerror=alert(1)>',
+        }
+    )
+    assert "<script>" not in markup
+    assert "<img" not in markup
+    assert "&lt;script&gt;" in markup
+    assert "x&lt;y&gt;&amp;z" in markup
+    assert "hi &amp; bye" in markup
+    assert "&lt;img" in markup
+
+
+def test_error_card_escapes_html() -> None:
+    import app as demo_app
+
+    markup = demo_app._error_card_html("<b>NVDA</b>", "boom <script>x</script>")
+    assert "<b>" not in markup
+    assert "<script>" not in markup
+    assert "&lt;b&gt;NVDA&lt;/b&gt;" in markup
+    assert "&lt;script&gt;" in markup

@@ -27,6 +27,15 @@ def test_band_thresholds(score: float, code: str) -> None:
     assert band_detail(score).startswith(code)
 
 
+def test_band_detail_wording_is_exact() -> None:
+    assert band_detail(75) == "GREEN — heuristic: stronger transparency signals (still verify)"
+    assert band_detail(50) == "YELLOW — heuristic: mixed signals; verify before relying"
+    assert band_detail(25) == "ORANGE — heuristic: weaker signals; elevated concern"
+    assert band_detail(0) == (
+        "RED — heuristic: opaque or thin signals (not a finding of fraud or illegality)"
+    )
+
+
 def test_fixture_nvda_is_green(fixture_scorer: TransparencyScorer) -> None:
     report = fixture_scorer.score("nvda")
     assert report["ticker"] == "NVDA"
@@ -101,6 +110,27 @@ def test_missing_crypto_id_is_flagged() -> None:
     report = TransparencyScorer(client).score("NVDA")
     assert any("crypto_id" in f for f in report["flags"])
     assert report["subscores"]["price"] == 45.0
+
+
+def test_adversarial_issuer_name_is_not_treated_as_backed() -> None:
+    client = RecordingClient(
+        info={2: {"symbol": "NVDA", "cik": "0001045810", "issuer": {"name": "Not Backed At All"}}},
+        issuers=[{"issuer_id": "abc", "name": "Not Backed At All"}],
+        issuer_details={
+            "abc": {
+                "name": "Not Backed At All",
+                "tokens": [{"rwa_id": 2, "crypto_id": 99}],
+            }
+        },
+    )
+    report = TransparencyScorer(client).score("NVDA")
+    assert report["heuristics"]["backed"] is False
+    assert report["heuristics"]["audited"] is False
+    assert report["heuristics"]["redeemable"] is False
+    assert report["subscores"]["backing"] == 35.0
+    assert report["subscores"]["reserves"] == 30.0
+    assert report["subscores"]["redemption"] == 25.0
+    assert any("heuristic" in n.lower() for n in report["notes"])
 
 
 def test_map_failure_is_not_silent() -> None:

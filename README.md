@@ -22,7 +22,7 @@ python -m rwa_score.demo
 
 Tokenized stocks (RWAs) can fail the same way traditional wrappers do — inflated claims, thin backing, then sudden closure — except on-chain you can surface a warning **before** the doors close.
 
-This tool rates a tokenized stock on how honest its issuer looks, using CoinMarketCap's RWA API (or bundled demo fixtures when you do not have a key).
+This tool rates a tokenized stock on how its public CMC/issuer signals look under our published heuristics, using CoinMarketCap's RWA API (or bundled demo fixtures when you do not have a key).
 
 ## The score (0–100)
 
@@ -36,7 +36,7 @@ This tool rates a tokenized stock on how honest its issuer looks, using CoinMark
 
 Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** below 25.
 
-Backing / reserves / redemption use **issuer-name heuristics** (see `rwa_score/issuer_registry.py`). The UI and CLI label them as heuristics — they are not audited attestations.
+Backing / reserves / redemption use **issuer-name heuristics** (see `rwa_score/issuer_registry.py`). Matching is a known-good allowlist at word boundaries (Backed Finance, Ondo, Paxos, xStocks, Securitize, …) — never the bare substring `backed`. Negative tokens (`not backed`, `unbacked`, `anti-`) reject first. The UI and CLI label them as heuristics — they are not audited attestations.
 
 ## How to run
 
@@ -108,7 +108,7 @@ This repo is **deploy-config ready**. A public URL appears only after you connec
 
 ## Disclaimer
 
-This tool is for informational and hackathon demo purposes only. It does **not** constitute financial advice. Always do your own research.
+Informational and educational hackathon demo only. Not financial, investment, legal, or tax advice. Not an offer, solicitation, or recommendation to buy, sell, or hold any security, digital asset, tokenized stock, or other instrument. Scores are automated heuristics (including issuer-name matching) plus third-party CoinMarketCap data or bundled demo fixtures — not audited attestations, not legal or audit opinions, and not a substitute for issuer filings, prospectuses, offering documents, or your own independent research. Data may be incomplete, delayed, inaccurate, or outdated. Nothing here guarantees accuracy, completeness, or fitness for any purpose. Past or present scores are not indicative of future results. This demo is not provided by a broker-dealer, exchange, ATS, funding portal, or registered investment adviser, and it does not create any advisory or fiduciary relationship. Do your own research. Use at your own risk.
 
 ## License
 
