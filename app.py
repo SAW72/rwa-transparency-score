@@ -17,6 +17,7 @@ import streamlit as st
 
 from rwa_score.client import create_client, env_flag
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
+from rwa_score.verifiers import VerificationLevel
 
 PAGE_TITLE = "RAT Score | RWA Transparency Score"
 BRAND_H1 = "RAT Score"
@@ -48,6 +49,29 @@ BAND_COLORS = {
     "ORANGE": "#F08A24",
     "RED": "#E5484D",
 }
+
+
+VERIFICATION_BADGE_COLORS = {
+    VerificationLevel.SELF_REPORTED.value: "#8B949E",
+    VerificationLevel.ON_CHAIN_POR.value: "#3DDC97",
+    VerificationLevel.ATTESTED.value: "#58A6FF",
+    VerificationLevel.EXAMINED.value: "#D2A8FF",
+    "heuristic fallback": "#F08A24",
+}
+
+
+def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
+    """Return (badge_text, evidence_line) for a pillar."""
+    block = (report.get("verification") or {}).get(pillar_key) or {}
+    level = block.get("level") or VerificationLevel.SELF_REPORTED.value
+    source = block.get("source") or ""
+    evidence = block.get("evidence") or "No evidence citation."
+    if source == "heuristic_fallback" or "heuristic fallback" in (evidence or "").lower():
+        badge = f"Verification: heuristic fallback · {level}"
+    else:
+        badge = f"Verification: {level}"
+    return badge, evidence
+
 
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
@@ -195,7 +219,8 @@ def _render_compare_card(report: dict, *, selected: bool = False) -> None:
         st.caption("Live CoinMarketCap data.")
 
     st.caption(
-        "Backing / reserves / redemption use **issuer-name heuristics**, not audited attestations."
+        "Backing / reserves / redemption use **issuer-name heuristics** when live "
+        "attestation/PoR is unavailable — labeled **heuristic fallback**, not audited attestations."
     )
 
     metric_bits = []
@@ -214,13 +239,25 @@ def _render_compare_card(report: dict, *, selected: bool = False) -> None:
     with st.expander("Pillar detail", expanded=False):
         for key in WEIGHTS:
             meta = PILLARS[key]
-            heuristic = key in {"backing", "reserves", "redemption"}
-            badge = " · heuristic" if heuristic else ""
+            badge_label, evidence = _verification_badge_label(key, report)
+            color = VERIFICATION_BADGE_COLORS.get(
+                (report.get("verification") or {}).get(key, {}).get("level"),
+                "#8B949E",
+            )
+            if "heuristic fallback" in badge_label:
+                color = VERIFICATION_BADGE_COLORS["heuristic fallback"]
             st.markdown(
                 f"**{meta['label']}** — {report['subscores'][key]:.0f}/100 "
-                f"(weight {WEIGHTS[key]:.0%}){badge}"
+                f"(weight {WEIGHTS[key]:.0%})"
+            )
+            st.markdown(
+                f'<span style="display:inline-block;padding:0.15rem 0.5rem;'
+                f'border-radius:999px;border:1px solid {color};color:{color};'
+                f'font-size:0.8rem;">{badge_label}</span>',
+                unsafe_allow_html=True,
             )
             st.caption(meta["what"])
+            st.caption(f"Evidence: {evidence}")
             st.write(report["explanations"][key])
 
         notes = report.get("notes") or []

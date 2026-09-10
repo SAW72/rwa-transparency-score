@@ -26,17 +26,28 @@ This tool rates a tokenized stock on how its public CMC/issuer signals look unde
 
 ## The score (0–100)
 
-| Pillar | What it checks | Weight |
-|---|---|---|
-| Backing model | Real shares with a regulated custodian vs. a thin debt note | 25% |
-| Proof of reserves | Independent auditor publishing on-chain (e.g. Chainlink) vs. a promise | 25% |
-| Redemption rights | Redeemable for the underlying share vs. sell-only | 20% |
-| Price integrity | Token 24h drift stays contained | 15% |
-| Disclosure | Real, matchable SEC CIK vs. missing | 15% |
+| Pillar | What it checks | Weight | Verification |
+|---|---|---|---|
+| Backing model | Real shares with a regulated custodian vs. a thin debt note | 25% | on-chain PoR / attested when a verifier is registered; else **heuristic fallback** |
+| Proof of reserves | Independent PoR or attestation vs. a promise | 25% | on-chain PoR (Backed/xStocks) or attested (Dinari); else **heuristic fallback** |
+| Redemption rights | Redeemable for the underlying share vs. sell-only | 20% | heuristic for now (TODO live hook) |
+| Price integrity | Token 24h drift stays contained | 15% | self-reported (CMC quote) |
+| Disclosure | Real, matchable SEC CIK vs. missing | 15% | self-reported (CMC RWA info) |
 
 Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** below 25.
 
-Backing / reserves / redemption use **issuer-name heuristics** (see `rwa_score/issuer_registry.py`). Matching is a known-good allowlist at word boundaries (Backed Finance, Ondo, Paxos, xStocks, Securitize, …) — never the bare substring `backed`. Negative tokens (`not backed`, `unbacked`, `anti-`) reject first. The UI and CLI label them as heuristics — they are not audited attestations.
+### Live attestation / PoR sources (free, no new paid APIs)
+
+| Source | Endpoint | How we use it |
+|---|---|---|
+| Backed / xStocks public PoR | `GET https://api.xstocks.fi/api/v2/public/proof-of-reserves/{symbol}` | `collateralization_ratio = sharesHeld / circulatingSupply` → reserves/backing score (≥0.999→95, ≥0.99→80, ≥0.95→60, else 30). Cached 1 hour. Badge: **on-chain PoR**. |
+| Dinari dShares page | `https://dinari.com/dshares` | Scrape for Big-4 / audit firm, Alpaca custody, and a **1:1** claim. Score 85 when all three are present. Badge: **attested** — labeled **attestation pending** (no signed report URL yet). |
+
+Unknown issuers stay on the name-match path in `rwa_score/issuer_registry.py`. Matching is a known-good allowlist at word boundaries (Backed Finance, Ondo, Paxos, xStocks, Securitize, …) — never the bare substring `backed`. Negative tokens (`not backed`, `unbacked`, `anti-`) reject first. The UI and CLI label those as heuristics — they are not audited attestations.
+
+### Heuristic fallback disclaimer
+
+If a live verifier errors, times out, or is skipped (fixture/offline mode), the pillar **falls back to issuer-name heuristics** and is explicitly labeled **heuristic fallback**. Failed verifiers are never dropped silently — the error is recorded in notes/flags. Heuristics are **not** audited attestations.
 
 ## How to run
 
@@ -70,9 +81,10 @@ If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://c
 ## Architecture
 
 ```
-app.py                 Streamlit demo (search, pillars, flags, compare)
+app.py                 Streamlit demo (search, pillars, verification badges, compare)
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
-rwa_score/scorer.py    Weighted pillars, bands, explanations, no silent fails
+rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
+rwa_score/verifiers.py Backed PoR + Dinari attestation scrapers (requests only)
 rwa_score/issuer_registry.py   Name-match heuristics (labeled as such)
 rwa_score/fixtures/    Demo JSON shaped like CMC RWA responses
 ```

@@ -2,8 +2,9 @@
 
 from .client import CMCClient, CMCError, FixtureClient, create_client, use_fixtures
 from .scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer, band_code
+from .verifiers import VerificationLevel
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "CMCClient",
@@ -12,6 +13,7 @@ __all__ = [
     "PILLARS",
     "ScoreError",
     "TransparencyScorer",
+    "VerificationLevel",
     "WEIGHTS",
     "__version__",
     "band_code",
