@@ -4,16 +4,28 @@ Each pillar returns a 0–100 sub-score. The final score is a weighted average.
 Weights and thresholds are documented so judges (and users) can see exactly
 why a token landed where it did.
 
-Issuer-name matching is a **heuristic**. Price and disclosure pillars use
-CMC fields when present; missing data is flagged instead of silently ignored.
+Backing and reserves prefer live attestation / PoR verifiers when the issuer
+is known. Redemption stays heuristic for now (TODO hook). Failed verifiers are
+never dropped silently — errors are appended to notes/flags and labeled
+**heuristic fallback**.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import requests
+
 from .client import RWAClient
 from .issuer_registry import HEURISTIC_NOTE, classify
+from .verifiers import (
+    VerificationLevel,
+    VerificationResult,
+    Verifier,
+    build_default_verifiers,
+    get_verifier_for_issuer,
+    heuristic_result,
+)
 
 WEIGHTS: dict[str, float] = {
     "backing": 0.25,
@@ -82,13 +94,44 @@ def _band(score: float) -> str:
     return band_detail(score)
 
 
+def _append_verification_notes(
+    explanation: str,
+    result: VerificationResult,
+) -> str:
+    bits = [
+        explanation,
+        f"Verification: {result.level.value}.",
+        f"Evidence: {result.evidence}",
+    ]
+    for note in result.notes:
+        if note and note not in bits:
+            bits.append(note)
+    if result.error:
+        bits.append(f"Verifier failure recorded (not dropped): {result.error}")
+    return " ".join(bits)
+
+
 class TransparencyScorer:
-    def __init__(self, client: RWAClient) -> None:
+    def __init__(
+        self,
+        client: RWAClient,
+        *,
+        session: requests.Session | None = None,
+        verifiers: dict[str, Verifier] | None = None,
+        use_live_verifiers: bool | None = None,
+    ) -> None:
         self.client = client
         self._map_cache: dict[str, int] | None = None
         # rwa_id -> {issuer_id, issuer_name, crypto_id}
         self._issuer_index: dict[int, dict[str, Any]] | None = None
         self._issuer_detail_cache: dict[str, dict[str, Any]] = {}
+        self._session = session
+        self._verifiers = verifiers if verifiers is not None else build_default_verifiers(session)
+        # Fixture / offline demos skip network attestation calls.
+        if use_live_verifiers is None:
+            self.use_live_verifiers = getattr(client, "source", "") != "fixture"
+        else:
+            self.use_live_verifiers = use_live_verifiers
 
     def _resolve(self, ticker: str) -> int:
         if self._map_cache is None:
@@ -205,6 +248,71 @@ class TransparencyScorer:
             f"24h change {float(raw_pct):+.2f}%; score = max(20, 100 − |Δ| × 2) = {score:.1f}.",
         )
 
+    def _verify_pillar(
+        self,
+        pillar: str,
+        *,
+        ticker: str,
+        issuer_name: str,
+    ) -> VerificationResult:
+        """Run the issuer's verifier, or heuristic for unknown / offline."""
+        if pillar == "redemption":
+            # TODO: hook a redemption-rights verifier (transfer-agent / prospectus scrape).
+            result = heuristic_result(
+                "redemption",
+                issuer_name,
+                reason="Redemption verifier not wired yet (TODO hook); using name heuristic.",
+            )
+            # Redemption heuristic is intentional, not a failed live call.
+            result.ok = True
+            result.notes = [
+                "heuristic fallback",
+                "TODO: redemption attestation verifier",
+                HEURISTIC_NOTE,
+            ]
+            result.evidence = (
+                f"heuristic fallback: issuer '{issuer_name or 'unknown'}' redemption "
+                f"rights via name list (live redemption verifier pending)."
+            )
+            return result
+
+        if not self.use_live_verifiers:
+            result = heuristic_result(
+                pillar,
+                issuer_name,
+                reason="Fixture/offline mode — live attestation verifiers skipped.",
+            )
+            # Fixture path is an intentional skip, keep labeled but ok=True for UX.
+            result.ok = True
+            return result
+
+        verifier = get_verifier_for_issuer(issuer_name, self._verifiers)
+        if verifier is None:
+            return heuristic_result(
+                pillar,
+                issuer_name,
+                reason="Unknown issuer — no attestation verifier registered.",
+            )
+
+        try:
+            if pillar == "backing":
+                return verifier.verify_backing(ticker=ticker, issuer_name=issuer_name)
+            if pillar == "reserves":
+                return verifier.verify_reserves(ticker=ticker, issuer_name=issuer_name)
+        except Exception as exc:  # noqa: BLE001 — never silently drop
+            return heuristic_result(
+                pillar,
+                issuer_name,
+                reason=f"{verifier.name} verifier raised unexpectedly.",
+                error=str(exc),
+            )
+
+        return heuristic_result(
+            pillar,
+            issuer_name,
+            reason=f"No verifier method for pillar {pillar}.",
+        )
+
     def score(self, ticker: str) -> dict[str, Any]:
         rwa_id = self._resolve(ticker)
         try:
@@ -221,34 +329,86 @@ class TransparencyScorer:
             or ""
         )
         flags = classify(issuer_name)
+        symbol = ticker.upper()
 
-        backing = 90.0 if flags["backed"] else 35.0
-        reserves = 90.0 if flags["audited"] else 30.0
-        redemption = 85.0 if flags["redeemable"] else 25.0
-        backing_why = (
-            f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the fully-backed name list."
-            if flags["backed"]
-            else f"Heuristic: issuer '{issuer_name or 'unknown'}' did not match known fully-backed issuers."
+        backing_v = self._verify_pillar("backing", ticker=symbol, issuer_name=issuer_name)
+        reserves_v = self._verify_pillar("reserves", ticker=symbol, issuer_name=issuer_name)
+        redemption_v = self._verify_pillar("redemption", ticker=symbol, issuer_name=issuer_name)
+
+        backing = backing_v.score
+        reserves = reserves_v.score
+        redemption = redemption_v.score
+
+        backing_why = _append_verification_notes(
+            (
+                f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the fully-backed name list."
+                if flags["backed"] and backing_v.source == "heuristic_fallback"
+                else (
+                    f"Heuristic: issuer '{issuer_name or 'unknown'}' did not match known fully-backed issuers."
+                    if backing_v.source == "heuristic_fallback"
+                    else f"Live backing check for '{issuer_name or 'unknown'}'."
+                )
+            ),
+            backing_v,
         )
-        reserves_why = (
-            f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the independent-PoR name list."
-            if flags["audited"]
-            else f"Heuristic: issuer '{issuer_name or 'unknown'}' has no independent on-chain PoR match."
+        reserves_why = _append_verification_notes(
+            (
+                f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the independent-PoR name list."
+                if flags["audited"] and reserves_v.source == "heuristic_fallback"
+                else (
+                    f"Heuristic: issuer '{issuer_name or 'unknown'}' has no independent on-chain PoR match."
+                    if reserves_v.source == "heuristic_fallback"
+                    else f"Live reserves check for '{issuer_name or 'unknown'}'."
+                )
+            ),
+            reserves_v,
         )
-        redemption_why = (
-            f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the redeemable name list."
-            if flags["redeemable"]
-            else f"Heuristic: issuer '{issuer_name or 'unknown'}' treated as sell-only (no redemption match)."
+        redemption_why = _append_verification_notes(
+            (
+                f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the redeemable name list."
+                if flags["redeemable"]
+                else f"Heuristic: issuer '{issuer_name or 'unknown'}' treated as sell-only (no redemption match)."
+            ),
+            redemption_v,
         )
 
         price_score, price_meta, price_flags, price_why = self._price_score(token.get("crypto_id"))
+        price_v = VerificationResult(
+            score=price_score,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence=(
+                f"CMC crypto quote crypto_id={price_meta.get('crypto_id')}; "
+                f"24hΔ={price_meta.get('percent_change_24h')}"
+                if price_meta.get("available")
+                else "CMC quote unavailable — self-reported gap."
+            ),
+            source="cmc_quote",
+            notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
+            ok=bool(price_meta.get("available")),
+        )
+        price_why = _append_verification_notes(price_why, price_v)
 
         cik = info.get("cik")
         disclosure = 80.0 if cik else 20.0
-        disclosure_why = (
-            f"SEC CIK {cik} present on the RWA info record."
-            if cik
-            else "No SEC CIK on the RWA info record — issuer identity not matchable to filings."
+        disclosure_v = VerificationResult(
+            score=disclosure,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence=(
+                f"SEC CIK {cik} on CMC RWA info record."
+                if cik
+                else "No SEC CIK on the RWA info record."
+            ),
+            source="cmc_rwa_info",
+            notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
+            ok=bool(cik),
+        )
+        disclosure_why = _append_verification_notes(
+            (
+                f"SEC CIK {cik} present on the RWA info record."
+                if cik
+                else "No SEC CIK on the RWA info record — issuer identity not matchable to filings."
+            ),
+            disclosure_v,
         )
 
         subscores = {
@@ -266,10 +426,23 @@ class TransparencyScorer:
         if reserves < 50:
             risk_flags.append("No independent on-chain proof of reserves found (heuristic).")
         if redemption < 50:
-            risk_flags.append("No redemption right — you can only sell the token, not claim the share (heuristic).")
+            risk_flags.append(
+                "No redemption right — you can only sell the token, not claim the share (heuristic)."
+            )
         if price_score < 50:
             risk_flags.append("Token price drifting hard from the underlying — possible thin liquidity.")
         risk_flags.extend(price_flags)
+
+        # Never silently drop a failed verifier — promote errors into flags.
+        for pillar_key, result in (
+            ("backing", backing_v),
+            ("reserves", reserves_v),
+            ("redemption", redemption_v),
+        ):
+            if result.error:
+                risk_flags.append(
+                    f"{pillar_key} verifier failure (heuristic fallback): {result.error}"
+                )
 
         notes = [HEURISTIC_NOTE]
         source = getattr(self.client, "source", "unknown")
@@ -277,6 +450,17 @@ class TransparencyScorer:
             notes.append(
                 "Scores below use bundled DEMO FIXTURE data, not live CoinMarketCap API responses."
             )
+        if not self.use_live_verifiers:
+            notes.append(
+                "Live attestation verifiers skipped (fixture/offline); "
+                "backing/reserves use heuristic fallback."
+            )
+        for result in (backing_v, reserves_v, redemption_v):
+            for note in result.notes:
+                if note not in notes:
+                    notes.append(note)
+            if result.error and f"Verifier error: {result.error}" not in notes:
+                notes.append(f"Verifier error (not dropped): {result.error}")
 
         explanations = {
             "backing": backing_why,
@@ -286,8 +470,16 @@ class TransparencyScorer:
             "disclosure": disclosure_why,
         }
 
+        verification = {
+            "backing": backing_v.as_dict(),
+            "reserves": reserves_v.as_dict(),
+            "redemption": redemption_v.as_dict(),
+            "price": price_v.as_dict(),
+            "disclosure": disclosure_v.as_dict(),
+        }
+
         return {
-            "ticker": ticker.upper(),
+            "ticker": symbol,
             "rwa_id": rwa_id,
             "issuer": issuer_name or "unknown",
             "score": round(final, 1),
@@ -297,6 +489,7 @@ class TransparencyScorer:
             "weights": dict(WEIGHTS),
             "pillars": PILLARS,
             "explanations": explanations,
+            "verification": verification,
             "flags": risk_flags,
             "notes": notes,
             "heuristics": {**flags, "source": "issuer_registry", "labeled": True},

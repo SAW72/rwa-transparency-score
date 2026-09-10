@@ -140,3 +140,94 @@ def test_map_failure_is_not_silent() -> None:
 
     with pytest.raises(ScoreError, match="RWA map"):
         TransparencyScorer(BrokenMap()).score("NVDA")
+
+def test_backed_live_por_scores_reserves_higher_than_unknown(monkeypatch) -> None:
+    """Backed issuer with mocked on-chain PoR outscores an unknown issuer on reserves."""
+    from rwa_score.verifiers import BackedVerifier, VerificationLevel, build_default_verifiers
+
+    class PorSession:
+        def get(self, url, timeout=None, headers=None):
+            class Resp:
+                status_code = 200
+                text = "{}"
+
+                def json(self):
+                    return {
+                        "symbol": "NVDAx",
+                        "sharesHeld": "1000",
+                        "circulatingSupply": "1000",
+                        "holdings": [{"provider": "Alpaca"}],
+                    }
+
+            if "proof-of-reserves" in url:
+                return Resp()
+            raise AssertionError(url)
+
+    backed_client = RecordingClient(
+        assets=[{"symbol": "NVDA", "rwa_id": 2}],
+        info={2: {"symbol": "NVDA", "cik": "0001045810", "issuer": {"name": "Backed Finance"}}},
+        issuers=[{"issuer_id": "abc", "name": "Backed Finance"}],
+        issuer_details={
+            "abc": {"name": "Backed Finance", "tokens": [{"rwa_id": 2, "crypto_id": 99}]},
+        },
+    )
+    unknown_client = RecordingClient(
+        assets=[{"symbol": "TSLA", "rwa_id": 15}],
+        info={15: {"symbol": "TSLA", "cik": None, "issuer": {"name": "NoteVault Demo Issuer"}}},
+        issuers=[{"issuer_id": "nv", "name": "NoteVault Demo Issuer"}],
+        issuer_details={
+            "nv": {
+                "name": "NoteVault Demo Issuer",
+                "tokens": [{"rwa_id": 15, "crypto_id": 99}],
+            }
+        },
+        quotes={99: {"quote": {"USD": {"percent_change_24h": 1.0, "price": 10.0}}}},
+    )
+
+    session = PorSession()
+    verifiers = build_default_verifiers(session=session)
+    backed_report = TransparencyScorer(
+        backed_client, verifiers=verifiers, use_live_verifiers=True
+    ).score("NVDA")
+    unknown_report = TransparencyScorer(
+        unknown_client, verifiers=verifiers, use_live_verifiers=True
+    ).score("TSLA")
+
+    assert backed_report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert backed_report["subscores"]["reserves"] >= 95.0
+    assert unknown_report["verification"]["reserves"]["source"] == "heuristic_fallback"
+    assert "heuristic fallback" in unknown_report["explanations"]["reserves"].lower()
+    assert backed_report["subscores"]["reserves"] > unknown_report["subscores"]["reserves"]
+
+
+def test_fixture_report_includes_verification_badges(fixture_scorer: TransparencyScorer) -> None:
+    report = fixture_scorer.score("NVDA")
+    assert "verification" in report
+    for key in WEIGHTS:
+        block = report["verification"][key]
+        assert "level" in block
+        assert "evidence" in block
+        assert block["level"] in {
+            "self-reported",
+            "on-chain PoR",
+            "attested",
+            "examined",
+        }
+    # Fixture mode skips live verifiers → heuristic fallback on backing/reserves.
+    assert report["verification"]["backing"]["source"] == "heuristic_fallback"
+    assert any("heuristic fallback" in n.lower() for n in report["notes"])
+
+
+def test_failed_verifier_is_not_silently_dropped() -> None:
+    from rwa_score.verifiers import BackedVerifier
+
+    class BoomSession:
+        def get(self, url, timeout=None, headers=None):
+            raise RuntimeError("network down")
+
+    client = RecordingClient()
+    verifiers = {"backed": BackedVerifier(session=BoomSession())}
+    report = TransparencyScorer(client, verifiers=verifiers, use_live_verifiers=True).score("NVDA")
+    assert any("verifier failure" in f.lower() or "network down" in f.lower() for f in report["flags"])
+    assert any("heuristic fallback" in n.lower() for n in report["notes"])
+    assert report["verification"]["reserves"]["error"]
