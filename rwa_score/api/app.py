@@ -22,7 +22,7 @@ from .attest import ATTESTATION_ALGO, ATTESTATION_FIELDS, attestation_payload, s
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store
-from .webhooks import apply_score_side_effects
+from .webhooks import apply_score_side_effects, assert_public_https_url
 
 BREAKDOWN_KEYS = (
     "ticker",
@@ -41,6 +41,7 @@ BREAKDOWN_KEYS = (
     "heuristics",
     "data_source",
     "price",
+    "basis",
     "cik",
     "issuer_note",
     "summary",
@@ -271,6 +272,10 @@ def create_app(
     def create_webhook(body: WebhookBody, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
         if body.trigger not in {"band_cross", "below_orange"}:
             raise _http_error(400, "bad_request", "trigger must be band_cross or below_orange.")
+        try:
+            assert_public_https_url(str(body.url))
+        except ValueError as exc:
+            raise _http_error(400, "bad_request", str(exc)) from exc
         secret = body.secret or secrets.token_urlsafe(24)
         hook = db.add_webhook(
             key.id,
@@ -324,8 +329,9 @@ def create_app(
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or None,
             "note": (
-                "Call ScoreAttestation.attest(scoreHash, ticker, timestamp, attester) "
-                "on Base Sepolia. The contract stores this hash only — never the raw score. "
+                "Call ScoreAttestation.attest(scoreHash, ticker, timestamp) "
+                "on Base Sepolia. Attester is msg.sender (not calldata). "
+                "The contract stores this hash only — never the raw score. "
                 "Mainnet is held."
             ),
         }

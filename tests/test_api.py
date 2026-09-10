@@ -55,13 +55,15 @@ def _minimal_report(ticker: str, score: float, band: str) -> dict[str, Any]:
             "redemption": 50.0,
             "price": 50.0,
             "disclosure": 50.0,
+            "basis": 50.0,
         },
         "weights": {
-            "backing": 0.25,
-            "reserves": 0.25,
-            "redemption": 0.20,
+            "backing": 0.20,
+            "reserves": 0.20,
+            "redemption": 0.15,
             "price": 0.15,
             "disclosure": 0.15,
+            "basis": 0.15,
         },
         "pillars": {},
         "explanations": {"backing": "x"},
@@ -71,6 +73,7 @@ def _minimal_report(ticker: str, score: float, band: str) -> dict[str, Any]:
             "redemption": {"score": 50.0, "level": "self-reported", "source": "test"},
             "price": {"score": 50.0, "level": "self-reported", "source": "test"},
             "disclosure": {"score": 50.0, "level": "self-reported", "source": "test"},
+            "basis": {"score": 50.0, "level": "self-reported", "source": "test"},
         },
         "flags": [],
         "notes": [],
@@ -195,6 +198,43 @@ def test_webhooks_and_history_are_paid_only(
     ).status_code == 403
     assert client.get("/v1/history/NVDA", headers=_headers(free)).status_code == 403
     assert client.get("/v1/attest/NVDA", headers=_headers(free)).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://hooks.example.com/hook",
+        "https://localhost/hook",
+        "https://127.0.0.1/hook",
+        "https://192.168.0.10/hook",
+        "https://10.1.2.3/hook",
+        "https://169.254.169.254/latest/meta-data",
+    ],
+)
+def test_webhook_url_allowlist_rejects_ssrf(
+    tmp_path: Path, fixture_scorer: TransparencyScorer, url: str
+) -> None:
+    client, store = _client(tmp_path, fixture_scorer)
+    raw = store.create_key(name="paid", tier="paid")
+    resp = client.post(
+        "/v1/webhooks",
+        headers=_headers(raw),
+        json={"url": url, "trigger": "band_cross"},
+    )
+    assert resp.status_code in {400, 422}
+
+
+def test_webhook_url_allowlist_accepts_public_https(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    client, store = _client(tmp_path, fixture_scorer)
+    raw = store.create_key(name="paid", tier="paid")
+    resp = client.post(
+        "/v1/webhooks",
+        headers=_headers(raw),
+        json={"url": "https://example.test/hook", "trigger": "band_cross"},
+    )
+    assert resp.status_code == 200, resp.text
 
 
 def test_webhook_fires_on_band_cross_same_cycle(tmp_path: Path) -> None:

@@ -68,14 +68,15 @@ RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures --json
 # → score_hash 0x…
 ```
 
-2. Submit **only that hash** (plus ticker / timestamp / attester):
+2. Submit **only that hash** (plus ticker / timestamp). The attester is always
+   the broadcasting `msg.sender` — there is no attester argument to spoof.
 
 ```bash
 cd contracts
 export ATTESTATION_CONTRACT=0x...
 export SCORE_HASH=0x...          # 32-byte hex from the client
 export TICKER=NVDA
-# optional: ATTEST_TIMESTAMP, ATTESTER
+# optional: ATTEST_TIMESTAMP
 
 forge script script/Attest.s.sol:Attest \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
@@ -97,4 +98,4 @@ python scripts/verify_attestation.py NVDA --fixtures \
 
 ## Hash algorithm
 
-`sha256` of canonical JSON (sorted keys, no whitespace) over ticker, rwa_id, issuer, score, band, subscores, weights, cik, data_source, and verification `{score, level, source}` per pillar. See `rwa_score/api/attest.py`.
+`sha256` of canonical JSON (sorted keys, no whitespace) over ticker, rwa_id, issuer, score, band, **full** subscores and weights (all six live pillars, including **basis**), cik, data_source, verification `{score, level, source}` per pillar (including basis), and the basis meta block. See `rwa_score/api/attest.py`. A cited breakdown that silently drops basis will not match.

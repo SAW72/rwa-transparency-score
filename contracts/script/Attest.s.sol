@@ -5,8 +5,8 @@ import {Script, console2} from "forge-std/Script.sol";
 import {ScoreAttestation} from "../src/ScoreAttestation.sol";
 
 /// @notice Submit a precomputed score hash. Never sends the raw score.
-/// Env: ATTESTATION_CONTRACT, SCORE_HASH, TICKER, ATTEST_TIMESTAMP (optional),
-///      ATTESTER (optional; defaults to the broadcaster).
+/// Env: ATTESTATION_CONTRACT, SCORE_HASH, TICKER, ATTEST_TIMESTAMP (optional).
+/// The attester is always the broadcaster (msg.sender). There is no ATTESTER override.
 contract Attest is Script {
     uint256 internal constant BASE_SEPOLIA = 84532;
 
@@ -16,13 +16,12 @@ contract Attest is Script {
         bytes32 scoreHash = vm.envBytes32("SCORE_HASH");
         string memory ticker = vm.envString("TICKER");
         uint256 timestamp = vm.envOr("ATTEST_TIMESTAMP", block.timestamp);
-        address attester = vm.envOr("ATTESTER", msg.sender);
 
         ScoreAttestation target = ScoreAttestation(contractAddr);
         uint256 fee = target.attestationFee();
 
         vm.startBroadcast();
-        target.attest{value: fee}(scoreHash, ticker, timestamp, attester);
+        target.attest{value: fee}(scoreHash, ticker, timestamp);
         vm.stopBroadcast();
 
         console2.log("attested", ticker);

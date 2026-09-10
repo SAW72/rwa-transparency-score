@@ -18,25 +18,33 @@ contract ScoreAttestationTest is Test {
 
     function test_attestStoresHashNotScore() public {
         vm.expectEmit(true, true, true, true);
-        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, 1_700_000_000, attester);
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000, attester);
+        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, 1_700_000_000, address(this));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
 
         assertTrue(attestor.attested(sampleHash));
         ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
         assertEq(rec.scoreHash, sampleHash);
         assertEq(rec.ticker, "NVDA");
         assertEq(rec.timestamp, 1_700_000_000);
-        assertEq(rec.attester, attester);
+        assertEq(rec.attester, address(this));
 
         // Storage holds the digest only — no score / band / pillar fields exist.
         (bool ok, uint256 ts, address who) = attestor.verify(sampleHash, "NVDA");
         assertTrue(ok);
         assertEq(ts, 1_700_000_000);
-        assertEq(who, attester);
+        assertEq(who, address(this));
+    }
+
+    function test_attestRecordsMsgSenderNotCalldata() public {
+        vm.prank(attester);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attester, attester);
+        assertTrue(rec.attester != address(this));
     }
 
     function test_verifyRejectsWrongTicker() public {
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 99, attester);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 99);
         (bool ok,,) = attestor.verify(sampleHash, "TSLA");
         assertFalse(ok);
     }
@@ -50,34 +58,29 @@ contract ScoreAttestationTest is Test {
 
     function test_rejectEmptyHash() public {
         vm.expectRevert(ScoreAttestation.EmptyHash.selector);
-        attestor.attest{value: 0.001 ether}(bytes32(0), "NVDA", 1, attester);
+        attestor.attest{value: 0.001 ether}(bytes32(0), "NVDA", 1);
     }
 
     function test_rejectEmptyTicker() public {
         vm.expectRevert(ScoreAttestation.EmptyTicker.selector);
-        attestor.attest{value: 0.001 ether}(sampleHash, "", 1, attester);
-    }
-
-    function test_rejectZeroAttester() public {
-        vm.expectRevert(ScoreAttestation.ZeroAttester.selector);
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1, address(0));
+        attestor.attest{value: 0.001 ether}(sampleHash, "", 1);
     }
 
     function test_rejectLowFee() public {
         vm.expectRevert(ScoreAttestation.InsufficientFee.selector);
-        attestor.attest{value: 0.0009 ether}(sampleHash, "NVDA", 1, attester);
+        attestor.attest{value: 0.0009 ether}(sampleHash, "NVDA", 1);
     }
 
     function test_rejectDuplicateHash() public {
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1, attester);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
         vm.expectRevert(ScoreAttestation.AlreadyAttested.selector);
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 2, attester);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 2);
     }
 
     function test_hashesForTicker() public {
         bytes32 other = keccak256("other");
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1, attester);
-        attestor.attest{value: 0.001 ether}(other, "NVDA", 2, attester);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+        attestor.attest{value: 0.001 ether}(other, "NVDA", 2);
         bytes32[] memory hashes = attestor.hashesForTicker("NVDA");
         assertEq(hashes.length, 2);
         assertEq(hashes[0], sampleHash);
@@ -86,14 +89,19 @@ contract ScoreAttestationTest is Test {
 
     function test_ownerCanSetFeeAndWithdraw() public {
         attestor.setFee(0);
-        attestor.attest(sampleHash, "NVDA", 1, attester);
+        attestor.attest(sampleHash, "NVDA", 1);
         attestor.setFee(0.002 ether);
 
         address payable sink = payable(address(0xBEEF));
-        attestor.attest{value: 0.002 ether}(keccak256("two"), "TSLA", 2, attester);
+        attestor.attest{value: 0.002 ether}(keccak256("two"), "TSLA", 2);
         uint256 before = sink.balance;
         attestor.withdraw(sink);
         assertEq(sink.balance - before, 0.002 ether);
+    }
+
+    function test_withdrawRejectsZeroAddress() public {
+        vm.expectRevert(ScoreAttestation.ZeroAttester.selector);
+        attestor.withdraw(payable(address(0)));
     }
 
     function test_nonOwnerCannotSetFee() public {

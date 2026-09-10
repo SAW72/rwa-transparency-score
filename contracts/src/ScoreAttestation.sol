@@ -40,15 +40,14 @@ contract ScoreAttestation {
     function attest(
         bytes32 scoreHash,
         string calldata ticker,
-        uint256 timestamp,
-        address attester
+        uint256 timestamp
     ) external payable {
         if (msg.value < attestationFee) revert InsufficientFee();
         if (scoreHash == bytes32(0)) revert EmptyHash();
         if (bytes(ticker).length == 0) revert EmptyTicker();
-        if (attester == address(0)) revert ZeroAttester();
         if (attested[scoreHash]) revert AlreadyAttested();
 
+        address attester = msg.sender;
         attested[scoreHash] = true;
         _records[scoreHash] = Record({
             scoreHash: scoreHash,

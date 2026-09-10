@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
+import socket
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -20,6 +23,59 @@ from .store import Store
 BAND_RANK = {"GREEN": 3, "YELLOW": 2, "ORANGE": 1, "RED": 0}
 
 DeliverFn = Callable[[str, str, dict[str, str]], tuple[int, bool]]
+
+_BLOCKED_HOSTS = {
+    "localhost",
+    "metadata.google.internal",
+    "metadata.internal",
+}
+
+
+def _ip_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def assert_public_https_url(url: str, *, resolve: bool = True) -> str:
+    """Allowlist public HTTPS webhook targets. Rejects SSRF-shaped hosts."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("webhook URL must be https")
+    if parsed.username or parsed.password:
+        raise ValueError("webhook URL must not include credentials")
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("webhook URL missing host")
+    if host in _BLOCKED_HOSTS or host.endswith(".localhost"):
+        raise ValueError("webhook URL host is not allowed")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and _ip_blocked(literal):
+        raise ValueError("webhook URL must not target a private or metadata address")
+    if resolve and literal is None:
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except socket.gaierror:
+            infos = []
+        for info in infos:
+            addr = info[4][0]
+            try:
+                resolved = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if _ip_blocked(resolved):
+                raise ValueError("webhook URL resolved to a private or metadata address")
+    return url
 
 
 def dropped_below_orange(new_band: str) -> bool:
@@ -42,6 +98,7 @@ def sign_body(secret: str, body: str) -> str:
 
 def default_poster(url: str, body: str, headers: dict[str, str], *, timeout: float = 5.0) -> tuple[int, bool]:
     try:
+        assert_public_https_url(url)
         resp = requests.post(url, data=body.encode("utf-8"), headers=headers, timeout=timeout)
         code = int(resp.status_code)
         return code, 200 <= code < 300

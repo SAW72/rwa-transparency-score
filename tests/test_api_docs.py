@@ -24,6 +24,16 @@ def test_ci_runs_forge_test() -> None:
     assert "foundry" in text.lower()
 
 
+def test_attest_uses_msg_sender_not_calldata() -> None:
+    src = (ROOT / "contracts/src/ScoreAttestation.sol").read_text()
+    block = src.split("function attest(", 1)[1].split(")", 1)[0]
+    assert "bytes32 scoreHash" in block
+    assert "string" in block
+    assert "uint256 timestamp" in block
+    assert "address attester" not in block
+    assert "address attester = msg.sender" in src
+
+
 def test_deploy_script_holds_mainnet() -> None:
     script = (ROOT / "contracts/script/DeploySepolia.s.sol").read_text(encoding="utf-8")
     assert "84532" in script
