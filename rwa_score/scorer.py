@@ -5,8 +5,9 @@ Weights and thresholds are documented so judges (and users) can see exactly
 why a token landed where it did.
 
 Backing and reserves prefer live attestation / PoR verifiers when the issuer
-is known. Redemption stays heuristic for now (TODO hook). Failed verifiers are
-never dropped silently — errors are appended to notes/flags and labeled
+is known. Redemption uses ``verify_redemption`` when that method exists
+(Robinhood); Backed and Dinari stay on the name heuristic. Failed verifiers
+are never dropped silently — errors are appended to notes/flags and labeled
 **heuristic fallback**.
 """
 
@@ -17,7 +18,7 @@ from typing import Any
 import requests
 
 from .client import RWAClient
-from .issuer_registry import HEURISTIC_NOTE, classify
+from .issuer_registry import HEURISTIC_NOTE, classify, issuer_note
 from .verifiers import (
     VerificationLevel,
     VerificationResult,
@@ -248,6 +249,26 @@ class TransparencyScorer:
             f"24h change {float(raw_pct):+.2f}%; score = max(20, 100 − |Δ| × 2) = {score:.1f}.",
         )
 
+    def _heuristic_redemption(self, issuer_name: str) -> VerificationResult:
+        """Name-list redemption for issuers that do not implement verify_redemption."""
+        result = heuristic_result(
+            "redemption",
+            issuer_name,
+            reason="Redemption verifier not wired yet (TODO hook); using name heuristic.",
+        )
+        # Redemption heuristic is intentional, not a failed live call.
+        result.ok = True
+        result.notes = [
+            "heuristic fallback",
+            "TODO: redemption attestation verifier",
+            HEURISTIC_NOTE,
+        ]
+        result.evidence = (
+            f"heuristic fallback: issuer '{issuer_name or 'unknown'}' redemption "
+            f"rights via name list (live redemption verifier pending)."
+        )
+        return result
+
     def _verify_pillar(
         self,
         pillar: str,
@@ -256,27 +277,9 @@ class TransparencyScorer:
         issuer_name: str,
     ) -> VerificationResult:
         """Run the issuer's verifier, or heuristic for unknown / offline."""
-        if pillar == "redemption":
-            # TODO: hook a redemption-rights verifier (transfer-agent / prospectus scrape).
-            result = heuristic_result(
-                "redemption",
-                issuer_name,
-                reason="Redemption verifier not wired yet (TODO hook); using name heuristic.",
-            )
-            # Redemption heuristic is intentional, not a failed live call.
-            result.ok = True
-            result.notes = [
-                "heuristic fallback",
-                "TODO: redemption attestation verifier",
-                HEURISTIC_NOTE,
-            ]
-            result.evidence = (
-                f"heuristic fallback: issuer '{issuer_name or 'unknown'}' redemption "
-                f"rights via name list (live redemption verifier pending)."
-            )
-            return result
-
         if not self.use_live_verifiers:
+            if pillar == "redemption":
+                return self._heuristic_redemption(issuer_name)
             result = heuristic_result(
                 pillar,
                 issuer_name,
@@ -287,6 +290,20 @@ class TransparencyScorer:
             return result
 
         verifier = get_verifier_for_issuer(issuer_name, self._verifiers)
+        if pillar == "redemption":
+            method = getattr(verifier, "verify_redemption", None) if verifier is not None else None
+            if callable(method):
+                try:
+                    return method(ticker=ticker, issuer_name=issuer_name)
+                except Exception as exc:  # noqa: BLE001 — never silently drop
+                    return heuristic_result(
+                        pillar,
+                        issuer_name,
+                        reason=f"{verifier.name} verifier raised unexpectedly.",
+                        error=str(exc),
+                    )
+            return self._heuristic_redemption(issuer_name)
+
         if verifier is None:
             return heuristic_result(
                 pillar,
@@ -496,5 +513,6 @@ class TransparencyScorer:
             "data_source": source,
             "price": price_meta,
             "cik": cik,
+            "issuer_note": issuer_note(issuer_name),
             "summary": f"{issuer_name or 'Unknown issuer'} — {len(risk_flags)} risk flag(s).",
         }

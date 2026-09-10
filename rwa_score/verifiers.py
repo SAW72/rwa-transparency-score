@@ -29,9 +29,11 @@ REQUEST_TIMEOUT = 15
 # Issuer-name keywords → verifier id. Unknown issuers stay heuristic-only.
 # Allowlist phrases only — never the bare token "backed" (false-positives
 # like "Not Backed At All"). Word-boundary match + negative-token reject.
+# "robinhood" is a whole-word allowlist hit (same harden as Backed).
 ISSUER_VERIFIER_KEYWORDS: dict[str, tuple[str, ...]] = {
     "backed": ("backed finance", "xstocks", "xstock"),
     "dinari": ("dinari", "dshares", "dshare"),
+    "robinhood": ("robinhood",),
 }
 
 _NEGATIVE_VERIFIER_RE = re.compile(r"\bunbacked\b|\bnot backed\b|\banti\b")
@@ -456,12 +458,67 @@ class DinariVerifier:
         return self._verify_pillar(ticker=ticker, issuer_name=issuer_name, pillar="reserves")
 
 
+class RobinhoodVerifier:
+    """Static self-reported scores for Robinhood tokenized stocks.
+
+    These tokens are debt securities — creditors of Robinhood Assets Jersey,
+    not shareholders of the listed company. CMC labels the issuer "Robinhood".
+    Self-reported 1:1, no public proof of reserves. A dedicated verifier
+    beats the unknown-issuer heuristic; the low scores are intentional.
+    """
+
+    name = "robinhood"
+
+    def verify_backing(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        return VerificationResult(
+            score=55.0,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence="Robinhood 1:1 claim, no public PoR",
+            source="robinhood",
+            notes=[
+                f"verification={VerificationLevel.SELF_REPORTED.value}",
+                "Debt security — creditor of Robinhood Assets Jersey, not a shareholder.",
+            ],
+            ok=True,
+            meta={"ticker": ticker, "issuer": issuer_name, "wrapper": "debt"},
+        )
+
+    def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        return VerificationResult(
+            score=40.0,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence="no independent attestation",
+            source="robinhood",
+            notes=[
+                f"verification={VerificationLevel.SELF_REPORTED.value}",
+                "No public independent attestation or on-chain PoR.",
+            ],
+            ok=True,
+            meta={"ticker": ticker, "issuer": issuer_name, "wrapper": "debt"},
+        )
+
+    def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        return VerificationResult(
+            score=35.0,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence="debt wrapper, creditor claim only",
+            source="robinhood",
+            notes=[
+                f"verification={VerificationLevel.SELF_REPORTED.value}",
+                "Redemption is a creditor claim on the issuer, not the listed share.",
+            ],
+            ok=True,
+            meta={"ticker": ticker, "issuer": issuer_name, "wrapper": "debt"},
+        )
+
+
 def build_default_verifiers(
     session: requests.Session | None = None,
 ) -> dict[str, Verifier]:
     return {
         "backed": BackedVerifier(session=session),
         "dinari": DinariVerifier(session=session),
+        "robinhood": RobinhoodVerifier(),
     }
 
 

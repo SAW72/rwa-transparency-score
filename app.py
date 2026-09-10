@@ -12,14 +12,20 @@ from __future__ import annotations
 import base64
 import html
 import os
+import time
 from pathlib import Path
 
 import streamlit as st
 
 from rwa_score.client import create_client, env_flag
+from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
 from rwa_score.verifiers import VerificationLevel
+
+EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
+# Per-symbol wall-clock cache for "Why this score?" — process-local dict.
+_explain_cache: dict[str, tuple[float, str]] = {}
 
 install_health_route()
 
@@ -135,6 +141,22 @@ def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
     return scorer.score(normalize_ticker(ticker))
 
 
+def _cached_explanation(report: dict) -> str:
+    """24h per-symbol cache around ``explain_score``. Never raises."""
+    symbol = str(report.get("ticker") or "").upper()
+    now = time.monotonic()
+    hit = _explain_cache.get(symbol)
+    if hit is not None and (now - hit[0]) <= EXPLAIN_CACHE_TTL_SECONDS:
+        return hit[1]
+    try:
+        text = explain_score(report)
+    except Exception as exc:  # noqa: BLE001 — card must still render
+        text = f"Explanation unavailable ({exc}). This is an automated summary, not financial advice."
+    if symbol:
+        _explain_cache[symbol] = (now, text)
+    return text
+
+
 def _score_slots(
     scorer: TransparencyScorer, slots: list[str]
 ) -> list[tuple[str, dict | None, str | None]]:
@@ -240,6 +262,10 @@ def _render_compare_card(report: dict, *, selected: bool = False) -> None:
             st.warning(flag)
     else:
         st.caption("No risk flags on this pass.")
+
+    st.markdown("**Why this score?**")
+    st.write(_cached_explanation(report))
+    st.caption(AI_FOOTNOTE)
 
     with st.expander("Pillar detail", expanded=False):
         for key in WEIGHTS:

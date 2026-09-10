@@ -218,6 +218,62 @@ def test_fixture_report_includes_verification_badges(fixture_scorer: Transparenc
     assert any("heuristic fallback" in n.lower() for n in report["notes"])
 
 
+def test_robinhood_live_path_uses_verifier_not_heuristic() -> None:
+    client = RecordingClient(
+        assets=[{"symbol": "AAPL", "rwa_id": 16}],
+        info={16: {"symbol": "AAPL", "cik": "0000320193", "issuer": {"name": "Robinhood"}}},
+        issuers=[{"issuer_id": "rh", "name": "Robinhood"}],
+        issuer_details={
+            "rh": {"name": "Robinhood", "tokens": [{"rwa_id": 16, "crypto_id": 99}]},
+        },
+    )
+    report = TransparencyScorer(client, use_live_verifiers=True).score("AAPL")
+    assert report["issuer"] == "Robinhood"
+    assert report["subscores"]["backing"] == 55.0
+    assert report["subscores"]["reserves"] == 40.0
+    assert report["subscores"]["redemption"] == 35.0
+    assert report["verification"]["backing"]["source"] == "robinhood"
+    assert report["verification"]["reserves"]["source"] == "robinhood"
+    assert report["verification"]["redemption"]["source"] == "robinhood"
+    assert report["verification"]["backing"]["evidence"] == "Robinhood 1:1 claim, no public PoR"
+    assert report["issuer_note"]
+    assert "debt" in report["issuer_note"].lower()
+    assert "Robinhood Assets Jersey" in report["issuer_note"]
+    # 55*0.25 + 40*0.25 + 35*0.20 + price + disclosure — low/mid is expected.
+    expected = round(55 * 0.25 + 40 * 0.25 + 35 * 0.20 + report["subscores"]["price"] * 0.15 + report["subscores"]["disclosure"] * 0.15, 1)
+    assert report["score"] == expected
+    assert report["band"] in {"YELLOW", "ORANGE"}
+
+
+def test_backed_keeps_heuristic_redemption() -> None:
+    from rwa_score.verifiers import BackedVerifier, VerificationLevel
+
+    class PorSession:
+        def get(self, url, timeout=None, headers=None):
+            class Resp:
+                status_code = 200
+                text = "{}"
+
+                def json(self):
+                    return {
+                        "symbol": "NVDAx",
+                        "sharesHeld": "1000",
+                        "circulatingSupply": "1000",
+                        "holdings": [{"provider": "Alpaca"}],
+                    }
+
+            if "proof-of-reserves" in url:
+                return Resp()
+            raise AssertionError(url)
+
+    client = RecordingClient()
+    verifiers = {"backed": BackedVerifier(session=PorSession())}
+    report = TransparencyScorer(client, verifiers=verifiers, use_live_verifiers=True).score("NVDA")
+    assert report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert report["verification"]["redemption"]["source"] == "heuristic_fallback"
+    assert "heuristic fallback" in report["verification"]["redemption"]["evidence"].lower()
+
+
 def test_failed_verifier_is_not_silently_dropped() -> None:
     from rwa_score.verifiers import BackedVerifier
 
