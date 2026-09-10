@@ -154,7 +154,7 @@ def create_app(
             )
         return key
 
-    def score_ticker(symbol: str) -> dict[str, Any]:
+    def score_ticker(symbol: str, key: ApiKey) -> dict[str, Any]:
         try:
             report = get_scorer().score(symbol)
         except ScoreError as exc:
@@ -163,6 +163,7 @@ def create_app(
         apply_score_side_effects(
             db,
             decorated,
+            key_id=key.id,
             poster=app.state.poster,
             timeout=cfg.webhook_timeout_seconds,
         )
@@ -192,15 +193,13 @@ def create_app(
 
     @app.get("/v1/score/{ticker}")
     def get_score(ticker: str, key: ApiKey = Depends(require_key)) -> dict[str, Any]:
-        del key
-        return score_ticker(ticker)
+        return score_ticker(ticker, key)
 
     @app.get("/v1/compare")
     def compare(
         tickers: str = Query(..., description="Comma-separated tickers"),
         key: ApiKey = Depends(require_key),
     ) -> dict[str, Any]:
-        del key
         symbols = [part.strip().upper() for part in tickers.split(",") if part.strip()]
         if not symbols:
             raise _http_error(400, "bad_request", "tickers query must list at least one symbol.")
@@ -213,7 +212,7 @@ def create_app(
         rows: list[dict[str, Any]] = []
         for symbol in symbols:
             try:
-                rows.append(score_ticker(symbol))
+                rows.append(score_ticker(symbol, key))
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
                 rows.append({"ticker": symbol, "error": detail.get("message", "error")})
@@ -225,7 +224,7 @@ def create_app(
         scores = []
         for symbol in symbols:
             try:
-                scores.append(score_ticker(symbol))
+                scores.append(score_ticker(symbol, key))
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
                 scores.append({"ticker": symbol, "error": detail.get("message", "error")})
@@ -317,8 +316,7 @@ def create_app(
 
     @app.get("/v1/attest/{ticker}")
     def attest(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        del key
-        report = score_ticker(ticker)
+        report = score_ticker(ticker, key)
         payload = attestation_payload(report)
         return {
             "ticker": report["ticker"],
@@ -330,9 +328,10 @@ def create_app(
             "contract": cfg.attestation_contract or None,
             "note": (
                 "Call ScoreAttestation.attest(scoreHash, ticker, timestamp) "
-                "on Base Sepolia. Attester is msg.sender (not calldata). "
-                "The contract stores this hash only — never the raw score. "
-                "Mainnet is held."
+                "on Base Sepolia from an authorized attester (owner or "
+                "allowlisted relayer / API-held key). Attester is msg.sender "
+                "(not calldata). The contract stores this hash only — never "
+                "the raw score. Mainnet is held."
             ),
         }
 

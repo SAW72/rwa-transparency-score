@@ -2,12 +2,16 @@
 
 Webhooks also fire inline after ``GET /v1/score`` / compare / watchlist.
 This poller is the background/cron path for the same crossing check.
+
+Side effects are applied per (key, ticker) so tenant A's watchlist cycle
+never updates tenant B's last_bands or fires tenant B's webhooks.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 
 from rwa_score.client import create_client
 from rwa_score.scorer import ScoreError, TransparencyScorer
@@ -29,17 +33,21 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(args.db or str(settings.db_path))
     client = create_client(use_fixtures_mode=True if args.fixtures else None)
     scorer = TransparencyScorer(client)
-    tickers = store.all_watchlist_tickers()
+    by_ticker: dict[str, list[int]] = defaultdict(list)
+    for key_id, ticker in store.watchlist_entries():
+        by_ticker[ticker].append(key_id)
     rows: list[dict] = []
     try:
-        for ticker in tickers:
+        for ticker, key_ids in by_ticker.items():
             try:
                 report = _decorate(scorer.score(ticker))
-                apply_score_side_effects(
-                    store,
-                    report,
-                    timeout=settings.webhook_timeout_seconds,
-                )
+                for key_id in key_ids:
+                    apply_score_side_effects(
+                        store,
+                        report,
+                        key_id=key_id,
+                        timeout=settings.webhook_timeout_seconds,
+                    )
                 rows.append(
                     {
                         "ticker": report["ticker"],

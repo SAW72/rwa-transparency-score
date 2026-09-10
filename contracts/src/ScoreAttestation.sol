@@ -6,6 +6,9 @@ pragma solidity ^0.8.24;
 ///         score, band, or pillar breakdown. Anyone can verify a cited score
 ///         was not quietly edited after the fact.
 /// @dev Deploy on Base Sepolia (84532) only until an explicit mainnet go.
+/// @dev `attest` is NOT permissionless. Only the owner or an allowlisted
+///      attester (relayer / API-held key) may lock a hash. Strangers who
+///      pay `attestationFee` cannot occupy a digest or brick an official one.
 contract ScoreAttestation {
     uint256 public constant DEFAULT_FEE = 0.001 ether;
 
@@ -22,8 +25,10 @@ contract ScoreAttestation {
     mapping(bytes32 => Record) private _records;
     mapping(bytes32 => bool) public attested;
     mapping(bytes32 => bytes32[]) private _tickerHashes;
+    mapping(address => bool) public isAttester;
 
     event ScoreAttested(string ticker, bytes32 scoreHash, uint256 timestamp, address attester);
+    event AttesterUpdated(address indexed attester, bool allowed);
 
     error InsufficientFee();
     error EmptyHash();
@@ -31,10 +36,26 @@ contract ScoreAttestation {
     error ZeroAttester();
     error AlreadyAttested();
     error NotOwner();
+    error NotAttester();
 
     constructor(uint256 fee_) {
         owner = msg.sender;
         attestationFee = fee_ == 0 ? DEFAULT_FEE : fee_;
+        isAttester[msg.sender] = true;
+        emit AttesterUpdated(msg.sender, true);
+    }
+
+    /// @notice Owner is always authorized, even if later removed from the map.
+    function authorized(address who) public view returns (bool) {
+        return who == owner || isAttester[who];
+    }
+
+    /// @notice Allowlist or revoke a relayer / API-held key. Owner only.
+    function setAttester(address attester, bool allowed) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (attester == address(0)) revert ZeroAttester();
+        isAttester[attester] = allowed;
+        emit AttesterUpdated(attester, allowed);
     }
 
     function attest(
@@ -42,6 +63,7 @@ contract ScoreAttestation {
         string calldata ticker,
         uint256 timestamp
     ) external payable {
+        if (!authorized(msg.sender)) revert NotAttester();
         if (msg.value < attestationFee) revert InsufficientFee();
         if (scoreHash == bytes32(0)) revert EmptyHash();
         if (bytes(ticker).length == 0) revert EmptyTicker();
