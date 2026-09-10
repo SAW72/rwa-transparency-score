@@ -24,7 +24,7 @@ TAGLINE = "Risk radar for tokenized stocks · CoinMarketCap Build-a-thon"
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 FAVICON_PATH = ASSETS_DIR / "favicon.png"
-MONOGRAM_PATH = ASSETS_DIR / "rat-icon-192.png"
+MONOGRAM_PATH = ASSETS_DIR / "rat-monogram.png"
 
 DISCLAIMER = (
     "This tool is for informational and hackathon demo purposes only. "
@@ -291,7 +291,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-_monogram_uri = _asset_data_uri(MONOGRAM_PATH) or _asset_data_uri(ASSETS_DIR / "rat-monogram.svg")
+_monogram_uri = (
+    _asset_data_uri(MONOGRAM_PATH)
+    or _asset_data_uri(ASSETS_DIR / "rat-icon-192.png")
+    or _asset_data_uri(ASSETS_DIR / "rat-monogram.svg")
+)
 _chip_html = (
     f'<div class="rat-chip"><img src="{_monogram_uri}" alt="" width="36" height="36" /></div>'
     if _monogram_uri
