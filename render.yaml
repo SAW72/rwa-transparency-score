@@ -30,3 +30,16 @@ services:
         sync: false
       - key: XAI_API_KEY
         sync: false
+      # Signed share-card HMAC. Never commit. Set in the dashboard / Bitwarden.
+      - key: SCORE_CARD_SIGNING_SECRET
+        sync: false
+      # X API v2 OAuth 1.0a user tokens. All four required to post.
+      # Missing any of these skips the X post; PNG download still works.
+      - key: X_API_KEY
+        sync: false
+      - key: X_API_SECRET
+        sync: false
+      - key: X_ACCESS_TOKEN
+        sync: false
+      - key: X_ACCESS_TOKEN_SECRET
+        sync: false
