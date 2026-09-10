@@ -74,8 +74,7 @@ def canonical_score_payload(report: dict[str, Any], timestamp: str) -> dict[str,
     raw_subs = report.get("subscores") or {}
     subscores: dict[str, float] = {}
     for key in WEIGHTS:
-        if key in raw_subs:
-            subscores[key] = round(float(raw_subs[key]), 1)
+        subscores[key] = round(float(raw_subs.get(key) or 0.0), 1)
     return {
         "band": str(report.get("band") or ""),
         "score": round(float(report.get("score") or 0.0), 1),
@@ -218,8 +217,8 @@ def render_score_card_png(
     font_issuer = _load_font(22, bold=False)
     font_score = _load_font(112, bold=True)
     font_band = _load_font(22, bold=True)
-    font_pillar = _load_font(20, bold=False)
-    font_pillar_num = _load_font(20, bold=True)
+    font_pillar = _load_font(18, bold=False)
+    font_pillar_num = _load_font(18, bold=True)
     font_foot = _load_font(16, bold=False)
 
     draw.text((title_x, 54), "RAT Score", font=font_title, fill=text)
@@ -248,33 +247,36 @@ def render_score_card_png(
     band_w = band_bbox[2] - band_bbox[0]
     draw.text((CARD_WIDTH - 56 - band_w, 268), band_short, font=font_band, fill=accent)
 
-    draw.line((56, 300, CARD_WIDTH - 56, 300), fill=(48, 54, 61), width=1)
+    draw.line((56, 288, CARD_WIDTH - 56, 288), fill=(48, 54, 61), width=1)
 
-    y = 324
+    pillar_count = max(1, len(WEIGHTS))
+    y = 304
+    footer_y = CARD_HEIGHT - 62
+    step = min(46, max(36, (footer_y - 18 - y) // pillar_count))
     bar_x = 360
     bar_w = 520
-    bar_h = 14
+    bar_h = 12
     for key in WEIGHTS:
         meta = PILLARS.get(key) or {"label": key}
         label = meta["label"]
         value = float(subs.get(key) or 0.0)
         draw.text((56, y - 4), label, font=font_pillar, fill=text)
-        _rounded_rect(draw, (bar_x, y + 4, bar_x + bar_w, y + 4 + bar_h), 7, bar_bg)
+        _rounded_rect(draw, (bar_x, y + 4, bar_x + bar_w, y + 4 + bar_h), 6, bar_bg)
         fill_w = max(0, min(bar_w, int(bar_w * (value / 100.0))))
         if fill_w > 0:
-            _rounded_rect(draw, (bar_x, y + 4, bar_x + fill_w, y + 4 + bar_h), 7, accent)
+            _rounded_rect(draw, (bar_x, y + 4, bar_x + fill_w, y + 4 + bar_h), 6, accent)
         num = f"{value:.0f}"
         num_bbox = draw.textbbox((0, 0), num, font=font_pillar_num)
         draw.text((CARD_WIDTH - 56 - (num_bbox[2] - num_bbox[0]), y - 4), num, font=font_pillar_num, fill=text)
-        y += 48
+        y += step
 
     sig_label = f"sig {fingerprint}" if signed else "unsigned — set SCORE_CARD_SIGNING_SECRET to sign"
     foot_left = f"{timestamp}  ·  {sig_label}"
     foot_right = "Not financial advice  ·  RAT Score"
-    draw.text((56, CARD_HEIGHT - 78), foot_left, font=font_foot, fill=muted)
+    draw.text((56, footer_y), foot_left, font=font_foot, fill=muted)
     right_bbox = draw.textbbox((0, 0), foot_right, font=font_foot)
     draw.text(
-        (CARD_WIDTH - 56 - (right_bbox[2] - right_bbox[0]), CARD_HEIGHT - 78),
+        (CARD_WIDTH - 56 - (right_bbox[2] - right_bbox[0]), footer_y),
         foot_right,
         font=font_foot,
         fill=muted,

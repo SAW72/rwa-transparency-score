@@ -73,7 +73,7 @@ Set `XAI_API_KEY` in `.env` locally or in the **Render dashboard** (`sync: false
 
 ### Shareable score card (X)
 
-Each compare card has a **Share score card** button. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, pillar bars, RAT branding) and offers a download. If X credentials are configured it also posts that image to X via API v2. If they are missing, the PNG still downloads and the UI says the X post was skipped. Generation or X failures never crash the demo.
+Each compare card has a **Share score card** button. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding) and offers a download. If X credentials are configured it also posts that image to X via API v2. If they are missing, the PNG still downloads and the UI says the X post was skipped. Generation or X failures never crash the demo.
 
 **Signing.** `SCORE_CARD_SIGNING_SECRET` HMAC-SHA256-signs canonical JSON of `{ticker, score, band, subscores, timestamp}`. The first 16 hex characters (the fingerprint) are printed on the image and in the caption so others can verify. No secret → card is labeled `UNSIGNED`. Never commit the secret. Store it in the **Render dashboard** (`sync: false`) or **Bitwarden**.
 

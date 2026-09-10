@@ -22,7 +22,7 @@ from rwa_score.score_card import (
     signature_fingerprint,
     verify_signature,
 )
-from rwa_score.scorer import TransparencyScorer
+from rwa_score.scorer import PILLARS, WEIGHTS, TransparencyScorer
 
 SAMPLE_REPORT: dict[str, Any] = {
     "ticker": "NVDA",
@@ -36,6 +36,7 @@ SAMPLE_REPORT: dict[str, Any] = {
         "redemption": 88.0,
         "price": 80.0,
         "disclosure": 80.0,
+        "basis": 92.0,
     },
 }
 
@@ -62,26 +63,41 @@ class RecordingXClient:
         return self._result
 
 
+def test_weights_include_six_pillars_with_basis() -> None:
+    assert list(WEIGHTS) == [
+        "backing",
+        "reserves",
+        "redemption",
+        "price",
+        "disclosure",
+        "basis",
+    ]
+    assert "basis" in PILLARS
+    assert "basis" in PILLARS["basis"]["label"].lower() or "basis" in PILLARS["basis"]["what"].lower()
+
+
 def test_canonical_payload_is_stable_and_sorted() -> None:
     payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    assert list(payload["subscores"]) == list(WEIGHTS)
     assert payload == {
         "band": "GREEN",
         "score": 88.6,
         "subscores": {
             "backing": 95.0,
-            "disclosure": 80.0,
-            "price": 80.0,
-            "redemption": 88.0,
             "reserves": 90.0,
+            "redemption": 88.0,
+            "price": 80.0,
+            "disclosure": 80.0,
+            "basis": 92.0,
         },
         "ticker": "NVDA",
         "timestamp": FIXED_TS,
     }
     dumped = canonical_json(payload)
     assert dumped == (
-        '{"band":"GREEN","score":88.6,"subscores":{"backing":95.0,"disclosure":80.0,'
-        '"price":80.0,"redemption":88.0,"reserves":90.0},"ticker":"NVDA",'
-        f'"timestamp":"{FIXED_TS}"}}'
+        '{"band":"GREEN","score":88.6,"subscores":{"backing":95.0,"basis":92.0,'
+        '"disclosure":80.0,"price":80.0,"redemption":88.0,"reserves":90.0},'
+        f'"ticker":"NVDA","timestamp":"{FIXED_TS}"}}'
     )
     assert dumped == canonical_json(canonical_score_payload(SAMPLE_REPORT, FIXED_TS))
 
@@ -132,7 +148,9 @@ def test_share_caption_mentions_pillars() -> None:
     payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
     text = share_caption(payload, "abc123def4567890")
     assert "Backing 95" in text
+    assert "Cross-issuer 92" in text
     assert "sig abc123def4567890" in text
+    assert "Not financial advice" in text
 
 
 def test_fixture_report_builds_card(fixture_scorer: TransparencyScorer) -> None:
@@ -143,6 +161,8 @@ def test_fixture_report_builds_card(fixture_scorer: TransparencyScorer) -> None:
         now=datetime(2026, 9, 10, 15, 2, 0, tzinfo=timezone.utc),
     )
     assert card.payload["ticker"] == "NVDA"
+    assert "basis" in card.payload["subscores"]
+    assert list(card.payload["subscores"]) == list(WEIGHTS)
     assert card.signed
     assert verify_signature(card.canonical, card.signature, TEST_SECRET)
     from PIL import Image
