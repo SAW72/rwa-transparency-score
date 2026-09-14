@@ -19,8 +19,7 @@ st.set_page_config(
 
 st.markdown(legal_markdown("terms"))
 st.divider()
-st.page_link("app.py", label="Back to RAT Score")
-st.page_link("pages/privacy.py", label="Privacy Policy")
+st.markdown("[Back to RAT Score](/) · [Privacy Policy](/privacy)")
 st.caption(
     "Product Disclaimer is in the app sidebar/footer and README. "
     f"These pages do not replace it. Contact: {CONTACT_EMAIL}"

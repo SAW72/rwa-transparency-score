@@ -63,16 +63,16 @@ def test_streamlit_legal_pages_exist_and_render_source() -> None:
         assert page.is_file()
         assert f'legal_markdown("{slug}")' in source
         assert "st.markdown" in source
+        assert "/privacy" in source
+        assert "/terms" in source
         assert CONTACT_EMAIL in source or "CONTACT_EMAIL" in source
         assert "Disclaimer" in source
 
 
 def test_app_sidebar_and_footer_link_legal_pages() -> None:
     source = (ROOT / "app.py").read_text(encoding="utf-8")
-    assert 'st.page_link("pages/privacy.py", label="Privacy Policy")' in source
-    assert 'st.page_link("pages/terms.py", label="Terms of Service")' in source
-    assert "[Privacy Policy](/privacy)" in source
-    assert "[Terms of Service](/terms)" in source
+    assert source.count("[Privacy Policy](/privacy)") >= 2
+    assert source.count("[Terms of Service](/terms)") >= 2
     assert "st.write(DISCLAIMER)" in source
     assert "st.caption(DISCLAIMER)" in source
 
@@ -95,6 +95,43 @@ def test_health_launcher_attaches_legal_routes() -> None:
     health = (ROOT / "rwa_score" / "health.py").read_text(encoding="utf-8")
     assert "attach_legal_handlers" in health
     assert "_attach_custom_routes" in health
+
+
+def test_legal_http_handlers_return_200_with_body() -> None:
+    from tornado.testing import AsyncHTTPTestCase
+    from tornado.web import Application
+
+    from rwa_score.legal import _legal_handler_class
+
+    class _LegalHTTP(AsyncHTTPTestCase):
+        def get_app(self) -> Application:
+            return Application(
+                [
+                    (r"/privacy/?", _legal_handler_class("privacy")),
+                    (r"/terms/?", _legal_handler_class("terms")),
+                ]
+            )
+
+        def test_privacy(self) -> None:
+            resp = self.fetch("/privacy")
+            assert resp.code == 200
+            assert b"text/html" in resp.headers["Content-Type"].encode()
+            assert CONTACT_EMAIL.encode() in resp.body
+            assert OPERATOR.encode() in resp.body
+            assert b"Privacy Policy" in resp.body
+
+        def test_terms(self) -> None:
+            resp = self.fetch("/terms")
+            assert resp.code == 200
+            assert CONTACT_EMAIL.encode() in resp.body
+            assert b"Terms of Service" in resp.body
+            assert b"Ohio" in resp.body
+
+    suite = _LegalHTTP("test_privacy")
+    suite.run()
+    suite = _LegalHTTP("test_terms")
+    result = suite.run()
+    assert result.wasSuccessful()
 
 
 def test_attach_legal_handlers_is_idempotent() -> None:
