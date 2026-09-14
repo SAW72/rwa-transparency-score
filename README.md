@@ -137,6 +137,11 @@ If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://c
 
 ```
 app.py                 Streamlit demo (search, pillars, verification badges, compare, AI explainer, share card)
+pages/privacy.py       Privacy Policy (Streamlit; URL `/privacy`)
+pages/terms.py         Terms of Service (Streamlit; URL `/terms`)
+PRIVACY.md             Privacy Policy source (Steward of the King LLC / Ohio)
+TERMS.md               Terms of Service source
+rwa_score/legal.py     Privacy/Terms markdown loader + HTML /privacy and /terms
 rwa_score/ticker_search.py  Prefix + category picker over the RWA map (no extra API)
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
 rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
@@ -262,7 +267,11 @@ Confirm live mode (no fixture overwrite, verifiers enabled) with:
 
 ```bash
 curl -sS https://rwa-transparency-score.onrender.com/health
+curl -sS -o /dev/null -w "%{http_code}\n" https://rwa-transparency-score.onrender.com/privacy
+curl -sS -o /dev/null -w "%{http_code}\n" https://rwa-transparency-score.onrender.com/terms
 ```
+
+``GET /privacy`` and ``GET /terms`` return HTTP 200 with the publish-ready policy HTML (same bodies as [`PRIVACY.md`](PRIVACY.md) and [`TERMS.md`](TERMS.md)). The health launcher registers those paths on Tornado before Streamlit's SPA catch-all, the same way it registers ``/health``. Streamlit pages `pages/privacy.py` and `pages/terms.py` render the same markdown in-app.
 
 Expected when Render is live:
 
@@ -279,6 +288,10 @@ This repo is **deploy-config ready**. A public URL appears only after you connec
 ## Disclaimer
 
 Informational and educational hackathon demo only. Not financial, investment, legal, or tax advice. Not an offer, solicitation, or recommendation to buy, sell, or hold any security, digital asset, tokenized stock, or other instrument. Scores are automated heuristics (including issuer-name matching) plus third-party CoinMarketCap data or bundled demo fixtures — not audited attestations, not legal or audit opinions, and not a substitute for issuer filings, prospectuses, offering documents, or your own independent research. Data may be incomplete, delayed, inaccurate, or outdated. Nothing here guarantees accuracy, completeness, or fitness for any purpose. Past or present scores are not indicative of future results. This demo is not provided by a broker-dealer, exchange, ATS, funding portal, or registered investment adviser, and it does not create any advisory or fiduciary relationship. Do your own research. Use at your own risk.
+
+## Privacy and Terms
+
+The Streamlit demo serves publish-ready policies at **`/privacy`** and **`/terms`** (same bodies as [`PRIVACY.md`](PRIVACY.md) and [`TERMS.md`](TERMS.md)). Operator: Steward of the King LLC (Ohio, USA). Contact: hello@stewardoftheking.com. These do not replace the product Disclaimer above.
 
 ## License
 
