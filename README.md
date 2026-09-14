@@ -9,7 +9,7 @@ pip install -r requirements.txt
 RWA_USE_FIXTURES=1 streamlit run app.py
 ```
 
-Then open the local URL Streamlit prints. Search `NVDA`, `TSLA`, or `AAPL`. Compare two or three tickers side by side.
+Then open the local URL Streamlit prints. Type a prefix like `NIV` to pick **NVDA / Nvidia**, then Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
 
 CLI equivalent:
 

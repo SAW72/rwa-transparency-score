@@ -22,6 +22,15 @@ from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import share_score_card
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
+from rwa_score.ticker_search import (
+    SEARCH_MIN_CHARS,
+    TickerOption,
+    format_option,
+    load_search_catalog,
+    normalize_ticker,
+    resolve_assign_symbol,
+    search_tickers,
+)
 from rwa_score.verifiers import VerificationLevel
 from rwa_score.x_client import x_credentials_ready
 
@@ -123,10 +132,6 @@ def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     return _init_scorer(use_fixtures)
 
 
-def normalize_ticker(raw: str) -> str:
-    return (raw or "").strip().upper()
-
-
 def assign_ticker_to_slot(slots: list[str], index: int, ticker: str) -> list[str]:
     """Replace one comparison slot. Returns a new list; does not mutate `slots`."""
     if not 0 <= index < len(slots):
@@ -195,6 +200,11 @@ def _ensure_slot_state() -> None:
 def _place_in_slot(ticker: str, index: int) -> None:
     st.session_state.slots = assign_ticker_to_slot(list(st.session_state.slots), index, ticker)
     st.session_state.active_slot = index
+
+
+def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
+    """Directory the scorer already loads (live CMC map or fixture map)."""
+    return load_search_catalog(scorer.client)
 
 
 def _score_card_html(report: dict, *, selected: bool = False) -> str:
@@ -515,14 +525,17 @@ _ensure_slot_state()
 st.subheader("Score / Compare")
 st.caption(
     "Compact search assigns a ticker into one of the four slots. "
+    "Type 3+ characters to pick a directory match, then Assign. "
     "All four compare side by side in one row."
 )
+
+catalog = _ticker_catalog(scorer)
 
 search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
 with search_col:
     query = st.text_input(
         "Ticker search",
-        placeholder="Search ticker…",
+        placeholder="Search ticker or name…",
         label_visibility="collapsed",
         key="ticker_query",
     )
@@ -530,24 +543,50 @@ with assign_col:
     assign_clicked = st.button("Assign", type="primary", use_container_width=True)
 
 typed = normalize_ticker(query)
+matches = search_tickers(query, catalog)
+picked_symbol: str | None = None
+if matches:
+    pick_col, _pick_pad = st.columns([1.7, 3.3], gap="small")
+    with pick_col:
+        labels = [format_option(opt) for opt in matches]
+        label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
+        chosen = st.selectbox(
+            "Matching tickers",
+            options=labels,
+            index=0,
+            label_visibility="collapsed",
+            key=f"ticker_pick_{typed}",
+        )
+        picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
+elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
+    st.caption("No directory matches — Assign uses the typed ticker.")
+
+to_assign = resolve_assign_symbol(
+    query, matches=matches, selected_symbol=picked_symbol
+)
+
 if use_fixtures:
     st.caption(
         "Fixture catalog: "
         + ", ".join(FIXTURE_TICKERS)
-        + ". Unknown tickers error in that slot."
+        + ". Prefix-match ticker or name (e.g. NIV → NVDA / Nvidia). "
+        "Unknown tickers error in that slot."
     )
 else:
-    st.caption("Live mode: any CMC-mapped ticker can fill a slot.")
+    st.caption(
+        "Live mode: the cached CMC RWA map is the directory. "
+        "Prefix-match ticker or name, then Assign into a slot."
+    )
 
 if assign_clicked:
-    if typed:
-        _place_in_slot(typed, int(st.session_state.active_slot))
+    if to_assign:
+        _place_in_slot(to_assign, int(st.session_state.active_slot))
     else:
         st.info("Type a ticker, then Assign — or click a slot to place it.")
 
-if typed:
-    if st.button(f"Use {typed}", key="use_typed_ticker"):
-        _place_in_slot(typed, int(st.session_state.active_slot))
+if to_assign:
+    if st.button(f"Use {to_assign}", key="use_typed_ticker"):
+        _place_in_slot(to_assign, int(st.session_state.active_slot))
 
 slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
 for index, symbol in enumerate(st.session_state.slots):
@@ -560,8 +599,8 @@ for index, symbol in enumerate(st.session_state.slots):
             type="primary" if selected else "secondary",
             use_container_width=True,
         ):
-            if typed:
-                _place_in_slot(typed, index)
+            if to_assign:
+                _place_in_slot(to_assign, index)
             else:
                 st.session_state.active_slot = index
             st.rerun()
