@@ -23,6 +23,7 @@ from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import share_score_card
 from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
 from rwa_score.ticker_search import (
+    CATEGORIES,
     SEARCH_MIN_CHARS,
     TickerOption,
     format_option,
@@ -525,22 +526,44 @@ _ensure_slot_state()
 st.subheader("Score / Compare")
 st.caption(
     "Compact search assigns a ticker into one of the four slots. "
-    "Type 3+ characters to pick a directory match, then Assign. "
+    "Type a ticker/name prefix (3+ chars) or a category (oil, AI, real estate). "
     "All four compare side by side in one row."
 )
 
 catalog = _ticker_catalog(scorer)
 
+# Chip click sets the search box on the next run (must happen before text_input).
+if "pending_ticker_query" in st.session_state:
+    st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
+
 search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
 with search_col:
     query = st.text_input(
         "Ticker search",
-        placeholder="Search ticker or name…",
+        placeholder="Ticker, name, or category…",
         label_visibility="collapsed",
         key="ticker_query",
     )
 with assign_col:
     assign_clicked = st.button("Assign", type="primary", use_container_width=True)
+
+CHIP_QUERIES = {
+    "ai_tech": "AI",
+    "oil_energy": "oil",
+    "real_estate": "real estate",
+    "auto_ev": "auto",
+}
+chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
+chip_cols = st.columns([0.7] * len(chip_cats) + [2.2], gap="small")
+for index, cat in enumerate(chip_cats):
+    with chip_cols[index]:
+        if st.button(
+            cat.label,
+            key=f"cat_chip_{cat.id}",
+            use_container_width=True,
+        ):
+            st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
+            st.rerun()
 
 typed = normalize_ticker(query)
 matches = search_tickers(query, catalog)
@@ -555,7 +578,7 @@ if matches:
             options=labels,
             index=0,
             label_visibility="collapsed",
-            key=f"ticker_pick_{typed}",
+            key=f"ticker_pick_{typed or query.strip().lower()}",
         )
         picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
 elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
@@ -569,13 +592,13 @@ if use_fixtures:
     st.caption(
         "Fixture catalog: "
         + ", ".join(FIXTURE_TICKERS)
-        + ". Prefix-match ticker or name (e.g. NIV → NVDA / Nvidia). "
-        "Unknown tickers error in that slot."
+        + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or category "
+        "(oil, AI, real estate, auto). Unknown tickers error in that slot."
     )
 else:
     st.caption(
         "Live mode: the cached CMC RWA map is the directory. "
-        "Prefix-match ticker or name, then Assign into a slot."
+        "Prefix-match ticker/name or type a category, then Assign into a slot."
     )
 
 if assign_clicked:
