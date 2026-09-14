@@ -12,6 +12,7 @@
       "slug": "nvidia",
       "rwa_id": 2,
       "asset_type": "stock",
+      "industry": "Semiconductors & Related Devices",
       "rwa_rank": 2,
       "has_tokens": true
     },
@@ -21,6 +22,7 @@
       "slug": "tesla",
       "rwa_id": 15,
       "asset_type": "stock",
+      "industry": "Motor Vehicles",
       "rwa_rank": 8,
       "has_tokens": true
     },
@@ -30,6 +32,7 @@
       "slug": "apple",
       "rwa_id": 16,
       "asset_type": "stock",
+      "industry": "Electronic Computers",
       "rwa_rank": 3,
       "has_tokens": true
     },
@@ -39,7 +42,28 @@
       "slug": "meta-platforms",
       "rwa_id": 18,
       "asset_type": "stock",
+      "industry": "Services-Computer Programming, Data Processing",
       "rwa_rank": 6,
+      "has_tokens": true
+    },
+    {
+      "name": "Exxon Mobil Corp",
+      "symbol": "XOM",
+      "slug": "exxon-mobil",
+      "rwa_id": 21,
+      "asset_type": "stock",
+      "industry": "Petroleum Refining",
+      "rwa_rank": 12,
+      "has_tokens": true
+    },
+    {
+      "name": "Prologis Inc",
+      "symbol": "PLD",
+      "slug": "prologis",
+      "rwa_id": 22,
+      "asset_type": "stock",
+      "industry": "Real Estate Investment Trusts",
+      "rwa_rank": 18,
       "has_tokens": true
     }
   ],
@@ -99,6 +123,34 @@
       "asset_type": "stock",
       "primary_exchange": "Nasdaq",
       "issuer": { "name": "Ondo" }
+    },
+    "21": {
+      "name": "Exxon Mobil Corp",
+      "symbol": "XOM",
+      "slug": "exxon-mobil",
+      "website": "https://corporate.exxonmobil.com",
+      "employees": 62000,
+      "founded": "1999-11-30",
+      "industry": "Petroleum Refining",
+      "cik": "0000034088",
+      "rwa_id": 21,
+      "asset_type": "stock",
+      "primary_exchange": "NYSE",
+      "issuer": { "name": "Backed Finance" }
+    },
+    "22": {
+      "name": "Prologis Inc",
+      "symbol": "PLD",
+      "slug": "prologis",
+      "website": "https://www.prologis.com",
+      "employees": 2500,
+      "founded": "1983-11-01",
+      "industry": "Real Estate Investment Trusts",
+      "cik": "0001045609",
+      "rwa_id": 22,
+      "asset_type": "stock",
+      "primary_exchange": "NYSE",
+      "issuer": { "name": "Ondo" }
     }
   },
   "issuers_list": [
@@ -106,7 +158,7 @@
       "name": "Backed Finance",
       "website": "https://assets.backed.fi/",
       "issuer_id": "6878977dcbbf471de3366e85",
-      "num_tokens": 1
+      "num_tokens": 2
     },
     {
       "name": "xStocks",
@@ -124,7 +176,7 @@
       "name": "Ondo",
       "website": "https://ondo.finance",
       "issuer_id": "6f6e646f00000000000000d2",
-      "num_tokens": 1
+      "num_tokens": 2
     }
   ],
   "issuers": {
@@ -132,13 +184,19 @@
       "name": "Backed Finance",
       "website": "https://assets.backed.fi/",
       "issuer_id": "6878977dcbbf471de3366e85",
-      "num_tokens": 1,
+      "num_tokens": 2,
       "tokens": [
         {
           "name": "NVIDIA tokenized stock (Backed) [FIXTURE]",
           "symbol": "NVDAx",
           "crypto_id": 36992,
           "rwa_id": 2
+        },
+        {
+          "name": "Exxon tokenized stock (Backed) [FIXTURE]",
+          "symbol": "XOMx",
+          "crypto_id": 36995,
+          "rwa_id": 21
         }
       ]
     },
@@ -174,13 +232,19 @@
       "name": "Ondo",
       "website": "https://ondo.finance",
       "issuer_id": "6f6e646f00000000000000d2",
-      "num_tokens": 1,
+      "num_tokens": 2,
       "tokens": [
         {
           "name": "Meta tokenized stock (Ondo) [FIXTURE]",
           "symbol": "METAx",
           "crypto_id": 36994,
           "rwa_id": 18
+        },
+        {
+          "name": "Prologis tokenized stock (Ondo) [FIXTURE]",
+          "symbol": "PLDx",
+          "crypto_id": 36996,
+          "rwa_id": 22
         }
       ]
     }
@@ -235,6 +299,32 @@
           "volume_24h": 2600000.0,
           "percent_change_24h": 1.2,
           "market_cap": 6200000.0
+        }
+      }
+    },
+    "36995": {
+      "id": 36995,
+      "name": "Exxon tokenized stock (Backed) [FIXTURE]",
+      "symbol": "XOMx",
+      "quote": {
+        "USD": {
+          "price": 118.2,
+          "volume_24h": 900000.0,
+          "percent_change_24h": 0.4,
+          "market_cap": 2100000.0
+        }
+      }
+    },
+    "36996": {
+      "id": 36996,
+      "name": "Prologis tokenized stock (Ondo) [FIXTURE]",
+      "symbol": "PLDx",
+      "quote": {
+        "USD": {
+          "price": 112.8,
+          "volume_24h": 640000.0,
+          "percent_change_24h": 0.6,
+          "market_cap": 1800000.0
         }
       }
     }
@@ -554,6 +644,82 @@
               "symbol": "USD",
               "price": 514.0,
               "volume_24h": 1400000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "21": {
+      "rwa_id": 21,
+      "name": "Exxon Mobil Corp",
+      "symbol": "XOM",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "market_id": 99401,
+          "market_pair": "XOMx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 36995,
+            "symbol": "XOMx",
+            "exchange_symbol": "XOMX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 118.2,
+              "volume_24h": 900000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "22": {
+      "rwa_id": 22,
+      "name": "Prologis Inc",
+      "symbol": "PLD",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "market_id": 99501,
+          "market_pair": "PLDx/USDT",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 36996,
+            "symbol": "PLDx",
+            "exchange_symbol": "PLDX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 825,
+            "symbol": "USDT",
+            "exchange_symbol": "USDT",
+            "currency_type": "cryptocurrency"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 112.8,
+              "volume_24h": 640000.0,
               "last_updated": "2026-09-10T12:00:00.000Z"
             }
           ]

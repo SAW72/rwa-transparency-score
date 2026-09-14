@@ -9,7 +9,17 @@ pip install -r requirements.txt
 RWA_USE_FIXTURES=1 streamlit run app.py
 ```
 
-Then open the local URL Streamlit prints. Search `NVDA`, `TSLA`, or `AAPL`. Compare two or three tickers side by side.
+Then open the local URL Streamlit prints. Type a prefix like `NIV` to pick **NVDA / Nvidia**, or a category like `oil`, `AI`, or `real estate`. Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
+
+**Search categories** (case-insensitive keywords; rows come from the CMC/fixture directory, bucketed by `industry` / `sector` plus name hints):
+
+| Category | Type | Fixture examples |
+|---|---|---|
+| AI/Tech | `ai`, `tech`, `semiconductor`, `software`, `computer` | NVDA, AAPL, META |
+| Oil/Energy | `oil`, `energy`, `petroleum`, `crude` | XOM |
+| Real Estate | `real estate`, `reit`, `realty`, `property` | PLD |
+| Auto/EV | `auto`, `ev`, `vehicle`, `motor` | TSLA |
+| Finance | `finance`, `bank`, `financial` | live directory only |
 
 CLI equivalent:
 
@@ -127,6 +137,7 @@ If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://c
 
 ```
 app.py                 Streamlit demo (search, pillars, verification badges, compare, AI explainer, share card)
+rwa_score/ticker_search.py  Prefix + category picker over the RWA map (no extra API)
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
 rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
 rwa_score/chainlink_por.py  Chainlink AggregatorV3 PoR reader (JSON-RPC eth_call, requests only)
