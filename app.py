@@ -448,12 +448,16 @@ st.markdown(
       .issuer { color: #8b949e; margin-top: 0.25rem; }
       .summary { margin-top: 0.35rem; }
       .score-hero.compact .summary { font-size: 0.85rem; }
-      /* Category browse + matching-ticker picker: read as interactive fields */
+      /* Search, category browse, matching-ticker picker: read as fields */
       [data-testid="stVerticalBlockBorderWrapper"] {
         border: 1px solid #6e7681 !important;
         border-radius: 10px !important;
         padding: 0.45rem 0.7rem !important;
         background-color: #161B22;
+      }
+      div[data-testid="stTextInput"] [data-baseweb="input"] {
+        border: 1px solid #6e7681 !important;
+        border-radius: 8px !important;
       }
       div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
         border: 1px solid #6e7681 !important;
@@ -553,13 +557,16 @@ if "pending_ticker_query" in st.session_state:
 
 search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
 with search_col:
-    query = st.text_input(
-        "Ticker search",
-        placeholder="Ticker, name, or category…",
-        label_visibility="collapsed",
-        key="ticker_query",
-    )
+    with st.container(border=True):
+        st.caption("Search")
+        query = st.text_input(
+            "Search",
+            placeholder="Ticker, name, or category…",
+            label_visibility="collapsed",
+            key="ticker_query",
+        )
 with assign_col:
+    st.caption("\u00a0")
     assign_clicked = st.button("Assign", type="primary", use_container_width=True)
 
 CHIP_QUERIES = {
