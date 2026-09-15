@@ -291,7 +291,8 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
 
     assert demo_app.next_place_index(["", "TSLA", "AAPL", "META"], 2) == 0
     assert demo_app.next_place_index(["NVDA", "", "AAPL", "META"], 0) == 1
-    assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 2) == 2
+    assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 2, "XOM") == 2
+    assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 0, "NVDA") == 1
 
 
 def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
@@ -309,6 +310,13 @@ def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
     )
     assert from_match == from_use == ["NVDA", "TSLA", "AAPL", "META"]
     assert next_active == use_next == 1
+    # Default demo row already has NVDA in slot 0 — pick must still land visibly.
+    replaced, nxt = demo_app.place_search_match(
+        list(demo_app.DEFAULT_SLOTS), 0, niv[0].symbol
+    )
+    assert replaced[1] == "NVDA"
+    assert replaced[0] == "NVDA"
+    assert nxt == 2
 
 
 def test_oil_typeahead_match_places_xom() -> None:

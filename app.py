@@ -214,11 +214,18 @@ def _place_in_slot(ticker: str, index: int) -> None:
     st.session_state.active_slot = index
 
 
-def next_place_index(slots: list[str], active: int) -> int:
-    """First empty compare slot, else the active slot (then the caller advances)."""
+def next_place_index(slots: list[str], active: int, ticker: str = "") -> int:
+    """First empty slot, else a slot that does not already hold ``ticker``."""
+    symbol = normalize_ticker(ticker)
     for index, raw in enumerate(slots):
         if not normalize_ticker(raw):
             return index
+    if symbol:
+        if 0 <= active < len(slots) and normalize_ticker(slots[active]) != symbol:
+            return active
+        for index, raw in enumerate(slots):
+            if normalize_ticker(raw) != symbol:
+                return index
     if 0 <= active < len(slots):
         return active
     return 0
@@ -229,10 +236,10 @@ def place_search_match(
 ) -> tuple[list[str], int]:
     """Search-match click and Use-chip click share this slot-fill path.
 
-    Fills the first empty slot, or replaces ``active`` when the row is full,
-    then advances the cursor so the next pick lands in the following slot.
+    Fills the first empty slot, or replaces a different filled slot when the
+    row is full, then advances the cursor so the next pick is visible.
     """
-    index = next_place_index(slots, active)
+    index = next_place_index(slots, active, ticker)
     updated = assign_ticker_to_slot(slots, index, ticker)
     return updated, (index + 1) % MAX_COMPARE_SLOTS
 
