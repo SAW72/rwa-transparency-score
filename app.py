@@ -98,6 +98,8 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
+CANDIDATE_STRIP_LIMIT = 10
+SEARCH_PICK_SENTINEL = "Select a match to compare…"
 
 st.set_page_config(
     page_title=PAGE_TITLE,
@@ -201,6 +203,56 @@ def _ensure_slot_state() -> None:
 def _place_in_slot(ticker: str, index: int) -> None:
     st.session_state.slots = assign_ticker_to_slot(list(st.session_state.slots), index, ticker)
     st.session_state.active_slot = index
+
+
+def next_place_index(slots: list[str], active: int) -> int:
+    """First empty compare slot, else the active slot (then the caller advances)."""
+    for index, raw in enumerate(slots):
+        if not normalize_ticker(raw):
+            return index
+    if 0 <= active < len(slots):
+        return active
+    return 0
+
+
+def browse_categories(catalog: list[TickerOption]) -> tuple:
+    """Chips for buckets that exist on the CMC/fixture map. Grows when the map does."""
+    present = {cid for opt in catalog for cid in opt.categories}
+    shown = tuple(cat for cat in CATEGORIES if cat.id in present)
+    return shown or CATEGORIES
+
+
+def chip_query(category) -> str:
+    """Search text a chip should type — first documented keyword."""
+    words = getattr(category, "keywords", ()) or ()
+    return str(words[0] if words else getattr(category, "label", "") or "")
+
+
+def _auto_place(ticker: str) -> None:
+    """Drop a pick into the next compare slot and advance (no Assign button)."""
+    symbol = normalize_ticker(ticker)
+    if not symbol:
+        return
+    if "slots" not in st.session_state:
+        st.session_state.slots = list(DEFAULT_SLOTS)
+    if "active_slot" not in st.session_state:
+        st.session_state.active_slot = 0
+    slots = list(st.session_state.slots)
+    index = next_place_index(slots, int(st.session_state.active_slot))
+    st.session_state.slots = assign_ticker_to_slot(slots, index, symbol)
+    st.session_state.active_slot = (index + 1) % MAX_COMPARE_SLOTS
+
+
+def _on_search_pick() -> None:
+    """Selectbox change inside Search — click a match to land it in a slot."""
+    mapping = st.session_state.get("ticker_pick_map") or {}
+    for key, value in list(st.session_state.items()):
+        if not str(key).startswith("ticker_pick_"):
+            continue
+        if value in mapping:
+            _auto_place(mapping[value])
+            st.session_state[key] = SEARCH_PICK_SENTINEL
+            return
 
 
 def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
@@ -457,7 +509,7 @@ st.markdown(
       .score-hero > * { position: relative; z-index: 1; }
       .score-hero.compact {
         flex-direction: column; align-items: flex-start; gap: 0.35rem;
-        padding: 0.85rem 1rem; margin: 0.25rem 0 0.75rem; min-height: 10.5rem;
+        padding: 0.7rem 0.9rem; margin: 0.15rem 0 0.5rem; min-height: 8rem;
       }
       .score-hero.compact.selected { box-shadow: 0 0 0 1px #3DDC97 inset; }
       .score-hero.compact.error { border-color: #E5484D; }
@@ -488,45 +540,21 @@ st.markdown(
         background-color: transparent !important;
         box-shadow: none !important;
       }
-      .search-assign-spacer {
-        margin: 0 0 0.25rem;
-        font-size: 0.875rem;
-        line-height: 1.25;
-        min-height: 1.25rem;
-      }
-      /* Assign: horizontal pill, single-line, match Search input height.
-         Live bug was a ~40px column that stacked A/s/i/g/n. */
-      .search-assign-anchor + div [data-testid="stButton"] {
-        min-width: 6.5rem;
-      }
-      .search-assign-anchor + div [data-testid="stButton"] button {
-        white-space: nowrap !important;
-        writing-mode: horizontal-tb !important;
-        text-orientation: mixed !important;
-        min-width: 6.5rem !important;
+      /* Search + match list read as one control (dropdown sits in the same box) */
+      .search-combobox-anchor + div div[data-testid="stTextInput"] [data-baseweb="input"] {
         min-height: 2.5rem !important;
-        height: 2.5rem !important;
-        border-radius: 999px !important;
-        padding: 0 1.15rem !important;
-        overflow: visible !important;
-        letter-spacing: normal !important;
+        border-radius: 0.5rem 0.5rem 0 0 !important;
       }
-      .search-assign-anchor + div [data-testid="stButton"] button p,
-      .search-assign-anchor + div [data-testid="stButton"] button div {
-        white-space: nowrap !important;
-        writing-mode: horizontal-tb !important;
-        word-break: keep-all !important;
-        overflow: visible !important;
-      }
-      .search-assign-anchor + div div[data-testid="stTextInput"] [data-baseweb="input"] {
+      .search-combobox-anchor + div + div div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+        border-top: none !important;
+        border-radius: 0 0 0.5rem 0.5rem !important;
         min-height: 2.5rem !important;
       }
       /* Category chips: grow to content, never split a word; light outline stays */
       .cat-chip-anchor + div [data-testid="stButton"] button {
         white-space: nowrap !important;
         padding: 0.75rem 1rem !important;
-        min-height: 2.4rem !important;
-        width: auto !important;
+        min-height: 2.75rem !important;
         overflow: visible !important;
       }
       .cat-chip-anchor + div [data-testid="stButton"] button p,
@@ -534,6 +562,12 @@ st.markdown(
         white-space: nowrap !important;
         word-break: keep-all !important;
         overflow: visible !important;
+      }
+      /* Candidate Use strip — big tap targets, not a second cage */
+      .use-strip-anchor + div [data-testid="stButton"] button {
+        white-space: nowrap !important;
+        min-height: 2.75rem !important;
+        padding: 0.75rem 0.85rem !important;
       }
       /* Matching dropdown sits above compare ghosts; 40px click/keyboard rows */
       div[data-testid="stSelectbox"] { position: relative; z-index: 40; }
@@ -622,9 +656,8 @@ _ensure_slot_state()
 
 st.subheader("Score / Compare")
 st.caption(
-    "Compact search assigns a ticker into one of the four slots. "
-    "Type a ticker/name prefix (3+ chars) or a category (oil, AI, real estate). "
-    "All four compare side by side in one row."
+    "Browse a category, type a ticker or name (3+ chars), then click a match "
+    "or a Use chip — it lands in the next compare slot."
 )
 
 catalog = _ticker_catalog(scorer)
@@ -633,91 +666,82 @@ catalog = _ticker_catalog(scorer)
 if "pending_ticker_query" in st.session_state:
     st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
 
-# Compact left cluster like the live hero — no Search card, no Browse cage,
-# no empty pad widgets that draw a second box. Assign stays a horizontal pill.
-cluster, _ = st.columns([3.15, 1.85], gap="small")
-with cluster:
-    st.markdown('<div class="search-assign-anchor"></div>', unsafe_allow_html=True)
-    search_col, assign_col = st.columns([3.45, 1.2], gap="small")
-    with search_col:
-        query = st.text_input(
-            "Search",
-            placeholder="Ticker, name, or category",
-            label_visibility="visible",
-            key="ticker_query",
-        )
-    with assign_col:
-        st.markdown(
-            '<p class="search-assign-spacer">&nbsp;</p>',
-            unsafe_allow_html=True,
-        )
-        assign_clicked = st.button("Assign", type="primary", use_container_width=True)
+# 1) Categories first — expand when the live/fixture map has more buckets.
+chip_cats = browse_categories(catalog)
+st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
+chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
+for index, cat in enumerate(chip_cats):
+    with chip_cols[index]:
+        if st.button(
+            chip_display_label(cat.label),
+            key=f"cat_chip_{cat.id}",
+            use_container_width=True,
+        ):
+            st.session_state.pending_ticker_query = chip_query(cat)
+            st.rerun()
 
-    CHIP_QUERIES = {
-        "ai_tech": "AI",
-        "oil_energy": "oil",
-        "real_estate": "real estate",
-        "auto_ev": "auto",
-    }
-    chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
-    # 2×2 siblings — nowrap + spaced slashes, light chip outline, no second cage.
-    for pair_start in range(0, len(chip_cats), 2):
-        pair = chip_cats[pair_start : pair_start + 2]
-        st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
-        chip_cols = st.columns(2, gap="small")
-        for index, cat in enumerate(pair):
-            with chip_cols[index]:
+# 2) Search — match list is the same control, not an orphan box. No Assign button.
+st.markdown('<div class="search-combobox-anchor"></div>', unsafe_allow_html=True)
+query = st.text_input(
+    "Search",
+    placeholder="Ticker, name, or category",
+    label_visibility="visible",
+    key="ticker_query",
+)
+matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
+picked_symbol: str | None = None
+if matches:
+    labels = [format_option(opt) for opt in matches]
+    label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
+    st.session_state.ticker_pick_map = label_to_symbol
+    pick_key = f"ticker_pick_{normalize_ticker(query) or (query or '').strip().lower()}"
+    chosen = st.selectbox(
+        "Matching tickers",
+        options=[SEARCH_PICK_SENTINEL, *labels],
+        index=0,
+        label_visibility="collapsed",
+        key=pick_key,
+        on_change=_on_search_pick,
+    )
+    if chosen != SEARCH_PICK_SENTINEL:
+        picked_symbol = label_to_symbol.get(chosen)
+elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
+    st.caption("No directory matches — type a ticker or tap a Use chip.")
+
+# 3) ~10 candidate Use chips — pick 4 of ~10 into the compare row.
+if matches:
+    candidates = matches
+elif not (query or "").strip():
+    candidates = list(catalog[:CANDIDATE_STRIP_LIMIT])
+else:
+    candidates = []
+if candidates:
+    st.markdown('<div class="use-strip-anchor"></div>', unsafe_allow_html=True)
+    for row_start in range(0, min(len(candidates), CANDIDATE_STRIP_LIMIT), 5):
+        row = candidates[row_start : row_start + 5]
+        use_cols = st.columns(5, gap="small")
+        for index, opt in enumerate(row):
+            with use_cols[index]:
                 if st.button(
-                    chip_display_label(cat.label),
-                    key=f"cat_chip_{cat.id}",
+                    f"Use {opt.symbol}",
+                    key=f"use_strip_{opt.symbol}_{row_start}",
                     use_container_width=True,
                 ):
-                    st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
+                    _auto_place(opt.symbol)
                     st.rerun()
-
-    typed = normalize_ticker(query)
-    matches = search_tickers(query, catalog)
-    picked_symbol: str | None = None
-    if matches:
-        labels = [format_option(opt) for opt in matches]
-        label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
-        chosen = st.selectbox(
-            "Matching tickers",
-            options=labels,
-            index=0,
-            label_visibility="collapsed",
-            key=f"ticker_pick_{typed or query.strip().lower()}",
-        )
-        picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
-    elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
-        st.caption("No directory matches — Assign uses the typed ticker.")
-
-to_assign = resolve_assign_symbol(
-    query, matches=matches, selected_symbol=picked_symbol
-)
 
 if use_fixtures:
     st.caption(
         "Fixture catalog: "
         + ", ".join(FIXTURE_TICKERS)
         + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or category "
-        "(oil, AI, real estate, auto). Unknown tickers error in that slot."
+        "(oil, AI, real estate, auto)."
     )
 else:
     st.caption(
         "Live mode: the cached CMC RWA map is the directory. "
-        "Prefix-match ticker/name or type a category, then Assign into a slot."
+        "Prefix-match ticker/name or tap a category, then click a match."
     )
-
-if assign_clicked:
-    if to_assign:
-        _place_in_slot(to_assign, int(st.session_state.active_slot))
-    else:
-        st.info("Type a ticker, then Assign — or click a slot to place it.")
-
-if to_assign:
-    if st.button(f"Use {to_assign}", key="use_typed_ticker"):
-        _place_in_slot(to_assign, int(st.session_state.active_slot))
 
 slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
 for index, symbol in enumerate(st.session_state.slots):
@@ -731,20 +755,15 @@ for index, symbol in enumerate(st.session_state.slots):
             type="primary" if selected else "secondary",
             use_container_width=True,
         ):
-            if to_assign:
-                _place_in_slot(to_assign, index)
-            else:
-                st.session_state.active_slot = index
+            st.session_state.active_slot = index
             st.rerun()
 
 active = int(st.session_state.active_slot)
 active_symbol = st.session_state.slots[active]
 if active_symbol:
-    st.caption(
-        f"Selected slot {active + 1} · **{active_symbol}** — next search replaces this name."
-    )
+    st.caption(f"Next Use replaces slot {active + 1} · **{active_symbol}**.")
 else:
-    st.caption(f"Selected slot {active + 1} · empty — next search fills this slot.")
+    st.caption(f"Next Use fills slot {active + 1}.")
 
 results = _score_slots(scorer, list(st.session_state.slots))
 

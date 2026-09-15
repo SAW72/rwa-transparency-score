@@ -107,7 +107,7 @@ def test_picker_assign_uses_selected_match_then_first_match() -> None:
     catalog = _fixture_catalog()
     matches = search_tickers("NIV", catalog)
     assert matches[0].symbol == "NVDA"
-    # Streamlit selectbox defaults to the first match — Assign must use it.
+    # Click-to-place / Use strip still resolve the selected match, then the first hit.
     assert resolve_assign_symbol("NIV", matches=matches) == "NVDA"
     assert resolve_assign_symbol("niv", matches=matches, selected_symbol="NVDA") == "NVDA"
     # User can still pick another row if the picker listed more than one.
@@ -213,14 +213,22 @@ def test_classify_uses_industry_field_not_invented_tickers() -> None:
     assert classify_categories(symbol="ZZZ", name="Unknown Co", industry="") == ()
 
 
-def test_app_picker_wires_directory_into_assign() -> None:
+def test_app_picker_wires_continuous_category_search_compare() -> None:
     import app as demo_app
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "search_tickers" in source
     assert "st.selectbox" in source
     assert "Matching tickers" in source
+    assert "on_change=_on_search_pick" in source
+    assert "search-combobox-anchor" in source
+    assert "use-strip-anchor" in source
+    assert "Use {opt.symbol}" in source or 'f"Use {opt.symbol}"' in source
+    assert 'st.button("Assign"' not in source
+    assert "assign_clicked" not in source
+    assert "search-assign-anchor" not in source
     assert demo_app.SEARCH_MIN_CHARS == 3
+    assert demo_app.CANDIDATE_STRIP_LIMIT == 10
     assert demo_app.normalize_ticker is normalize_ticker
 
     catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
@@ -243,8 +251,13 @@ def test_app_picker_wires_directory_into_assign() -> None:
         demo_app.resolve_assign_symbol("oil", matches=oil_hits),
     )
     assert slots[1] == "XOM"
+
+    # Categories sit above Search in the Score / Compare body (CSS may mention
+    # the same class names earlier).
+    body = source.split('st.subheader("Score / Compare")', 1)[1]
+    assert body.index("cat-chip-anchor") < body.index("search-combobox-anchor")
+    assert body.index("search-combobox-anchor") < body.index("use-strip-anchor")
     assert "cat_chip_" in source
-    assert "real estate" in source.lower()
     assert "Ticker, name, or category" in source
     assert 'placeholder="Ticker, name, or category"' in source
     assert 'st.text_input(' in source
@@ -255,12 +268,6 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert "rgba(250, 250, 250, 0.2)" in source
     assert "stVerticalBlockBorderWrapper" not in source
     assert "border=True" not in source
-    assert "[1.15, 0.55, 3.3]" not in source
-    assert "writing-mode: horizontal-tb" in source
-    assert "white-space: nowrap" in source
-    assert "min-width: 6.5rem" in source
-    assert "search-assign-anchor" in source
-    assert "cat-chip-anchor" in source
     assert "Browse categories" not in source
     assert "chip_display_label" in source
     assert "score-hero.compact.ghost" in source
@@ -269,3 +276,16 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert demo_app.chip_display_label("Oil/Energy") == "Oil / Energy"
     assert demo_app.chip_display_label("Auto/EV") == "Auto / EV"
     assert demo_app.chip_display_label("Real Estate") == "Real Estate"
+    assert demo_app.chip_query(CATEGORIES[0]) == "ai"
+
+    shown = demo_app.browse_categories(catalog)
+    assert [cat.id for cat in shown] == ["ai_tech", "oil_energy", "real_estate", "auto_ev"]
+    finance_row = TickerOption(
+        symbol="JPM", name="JPMorgan", categories=("finance",)
+    )
+    expanded = demo_app.browse_categories([*catalog, finance_row])
+    assert [cat.id for cat in expanded][-1] == "finance"
+
+    assert demo_app.next_place_index(["", "TSLA", "AAPL", "META"], 2) == 0
+    assert demo_app.next_place_index(["NVDA", "", "AAPL", "META"], 0) == 1
+    assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 2) == 2
