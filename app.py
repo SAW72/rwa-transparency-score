@@ -10,7 +10,6 @@ Render binds 0.0.0.0:$PORT via render.yaml and starts with
 from __future__ import annotations
 
 import base64
-import html
 import os
 import time
 from pathlib import Path
@@ -36,7 +35,7 @@ from rwa_score.verifiers import VerificationLevel
 from rwa_score.x_client import x_credentials_ready
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
-# Per-symbol wall-clock cache for "Why this score?" — process-local dict.
+# Per-symbol wall-clock cache for the explainer — process-local dict.
 _explain_cache: dict[str, tuple[float, str]] = {}
 
 install_health_route()
@@ -98,6 +97,10 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
+CANDIDATE_STRIP_LIMIT = 4
+USE_STRIP_LIMIT = 4
+# Process-local fallback when session_state is unavailable (unit tests).
+_score_memo: dict[str, dict] = {}
 
 st.set_page_config(
     page_title=PAGE_TITLE,
@@ -145,8 +148,40 @@ def assign_ticker_to_slot(slots: list[str], index: int, ticker: str) -> list[str
     return updated
 
 
+def _score_cache_key(scorer: TransparencyScorer, symbol: str) -> str:
+    source = str(getattr(scorer.client, "source", "") or "")
+    return f"{source}:{symbol}"
+
+
+def _report_cache() -> dict:
+    """Session cache of scored reports. Falls back to the process memo."""
+    try:
+        cache = st.session_state.get("score_reports")
+        if not isinstance(cache, dict):
+            cache = {}
+            st.session_state["score_reports"] = cache
+        return cache
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return _score_memo
+
+
 def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
-    return scorer.score(normalize_ticker(ticker))
+    """Return a cached report. Unchanged slots are never re-scored."""
+    symbol = normalize_ticker(ticker)
+    key = _score_cache_key(scorer, symbol)
+    session_cache = _report_cache()
+    hit = session_cache.get(key)
+    if hit is not None:
+        _score_memo[key] = hit
+        return hit
+    hit = _score_memo.get(key)
+    if hit is not None:
+        session_cache[key] = hit
+        return hit
+    report = scorer.score(symbol)
+    session_cache[key] = report
+    _score_memo[key] = report
+    return report
 
 
 def _cached_explanation(report: dict) -> str:
@@ -187,15 +222,14 @@ def _score_slots(
 def _ensure_slot_state() -> None:
     if "slots" not in st.session_state:
         st.session_state.slots = list(DEFAULT_SLOTS)
-    if "active_slot" not in st.session_state:
-        st.session_state.active_slot = 0
-    # Recover from a stale session that somehow lost a slot.
     slots = list(st.session_state.slots)
     if len(slots) != MAX_COMPARE_SLOTS:
-        padded = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
-        st.session_state.slots = padded
+        slots = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
+        st.session_state.slots = slots
+    if "active_slot" not in st.session_state:
+        st.session_state.active_slot = default_active_slot(slots)
     if not 0 <= int(st.session_state.active_slot) < MAX_COMPARE_SLOTS:
-        st.session_state.active_slot = 0
+        st.session_state.active_slot = default_active_slot(slots)
 
 
 def _place_in_slot(ticker: str, index: int) -> None:
@@ -203,48 +237,170 @@ def _place_in_slot(ticker: str, index: int) -> None:
     st.session_state.active_slot = index
 
 
+def default_active_slot(slots: list[str]) -> int:
+    """First empty slot, else slot 0."""
+    for index, raw in enumerate(slots):
+        if not normalize_ticker(raw):
+            return index
+    return 0
+
+
+def next_place_index(slots: list[str], active: int, ticker: str = "") -> int:
+    """First empty slot; if the row is full, the active replace target.
+
+    ``ticker`` is unused — match and Use share this helper and always pass it.
+    """
+    _ = ticker
+    for index, raw in enumerate(slots):
+        if not normalize_ticker(raw):
+            return index
+    if 0 <= active < len(slots):
+        return active
+    return 0
+
+
+def place_search_match(
+    slots: list[str], active: int, ticker: str
+) -> tuple[list[str], int]:
+    """Search-match click and Use-chip click share this slot-fill path.
+
+    Empty row: fill the first empty slot, then aim at the next empty.
+    Full row: replace the active slot, then advance 0→1→2→3→0.
+    """
+    index = next_place_index(slots, active, ticker)
+    updated = assign_ticker_to_slot(slots, index, ticker)
+    if all(normalize_ticker(raw) for raw in updated):
+        return updated, (index + 1) % MAX_COMPARE_SLOTS
+    return updated, default_active_slot(updated)
+
+
+def browse_categories(catalog: list[TickerOption]) -> tuple:
+    """Chips for buckets that exist on the CMC/fixture map. Grows when the map does."""
+    present = {cid for opt in catalog for cid in opt.categories}
+    shown = tuple(cat for cat in CATEGORIES if cat.id in present)
+    return shown or CATEGORIES
+
+
+def chip_query(category) -> str:
+    """Search text a chip should type — first documented keyword."""
+    words = getattr(category, "keywords", ()) or ()
+    return str(words[0] if words else getattr(category, "label", "") or "")
+
+
+def _maybe_rerun() -> None:
+    """Rerun only inside a live Streamlit script (no-op in unit tests)."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # noqa: BLE001
+        return
+    if get_script_run_ctx() is None:
+        return
+    st.rerun()
+
+
+def _auto_place(ticker: str) -> None:
+    """Drop a pick into the next compare slot and advance (no Assign button)."""
+    symbol = normalize_ticker(ticker)
+    if not symbol:
+        return
+    if "slots" not in st.session_state:
+        st.session_state.slots = list(DEFAULT_SLOTS)
+    if "active_slot" not in st.session_state:
+        st.session_state.active_slot = default_active_slot(
+            list(st.session_state.slots)
+        )
+    updated, nxt = place_search_match(
+        list(st.session_state.slots), int(st.session_state.active_slot), symbol
+    )
+    st.session_state.slots = updated
+    st.session_state.active_slot = nxt
+    # Drop Search + match/Use widgets on the next run (cannot mutate the
+    # ticker_query widget after it already exists on this run).
+    st.session_state["_clear_search"] = True
+    _maybe_rerun()
+
+
+def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
+    """Categories → Search(+matches) → Use strip.
+
+    Chip click writes ``ticker_query`` before the Search box is created so
+    matches and Use chips appear on this run — no Enter, no extra rerun.
+    After a successful place, ``_clear_search`` empties the box first so
+    match/Use buttons are not created.
+    """
+    if st.session_state.get("_clear_search"):
+        st.session_state["_clear_search"] = False
+        st.session_state.ticker_query = ""
+
+    chip_cats = browse_categories(catalog)
+    chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
+    for index, cat in enumerate(chip_cats):
+        with chip_cols[index]:
+            if st.button(
+                chip_display_label(cat.label),
+                key=f"cat_chip_{cat.id}",
+                use_container_width=True,
+            ):
+                st.session_state.ticker_query = chip_query(cat)
+
+    query = st.text_input(
+        "Search",
+        placeholder="Ticker, name, or category",
+        label_visibility="visible",
+        key="ticker_query",
+    )
+    matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
+    if matches:
+        for opt in matches:
+            if st.button(
+                format_option(opt),
+                key=f"search_match_{opt.symbol}",
+                use_container_width=True,
+            ):
+                _auto_place(opt.symbol)
+    elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
+        st.caption("No directory matches — type a ticker or tap a category.")
+
+    # Use chips only after a search/category match — no idle catalog strip.
+    candidates = list(matches[:USE_STRIP_LIMIT]) if matches else []
+    if candidates:
+        use_cols = st.columns(len(candidates), gap="small")
+        for index, opt in enumerate(candidates):
+            with use_cols[index]:
+                if st.button(
+                    f"Use {opt.symbol}",
+                    key=f"use_strip_{opt.symbol}",
+                    use_container_width=True,
+                ):
+                    _auto_place(opt.symbol)
+
+    if use_fixtures:
+        st.caption(
+            "Fixture catalog: "
+            + ", ".join(FIXTURE_TICKERS)
+            + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or a category "
+            "(oil, AI, real estate, auto), then click a match or Use chip."
+        )
+    else:
+        st.caption(
+            "Live mode: the cached CMC RWA map is the directory. "
+            "Prefix-match ticker/name or tap a category, then click a match."
+        )
+
+
 def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
     """Directory the scorer already loads (live CMC map or fixture map)."""
-    return load_search_catalog(scorer.client)
+    cached = getattr(scorer, "_search_catalog", None)
+    if cached is not None:
+        return cached
+    catalog = load_search_catalog(scorer.client)
+    scorer._search_catalog = catalog
+    return catalog
 
 
-def _score_card_html(report: dict, *, selected: bool = False) -> str:
-    """Build the compact score card. Dynamic fields are HTML-escaped."""
-    band = report["band"]
-    color = BAND_COLORS.get(band, "#8B949E")
-    ring = "3px" if selected else "2px"
-    selected_attr = " selected" if selected else ""
-    ticker = html.escape(str(report["ticker"]))
-    issuer = html.escape(str(report["issuer"]))
-    summary = html.escape(str(report["summary"]))
-    band_label = html.escape(str(report["band_label"]))
-    return f"""
-        <div class="score-hero compact{selected_attr}" style="border-color:{color};border-width:{ring}">
-          <div class="score-num">{report['score']:.1f}</div>
-          <div class="score-meta">
-            <div class="band" style="color:{color}">{band_label}</div>
-            <div class="issuer">{ticker} · {issuer}</div>
-            <div class="summary">{summary}</div>
-          </div>
-        </div>
-        """
-
-
-def _error_card_html(ticker: str, message: str, *, selected: bool = False) -> str:
-    """Build the unavailable-slot card. Dynamic fields are HTML-escaped."""
-    ring = " selected" if selected else ""
-    safe_ticker = html.escape(ticker or "Empty slot")
-    safe_message = html.escape(message)
-    return f"""
-        <div class="score-hero compact error{ring}">
-          <div class="score-num">—</div>
-          <div class="score-meta">
-            <div class="band" style="color:#E5484D">Unavailable</div>
-            <div class="issuer">{safe_ticker}</div>
-            <div class="summary">{safe_message}</div>
-          </div>
-        </div>
-        """
+def chip_display_label(label: str) -> str:
+    """Chip text: spaces around slashes so wrap cannot split a word."""
+    return (label or "").replace("/", " / ")
 
 
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
@@ -285,14 +441,8 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
         st.info(bundle.x_message)
 
 
-def _render_compare_card(
-    report: dict, *, selected: bool = False, slot_index: int = 0
-) -> None:
-    st.markdown(
-        _score_card_html(report, selected=selected),
-        unsafe_allow_html=True,
-    )
-
+def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
+    """Share + explainer + pillars — unused on Score/Compare this PR."""
     if report.get("data_source") == "fixture":
         st.caption("Demo fixture data — not a live CoinMarketCap API response.")
     else:
@@ -316,12 +466,6 @@ def _render_compare_card(
             "Cross-issuer basis: only one wrapper on CMC market-pairs — no issuer compare."
         )
 
-    metric_bits = []
-    for key in WEIGHTS:
-        meta = PILLARS[key]
-        metric_bits.append(f"**{meta['label']}** {report['subscores'][key]:.0f}")
-    st.markdown(" · ".join(metric_bits))
-
     flags = report.get("flags") or []
     if flags:
         for flag in flags:
@@ -331,7 +475,6 @@ def _render_compare_card(
 
     _render_share_controls(report, slot_index=slot_index)
 
-    st.markdown("**Why this score?**")
     st.write(_cached_explanation(report))
     st.caption(AI_FOOTNOTE)
 
@@ -339,22 +482,11 @@ def _render_compare_card(
         for key in WEIGHTS:
             meta = PILLARS[key]
             badge_label, evidence = _verification_badge_label(key, report)
-            color = VERIFICATION_BADGE_COLORS.get(
-                (report.get("verification") or {}).get(key, {}).get("level"),
-                "#8B949E",
-            )
-            if "heuristic fallback" in badge_label:
-                color = VERIFICATION_BADGE_COLORS["heuristic fallback"]
             st.markdown(
                 f"**{meta['label']}** — {report['subscores'][key]:.0f}/100 "
                 f"(weight {WEIGHTS[key]:.0%})"
             )
-            st.markdown(
-                f'<span style="display:inline-block;padding:0.15rem 0.5rem;'
-                f'border-radius:999px;border:1px solid {color};color:{color};'
-                f'font-size:0.8rem;">{badge_label}</span>',
-                unsafe_allow_html=True,
-            )
+            st.caption(badge_label)
             st.caption(meta["what"])
             st.caption(f"Evidence: {evidence}")
             st.write(report["explanations"][key])
@@ -366,132 +498,49 @@ def _render_compare_card(
                 st.info(note)
 
 
+def _render_compare_card(
+    report: dict, *, selected: bool = False, slot_index: int = 0
+) -> None:
+    """Ticker + one metric (score/band). No progress bars or expanders."""
+    del slot_index
+    ticker = str(report.get("ticker") or "")
+    if selected:
+        ticker = f"● {ticker}"
+    band = str(report.get("band_label") or report.get("band") or "")
+    score = float(report.get("score") or 0)
+    st.metric(ticker, f"{score:.1f}", band)
+
+
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
-    st.markdown(
-        _error_card_html(ticker, message, selected=selected),
-        unsafe_allow_html=True,
-    )
+    label = ticker or "Empty slot"
+    if selected:
+        label = f"● {label}"
+    st.metric(label, "—", "Unavailable")
     st.error(message)
+
+
+def _render_empty_slot(*, selected: bool = False) -> None:
+    title = "● Empty slot" if selected else "Empty slot"
+    st.metric(title, "—")
+    st.caption("Pick a ticker to compare here.")
 
 
 st.markdown(
     """
     <style>
-      .rat-brand { margin: 0 0 0.35rem; }
-      .rat-brand-row { display: flex; align-items: center; gap: 0.75rem; }
-      .rat-chip {
-        width: 36px; height: 36px; flex: 0 0 36px;
-        border-radius: 10px; overflow: hidden;
-        border: 1px solid rgba(61, 220, 151, 0.35);
-        background: #161B22;
-      }
-      .rat-chip img { width: 36px; height: 36px; display: block; }
-      .rat-titles h1 {
-        margin: 0; padding: 0;
-        font-size: 2.05rem; font-weight: 700; line-height: 1.1;
-        color: #E6EDF3; letter-spacing: -0.02em;
-      }
-      .rat-sub {
-        margin: 0.2rem 0 0;
-        color: #8b949e;
-        font-size: 0.95rem;
-        font-weight: 500;
-      }
-      .rat-tagline {
-        margin: 0.55rem 0 0.15rem;
-        color: #8b949e;
-        font-size: 0.95rem;
-      }
-      .mode-chip {
-        display: inline-flex; align-items: center;
-        border: 1px solid #3DDC97;
-        color: #3DDC97;
-        background: transparent;
-        border-radius: 999px;
-        padding: 0.18rem 0.72rem;
-        font-size: 0.75rem;
-        font-weight: 600;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-      }
-      .score-hero {
-        position: relative;
-        isolation: isolate;
-        overflow: hidden;
-        display: flex; gap: 1.5rem; align-items: center;
-        border: 2px solid #30363d; border-radius: 16px;
-        padding: 1.25rem 1.5rem; margin: 0.5rem 0 1.25rem;
-        background: #161b22;
-      }
-      .score-hero::before {
-        content: "";
-        position: absolute;
-        inset: -35% -10% -35% -25%;
-        pointer-events: none;
-        z-index: 0;
-        background:
-          radial-gradient(circle at 28% 48%, transparent 16%, rgba(61,220,151,0.12) 17%, transparent 18%),
-          radial-gradient(circle at 28% 48%, transparent 30%, rgba(61,220,151,0.10) 31%, transparent 32%),
-          radial-gradient(circle at 28% 48%, transparent 44%, rgba(61,220,151,0.08) 45%, transparent 46%);
-      }
-      .score-hero > * { position: relative; z-index: 1; }
-      .score-hero.compact {
-        flex-direction: column; align-items: flex-start; gap: 0.35rem;
-        padding: 0.85rem 1rem; margin: 0.25rem 0 0.75rem; min-height: 10.5rem;
-      }
-      .score-hero.compact.selected { box-shadow: 0 0 0 1px #3DDC97 inset; }
-      .score-hero.compact.error { border-color: #E5484D; }
-      .score-num { font-size: 4rem; font-weight: 700; line-height: 1; }
-      .score-hero.compact .score-num { font-size: 2.35rem; }
-      .band { font-size: 1.15rem; font-weight: 600; }
-      .score-hero.compact .band { font-size: 0.95rem; }
-      .issuer { color: #8b949e; margin-top: 0.25rem; }
-      .summary { margin-top: 0.35rem; }
-      .score-hero.compact .summary { font-size: 0.85rem; }
-      /* Light outline — same family as category chip (secondary) buttons */
-      div[data-testid="stTextInput"] [data-baseweb="input"],
-      div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+      /* Minimal light Search border — no score-card HTML, no anchor CSS. */
+      div[data-testid="stTextInput"] [data-baseweb="input"] {
         border: 1px solid rgba(250, 250, 250, 0.2) !important;
-        border-radius: 0.5rem !important;
-        background-color: transparent !important;
         box-shadow: none !important;
-      }
-      .search-assign-spacer {
-        margin: 0 0 0.25rem;
-        font-size: 0.875rem;
-        line-height: 1.25;
-        min-height: 1.25rem;
       }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-_monogram_uri = (
-    _asset_data_uri(MONOGRAM_PATH)
-    or _asset_data_uri(ASSETS_DIR / "rat-icon-192.png")
-    or _asset_data_uri(ASSETS_DIR / "rat-monogram.svg")
-)
-_chip_html = (
-    f'<div class="rat-chip"><img src="{_monogram_uri}" alt="" width="36" height="36" /></div>'
-    if _monogram_uri
-    else '<div class="rat-chip" aria-hidden="true"></div>'
-)
-st.markdown(
-    f"""
-    <div class="rat-brand">
-      <div class="rat-brand-row">
-        {_chip_html}
-        <div class="rat-titles">
-          <h1>{BRAND_H1}</h1>
-          <p class="rat-sub">{BRAND_SUB}</p>
-        </div>
-      </div>
-      <p class="rat-tagline">{TAGLINE}</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.header(BRAND_H1)
+st.caption(BRAND_SUB)
+st.caption(TAGLINE)
 
 default_fixtures = env_flag("RWA_USE_FIXTURES") or not os.getenv("CMC_API_KEY")
 
@@ -526,10 +575,7 @@ with st.sidebar:
     st.caption("These do not replace the Disclaimer.")
 
 mode_label = "Fixture" if use_fixtures else "Live"
-st.markdown(
-    f'<div class="mode-chip" title="Data mode">{mode_label}</div>',
-    unsafe_allow_html=True,
-)
+st.caption(f"Mode: {mode_label}")
 
 try:
     scorer = _cached_scorer(use_fixtures)
@@ -543,131 +589,61 @@ _ensure_slot_state()
 
 st.subheader("Score / Compare")
 st.caption(
-    "Compact search assigns a ticker into one of the four slots. "
-    "Type a ticker/name prefix (3+ chars) or a category (oil, AI, real estate). "
-    "All four compare side by side in one row."
+    "Browse a category, type a ticker or name (3+ chars), then click a match "
+    "or a Use chip. Click a slot to choose which one the next pick replaces."
 )
 
 catalog = _ticker_catalog(scorer)
+_render_search_picker(catalog, use_fixtures)
 
-# Chip click sets the search box on the next run (must happen before text_input).
-if "pending_ticker_query" in st.session_state:
-    st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
-
-search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
-with search_col:
-    query = st.text_input(
-        "Search",
-        placeholder="Ticker, name, or category…",
-        label_visibility="visible",
-        key="ticker_query",
-    )
-with assign_col:
-    st.markdown(
-        '<p class="search-assign-spacer">&nbsp;</p>',
-        unsafe_allow_html=True,
-    )
-    assign_clicked = st.button("Assign", type="primary", use_container_width=True)
-
-CHIP_QUERIES = {
-    "ai_tech": "AI",
-    "oil_energy": "oil",
-    "real_estate": "real estate",
-    "auto_ev": "auto",
-}
-chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
-chip_cols = st.columns([0.7] * len(chip_cats) + [2.2], gap="small")
-for index, cat in enumerate(chip_cats):
-    with chip_cols[index]:
-        if st.button(
-            cat.label,
-            key=f"cat_chip_{cat.id}",
-            use_container_width=True,
-        ):
-            st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
-            st.rerun()
-
-typed = normalize_ticker(query)
-matches = search_tickers(query, catalog)
-picked_symbol: str | None = None
-if matches:
-    pick_col, _pick_pad = st.columns([1.7, 3.3], gap="small")
-    with pick_col:
-        labels = [format_option(opt) for opt in matches]
-        label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
-        chosen = st.selectbox(
-            "Matching tickers",
-            options=labels,
-            index=0,
-            label_visibility="collapsed",
-            key=f"ticker_pick_{typed or query.strip().lower()}",
-        )
-        picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
-elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
-    st.caption("No directory matches — Assign uses the typed ticker.")
-
-to_assign = resolve_assign_symbol(
-    query, matches=matches, selected_symbol=picked_symbol
-)
-
-if use_fixtures:
-    st.caption(
-        "Fixture catalog: "
-        + ", ".join(FIXTURE_TICKERS)
-        + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or category "
-        "(oil, AI, real estate, auto). Unknown tickers error in that slot."
-    )
-else:
-    st.caption(
-        "Live mode: the cached CMC RWA map is the directory. "
-        "Prefix-match ticker/name or type a category, then Assign into a slot."
-    )
-
-if assign_clicked:
-    if to_assign:
-        _place_in_slot(to_assign, int(st.session_state.active_slot))
-    else:
-        st.info("Type a ticker, then Assign — or click a slot to place it.")
-
-if to_assign:
-    if st.button(f"Use {to_assign}", key="use_typed_ticker"):
-        _place_in_slot(to_assign, int(st.session_state.active_slot))
+active = int(st.session_state.active_slot)
+target = next_place_index(list(st.session_state.slots), active)
+target_symbol = st.session_state.slots[target]
 
 slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
 for index, symbol in enumerate(st.session_state.slots):
     with slot_cols[index]:
-        selected = index == int(st.session_state.active_slot)
-        label = f"● {symbol}" if selected else symbol
+        selected = index == target
+        slot_label = symbol or f"Slot {index + 1}"
+        label = f"● {slot_label}" if selected else slot_label
         if st.button(
             label,
             key=f"slot_{index}",
             type="primary" if selected else "secondary",
             use_container_width=True,
         ):
-            if to_assign:
-                _place_in_slot(to_assign, index)
-            else:
-                st.session_state.active_slot = index
-            st.rerun()
+            st.session_state.active_slot = index
 
 active = int(st.session_state.active_slot)
-active_symbol = st.session_state.slots[active]
-st.caption(
-    f"Selected slot {active + 1} · **{active_symbol}** — next search replaces this name."
-)
+target = next_place_index(list(st.session_state.slots), active)
+target_symbol = st.session_state.slots[target]
+if target_symbol:
+    st.caption(
+        f"Next pick replaces slot {target + 1} · **{target_symbol}**. "
+        "Click a slot to change the target."
+    )
+else:
+    st.caption(
+        f"Next pick fills slot {target + 1}. "
+        "When the row is full, the highlighted slot is replaced."
+    )
 
 results = _score_slots(scorer, list(st.session_state.slots))
 
-compare_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
-for col, (symbol, report, error), index in zip(
-    compare_cols, results, range(MAX_COMPARE_SLOTS)
-):
-    with col:
-        selected = index == int(st.session_state.active_slot)
-        if error or report is None:
-            _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
-        else:
-            _render_compare_card(report, selected=selected, slot_index=index)
+# Hide empty compare boxes until a ticker is assigned; filled slots stay in one row.
+if any(symbol for symbol, _report, _error in results):
+    compare_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
+    for col, (symbol, report, error), index in zip(
+        compare_cols, results, range(MAX_COMPARE_SLOTS)
+    ):
+        with col:
+            selected = index == target
+            if not symbol:
+                _render_empty_slot(selected=selected)
+            elif error or report is None:
+                _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
+            else:
+                _render_compare_card(report, selected=selected, slot_index=index)
 
 ok_reports = [report for _symbol, report, error in results if report is not None and not error]
 if ok_reports:
