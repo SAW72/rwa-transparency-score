@@ -246,10 +246,10 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert "cat_chip_" in source
     assert "real estate" in source.lower()
     assert "Ticker, name, or category" in source
-    assert 'st.text_input(\n            "Search"' in source
+    assert 'st.text_input(\n        "Search"' in source
     assert "Ticker search" not in source
-    assert "st.container" in source
-    assert "border=True" in source
-    assert "Browse categories" in source
-    assert 'stVerticalBlockBorderWrapper' in source
+    assert 'label_visibility="visible"' in source
     assert "stTextInput" in source
+    assert "rgba(250, 250, 250, 0.2)" in source
+    assert "stVerticalBlockBorderWrapper" not in source
+    assert "border=True" not in source
