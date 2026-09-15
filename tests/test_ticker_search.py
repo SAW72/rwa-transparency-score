@@ -226,6 +226,9 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search-match-anchor" in source
     assert "use-strip-anchor" in source
     assert "Use {opt.symbol}" in source or 'f"Use {opt.symbol}"' in source
+    assert "on_click=_auto_place" in source
+    assert "@st.fragment" in source
+    assert "_render_search_picker" in source
     assert 'st.button("Assign"' not in source
     assert "assign_clicked" not in source
     assert "search-assign-anchor" not in source
@@ -254,12 +257,15 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     )
     assert slots[1] == "XOM"
 
-    # Categories sit above Search in the Score / Compare body (CSS may mention
-    # the same class names earlier).
+    # Categories sit above Search in the picker fragment (CSS may mention
+    # the same class names earlier). Compare cards stay outside that fragment.
+    picker = source.split("def _render_search_picker", 1)[1]
+    assert picker.index("cat-chip-anchor") < picker.index("search-combobox-anchor")
+    assert picker.index("search-combobox-anchor") < picker.index("search-match-anchor")
+    assert picker.index("search-match-anchor") < picker.index("use-strip-anchor")
     body = source.split('st.subheader("Score / Compare")', 1)[1]
-    assert body.index("cat-chip-anchor") < body.index("search-combobox-anchor")
-    assert body.index("search-combobox-anchor") < body.index("search-match-anchor")
-    assert body.index("search-match-anchor") < body.index("use-strip-anchor")
+    assert "_render_search_picker(catalog, use_fixtures)" in body
+    assert "search_match_" not in body.split("_render_search_picker", 1)[0]
     assert "cat_chip_" in source
     assert "Ticker, name, or category" in source
     assert 'placeholder="Ticker, name, or category"' in source
@@ -317,6 +323,10 @@ def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
     assert replaced[1] == "NVDA"
     assert replaced[0] == "NVDA"
     assert nxt == 2
+    # Match row and Use chip both bind the same on_click helper.
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "on_click=_auto_place" in source
+    assert source.count("on_click=_auto_place") >= 2
 
 
 def test_oil_typeahead_match_places_xom() -> None:

@@ -273,6 +273,88 @@ def _auto_place(ticker: str) -> None:
     st.session_state.active_slot = nxt
 
 
+@st.fragment
+def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
+    """Categories → Search(+matches) → Use strip. Keystrokes stay in this fragment.
+
+    Match rows and Use chips share ``_auto_place`` (same slot-fill helper). A
+    successful click full-reruns the app so compare cards refresh; typing does
+    not remount those cards.
+    """
+    if "pending_ticker_query" in st.session_state:
+        st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
+
+    chip_cats = browse_categories(catalog)
+    st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
+    chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
+    for index, cat in enumerate(chip_cats):
+        with chip_cols[index]:
+            if st.button(
+                chip_display_label(cat.label),
+                key=f"cat_chip_{cat.id}",
+                use_container_width=True,
+            ):
+                st.session_state.pending_ticker_query = chip_query(cat)
+                st.rerun(scope="fragment")
+
+    st.markdown('<div class="search-combobox-anchor"></div>', unsafe_allow_html=True)
+    query = st.text_input(
+        "Search",
+        placeholder="Ticker, name, or category",
+        label_visibility="visible",
+        key="ticker_query",
+    )
+    matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
+    if matches:
+        st.markdown('<div class="search-match-anchor"></div>', unsafe_allow_html=True)
+        for opt in matches:
+            if st.button(
+                format_option(opt),
+                key=f"search_match_{opt.symbol}",
+                use_container_width=True,
+                on_click=_auto_place,
+                args=(opt.symbol,),
+            ):
+                st.rerun()
+    elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
+        st.caption("No directory matches — type a ticker or tap a Use chip.")
+
+    if matches:
+        candidates = matches
+    elif not (query or "").strip():
+        candidates = list(catalog[:CANDIDATE_STRIP_LIMIT])
+    else:
+        candidates = []
+    if candidates:
+        st.markdown('<div class="use-strip-anchor"></div>', unsafe_allow_html=True)
+        for row_start in range(0, min(len(candidates), CANDIDATE_STRIP_LIMIT), 5):
+            row = candidates[row_start : row_start + 5]
+            use_cols = st.columns(5, gap="small")
+            for index, opt in enumerate(row):
+                with use_cols[index]:
+                    if st.button(
+                        f"Use {opt.symbol}",
+                        key=f"use_strip_{opt.symbol}_{row_start}",
+                        use_container_width=True,
+                        on_click=_auto_place,
+                        args=(opt.symbol,),
+                    ):
+                        st.rerun()
+
+    if use_fixtures:
+        st.caption(
+            "Fixture catalog: "
+            + ", ".join(FIXTURE_TICKERS)
+            + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or category "
+            "(oil, AI, real estate, auto)."
+        )
+    else:
+        st.caption(
+            "Live mode: the cached CMC RWA map is the directory. "
+            "Prefix-match ticker/name or tap a category, then click a match."
+        )
+
+
 def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
     """Directory the scorer already loads (live CMC map or fixture map)."""
     cached = getattr(scorer, "_search_catalog", None)
@@ -684,81 +766,7 @@ st.caption(
 )
 
 catalog = _ticker_catalog(scorer)
-
-# Chip click sets the search box on the next run (must happen before text_input).
-if "pending_ticker_query" in st.session_state:
-    st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
-
-# 1) Categories first — expand when the live/fixture map has more buckets.
-chip_cats = browse_categories(catalog)
-st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
-chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
-for index, cat in enumerate(chip_cats):
-    with chip_cols[index]:
-        if st.button(
-            chip_display_label(cat.label),
-            key=f"cat_chip_{cat.id}",
-            use_container_width=True,
-        ):
-            st.session_state.pending_ticker_query = chip_query(cat)
-            st.rerun()
-
-# 2) Search — matches are the same click-to-place path as Use chips. No Assign.
-st.markdown('<div class="search-combobox-anchor"></div>', unsafe_allow_html=True)
-query = st.text_input(
-    "Search",
-    placeholder="Ticker, name, or category",
-    label_visibility="visible",
-    key="ticker_query",
-)
-matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
-if matches:
-    st.markdown('<div class="search-match-anchor"></div>', unsafe_allow_html=True)
-    for opt in matches:
-        if st.button(
-            format_option(opt),
-            key=f"search_match_{opt.symbol}",
-            use_container_width=True,
-        ):
-            _auto_place(opt.symbol)
-            st.rerun()
-elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
-    st.caption("No directory matches — type a ticker or tap a Use chip.")
-
-# 3) ~10 candidate Use chips — pick 4 of ~10 into the compare row.
-if matches:
-    candidates = matches
-elif not (query or "").strip():
-    candidates = list(catalog[:CANDIDATE_STRIP_LIMIT])
-else:
-    candidates = []
-if candidates:
-    st.markdown('<div class="use-strip-anchor"></div>', unsafe_allow_html=True)
-    for row_start in range(0, min(len(candidates), CANDIDATE_STRIP_LIMIT), 5):
-        row = candidates[row_start : row_start + 5]
-        use_cols = st.columns(5, gap="small")
-        for index, opt in enumerate(row):
-            with use_cols[index]:
-                if st.button(
-                    f"Use {opt.symbol}",
-                    key=f"use_strip_{opt.symbol}_{row_start}",
-                    use_container_width=True,
-                ):
-                    _auto_place(opt.symbol)
-                    st.rerun()
-
-if use_fixtures:
-    st.caption(
-        "Fixture catalog: "
-        + ", ".join(FIXTURE_TICKERS)
-        + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or category "
-        "(oil, AI, real estate, auto)."
-    )
-else:
-    st.caption(
-        "Live mode: the cached CMC RWA map is the directory. "
-        "Prefix-match ticker/name or tap a category, then click a match."
-    )
+_render_search_picker(catalog, use_fixtures)
 
 slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
 for index, symbol in enumerate(st.session_state.slots):
