@@ -448,6 +448,21 @@ st.markdown(
       .issuer { color: #8b949e; margin-top: 0.25rem; }
       .summary { margin-top: 0.35rem; }
       .score-hero.compact .summary { font-size: 0.85rem; }
+      /* Search, category browse, matching-ticker picker: read as fields */
+      [data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid #6e7681 !important;
+        border-radius: 10px !important;
+        padding: 0.45rem 0.7rem !important;
+        background-color: #161B22;
+      }
+      div[data-testid="stTextInput"] [data-baseweb="input"] {
+        border: 1px solid #6e7681 !important;
+        border-radius: 8px !important;
+      }
+      div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+        border: 1px solid #6e7681 !important;
+        border-radius: 8px !important;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -542,13 +557,16 @@ if "pending_ticker_query" in st.session_state:
 
 search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
 with search_col:
-    query = st.text_input(
-        "Ticker search",
-        placeholder="Ticker, name, or category…",
-        label_visibility="collapsed",
-        key="ticker_query",
-    )
+    with st.container(border=True):
+        st.caption("Search")
+        query = st.text_input(
+            "Search",
+            placeholder="Ticker, name, or category…",
+            label_visibility="collapsed",
+            key="ticker_query",
+        )
 with assign_col:
+    st.caption("\u00a0")
     assign_clicked = st.button("Assign", type="primary", use_container_width=True)
 
 CHIP_QUERIES = {
@@ -558,16 +576,20 @@ CHIP_QUERIES = {
     "auto_ev": "auto",
 }
 chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
-chip_cols = st.columns([0.7] * len(chip_cats) + [2.2], gap="small")
-for index, cat in enumerate(chip_cats):
-    with chip_cols[index]:
-        if st.button(
-            cat.label,
-            key=f"cat_chip_{cat.id}",
-            use_container_width=True,
-        ):
-            st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
-            st.rerun()
+browse_col, _browse_pad = st.columns([2.8, 2.2], gap="small")
+with browse_col:
+    with st.container(border=True):
+        st.caption("Browse categories")
+        chip_cols = st.columns(len(chip_cats), gap="small")
+        for index, cat in enumerate(chip_cats):
+            with chip_cols[index]:
+                if st.button(
+                    cat.label,
+                    key=f"cat_chip_{cat.id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
+                    st.rerun()
 
 typed = normalize_ticker(query)
 matches = search_tickers(query, catalog)
@@ -575,16 +597,17 @@ picked_symbol: str | None = None
 if matches:
     pick_col, _pick_pad = st.columns([1.7, 3.3], gap="small")
     with pick_col:
-        labels = [format_option(opt) for opt in matches]
-        label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
-        chosen = st.selectbox(
-            "Matching tickers",
-            options=labels,
-            index=0,
-            label_visibility="collapsed",
-            key=f"ticker_pick_{typed or query.strip().lower()}",
-        )
-        picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
+        with st.container(border=True):
+            labels = [format_option(opt) for opt in matches]
+            label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
+            chosen = st.selectbox(
+                "Matching tickers",
+                options=labels,
+                index=0,
+                label_visibility="collapsed",
+                key=f"ticker_pick_{typed or query.strip().lower()}",
+            )
+            picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
 elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
     st.caption("No directory matches — Assign uses the typed ticker.")
 
