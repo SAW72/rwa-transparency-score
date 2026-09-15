@@ -287,6 +287,17 @@ def chip_query(category) -> str:
     return str(words[0] if words else getattr(category, "label", "") or "")
 
 
+def _maybe_rerun() -> None:
+    """Rerun only inside a live Streamlit script (no-op in unit tests)."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # noqa: BLE001
+        return
+    if get_script_run_ctx() is None:
+        return
+    st.rerun()
+
+
 def _auto_place(ticker: str) -> None:
     """Drop a pick into the next compare slot and advance (no Assign button)."""
     symbol = normalize_ticker(ticker)
@@ -303,6 +314,10 @@ def _auto_place(ticker: str) -> None:
     )
     st.session_state.slots = updated
     st.session_state.active_slot = nxt
+    # Drop Search + match/Use widgets on the next run (cannot mutate the
+    # ticker_query widget after it already exists on this run).
+    st.session_state["_clear_search"] = True
+    _maybe_rerun()
 
 
 def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
@@ -310,7 +325,13 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
 
     Chip click writes ``ticker_query`` before the Search box is created so
     matches and Use chips appear on this run — no Enter, no extra rerun.
+    After a successful place, ``_clear_search`` empties the box first so
+    match/Use buttons are not created.
     """
+    if st.session_state.get("_clear_search"):
+        st.session_state["_clear_search"] = False
+        st.session_state.ticker_query = ""
+
     chip_cats = browse_categories(catalog)
     chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
     for index, cat in enumerate(chip_cats):
@@ -480,20 +501,14 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
 def _render_compare_card(
     report: dict, *, selected: bool = False, slot_index: int = 0
 ) -> None:
-    """Native metric + progress. No explainer on this page (crash surface)."""
+    """Ticker + one metric (score/band). No progress bars or expanders."""
     del slot_index
     ticker = str(report.get("ticker") or "")
-    issuer = str(report.get("issuer") or "")
-    label = f"{ticker} · {issuer}" if issuer else ticker
     if selected:
-        label = f"● {label}"
+        ticker = f"● {ticker}"
     band = str(report.get("band_label") or report.get("band") or "")
     score = float(report.get("score") or 0)
-    st.metric(label, f"{score:.1f}", band)
-    summary = str(report.get("summary") or "")
-    if summary:
-        st.caption(summary)
-    st.progress(min(max(score / 100.0, 0.0), 1.0))
+    st.metric(ticker, f"{score:.1f}", band)
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:

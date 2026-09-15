@@ -236,7 +236,9 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.CANDIDATE_STRIP_LIMIT == 4
     assert "catalog[:USE_STRIP_LIMIT]" not in source
     assert "st.metric" in source
-    assert "st.progress" in source
+    assert "st.progress" not in source.split("def _render_compare_card", 1)[1].split(
+        "def _render_slot_error", 1
+    )[0]
     assert "_score_card_html" not in source
     assert "score-hero" not in source
     assert demo_app.normalize_ticker is normalize_ticker
@@ -263,6 +265,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert slots[1] == "XOM"
 
     picker = source.split("def _render_search_picker", 1)[1]
+    assert picker.index("_clear_search") < picker.index("cat_chip_")
     assert picker.index("cat_chip_") < picker.index(
         'placeholder="Ticker, name, or category"'
     )
@@ -291,6 +294,8 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.chip_query(CATEGORIES[0]) == "ai"
     assert demo_app.chip_query(CATEGORIES[1]) == "oil"
     assert "st.session_state.ticker_query = chip_query(cat)" in source
+    assert 'st.session_state.ticker_query = ""' in source
+    assert "_clear_search" in source
     assert "pending_ticker_query" not in source
     assert "Why this score?" not in source
     assert "st.form" not in source
@@ -429,3 +434,4 @@ def test_place_and_auto_place_do_not_score(monkeypatch) -> None:
     demo_app._auto_place("XOM")
     assert demo_app.st.session_state.slots[0] == "XOM"
     assert demo_app.st.session_state.active_slot == 1
+    assert demo_app.st.session_state["_clear_search"] is True
