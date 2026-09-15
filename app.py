@@ -230,6 +230,11 @@ def _score_card_html(report: dict, *, selected: bool = False) -> str:
         """
 
 
+def chip_display_label(label: str) -> str:
+    """Chip text: spaces around slashes so wrap cannot split a word."""
+    return (label or "").replace("/", " / ")
+
+
 def _error_card_html(ticker: str, message: str, *, selected: bool = False) -> str:
     """Build the unavailable-slot card. Dynamic fields are HTML-escaped."""
     ring = " selected" if selected else ""
@@ -243,6 +248,17 @@ def _error_card_html(ticker: str, message: str, *, selected: bool = False) -> st
             <div class="issuer">{safe_ticker}</div>
             <div class="summary">{safe_message}</div>
           </div>
+        </div>
+        """
+
+
+def _empty_slot_html(*, selected: bool = False) -> str:
+    """Dashed ghost for an unfilled compare column — not a solid empty box."""
+    ring = " selected" if selected else ""
+    return f"""
+        <div class="score-hero compact ghost{ring}">
+          <div class="ghost-label">Empty slot</div>
+          <div class="summary">Assign a ticker to compare here.</div>
         </div>
         """
 
@@ -374,6 +390,10 @@ def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> 
     st.error(message)
 
 
+def _render_empty_slot(*, selected: bool = False) -> None:
+    st.markdown(_empty_slot_html(selected=selected), unsafe_allow_html=True)
+
+
 st.markdown(
     """
     <style>
@@ -441,6 +461,18 @@ st.markdown(
       }
       .score-hero.compact.selected { box-shadow: 0 0 0 1px #3DDC97 inset; }
       .score-hero.compact.error { border-color: #E5484D; }
+      .score-hero.compact.ghost {
+        border: 1px dashed rgba(250, 250, 250, 0.2);
+        background: transparent;
+        min-height: 4.5rem;
+        box-shadow: none;
+      }
+      .score-hero.compact.ghost::before { display: none; }
+      .score-hero.compact.ghost .ghost-label {
+        color: #8b949e;
+        font-size: 0.9rem;
+        font-weight: 600;
+      }
       .score-num { font-size: 4rem; font-weight: 700; line-height: 1; }
       .score-hero.compact .score-num { font-size: 2.35rem; }
       .band { font-size: 1.15rem; font-weight: 600; }
@@ -462,6 +494,45 @@ st.markdown(
         line-height: 1.25;
         min-height: 1.25rem;
       }
+      /* Assign: horizontal pill, single-line, match Search input height */
+      .search-assign-anchor + div [data-testid="stButton"] button {
+        white-space: nowrap !important;
+        writing-mode: horizontal-tb !important;
+        text-orientation: mixed !important;
+        min-height: 2.5rem !important;
+        height: 2.5rem !important;
+        border-radius: 999px !important;
+        padding: 0 1.15rem !important;
+        overflow: visible !important;
+      }
+      .search-assign-anchor + div [data-testid="stButton"] button p,
+      .search-assign-anchor + div [data-testid="stButton"] button div {
+        white-space: nowrap !important;
+        writing-mode: horizontal-tb !important;
+        word-break: keep-all !important;
+      }
+      .search-assign-anchor + div div[data-testid="stTextInput"] [data-baseweb="input"] {
+        min-height: 2.5rem !important;
+      }
+      /* Category chips: grow with nowrap; keep the existing light outline */
+      .cat-chip-anchor + div [data-testid="stButton"] button {
+        white-space: nowrap !important;
+        padding: 0.75rem 1rem !important;
+        min-height: 2.4rem !important;
+        overflow: visible !important;
+      }
+      .cat-chip-anchor + div [data-testid="stButton"] button p,
+      .cat-chip-anchor + div [data-testid="stButton"] button div {
+        white-space: nowrap !important;
+        word-break: keep-all !important;
+        overflow: visible !important;
+      }
+      /* Matching dropdown sits above compare ghosts; 40px click/keyboard rows */
+      div[data-testid="stSelectbox"] { position: relative; z-index: 40; }
+      div[data-testid="stSelectbox"] [data-baseweb="popover"],
+      ul[role="listbox"],
+      [data-baseweb="menu"] { z-index: 60 !important; }
+      [role="option"] { min-height: 40px !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -554,11 +625,13 @@ catalog = _ticker_catalog(scorer)
 if "pending_ticker_query" in st.session_state:
     st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
 
-search_col, assign_col, _pad = st.columns([1.15, 0.55, 3.3], gap="small")
+# Search + Assign on one surface. Assign is a horizontal pill, never vertical text.
+st.markdown('<div class="search-assign-anchor"></div>', unsafe_allow_html=True)
+search_col, assign_col = st.columns([4.2, 1.0], gap="small")
 with search_col:
     query = st.text_input(
         "Search",
-        placeholder="Ticker, name, or category…",
+        placeholder="Ticker, name, or category",
         label_visibility="visible",
         key="ticker_query",
     )
@@ -576,16 +649,20 @@ CHIP_QUERIES = {
     "auto_ev": "auto",
 }
 chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
-chip_cols = st.columns([0.7] * len(chip_cats) + [2.2], gap="small")
-for index, cat in enumerate(chip_cats):
-    with chip_cols[index]:
-        if st.button(
-            cat.label,
-            key=f"cat_chip_{cat.id}",
-            use_container_width=True,
-        ):
-            st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
-            st.rerun()
+# 2×2 siblings of Search — no second bordered cage; labels nowrap + spaced slashes.
+for pair_start in range(0, len(chip_cats), 2):
+    pair = chip_cats[pair_start : pair_start + 2]
+    st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
+    chip_cols = st.columns([1.5, 1.5, 2.0], gap="small")
+    for index, cat in enumerate(pair):
+        with chip_cols[index]:
+            if st.button(
+                chip_display_label(cat.label),
+                key=f"cat_chip_{cat.id}",
+                use_container_width=True,
+            ):
+                st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
+                st.rerun()
 
 typed = normalize_ticker(query)
 matches = search_tickers(query, catalog)
@@ -637,7 +714,8 @@ slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
 for index, symbol in enumerate(st.session_state.slots):
     with slot_cols[index]:
         selected = index == int(st.session_state.active_slot)
-        label = f"● {symbol}" if selected else symbol
+        slot_label = symbol or f"Slot {index + 1}"
+        label = f"● {slot_label}" if selected else slot_label
         if st.button(
             label,
             key=f"slot_{index}",
@@ -652,22 +730,29 @@ for index, symbol in enumerate(st.session_state.slots):
 
 active = int(st.session_state.active_slot)
 active_symbol = st.session_state.slots[active]
-st.caption(
-    f"Selected slot {active + 1} · **{active_symbol}** — next search replaces this name."
-)
+if active_symbol:
+    st.caption(
+        f"Selected slot {active + 1} · **{active_symbol}** — next search replaces this name."
+    )
+else:
+    st.caption(f"Selected slot {active + 1} · empty — next search fills this slot.")
 
 results = _score_slots(scorer, list(st.session_state.slots))
 
-compare_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
-for col, (symbol, report, error), index in zip(
-    compare_cols, results, range(MAX_COMPARE_SLOTS)
-):
-    with col:
-        selected = index == int(st.session_state.active_slot)
-        if error or report is None:
-            _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
-        else:
-            _render_compare_card(report, selected=selected, slot_index=index)
+# Hide empty compare boxes until a ticker is assigned; filled slots stay in one row.
+if any(symbol for symbol, _report, _error in results):
+    compare_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
+    for col, (symbol, report, error), index in zip(
+        compare_cols, results, range(MAX_COMPARE_SLOTS)
+    ):
+        with col:
+            selected = index == int(st.session_state.active_slot)
+            if not symbol:
+                _render_empty_slot(selected=selected)
+            elif error or report is None:
+                _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
+            else:
+                _render_compare_card(report, selected=selected, slot_index=index)
 
 ok_reports = [report for _symbol, report, error in results if report is not None and not error]
 if ok_reports:

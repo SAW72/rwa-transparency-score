@@ -229,6 +229,26 @@ def test_error_card_escapes_html() -> None:
     assert "&lt;script&gt;" in markup
 
 
+def test_empty_slot_is_ghost_not_error_box() -> None:
+    import app as demo_app
+
+    markup = demo_app._empty_slot_html()
+    assert "score-hero compact ghost" in markup
+    assert "Empty slot" in markup
+    assert "error" not in markup
+    selected = demo_app._empty_slot_html(selected=True)
+    assert " selected" in selected
+
+
+def test_score_slots_empty_symbol_does_not_score(fixture_scorer) -> None:
+    import app as demo_app
+
+    results = demo_app._score_slots(fixture_scorer, ["NVDA", "", "AAPL", "META"])
+    assert results[0][1] is not None
+    assert results[1] == ("", None, "Empty slot.")
+    assert results[2][0] == "AAPL"
+
+
 def test_ui_surfaces_sixth_pillar_badge(fixture_scorer) -> None:
     import app as demo_app
     from rwa_score.scorer import PILLARS, WEIGHTS

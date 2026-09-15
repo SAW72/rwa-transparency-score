@@ -246,6 +246,7 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert "cat_chip_" in source
     assert "real estate" in source.lower()
     assert "Ticker, name, or category" in source
+    assert 'placeholder="Ticker, name, or category"' in source
     assert 'st.text_input(\n        "Search"' in source
     assert "Ticker search" not in source
     assert 'label_visibility="visible"' in source
@@ -253,3 +254,15 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert "rgba(250, 250, 250, 0.2)" in source
     assert "stVerticalBlockBorderWrapper" not in source
     assert "border=True" not in source
+    assert "[1.15, 0.55, 3.3]" not in source
+    assert "writing-mode: horizontal-tb" in source
+    assert "white-space: nowrap" in source
+    assert "search-assign-anchor" in source
+    assert "cat-chip-anchor" in source
+    assert "chip_display_label" in source
+    assert "score-hero.compact.ghost" in source
+    assert "1px dashed" in source
+    assert demo_app.chip_display_label("AI/Tech") == "AI / Tech"
+    assert demo_app.chip_display_label("Oil/Energy") == "Oil / Energy"
+    assert demo_app.chip_display_label("Auto/EV") == "Auto / EV"
+    assert demo_app.chip_display_label("Real Estate") == "Real Estate"
