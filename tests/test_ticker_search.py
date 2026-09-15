@@ -289,6 +289,11 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.chip_display_label("Auto/EV") == "Auto / EV"
     assert demo_app.chip_display_label("Real Estate") == "Real Estate"
     assert demo_app.chip_query(CATEGORIES[0]) == "ai"
+    assert demo_app.chip_query(CATEGORIES[1]) == "oil"
+    assert "st.session_state.ticker_query = chip_query(cat)" in source
+    assert "pending_ticker_query" not in source
+    assert "Why this score?" not in source
+    assert "st.form" not in source
 
     shown = demo_app.browse_categories(catalog)
     assert [cat.id for cat in shown] == ["ai_tech", "oil_energy", "real_estate", "auto_ev"]

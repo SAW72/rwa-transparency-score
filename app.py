@@ -35,7 +35,7 @@ from rwa_score.verifiers import VerificationLevel
 from rwa_score.x_client import x_credentials_ready
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
-# Per-symbol wall-clock cache for "Why this score?" — process-local dict.
+# Per-symbol wall-clock cache for the explainer — process-local dict.
 _explain_cache: dict[str, tuple[float, str]] = {}
 
 install_health_route()
@@ -308,12 +308,9 @@ def _auto_place(ticker: str) -> None:
 def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
     """Categories → Search(+matches) → Use strip.
 
-    Match rows and Use chips share ``_auto_place``. One Streamlit rerun per
-    click — no fragment, no on_click, no extra ``st.rerun()``.
+    Chip click writes ``ticker_query`` before the Search box is created so
+    matches and Use chips appear on this run — no Enter, no extra rerun.
     """
-    if "pending_ticker_query" in st.session_state:
-        st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
-
     chip_cats = browse_categories(catalog)
     chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
     for index, cat in enumerate(chip_cats):
@@ -323,7 +320,7 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
                 key=f"cat_chip_{cat.id}",
                 use_container_width=True,
             ):
-                st.session_state.pending_ticker_query = chip_query(cat)
+                st.session_state.ticker_query = chip_query(cat)
 
     query = st.text_input(
         "Search",
@@ -424,7 +421,7 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
 
 
 def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
-    """Share + explainer + pillars — only after the user opens Why this score?"""
+    """Share + explainer + pillars — unused on Score/Compare this PR."""
     if report.get("data_source") == "fixture":
         st.caption("Demo fixture data — not a live CoinMarketCap API response.")
     else:
@@ -483,7 +480,8 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
 def _render_compare_card(
     report: dict, *, selected: bool = False, slot_index: int = 0
 ) -> None:
-    """Native metric card. Explainer is not called until the user asks."""
+    """Native metric + progress. No explainer on this page (crash surface)."""
+    del slot_index
     ticker = str(report.get("ticker") or "")
     issuer = str(report.get("issuer") or "")
     label = f"{ticker} · {issuer}" if issuer else ticker
@@ -496,17 +494,6 @@ def _render_compare_card(
     if summary:
         st.caption(summary)
     st.progress(min(max(score / 100.0, 0.0), 1.0))
-
-    if not selected:
-        return
-
-    why_key = f"explain_{slot_index}_{ticker or 'UNK'}"
-    with st.expander("Why this score?", expanded=False):
-        if st.session_state.get(why_key):
-            _render_card_details(report, slot_index=slot_index)
-        elif st.button("Show explanation", key=f"explain_btn_{slot_index}_{ticker or 'UNK'}"):
-            st.session_state[why_key] = True
-            _render_card_details(report, slot_index=slot_index)
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
