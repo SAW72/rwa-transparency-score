@@ -40,7 +40,8 @@ def test_brand_copy_replaces_old_page_title() -> None:
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert 'page_title="RWA Transparency Score"' not in source
     assert "st.title(" not in source
-    assert 'class="mode-chip"' in source
+    assert "st.header(BRAND_H1)" in source
+    assert 'Mode: {mode_label}' in source or "Mode:" in source
     assert "RTS" not in demo_app.PAGE_TITLE
     assert "RTS" not in demo_app.BRAND_H1
 
@@ -198,48 +199,24 @@ def test_share_score_card_is_button_gated() -> None:
     assert "st.image(bundle.png_bytes, use_column_width=True)" in source
 
 
-def test_score_card_escapes_html() -> None:
+def test_compare_row_is_native_streamlit_not_html() -> None:
     import app as demo_app
 
-    markup = demo_app._score_card_html(
-        {
-            "score": 80.0,
-            "band": "GREEN",
-            "band_label": "GREEN — heuristic: stronger transparency signals (still verify)",
-            "ticker": "<script>alert(1)</script>",
-            "issuer": "x<y>&z",
-            "summary": 'hi & bye <img src=x onerror=alert(1)>',
-        }
-    )
-    assert "<script>" not in markup
-    assert "<img" not in markup
-    assert "&lt;script&gt;" in markup
-    assert "x&lt;y&gt;&amp;z" in markup
-    assert "hi &amp; bye" in markup
-    assert "&lt;img" in markup
-
-
-def test_error_card_escapes_html() -> None:
-    import app as demo_app
-
-    markup = demo_app._error_card_html("<b>NVDA</b>", "boom <script>x</script>")
-    assert "<b>" not in markup
-    assert "<script>" not in markup
-    assert "&lt;b&gt;NVDA&lt;/b&gt;" in markup
-    assert "&lt;script&gt;" in markup
-
-
-def test_empty_slot_is_ghost_not_error_box() -> None:
-    import app as demo_app
-
-    markup = demo_app._empty_slot_html()
-    assert "score-hero compact ghost" in markup
-    assert "Empty slot" in markup
-    assert "Pick a ticker to compare here" in markup
-    assert "Assign a ticker" not in markup
-    assert "error" not in markup
-    selected = demo_app._empty_slot_html(selected=True)
-    assert " selected" in selected
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "st.metric" in source
+    assert "st.progress" in source
+    assert "_score_card_html" not in source
+    assert "_error_card_html" not in source
+    assert "_empty_slot_html" not in source
+    assert "score-hero" not in source
+    assert source.count("unsafe_allow_html") <= 1
+    assert "Pick a ticker to compare here" in source
+    assert "Assign a ticker" not in source
+    render = source.split("def _render_compare_card", 1)[1].split(
+        "def _render_slot_error", 1
+    )[0]
+    assert "unsafe_allow_html" not in render
+    assert "st.metric" in render
 
 
 def test_score_one_session_cache_skips_rescore(fixture_scorer, monkeypatch) -> None:

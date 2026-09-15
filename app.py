@@ -10,7 +10,6 @@ Render binds 0.0.0.0:$PORT via render.yaml and starts with
 from __future__ import annotations
 
 import base64
-import html
 import os
 import time
 from pathlib import Path
@@ -98,8 +97,8 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
-CANDIDATE_STRIP_LIMIT = 6
-USE_STRIP_LIMIT = 6
+CANDIDATE_STRIP_LIMIT = 4
+USE_STRIP_LIMIT = 4
 # Process-local fallback when session_state is unavailable (unit tests).
 _score_memo: dict[str, dict] = {}
 
@@ -316,7 +315,6 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
 
     chip_cats = browse_categories(catalog)
-    st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
     chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
     for index, cat in enumerate(chip_cats):
         with chip_cols[index]:
@@ -327,7 +325,6 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
             ):
                 st.session_state.pending_ticker_query = chip_query(cat)
 
-    st.markdown('<div class="search-combobox-anchor"></div>', unsafe_allow_html=True)
     query = st.text_input(
         "Search",
         placeholder="Ticker, name, or category",
@@ -336,7 +333,6 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
     )
     matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
     if matches:
-        st.markdown('<div class="search-match-anchor"></div>', unsafe_allow_html=True)
         for opt in matches:
             if st.button(
                 format_option(opt),
@@ -350,18 +346,15 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
     # Use chips only after a search/category match — no idle catalog strip.
     candidates = list(matches[:USE_STRIP_LIMIT]) if matches else []
     if candidates:
-        st.markdown('<div class="use-strip-anchor"></div>', unsafe_allow_html=True)
-        for row_start in range(0, len(candidates), 5):
-            row = candidates[row_start : row_start + 5]
-            use_cols = st.columns(len(row), gap="small")
-            for index, opt in enumerate(row):
-                with use_cols[index]:
-                    if st.button(
-                        f"Use {opt.symbol}",
-                        key=f"use_strip_{opt.symbol}_{row_start}",
-                        use_container_width=True,
-                    ):
-                        _auto_place(opt.symbol)
+        use_cols = st.columns(len(candidates), gap="small")
+        for index, opt in enumerate(candidates):
+            with use_cols[index]:
+                if st.button(
+                    f"Use {opt.symbol}",
+                    key=f"use_strip_{opt.symbol}",
+                    use_container_width=True,
+                ):
+                    _auto_place(opt.symbol)
 
     if use_fixtures:
         st.caption(
@@ -387,59 +380,9 @@ def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
     return catalog
 
 
-def _score_card_html(report: dict, *, selected: bool = False) -> str:
-    """Build the compact score card. Dynamic fields are HTML-escaped."""
-    band = report["band"]
-    color = BAND_COLORS.get(band, "#8B949E")
-    ring = "3px" if selected else "2px"
-    selected_attr = " selected" if selected else ""
-    ticker = html.escape(str(report["ticker"]))
-    issuer = html.escape(str(report["issuer"]))
-    summary = html.escape(str(report["summary"]))
-    band_label = html.escape(str(report["band_label"]))
-    return f"""
-        <div class="score-hero compact{selected_attr}" style="border-color:{color};border-width:{ring}">
-          <div class="score-num">{report['score']:.1f}</div>
-          <div class="score-meta">
-            <div class="band" style="color:{color}">{band_label}</div>
-            <div class="issuer">{ticker} · {issuer}</div>
-            <div class="summary">{summary}</div>
-          </div>
-        </div>
-        """
-
-
 def chip_display_label(label: str) -> str:
     """Chip text: spaces around slashes so wrap cannot split a word."""
     return (label or "").replace("/", " / ")
-
-
-def _error_card_html(ticker: str, message: str, *, selected: bool = False) -> str:
-    """Build the unavailable-slot card. Dynamic fields are HTML-escaped."""
-    ring = " selected" if selected else ""
-    safe_ticker = html.escape(ticker or "Empty slot")
-    safe_message = html.escape(message)
-    return f"""
-        <div class="score-hero compact error{ring}">
-          <div class="score-num">—</div>
-          <div class="score-meta">
-            <div class="band" style="color:#E5484D">Unavailable</div>
-            <div class="issuer">{safe_ticker}</div>
-            <div class="summary">{safe_message}</div>
-          </div>
-        </div>
-        """
-
-
-def _empty_slot_html(*, selected: bool = False) -> str:
-    """Dashed ghost for an unfilled compare column — not a solid empty box."""
-    ring = " selected" if selected else ""
-    return f"""
-        <div class="score-hero compact ghost{ring}">
-          <div class="ghost-label">Empty slot</div>
-          <div class="summary">Pick a ticker to compare here.</div>
-        </div>
-        """
 
 
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
@@ -521,22 +464,11 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
         for key in WEIGHTS:
             meta = PILLARS[key]
             badge_label, evidence = _verification_badge_label(key, report)
-            color = VERIFICATION_BADGE_COLORS.get(
-                (report.get("verification") or {}).get(key, {}).get("level"),
-                "#8B949E",
-            )
-            if "heuristic fallback" in badge_label:
-                color = VERIFICATION_BADGE_COLORS["heuristic fallback"]
             st.markdown(
                 f"**{meta['label']}** — {report['subscores'][key]:.0f}/100 "
                 f"(weight {WEIGHTS[key]:.0%})"
             )
-            st.markdown(
-                f'<span style="display:inline-block;padding:0.15rem 0.5rem;'
-                f'border-radius:999px;border:1px solid {color};color:{color};'
-                f'font-size:0.8rem;">{badge_label}</span>',
-                unsafe_allow_html=True,
-            )
+            st.caption(badge_label)
             st.caption(meta["what"])
             st.caption(f"Evidence: {evidence}")
             st.write(report["explanations"][key])
@@ -551,201 +483,62 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
 def _render_compare_card(
     report: dict, *, selected: bool = False, slot_index: int = 0
 ) -> None:
-    """Compact hero + metrics. Explainer is not called until the user asks."""
-    st.markdown(
-        _score_card_html(report, selected=selected),
-        unsafe_allow_html=True,
-    )
-    metric_bits = []
-    for key in WEIGHTS:
-        meta = PILLARS[key]
-        metric_bits.append(f"**{meta['label']}** {report['subscores'][key]:.0f}")
-    st.markdown(" · ".join(metric_bits))
+    """Native metric card. Explainer is not called until the user asks."""
+    ticker = str(report.get("ticker") or "")
+    issuer = str(report.get("issuer") or "")
+    label = f"{ticker} · {issuer}" if issuer else ticker
+    if selected:
+        label = f"● {label}"
+    band = str(report.get("band_label") or report.get("band") or "")
+    score = float(report.get("score") or 0)
+    st.metric(label, f"{score:.1f}", band)
+    summary = str(report.get("summary") or "")
+    if summary:
+        st.caption(summary)
+    st.progress(min(max(score / 100.0, 0.0), 1.0))
 
     if not selected:
         return
 
-    ticker = str(report.get("ticker") or "UNK")
-    why_key = f"explain_{slot_index}_{ticker}"
+    why_key = f"explain_{slot_index}_{ticker or 'UNK'}"
     with st.expander("Why this score?", expanded=False):
         if st.session_state.get(why_key):
             _render_card_details(report, slot_index=slot_index)
-        elif st.button("Show explanation", key=f"explain_btn_{slot_index}_{ticker}"):
+        elif st.button("Show explanation", key=f"explain_btn_{slot_index}_{ticker or 'UNK'}"):
             st.session_state[why_key] = True
             _render_card_details(report, slot_index=slot_index)
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
-    st.markdown(
-        _error_card_html(ticker, message, selected=selected),
-        unsafe_allow_html=True,
-    )
+    label = ticker or "Empty slot"
+    if selected:
+        label = f"● {label}"
+    st.metric(label, "—", "Unavailable")
     st.error(message)
 
 
 def _render_empty_slot(*, selected: bool = False) -> None:
-    st.markdown(_empty_slot_html(selected=selected), unsafe_allow_html=True)
+    title = "● Empty slot" if selected else "Empty slot"
+    st.metric(title, "—")
+    st.caption("Pick a ticker to compare here.")
 
 
 st.markdown(
     """
     <style>
-      .rat-brand { margin: 0 0 0.35rem; }
-      .rat-brand-row { display: flex; align-items: center; gap: 0.75rem; }
-      .rat-chip {
-        width: 36px; height: 36px; flex: 0 0 36px;
-        border-radius: 10px; overflow: hidden;
-        border: 1px solid rgba(61, 220, 151, 0.35);
-        background: #161B22;
-      }
-      .rat-chip img { width: 36px; height: 36px; display: block; }
-      .rat-titles h1 {
-        margin: 0; padding: 0;
-        font-size: 2.05rem; font-weight: 700; line-height: 1.1;
-        color: #E6EDF3; letter-spacing: -0.02em;
-      }
-      .rat-sub {
-        margin: 0.2rem 0 0;
-        color: #8b949e;
-        font-size: 0.95rem;
-        font-weight: 500;
-      }
-      .rat-tagline {
-        margin: 0.55rem 0 0.15rem;
-        color: #8b949e;
-        font-size: 0.95rem;
-      }
-      .mode-chip {
-        display: inline-flex; align-items: center;
-        border: 1px solid #3DDC97;
-        color: #3DDC97;
-        background: transparent;
-        border-radius: 999px;
-        padding: 0.18rem 0.72rem;
-        font-size: 0.75rem;
-        font-weight: 600;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-      }
-      .score-hero {
-        position: relative;
-        isolation: isolate;
-        overflow: hidden;
-        display: flex; gap: 1.5rem; align-items: center;
-        border: 2px solid #30363d; border-radius: 16px;
-        padding: 1.25rem 1.5rem; margin: 0.5rem 0 1.25rem;
-        background: #161b22;
-      }
-      .score-hero::before {
-        content: "";
-        position: absolute;
-        inset: -35% -10% -35% -25%;
-        pointer-events: none;
-        z-index: 0;
-        background:
-          radial-gradient(circle at 28% 48%, transparent 16%, rgba(61,220,151,0.12) 17%, transparent 18%),
-          radial-gradient(circle at 28% 48%, transparent 30%, rgba(61,220,151,0.10) 31%, transparent 32%),
-          radial-gradient(circle at 28% 48%, transparent 44%, rgba(61,220,151,0.08) 45%, transparent 46%);
-      }
-      .score-hero > * { position: relative; z-index: 1; }
-      .score-hero.compact {
-        flex-direction: column; align-items: flex-start; gap: 0.35rem;
-        padding: 0.55rem 0.8rem; margin: 0.1rem 0 0.35rem; min-height: 6.5rem;
-      }
-      .score-hero.compact.selected { box-shadow: 0 0 0 1px #3DDC97 inset; }
-      .score-hero.compact.error { border-color: #E5484D; }
-      .score-hero.compact.ghost {
-        border: 1px dashed rgba(250, 250, 250, 0.2);
-        background: transparent;
-        min-height: 4.5rem;
-        box-shadow: none;
-      }
-      .score-hero.compact.ghost::before { display: none; }
-      .score-hero.compact.ghost .ghost-label {
-        color: #8b949e;
-        font-size: 0.9rem;
-        font-weight: 600;
-      }
-      .score-num { font-size: 4rem; font-weight: 700; line-height: 1; }
-      .score-hero.compact .score-num { font-size: 2.35rem; }
-      .band { font-size: 1.15rem; font-weight: 600; }
-      .score-hero.compact .band { font-size: 0.95rem; }
-      .issuer { color: #8b949e; margin-top: 0.25rem; }
-      .summary { margin-top: 0.35rem; }
-      .score-hero.compact .summary { font-size: 0.85rem; }
-      /* Light outline — same family as category chip (secondary) buttons */
-      div[data-testid="stTextInput"] [data-baseweb="input"],
-      div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
+      /* Minimal light Search border — no score-card HTML, no anchor CSS. */
+      div[data-testid="stTextInput"] [data-baseweb="input"] {
         border: 1px solid rgba(250, 250, 250, 0.2) !important;
-        border-radius: 0.5rem !important;
-        background-color: transparent !important;
         box-shadow: none !important;
       }
-      /* Search + match buttons read as one control (no fragile selectbox) */
-      .search-combobox-anchor + div div[data-testid="stTextInput"] [data-baseweb="input"] {
-        min-height: 2.5rem !important;
-      }
-      .search-match-anchor + div [data-testid="stButton"] button {
-        white-space: nowrap !important;
-        min-height: 2.75rem !important;
-        padding: 0.75rem 1rem !important;
-        overflow: visible !important;
-      }
-      /* Category chips: grow to content, never split a word; light outline stays */
-      .cat-chip-anchor + div [data-testid="stButton"] button {
-        white-space: nowrap !important;
-        padding: 0.75rem 1rem !important;
-        min-height: 2.75rem !important;
-        overflow: visible !important;
-      }
-      .cat-chip-anchor + div [data-testid="stButton"] button p,
-      .cat-chip-anchor + div [data-testid="stButton"] button div {
-        white-space: nowrap !important;
-        word-break: keep-all !important;
-        overflow: visible !important;
-      }
-      /* Candidate Use strip — big tap targets, not a second cage */
-      .use-strip-anchor + div [data-testid="stButton"] button {
-        white-space: nowrap !important;
-        min-height: 2.75rem !important;
-        padding: 0.75rem 0.85rem !important;
-      }
-      /* Matching dropdown sits above compare ghosts; 40px click/keyboard rows */
-      div[data-testid="stSelectbox"] { position: relative; z-index: 40; }
-      div[data-testid="stSelectbox"] [data-baseweb="popover"],
-      ul[role="listbox"],
-      [data-baseweb="menu"] { z-index: 60 !important; }
-      [role="option"] { min-height: 40px !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-_monogram_uri = (
-    _asset_data_uri(MONOGRAM_PATH)
-    or _asset_data_uri(ASSETS_DIR / "rat-icon-192.png")
-    or _asset_data_uri(ASSETS_DIR / "rat-monogram.svg")
-)
-_chip_html = (
-    f'<div class="rat-chip"><img src="{_monogram_uri}" alt="" width="36" height="36" /></div>'
-    if _monogram_uri
-    else '<div class="rat-chip" aria-hidden="true"></div>'
-)
-st.markdown(
-    f"""
-    <div class="rat-brand">
-      <div class="rat-brand-row">
-        {_chip_html}
-        <div class="rat-titles">
-          <h1>{BRAND_H1}</h1>
-          <p class="rat-sub">{BRAND_SUB}</p>
-        </div>
-      </div>
-      <p class="rat-tagline">{TAGLINE}</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.header(BRAND_H1)
+st.caption(BRAND_SUB)
+st.caption(TAGLINE)
 
 default_fixtures = env_flag("RWA_USE_FIXTURES") or not os.getenv("CMC_API_KEY")
 
@@ -780,10 +573,7 @@ with st.sidebar:
     st.caption("These do not replace the Disclaimer.")
 
 mode_label = "Fixture" if use_fixtures else "Live"
-st.markdown(
-    f'<div class="mode-chip" title="Data mode">{mode_label}</div>',
-    unsafe_allow_html=True,
-)
+st.caption(f"Mode: {mode_label}")
 
 try:
     scorer = _cached_scorer(use_fixtures)

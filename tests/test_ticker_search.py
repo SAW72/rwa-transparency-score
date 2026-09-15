@@ -222,22 +222,23 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "place_search_match" in source
     assert "st.selectbox" not in source
     assert "on_change=_on_search_pick" not in source
-    assert "search-combobox-anchor" in source
-    assert "search-match-anchor" in source
-    assert "use-strip-anchor" in source
     assert "Use {opt.symbol}" in source or 'f"Use {opt.symbol}"' in source
     assert "on_click=_auto_place" not in source
     assert "@st.fragment" not in source
     assert "_render_search_picker" in source
     assert "Next pick replaces slot" in source
     assert "Next pick fills slot" in source
-    assert demo_app.USE_STRIP_LIMIT == 6
+    assert demo_app.USE_STRIP_LIMIT == 4
     assert 'st.button("Assign"' not in source
     assert "assign_clicked" not in source
     assert "search-assign-anchor" not in source
     assert demo_app.SEARCH_MIN_CHARS == 3
-    assert demo_app.CANDIDATE_STRIP_LIMIT == 6
+    assert demo_app.CANDIDATE_STRIP_LIMIT == 4
     assert "catalog[:USE_STRIP_LIMIT]" not in source
+    assert "st.metric" in source
+    assert "st.progress" in source
+    assert "_score_card_html" not in source
+    assert "score-hero" not in source
     assert demo_app.normalize_ticker is normalize_ticker
 
     catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
@@ -261,12 +262,11 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     )
     assert slots[1] == "XOM"
 
-    # Categories sit above Search in the picker (CSS may mention
-    # the same class names earlier).
     picker = source.split("def _render_search_picker", 1)[1]
-    assert picker.index("cat-chip-anchor") < picker.index("search-combobox-anchor")
-    assert picker.index("search-combobox-anchor") < picker.index("search-match-anchor")
-    assert picker.index("search-match-anchor") < picker.index("use-strip-anchor")
+    assert picker.index("cat_chip_") < picker.index(
+        'placeholder="Ticker, name, or category"'
+    )
+    assert picker.index("search_match_") < picker.index("use_strip_")
     body = source.split('st.subheader("Score / Compare")', 1)[1]
     assert "_render_search_picker(catalog, use_fixtures)" in body
     assert "search_match_" not in body.split("_render_search_picker", 1)[0]
@@ -283,8 +283,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "border=True" not in source
     assert "Browse categories" not in source
     assert "chip_display_label" in source
-    assert "score-hero.compact.ghost" in source
-    assert "1px dashed" in source
+    assert "Pick a ticker to compare here" in source
     assert demo_app.chip_display_label("AI/Tech") == "AI / Tech"
     assert demo_app.chip_display_label("Oil/Energy") == "Oil / Energy"
     assert demo_app.chip_display_label("Auto/EV") == "Auto / EV"
