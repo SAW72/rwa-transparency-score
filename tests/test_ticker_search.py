@@ -247,7 +247,8 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert "real estate" in source.lower()
     assert "Ticker, name, or category" in source
     assert 'placeholder="Ticker, name, or category"' in source
-    assert 'st.text_input(\n        "Search"' in source
+    assert 'st.text_input(' in source
+    assert '"Search"' in source
     assert "Ticker search" not in source
     assert 'label_visibility="visible"' in source
     assert "stTextInput" in source
@@ -257,8 +258,10 @@ def test_app_picker_wires_directory_into_assign() -> None:
     assert "[1.15, 0.55, 3.3]" not in source
     assert "writing-mode: horizontal-tb" in source
     assert "white-space: nowrap" in source
+    assert "min-width: 6.5rem" in source
     assert "search-assign-anchor" in source
     assert "cat-chip-anchor" in source
+    assert "Browse categories" not in source
     assert "chip_display_label" in source
     assert "score-hero.compact.ghost" in source
     assert "1px dashed" in source

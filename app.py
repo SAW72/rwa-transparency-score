@@ -494,31 +494,39 @@ st.markdown(
         line-height: 1.25;
         min-height: 1.25rem;
       }
-      /* Assign: horizontal pill, single-line, match Search input height */
+      /* Assign: horizontal pill, single-line, match Search input height.
+         Live bug was a ~40px column that stacked A/s/i/g/n. */
+      .search-assign-anchor + div [data-testid="stButton"] {
+        min-width: 6.5rem;
+      }
       .search-assign-anchor + div [data-testid="stButton"] button {
         white-space: nowrap !important;
         writing-mode: horizontal-tb !important;
         text-orientation: mixed !important;
+        min-width: 6.5rem !important;
         min-height: 2.5rem !important;
         height: 2.5rem !important;
         border-radius: 999px !important;
         padding: 0 1.15rem !important;
         overflow: visible !important;
+        letter-spacing: normal !important;
       }
       .search-assign-anchor + div [data-testid="stButton"] button p,
       .search-assign-anchor + div [data-testid="stButton"] button div {
         white-space: nowrap !important;
         writing-mode: horizontal-tb !important;
         word-break: keep-all !important;
+        overflow: visible !important;
       }
       .search-assign-anchor + div div[data-testid="stTextInput"] [data-baseweb="input"] {
         min-height: 2.5rem !important;
       }
-      /* Category chips: grow with nowrap; keep the existing light outline */
+      /* Category chips: grow to content, never split a word; light outline stays */
       .cat-chip-anchor + div [data-testid="stButton"] button {
         white-space: nowrap !important;
         padding: 0.75rem 1rem !important;
         min-height: 2.4rem !important;
+        width: auto !important;
         overflow: visible !important;
       }
       .cat-chip-anchor + div [data-testid="stButton"] button p,
@@ -625,51 +633,52 @@ catalog = _ticker_catalog(scorer)
 if "pending_ticker_query" in st.session_state:
     st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
 
-# Search + Assign on one surface. Assign is a horizontal pill, never vertical text.
-st.markdown('<div class="search-assign-anchor"></div>', unsafe_allow_html=True)
-search_col, assign_col = st.columns([4.2, 1.0], gap="small")
-with search_col:
-    query = st.text_input(
-        "Search",
-        placeholder="Ticker, name, or category",
-        label_visibility="visible",
-        key="ticker_query",
-    )
-with assign_col:
-    st.markdown(
-        '<p class="search-assign-spacer">&nbsp;</p>',
-        unsafe_allow_html=True,
-    )
-    assign_clicked = st.button("Assign", type="primary", use_container_width=True)
+# Compact left cluster like the live hero — no Search card, no Browse cage,
+# no empty pad widgets that draw a second box. Assign stays a horizontal pill.
+cluster, _ = st.columns([3.15, 1.85], gap="small")
+with cluster:
+    st.markdown('<div class="search-assign-anchor"></div>', unsafe_allow_html=True)
+    search_col, assign_col = st.columns([3.45, 1.2], gap="small")
+    with search_col:
+        query = st.text_input(
+            "Search",
+            placeholder="Ticker, name, or category",
+            label_visibility="visible",
+            key="ticker_query",
+        )
+    with assign_col:
+        st.markdown(
+            '<p class="search-assign-spacer">&nbsp;</p>',
+            unsafe_allow_html=True,
+        )
+        assign_clicked = st.button("Assign", type="primary", use_container_width=True)
 
-CHIP_QUERIES = {
-    "ai_tech": "AI",
-    "oil_energy": "oil",
-    "real_estate": "real estate",
-    "auto_ev": "auto",
-}
-chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
-# 2×2 siblings of Search — no second bordered cage; labels nowrap + spaced slashes.
-for pair_start in range(0, len(chip_cats), 2):
-    pair = chip_cats[pair_start : pair_start + 2]
-    st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
-    chip_cols = st.columns([1.5, 1.5, 2.0], gap="small")
-    for index, cat in enumerate(pair):
-        with chip_cols[index]:
-            if st.button(
-                chip_display_label(cat.label),
-                key=f"cat_chip_{cat.id}",
-                use_container_width=True,
-            ):
-                st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
-                st.rerun()
+    CHIP_QUERIES = {
+        "ai_tech": "AI",
+        "oil_energy": "oil",
+        "real_estate": "real estate",
+        "auto_ev": "auto",
+    }
+    chip_cats = [cat for cat in CATEGORIES if cat.id in CHIP_QUERIES]
+    # 2×2 siblings — nowrap + spaced slashes, light chip outline, no second cage.
+    for pair_start in range(0, len(chip_cats), 2):
+        pair = chip_cats[pair_start : pair_start + 2]
+        st.markdown('<div class="cat-chip-anchor"></div>', unsafe_allow_html=True)
+        chip_cols = st.columns(2, gap="small")
+        for index, cat in enumerate(pair):
+            with chip_cols[index]:
+                if st.button(
+                    chip_display_label(cat.label),
+                    key=f"cat_chip_{cat.id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pending_ticker_query = CHIP_QUERIES[cat.id]
+                    st.rerun()
 
-typed = normalize_ticker(query)
-matches = search_tickers(query, catalog)
-picked_symbol: str | None = None
-if matches:
-    pick_col, _pick_pad = st.columns([1.7, 3.3], gap="small")
-    with pick_col:
+    typed = normalize_ticker(query)
+    matches = search_tickers(query, catalog)
+    picked_symbol: str | None = None
+    if matches:
         labels = [format_option(opt) for opt in matches]
         label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
         chosen = st.selectbox(
@@ -680,8 +689,8 @@ if matches:
             key=f"ticker_pick_{typed or query.strip().lower()}",
         )
         picked_symbol = label_to_symbol.get(chosen, matches[0].symbol)
-elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
-    st.caption("No directory matches — Assign uses the typed ticker.")
+    elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
+        st.caption("No directory matches — Assign uses the typed ticker.")
 
 to_assign = resolve_assign_symbol(
     query, matches=matches, selected_symbol=picked_symbol
