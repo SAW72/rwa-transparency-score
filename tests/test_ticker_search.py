@@ -236,7 +236,8 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "assign_clicked" not in source
     assert "search-assign-anchor" not in source
     assert demo_app.SEARCH_MIN_CHARS == 3
-    assert demo_app.CANDIDATE_STRIP_LIMIT == 10
+    assert demo_app.CANDIDATE_STRIP_LIMIT == 6
+    assert "catalog[:USE_STRIP_LIMIT]" not in source
     assert demo_app.normalize_ticker is normalize_ticker
 
     catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
@@ -381,3 +382,46 @@ def test_full_board_replace_follows_active_then_wraps() -> None:
     assert slots[1] == "XOM"
     assert slots[0] == "NVDA"
     assert active == 3
+
+
+def test_place_and_auto_place_do_not_score(monkeypatch) -> None:
+    """Use/match slot fill is session-only — no scorer or explainer on this path."""
+    import inspect
+
+    import app as demo_app
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("place_search_match / _auto_place must not score")
+
+    monkeypatch.setattr(demo_app, "_score_one", boom)
+    monkeypatch.setattr(demo_app, "_score_slots", boom)
+    monkeypatch.setattr(demo_app, "_cached_explanation", boom)
+    monkeypatch.setattr(demo_app, "explain_score", boom)
+
+    place_src = inspect.getsource(demo_app.place_search_match)
+    auto_src = inspect.getsource(demo_app._auto_place)
+    assert "score" not in place_src.lower()
+    assert "explain" not in place_src.lower()
+    assert "score" not in auto_src.lower()
+    assert "explain" not in auto_src.lower()
+
+    slots, active = demo_app.place_search_match(
+        list(demo_app.DEFAULT_SLOTS), 0, "XOM"
+    )
+    assert slots == ["XOM", "TSLA", "AAPL", "META"]
+    assert active == 1
+
+    class _FakeSS(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    demo_app._auto_place("XOM")
+    assert demo_app.st.session_state.slots[0] == "XOM"
+    assert demo_app.st.session_state.active_slot == 1

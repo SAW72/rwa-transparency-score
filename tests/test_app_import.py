@@ -242,6 +242,29 @@ def test_empty_slot_is_ghost_not_error_box() -> None:
     assert " selected" in selected
 
 
+def test_score_one_session_cache_skips_rescore(fixture_scorer, monkeypatch) -> None:
+    import app as demo_app
+
+    calls = {"n": 0}
+    real = fixture_scorer.score
+
+    def wrapped(symbol):
+        calls["n"] += 1
+        return real(symbol)
+
+    monkeypatch.setattr(fixture_scorer, "score", wrapped)
+    demo_app._score_memo.clear()
+    try:
+        demo_app.st.session_state["score_reports"] = {}
+    except Exception:
+        pass
+    first = demo_app._score_one(fixture_scorer, "NVDA")
+    second = demo_app._score_one(fixture_scorer, "NVDA")
+    assert first["ticker"] == second["ticker"] == "NVDA"
+    assert first["score"] == second["score"]
+    assert calls["n"] == 1
+
+
 def test_score_slots_empty_symbol_does_not_score(fixture_scorer) -> None:
     import app as demo_app
 

@@ -98,9 +98,9 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
-CANDIDATE_STRIP_LIMIT = 10
+CANDIDATE_STRIP_LIMIT = 6
 USE_STRIP_LIMIT = 6
-# Process-local score memo — widget reruns must not rescore four cards.
+# Process-local fallback when session_state is unavailable (unit tests).
 _score_memo: dict[str, dict] = {}
 
 st.set_page_config(
@@ -149,14 +149,38 @@ def assign_ticker_to_slot(slots: list[str], index: int, ticker: str) -> list[str
     return updated
 
 
-def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
-    symbol = normalize_ticker(ticker)
+def _score_cache_key(scorer: TransparencyScorer, symbol: str) -> str:
     source = str(getattr(scorer.client, "source", "") or "")
-    key = f"{source}:{id(scorer)}:{symbol}"
+    return f"{source}:{symbol}"
+
+
+def _report_cache() -> dict:
+    """Session cache of scored reports. Falls back to the process memo."""
+    try:
+        cache = st.session_state.get("score_reports")
+        if not isinstance(cache, dict):
+            cache = {}
+            st.session_state["score_reports"] = cache
+        return cache
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return _score_memo
+
+
+def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
+    """Return a cached report. Unchanged slots are never re-scored."""
+    symbol = normalize_ticker(ticker)
+    key = _score_cache_key(scorer, symbol)
+    session_cache = _report_cache()
+    hit = session_cache.get(key)
+    if hit is not None:
+        _score_memo[key] = hit
+        return hit
     hit = _score_memo.get(key)
     if hit is not None:
+        session_cache[key] = hit
         return hit
     report = scorer.score(symbol)
+    session_cache[key] = report
     _score_memo[key] = report
     return report
 
@@ -321,15 +345,10 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
             ):
                 _auto_place(opt.symbol)
     elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
-        st.caption("No directory matches — type a ticker or tap a Use chip.")
+        st.caption("No directory matches — type a ticker or tap a category.")
 
-    # Cap the strip. Matches reuse the same 1–few chips; idle shows the catalog.
-    if matches:
-        candidates = list(matches[:USE_STRIP_LIMIT])
-    elif not (query or "").strip():
-        candidates = list(catalog[:USE_STRIP_LIMIT])
-    else:
-        candidates = []
+    # Use chips only after a search/category match — no idle catalog strip.
+    candidates = list(matches[:USE_STRIP_LIMIT]) if matches else []
     if candidates:
         st.markdown('<div class="use-strip-anchor"></div>', unsafe_allow_html=True)
         for row_start in range(0, len(candidates), 5):
@@ -348,8 +367,8 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         st.caption(
             "Fixture catalog: "
             + ", ".join(FIXTURE_TICKERS)
-            + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or category "
-            "(oil, AI, real estate, auto)."
+            + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or a category "
+            "(oil, AI, real estate, auto), then click a match or Use chip."
         )
     else:
         st.caption(
@@ -461,14 +480,8 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
         st.info(bundle.x_message)
 
 
-def _render_compare_card(
-    report: dict, *, selected: bool = False, slot_index: int = 0
-) -> None:
-    st.markdown(
-        _score_card_html(report, selected=selected),
-        unsafe_allow_html=True,
-    )
-
+def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
+    """Share + explainer + pillars — only after the user opens Why this score?"""
     if report.get("data_source") == "fixture":
         st.caption("Demo fixture data — not a live CoinMarketCap API response.")
     else:
@@ -492,16 +505,6 @@ def _render_compare_card(
             "Cross-issuer basis: only one wrapper on CMC market-pairs — no issuer compare."
         )
 
-    metric_bits = []
-    for key in WEIGHTS:
-        meta = PILLARS[key]
-        metric_bits.append(f"**{meta['label']}** {report['subscores'][key]:.0f}")
-    st.markdown(" · ".join(metric_bits))
-
-    # Unselected cards stay compact so a Use/match click remounts one detail pane.
-    if not selected:
-        return
-
     flags = report.get("flags") or []
     if flags:
         for flag in flags:
@@ -511,7 +514,6 @@ def _render_compare_card(
 
     _render_share_controls(report, slot_index=slot_index)
 
-    st.markdown("**Why this score?**")
     st.write(_cached_explanation(report))
     st.caption(AI_FOOTNOTE)
 
@@ -544,6 +546,33 @@ def _render_compare_card(
             st.markdown("**Notes**")
             for note in notes:
                 st.info(note)
+
+
+def _render_compare_card(
+    report: dict, *, selected: bool = False, slot_index: int = 0
+) -> None:
+    """Compact hero + metrics. Explainer is not called until the user asks."""
+    st.markdown(
+        _score_card_html(report, selected=selected),
+        unsafe_allow_html=True,
+    )
+    metric_bits = []
+    for key in WEIGHTS:
+        meta = PILLARS[key]
+        metric_bits.append(f"**{meta['label']}** {report['subscores'][key]:.0f}")
+    st.markdown(" · ".join(metric_bits))
+
+    if not selected:
+        return
+
+    ticker = str(report.get("ticker") or "UNK")
+    why_key = f"explain_{slot_index}_{ticker}"
+    with st.expander("Why this score?", expanded=False):
+        if st.session_state.get(why_key):
+            _render_card_details(report, slot_index=slot_index)
+        elif st.button("Show explanation", key=f"explain_btn_{slot_index}_{ticker}"):
+            st.session_state[why_key] = True
+            _render_card_details(report, slot_index=slot_index)
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
