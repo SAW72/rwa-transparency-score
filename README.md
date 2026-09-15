@@ -9,6 +9,10 @@ pip install -r requirements.txt
 RWA_USE_FIXTURES=1 streamlit run app.py
 ```
 
+**Judge one-pager:** [`docs/JUDGE_FRICTION.md`](docs/JUDGE_FRICTION.md) — CMC Basic `HTTP 429` / `error_code` 1008, wait ~1 minute, DoraHacks Startup limits, Free Render cold starts, offline fixtures, live `/health`.
+
+**Paid API evidence:** [`docs/API_EVIDENCE.md`](docs/API_EVIDENCE.md) — redacted `GET /v1/score/NVDA` with `X-API-Key: <REDACTED>` plus a real JSON body captured from the paid API locally under `RWA_USE_FIXTURES=1` (**fixture-backed, not live CMC**).
+
 Then open the local URL Streamlit prints. Type a prefix like `NIV` to pick **NVDA / Nvidia**, or a category like `oil`, `AI`, or `real estate`. Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
 
 **Search categories** (case-insensitive keywords; rows come from the CMC/fixture directory, bucketed by `industry` / `sector` plus name hints):
@@ -197,6 +201,39 @@ python -m rwa_score.api.keys create --name local --tier paid
 RWA_USE_FIXTURES=1 python -m rwa_score.api
 curl -sS -H "X-API-Key: $KEY" http://127.0.0.1:8000/v1/score/NVDA
 ```
+
+### Request / response evidence (fixture-backed)
+
+The hosted Render demo is Streamlit + `/health` only. The paid REST API is **not** deployed (spend hold). Self-host it locally. This sample was captured with `RWA_USE_FIXTURES=1` — **fixture-backed, not live CMC**. Full request, headers, and JSON: [`docs/API_EVIDENCE.md`](docs/API_EVIDENCE.md) and [`docs/examples/v1_score_NVDA.fixture.json`](docs/examples/v1_score_NVDA.fixture.json). Judge notes (429 / cold start): [`docs/JUDGE_FRICTION.md`](docs/JUDGE_FRICTION.md).
+
+```bash
+curl -sS -H "X-API-Key: <REDACTED>" http://127.0.0.1:8000/v1/score/NVDA
+```
+
+```json
+{
+  "ticker": "NVDA",
+  "issuer": "Backed Finance",
+  "score": 90.2,
+  "band": "GREEN",
+  "data_source": "fixture",
+  "subscores": {
+    "backing": 90.0,
+    "reserves": 90.0,
+    "redemption": 85.0,
+    "price": 98.4,
+    "disclosure": 80.0,
+    "basis": 97.9
+  },
+  "confidence": { "score": 0.4, "label": "low" },
+  "attestation": {
+    "score_hash": "0x0060941adfb0dc745e24dde266180cb127afbe6cdfb63513f492cc703f213953",
+    "algo": "sha256"
+  }
+}
+```
+
+The captured file is the full authentic envelope (pillars, verification, basis wrappers, hash fields). `data_source` is `"fixture"` on purpose. A live CMC call keeps the same schema and sets `"live"`.
 
 | Method | Path | Who |
 |---|---|---|
