@@ -272,7 +272,9 @@ def _auto_place(ticker: str) -> None:
     if "slots" not in st.session_state:
         st.session_state.slots = list(DEFAULT_SLOTS)
     if "active_slot" not in st.session_state:
-        st.session_state.active_slot = 0
+        st.session_state.active_slot = default_active_slot(
+            list(st.session_state.slots)
+        )
     updated, nxt = place_search_match(
         list(st.session_state.slots), int(st.session_state.active_slot), symbol
     )
