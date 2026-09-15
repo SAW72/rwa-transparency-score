@@ -99,6 +99,7 @@ FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
 CANDIDATE_STRIP_LIMIT = 10
+USE_STRIP_LIMIT = 6
 # Process-local score memo — widget reruns must not rescore four cards.
 _score_memo: dict[str, dict] = {}
 
@@ -198,15 +199,14 @@ def _score_slots(
 def _ensure_slot_state() -> None:
     if "slots" not in st.session_state:
         st.session_state.slots = list(DEFAULT_SLOTS)
-    if "active_slot" not in st.session_state:
-        st.session_state.active_slot = 0
-    # Recover from a stale session that somehow lost a slot.
     slots = list(st.session_state.slots)
     if len(slots) != MAX_COMPARE_SLOTS:
-        padded = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
-        st.session_state.slots = padded
+        slots = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
+        st.session_state.slots = slots
+    if "active_slot" not in st.session_state:
+        st.session_state.active_slot = default_active_slot(slots)
     if not 0 <= int(st.session_state.active_slot) < MAX_COMPARE_SLOTS:
-        st.session_state.active_slot = 0
+        st.session_state.active_slot = default_active_slot(slots)
 
 
 def _place_in_slot(ticker: str, index: int) -> None:
@@ -214,18 +214,23 @@ def _place_in_slot(ticker: str, index: int) -> None:
     st.session_state.active_slot = index
 
 
-def next_place_index(slots: list[str], active: int, ticker: str = "") -> int:
-    """First empty slot, else a slot that does not already hold ``ticker``."""
-    symbol = normalize_ticker(ticker)
+def default_active_slot(slots: list[str]) -> int:
+    """First empty slot, else slot 0."""
     for index, raw in enumerate(slots):
         if not normalize_ticker(raw):
             return index
-    if symbol:
-        if 0 <= active < len(slots) and normalize_ticker(slots[active]) != symbol:
-            return active
-        for index, raw in enumerate(slots):
-            if normalize_ticker(raw) != symbol:
-                return index
+    return 0
+
+
+def next_place_index(slots: list[str], active: int, ticker: str = "") -> int:
+    """First empty slot; if the row is full, the active replace target.
+
+    ``ticker`` is unused — match and Use share this helper and always pass it.
+    """
+    _ = ticker
+    for index, raw in enumerate(slots):
+        if not normalize_ticker(raw):
+            return index
     if 0 <= active < len(slots):
         return active
     return 0
@@ -236,12 +241,14 @@ def place_search_match(
 ) -> tuple[list[str], int]:
     """Search-match click and Use-chip click share this slot-fill path.
 
-    Fills the first empty slot, or replaces a different filled slot when the
-    row is full, then advances the cursor so the next pick is visible.
+    Empty row: fill the first empty slot, then aim at the next empty.
+    Full row: replace the active slot, then advance 0→1→2→3→0.
     """
     index = next_place_index(slots, active, ticker)
     updated = assign_ticker_to_slot(slots, index, ticker)
-    return updated, (index + 1) % MAX_COMPARE_SLOTS
+    if all(normalize_ticker(raw) for raw in updated):
+        return updated, (index + 1) % MAX_COMPARE_SLOTS
+    return updated, default_active_slot(updated)
 
 
 def browse_categories(catalog: list[TickerOption]) -> tuple:
@@ -273,13 +280,11 @@ def _auto_place(ticker: str) -> None:
     st.session_state.active_slot = nxt
 
 
-@st.fragment
 def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
-    """Categories → Search(+matches) → Use strip. Keystrokes stay in this fragment.
+    """Categories → Search(+matches) → Use strip.
 
-    Match rows and Use chips share ``_auto_place`` (same slot-fill helper). A
-    successful click full-reruns the app so compare cards refresh; typing does
-    not remount those cards.
+    Match rows and Use chips share ``_auto_place``. One Streamlit rerun per
+    click — no fragment, no on_click, no extra ``st.rerun()``.
     """
     if "pending_ticker_query" in st.session_state:
         st.session_state.ticker_query = st.session_state.pop("pending_ticker_query")
@@ -295,7 +300,6 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
                 use_container_width=True,
             ):
                 st.session_state.pending_ticker_query = chip_query(cat)
-                st.rerun(scope="fragment")
 
     st.markdown('<div class="search-combobox-anchor"></div>', unsafe_allow_html=True)
     query = st.text_input(
@@ -312,34 +316,31 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
                 format_option(opt),
                 key=f"search_match_{opt.symbol}",
                 use_container_width=True,
-                on_click=_auto_place,
-                args=(opt.symbol,),
             ):
-                st.rerun()
+                _auto_place(opt.symbol)
     elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
         st.caption("No directory matches — type a ticker or tap a Use chip.")
 
+    # Cap the strip. Matches reuse the same 1–few chips; idle shows the catalog.
     if matches:
-        candidates = matches
+        candidates = list(matches[:USE_STRIP_LIMIT])
     elif not (query or "").strip():
-        candidates = list(catalog[:CANDIDATE_STRIP_LIMIT])
+        candidates = list(catalog[:USE_STRIP_LIMIT])
     else:
         candidates = []
     if candidates:
         st.markdown('<div class="use-strip-anchor"></div>', unsafe_allow_html=True)
-        for row_start in range(0, min(len(candidates), CANDIDATE_STRIP_LIMIT), 5):
+        for row_start in range(0, len(candidates), 5):
             row = candidates[row_start : row_start + 5]
-            use_cols = st.columns(5, gap="small")
+            use_cols = st.columns(len(row), gap="small")
             for index, opt in enumerate(row):
                 with use_cols[index]:
                     if st.button(
                         f"Use {opt.symbol}",
                         key=f"use_strip_{opt.symbol}_{row_start}",
                         use_container_width=True,
-                        on_click=_auto_place,
-                        args=(opt.symbol,),
                     ):
-                        st.rerun()
+                        _auto_place(opt.symbol)
 
     if use_fixtures:
         st.caption(
@@ -494,6 +495,10 @@ def _render_compare_card(
         meta = PILLARS[key]
         metric_bits.append(f"**{meta['label']}** {report['subscores'][key]:.0f}")
     st.markdown(" · ".join(metric_bits))
+
+    # Unselected cards stay compact so a Use/match click remounts one detail pane.
+    if not selected:
+        return
 
     flags = report.get("flags") or []
     if flags:
@@ -762,16 +767,20 @@ _ensure_slot_state()
 st.subheader("Score / Compare")
 st.caption(
     "Browse a category, type a ticker or name (3+ chars), then click a match "
-    "or a Use chip — it lands in the next compare slot."
+    "or a Use chip. Click a slot to choose which one the next pick replaces."
 )
 
 catalog = _ticker_catalog(scorer)
 _render_search_picker(catalog, use_fixtures)
 
+active = int(st.session_state.active_slot)
+target = next_place_index(list(st.session_state.slots), active)
+target_symbol = st.session_state.slots[target]
+
 slot_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
 for index, symbol in enumerate(st.session_state.slots):
     with slot_cols[index]:
-        selected = index == int(st.session_state.active_slot)
+        selected = index == target
         slot_label = symbol or f"Slot {index + 1}"
         label = f"● {slot_label}" if selected else slot_label
         if st.button(
@@ -781,14 +790,20 @@ for index, symbol in enumerate(st.session_state.slots):
             use_container_width=True,
         ):
             st.session_state.active_slot = index
-            st.rerun()
 
 active = int(st.session_state.active_slot)
-active_symbol = st.session_state.slots[active]
-if active_symbol:
-    st.caption(f"Next Use replaces slot {active + 1} · **{active_symbol}**.")
+target = next_place_index(list(st.session_state.slots), active)
+target_symbol = st.session_state.slots[target]
+if target_symbol:
+    st.caption(
+        f"Next pick replaces slot {target + 1} · **{target_symbol}**. "
+        "Click a slot to change the target."
+    )
 else:
-    st.caption(f"Next Use fills slot {active + 1}.")
+    st.caption(
+        f"Next pick fills slot {target + 1}. "
+        "When the row is full, the highlighted slot is replaced."
+    )
 
 results = _score_slots(scorer, list(st.session_state.slots))
 
@@ -799,7 +814,7 @@ if any(symbol for symbol, _report, _error in results):
         compare_cols, results, range(MAX_COMPARE_SLOTS)
     ):
         with col:
-            selected = index == int(st.session_state.active_slot)
+            selected = index == target
             if not symbol:
                 _render_empty_slot(selected=selected)
             elif error or report is None:

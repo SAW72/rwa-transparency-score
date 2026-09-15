@@ -226,9 +226,12 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search-match-anchor" in source
     assert "use-strip-anchor" in source
     assert "Use {opt.symbol}" in source or 'f"Use {opt.symbol}"' in source
-    assert "on_click=_auto_place" in source
-    assert "@st.fragment" in source
+    assert "on_click=_auto_place" not in source
+    assert "@st.fragment" not in source
     assert "_render_search_picker" in source
+    assert "Next pick replaces slot" in source
+    assert "Next pick fills slot" in source
+    assert demo_app.USE_STRIP_LIMIT == 6
     assert 'st.button("Assign"' not in source
     assert "assign_clicked" not in source
     assert "search-assign-anchor" not in source
@@ -257,8 +260,8 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     )
     assert slots[1] == "XOM"
 
-    # Categories sit above Search in the picker fragment (CSS may mention
-    # the same class names earlier). Compare cards stay outside that fragment.
+    # Categories sit above Search in the picker (CSS may mention
+    # the same class names earlier).
     picker = source.split("def _render_search_picker", 1)[1]
     assert picker.index("cat-chip-anchor") < picker.index("search-combobox-anchor")
     assert picker.index("search-combobox-anchor") < picker.index("search-match-anchor")
@@ -298,7 +301,9 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.next_place_index(["", "TSLA", "AAPL", "META"], 2) == 0
     assert demo_app.next_place_index(["NVDA", "", "AAPL", "META"], 0) == 1
     assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 2, "XOM") == 2
-    assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 0, "NVDA") == 1
+    assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 0, "NVDA") == 0
+    assert demo_app.default_active_slot(["NVDA", "TSLA", "AAPL", "META"]) == 0
+    assert demo_app.default_active_slot(["NVDA", "", "AAPL", "META"]) == 1
 
 
 def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
@@ -316,17 +321,16 @@ def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
     )
     assert from_match == from_use == ["NVDA", "TSLA", "AAPL", "META"]
     assert next_active == use_next == 1
-    # Default demo row already has NVDA in slot 0 — pick must still land visibly.
+    # Full default row: replace the active slot (0), then advance.
     replaced, nxt = demo_app.place_search_match(
         list(demo_app.DEFAULT_SLOTS), 0, niv[0].symbol
     )
-    assert replaced[1] == "NVDA"
-    assert replaced[0] == "NVDA"
-    assert nxt == 2
-    # Match row and Use chip both bind the same on_click helper.
+    assert replaced == ["NVDA", "TSLA", "AAPL", "META"]
+    assert nxt == 1
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert "on_click=_auto_place" in source
-    assert source.count("on_click=_auto_place") >= 2
+    assert "_auto_place(opt.symbol)" in source
+    assert source.count("_auto_place(opt.symbol)") >= 2
+    assert "on_click=_auto_place" not in source
 
 
 def test_oil_typeahead_match_places_xom() -> None:
@@ -354,3 +358,26 @@ def test_full_row_replace_advances_cursor() -> None:
     slots, active = demo_app.place_search_match(slots, active, "PLD")
     assert slots[1] == "PLD"
     assert active == 2
+
+
+def test_full_board_replace_follows_active_then_wraps() -> None:
+    """QA: full NVDA/NVDA/AAPL/META + active 2 → oil/XOM replaces slot 3."""
+    import app as demo_app
+
+    board = ["NVDA", "NVDA", "AAPL", "META"]
+    slots, active = demo_app.place_search_match(board, 2, "XOM")
+    assert slots == ["NVDA", "NVDA", "XOM", "META"]
+    assert active == 3
+    slots, active = demo_app.place_search_match(slots, active, "PLD")
+    assert slots == ["NVDA", "NVDA", "XOM", "PLD"]
+    assert active == 0
+    slots, active = demo_app.place_search_match(slots, 0, "TSLA")
+    assert slots[0] == "TSLA"
+    assert active == 1
+    # Empty wins over a clicked filled slot.
+    slots, active = demo_app.place_search_match(
+        ["NVDA", "", "AAPL", ""], 3, "XOM"
+    )
+    assert slots[1] == "XOM"
+    assert slots[0] == "NVDA"
+    assert active == 3
