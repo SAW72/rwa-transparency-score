@@ -507,6 +507,10 @@ with st.sidebar:
     st.markdown("### Disclaimer")
     st.write(DISCLAIMER)
 
+    st.markdown("### Legal")
+    st.markdown("[Privacy Policy](/privacy) · [Terms of Service](/terms)")
+    st.caption("These do not replace the Disclaimer.")
+
 mode_label = "Fixture" if use_fixtures else "Live"
 st.markdown(
     f'<div class="mode-chip" title="Data mode">{mode_label}</div>',
@@ -664,3 +668,4 @@ if ok_reports:
 
 st.divider()
 st.caption(DISCLAIMER)
+st.markdown("[Privacy Policy](/privacy) · [Terms of Service](/terms)")

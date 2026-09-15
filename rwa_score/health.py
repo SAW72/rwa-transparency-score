@@ -3,6 +3,7 @@
 Streamlit 1.39 serves unknown paths as the SPA (``index.html``), so a real
 JSON ``/health`` has to be registered on Tornado *before* ``Server._create_app``
 runs. ``python -m rwa_score.health`` does that, then launches Streamlit.
+The same hook registers HTML ``/privacy`` and ``/terms``.
 ``app.py`` also installs the route and stops UI rendering if ``/health``
 (or ``?health``) is requested after the script is already running.
 """
@@ -169,13 +170,21 @@ def _attach_to_running_server() -> None:
                 continue
             callback = getattr(obj, "request_callback", None)
             if isinstance(callback, Application):
-                _attach_health_handler(callback)
+                _attach_custom_routes(callback)
         except Exception:  # noqa: BLE001
             continue
 
 
+def _attach_custom_routes(app: Any) -> None:
+    """JSON ``/health`` plus HTML ``/privacy`` and ``/terms``."""
+    _attach_health_handler(app)
+    from .legal import attach_legal_handlers
+
+    attach_legal_handlers(app)
+
+
 def install_health_route() -> None:
-    """Patch Streamlit so ``GET /health`` returns JSON, if Tornado is available."""
+    """Patch Streamlit so ``GET /health``, ``/privacy``, and ``/terms`` are real routes."""
     try:
         from streamlit.web.server.server import Server
     except Exception:  # noqa: BLE001
@@ -185,7 +194,7 @@ def install_health_route() -> None:
 
         def _create_app(self):  # type: ignore[no-untyped-def]
             app = original(self)
-            _attach_health_handler(app)
+            _attach_custom_routes(app)
             return app
 
         Server._create_app = _create_app  # type: ignore[method-assign]
@@ -194,7 +203,7 @@ def install_health_route() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Patch ``/health``, then ``streamlit run app.py`` with the remaining args."""
+    """Patch ``/health`` plus legal HTML routes, then ``streamlit run app.py``."""
     install_health_route()
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--":
