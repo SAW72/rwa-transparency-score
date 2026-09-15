@@ -218,10 +218,12 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "search_tickers" in source
-    assert "st.selectbox" in source
-    assert "Matching tickers" in source
-    assert "on_change=_on_search_pick" in source
+    assert "search_match_" in source
+    assert "place_search_match" in source
+    assert "st.selectbox" not in source
+    assert "on_change=_on_search_pick" not in source
     assert "search-combobox-anchor" in source
+    assert "search-match-anchor" in source
     assert "use-strip-anchor" in source
     assert "Use {opt.symbol}" in source or 'f"Use {opt.symbol}"' in source
     assert 'st.button("Assign"' not in source
@@ -256,7 +258,8 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     # the same class names earlier).
     body = source.split('st.subheader("Score / Compare")', 1)[1]
     assert body.index("cat-chip-anchor") < body.index("search-combobox-anchor")
-    assert body.index("search-combobox-anchor") < body.index("use-strip-anchor")
+    assert body.index("search-combobox-anchor") < body.index("search-match-anchor")
+    assert body.index("search-match-anchor") < body.index("use-strip-anchor")
     assert "cat_chip_" in source
     assert "Ticker, name, or category" in source
     assert 'placeholder="Ticker, name, or category"' in source
@@ -289,3 +292,47 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.next_place_index(["", "TSLA", "AAPL", "META"], 2) == 0
     assert demo_app.next_place_index(["NVDA", "", "AAPL", "META"], 0) == 1
     assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 2) == 2
+
+
+def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
+    import app as demo_app
+
+    catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
+    niv = demo_app.search_tickers("niv", catalog)
+    assert [opt.symbol for opt in niv] == ["NVDA"]
+    # Empty first slot — Search match and Use NVDA both fill it via place_search_match.
+    from_match, next_active = demo_app.place_search_match(
+        ["", "TSLA", "AAPL", "META"], 0, niv[0].symbol
+    )
+    from_use, use_next = demo_app.place_search_match(
+        ["", "TSLA", "AAPL", "META"], 0, "NVDA"
+    )
+    assert from_match == from_use == ["NVDA", "TSLA", "AAPL", "META"]
+    assert next_active == use_next == 1
+
+
+def test_oil_typeahead_match_places_xom() -> None:
+    import app as demo_app
+
+    catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
+    oil = demo_app.search_tickers("oil", catalog)
+    assert [opt.symbol for opt in oil] == ["XOM"]
+    slots, active = demo_app.place_search_match(
+        list(demo_app.DEFAULT_SLOTS), 1, oil[0].symbol
+    )
+    assert slots[1] == "XOM"
+    assert slots[0] == "NVDA"
+    assert active == 2
+
+
+def test_full_row_replace_advances_cursor() -> None:
+    import app as demo_app
+
+    slots, active = demo_app.place_search_match(
+        ["NVDA", "TSLA", "AAPL", "META"], 0, "XOM"
+    )
+    assert slots == ["XOM", "TSLA", "AAPL", "META"]
+    assert active == 1
+    slots, active = demo_app.place_search_match(slots, active, "PLD")
+    assert slots[1] == "PLD"
+    assert active == 2

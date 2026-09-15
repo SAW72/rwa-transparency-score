@@ -99,7 +99,8 @@ FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
 CANDIDATE_STRIP_LIMIT = 10
-SEARCH_PICK_SENTINEL = "Select a match to compare…"
+# Process-local score memo — widget reruns must not rescore four cards.
+_score_memo: dict[str, dict] = {}
 
 st.set_page_config(
     page_title=PAGE_TITLE,
@@ -148,7 +149,15 @@ def assign_ticker_to_slot(slots: list[str], index: int, ticker: str) -> list[str
 
 
 def _score_one(scorer: TransparencyScorer, ticker: str) -> dict:
-    return scorer.score(normalize_ticker(ticker))
+    symbol = normalize_ticker(ticker)
+    source = str(getattr(scorer.client, "source", "") or "")
+    key = f"{source}:{id(scorer)}:{symbol}"
+    hit = _score_memo.get(key)
+    if hit is not None:
+        return hit
+    report = scorer.score(symbol)
+    _score_memo[key] = report
+    return report
 
 
 def _cached_explanation(report: dict) -> str:
@@ -215,6 +224,19 @@ def next_place_index(slots: list[str], active: int) -> int:
     return 0
 
 
+def place_search_match(
+    slots: list[str], active: int, ticker: str
+) -> tuple[list[str], int]:
+    """Search-match click and Use-chip click share this slot-fill path.
+
+    Fills the first empty slot, or replaces ``active`` when the row is full,
+    then advances the cursor so the next pick lands in the following slot.
+    """
+    index = next_place_index(slots, active)
+    updated = assign_ticker_to_slot(slots, index, ticker)
+    return updated, (index + 1) % MAX_COMPARE_SLOTS
+
+
 def browse_categories(catalog: list[TickerOption]) -> tuple:
     """Chips for buckets that exist on the CMC/fixture map. Grows when the map does."""
     present = {cid for opt in catalog for cid in opt.categories}
@@ -237,27 +259,21 @@ def _auto_place(ticker: str) -> None:
         st.session_state.slots = list(DEFAULT_SLOTS)
     if "active_slot" not in st.session_state:
         st.session_state.active_slot = 0
-    slots = list(st.session_state.slots)
-    index = next_place_index(slots, int(st.session_state.active_slot))
-    st.session_state.slots = assign_ticker_to_slot(slots, index, symbol)
-    st.session_state.active_slot = (index + 1) % MAX_COMPARE_SLOTS
-
-
-def _on_search_pick() -> None:
-    """Selectbox change inside Search — click a match to land it in a slot."""
-    mapping = st.session_state.get("ticker_pick_map") or {}
-    for key, value in list(st.session_state.items()):
-        if not str(key).startswith("ticker_pick_"):
-            continue
-        if value in mapping:
-            _auto_place(mapping[value])
-            st.session_state[key] = SEARCH_PICK_SENTINEL
-            return
+    updated, nxt = place_search_match(
+        list(st.session_state.slots), int(st.session_state.active_slot), symbol
+    )
+    st.session_state.slots = updated
+    st.session_state.active_slot = nxt
 
 
 def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
     """Directory the scorer already loads (live CMC map or fixture map)."""
-    return load_search_catalog(scorer.client)
+    cached = getattr(scorer, "_search_catalog", None)
+    if cached is not None:
+        return cached
+    catalog = load_search_catalog(scorer.client)
+    scorer._search_catalog = catalog
+    return catalog
 
 
 def _score_card_html(report: dict, *, selected: bool = False) -> str:
@@ -310,7 +326,7 @@ def _empty_slot_html(*, selected: bool = False) -> str:
     return f"""
         <div class="score-hero compact ghost{ring}">
           <div class="ghost-label">Empty slot</div>
-          <div class="summary">Assign a ticker to compare here.</div>
+          <div class="summary">Pick a ticker to compare here.</div>
         </div>
         """
 
@@ -509,7 +525,7 @@ st.markdown(
       .score-hero > * { position: relative; z-index: 1; }
       .score-hero.compact {
         flex-direction: column; align-items: flex-start; gap: 0.35rem;
-        padding: 0.7rem 0.9rem; margin: 0.15rem 0 0.5rem; min-height: 8rem;
+        padding: 0.55rem 0.8rem; margin: 0.1rem 0 0.35rem; min-height: 6.5rem;
       }
       .score-hero.compact.selected { box-shadow: 0 0 0 1px #3DDC97 inset; }
       .score-hero.compact.error { border-color: #E5484D; }
@@ -540,15 +556,15 @@ st.markdown(
         background-color: transparent !important;
         box-shadow: none !important;
       }
-      /* Search + match list read as one control (dropdown sits in the same box) */
+      /* Search + match buttons read as one control (no fragile selectbox) */
       .search-combobox-anchor + div div[data-testid="stTextInput"] [data-baseweb="input"] {
         min-height: 2.5rem !important;
-        border-radius: 0.5rem 0.5rem 0 0 !important;
       }
-      .search-combobox-anchor + div + div div[data-testid="stSelectbox"] [data-baseweb="select"] > div {
-        border-top: none !important;
-        border-radius: 0 0 0.5rem 0.5rem !important;
-        min-height: 2.5rem !important;
+      .search-match-anchor + div [data-testid="stButton"] button {
+        white-space: nowrap !important;
+        min-height: 2.75rem !important;
+        padding: 0.75rem 1rem !important;
+        overflow: visible !important;
       }
       /* Category chips: grow to content, never split a word; light outline stays */
       .cat-chip-anchor + div [data-testid="stButton"] button {
@@ -680,7 +696,7 @@ for index, cat in enumerate(chip_cats):
             st.session_state.pending_ticker_query = chip_query(cat)
             st.rerun()
 
-# 2) Search — match list is the same control, not an orphan box. No Assign button.
+# 2) Search — matches are the same click-to-place path as Use chips. No Assign.
 st.markdown('<div class="search-combobox-anchor"></div>', unsafe_allow_html=True)
 query = st.text_input(
     "Search",
@@ -689,22 +705,16 @@ query = st.text_input(
     key="ticker_query",
 )
 matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
-picked_symbol: str | None = None
 if matches:
-    labels = [format_option(opt) for opt in matches]
-    label_to_symbol = {format_option(opt): opt.symbol for opt in matches}
-    st.session_state.ticker_pick_map = label_to_symbol
-    pick_key = f"ticker_pick_{normalize_ticker(query) or (query or '').strip().lower()}"
-    chosen = st.selectbox(
-        "Matching tickers",
-        options=[SEARCH_PICK_SENTINEL, *labels],
-        index=0,
-        label_visibility="collapsed",
-        key=pick_key,
-        on_change=_on_search_pick,
-    )
-    if chosen != SEARCH_PICK_SENTINEL:
-        picked_symbol = label_to_symbol.get(chosen)
+    st.markdown('<div class="search-match-anchor"></div>', unsafe_allow_html=True)
+    for opt in matches:
+        if st.button(
+            format_option(opt),
+            key=f"search_match_{opt.symbol}",
+            use_container_width=True,
+        ):
+            _auto_place(opt.symbol)
+            st.rerun()
 elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
     st.caption("No directory matches — type a ticker or tap a Use chip.")
 

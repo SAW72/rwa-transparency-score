@@ -235,6 +235,8 @@ def test_empty_slot_is_ghost_not_error_box() -> None:
     markup = demo_app._empty_slot_html()
     assert "score-hero compact ghost" in markup
     assert "Empty slot" in markup
+    assert "Pick a ticker to compare here" in markup
+    assert "Assign a ticker" not in markup
     assert "error" not in markup
     selected = demo_app._empty_slot_html(selected=True)
     assert " selected" in selected
