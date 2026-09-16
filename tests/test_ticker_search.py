@@ -220,21 +220,24 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search_tickers" in source
     assert "search_match_" in source
     assert "place_search_match" in source
-    assert "st.selectbox" not in source
+    assert "st.selectbox" in source
+    assert "index=None" in source
     assert "on_change=_on_search_pick" not in source
-    assert "Use {opt.symbol}" in source or 'f"Use {opt.symbol}"' in source
+    assert "Use {opt.symbol}" not in source and 'f"Use {opt.symbol}"' not in source
+    assert "use_strip_" not in source
+    assert "USE_STRIP_LIMIT" not in source
     assert "on_click=_auto_place" not in source
     assert "@st.fragment" not in source
     assert "_render_search_picker" in source
     assert "Next pick replaces slot" in source
     assert "Next pick fills slot" in source
-    assert demo_app.USE_STRIP_LIMIT == 4
     assert 'st.button("Assign"' not in source
     assert "assign_clicked" not in source
     assert "search-assign-anchor" not in source
     assert demo_app.SEARCH_MIN_CHARS == 3
     assert demo_app.CANDIDATE_STRIP_LIMIT == 4
-    assert "catalog[:USE_STRIP_LIMIT]" not in source
+    assert demo_app.SEARCH_MATCH_KEY == "search_match_pick"
+    assert demo_app.SEARCH_FIELD_MAX == "17rem"
     assert "st.metric" in source
     assert "st.progress" not in source.split("def _render_compare_card", 1)[1].split(
         "def _render_slot_error", 1
@@ -269,7 +272,18 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert picker.index("cat_chip_") < picker.index(
         'placeholder="Ticker, name, or category"'
     )
-    assert picker.index("search_match_") < picker.index("use_strip_")
+    assert picker.index("st.selectbox") < picker.index("Choose a ticker")
+    assert "search_match_pick" in source
+    chip_block = picker.split("st.text_input", 1)[0]
+    assert "use_container_width=True" not in chip_block
+    assert "use_container_width=False" in chip_block
+    assert "st.selectbox" in picker
+    assert "index=None" in picker
+    assert "_auto_place(picked)" in picker
+    assert "max-width" in source
+    assert "stSelectbox" in source
+    assert "z-index: 40" in source
+    assert "z-index: 1000" in source
     body = source.split('st.subheader("Score / Compare")', 1)[1]
     assert "_render_search_picker(catalog, use_fixtures)" in body
     assert "search_match_" not in body.split("_render_search_picker", 1)[0]
@@ -338,8 +352,8 @@ def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
     assert replaced == ["NVDA", "TSLA", "AAPL", "META"]
     assert nxt == 1
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert "_auto_place(opt.symbol)" in source
-    assert source.count("_auto_place(opt.symbol)") >= 2
+    assert "_auto_place(picked)" in source
+    assert "use_strip_" not in source
     assert "on_click=_auto_place" not in source
 
 
@@ -391,6 +405,35 @@ def test_full_board_replace_follows_active_then_wraps() -> None:
     assert slots[1] == "XOM"
     assert slots[0] == "NVDA"
     assert active == 3
+
+
+def test_compare_card_helpers_short_name_mode_and_weakest() -> None:
+    import app as demo_app
+
+    assert demo_app.short_company_name("Nvidia Corp") == "Nvidia"
+    assert demo_app.short_company_name("Apple Inc") == "Apple"
+    assert demo_app.short_company_name("Meta Platforms Inc") == "Meta Platforms"
+    assert demo_app.short_company_name("Exxon Mobil Corp") == "Exxon Mobil"
+    catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
+    assert demo_app.catalog_company("NVDA", catalog) == "Nvidia"
+    assert demo_app.catalog_company("XOM", catalog) == "Exxon Mobil"
+    assert demo_app.mode_cue({"data_source": "fixture"}) == "FIXTURE"
+    assert demo_app.mode_cue({"data_source": "live"}) == "LIVE"
+    report = {
+        "subscores": {
+            "backing": 80,
+            "reserves": 40,
+            "redemption": 70,
+            "price": 65,
+            "disclosure": 75,
+            "basis": 55,
+        }
+    }
+    assert demo_app.weakest_pillar_line(report) == "Weakest: Proof of reserves 40"
+    dots = demo_app.pillar_dots(report)
+    assert len(dots) == 6
+    assert "●" in dots
+    assert "○" in dots or "◐" in dots
 
 
 def test_place_and_auto_place_do_not_score(monkeypatch) -> None:

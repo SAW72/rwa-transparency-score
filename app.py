@@ -20,7 +20,7 @@ from rwa_score.client import create_client, env_flag
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import share_score_card
-from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer
+from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer, band_code
 from rwa_score.ticker_search import (
     CATEGORIES,
     SEARCH_MIN_CHARS,
@@ -98,9 +98,12 @@ FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
 CANDIDATE_STRIP_LIMIT = 4
-USE_STRIP_LIMIT = 4
+SEARCH_MATCH_KEY = "search_match_pick"
+SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
 # Process-local fallback when session_state is unavailable (unit tests).
 _score_memo: dict[str, dict] = {}
+_COMPANY_SUFFIXES = frozenset({"corp", "inc", "ltd", "llc", "co", "the", "plc", "sa"})
+_DOT_BY_BAND = {"GREEN": "●", "YELLOW": "●", "ORANGE": "◐", "RED": "○"}
 
 st.set_page_config(
     page_title=PAGE_TITLE,
@@ -287,6 +290,45 @@ def chip_query(category) -> str:
     return str(words[0] if words else getattr(category, "label", "") or "")
 
 
+def short_company_name(name: str) -> str:
+    """Drop Inc/Corp-style suffixes so cards show a short company name."""
+    parts = [part for part in (name or "").strip().split() if part]
+    while parts and parts[-1].rstrip(".,").lower() in _COMPANY_SUFFIXES:
+        parts.pop()
+    return " ".join(parts) or (name or "").strip()
+
+
+def catalog_company(ticker: str, catalog: list[TickerOption]) -> str:
+    """Underlying company name from the search directory, if present."""
+    symbol = normalize_ticker(ticker)
+    for opt in catalog:
+        if opt.symbol == symbol:
+            return short_company_name(opt.name)
+    return ""
+
+
+def mode_cue(report: dict) -> str:
+    """LIVE vs fixture badge for a compare card."""
+    return "FIXTURE" if report.get("data_source") == "fixture" else "LIVE"
+
+
+def pillar_dots(report: dict) -> str:
+    """One compact dot per pillar (filled / half / empty by band)."""
+    subs = report.get("subscores") or {}
+    return "".join(
+        _DOT_BY_BAND.get(band_code(float(subs.get(key) or 0)), "·") for key in WEIGHTS
+    )
+
+
+def weakest_pillar_line(report: dict) -> str:
+    """One-line weakest-pillar cue so cards are not score-only."""
+    subs = report.get("subscores") or {}
+    if not subs:
+        return ""
+    key = min(WEIGHTS, key=lambda item: float(subs.get(item) or 0))
+    return f"Weakest: {PILLARS[key]['label']} {float(subs.get(key) or 0):.0f}"
+
+
 def _maybe_rerun() -> None:
     """Rerun only inside a live Streamlit script (no-op in unit tests)."""
     try:
@@ -314,32 +356,35 @@ def _auto_place(ticker: str) -> None:
     )
     st.session_state.slots = updated
     st.session_state.active_slot = nxt
-    # Drop Search + match/Use widgets on the next run (cannot mutate the
+    # Drop Search + match dropdown on the next run (cannot mutate the
     # ticker_query widget after it already exists on this run).
     st.session_state["_clear_search"] = True
     _maybe_rerun()
 
 
 def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
-    """Categories → Search(+matches) → Use strip.
+    """Categories → compact Search + attached match dropdown.
 
     Chip click writes ``ticker_query`` before the Search box is created so
-    matches and Use chips appear on this run — no Enter, no extra rerun.
+    matches appear on this run — no Enter, no extra rerun.
     After a successful place, ``_clear_search`` empties the box first so
-    match/Use buttons are not created.
+    the match dropdown is not created.
     """
     if st.session_state.get("_clear_search"):
         st.session_state["_clear_search"] = False
         st.session_state.ticker_query = ""
+        st.session_state.pop(SEARCH_MATCH_KEY, None)
 
     chip_cats = browse_categories(catalog)
-    chip_cols = st.columns(max(len(chip_cats), 1), gap="small")
+    n_chips = max(len(chip_cats), 1)
+    # Trailing spacer keeps chips content-sized / left-packed, not full-bleed.
+    chip_cols = st.columns([1] * n_chips + [max(n_chips + 2, 6)], gap="small")
     for index, cat in enumerate(chip_cats):
         with chip_cols[index]:
             if st.button(
                 chip_display_label(cat.label),
                 key=f"cat_chip_{cat.id}",
-                use_container_width=True,
+                use_container_width=False,
             ):
                 st.session_state.ticker_query = chip_query(cat)
 
@@ -351,40 +396,38 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
     )
     matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
     if matches:
-        for opt in matches:
-            if st.button(
-                format_option(opt),
-                key=f"search_match_{opt.symbol}",
-                use_container_width=True,
-            ):
-                _auto_place(opt.symbol)
-    elif len((query or "").strip()) >= SEARCH_MIN_CHARS:
-        st.caption("No directory matches — type a ticker or tap a category.")
-
-    # Use chips only after a search/category match — no idle catalog strip.
-    candidates = list(matches[:USE_STRIP_LIMIT]) if matches else []
-    if candidates:
-        use_cols = st.columns(len(candidates), gap="small")
-        for index, opt in enumerate(candidates):
-            with use_cols[index]:
-                if st.button(
-                    f"Use {opt.symbol}",
-                    key=f"use_strip_{opt.symbol}",
-                    use_container_width=True,
-                ):
-                    _auto_place(opt.symbol)
+        options = [opt.symbol for opt in matches]
+        labels = {opt.symbol: format_option(opt) for opt in matches}
+        stored = st.session_state.get(SEARCH_MATCH_KEY)
+        if stored not in options and SEARCH_MATCH_KEY in st.session_state:
+            del st.session_state[SEARCH_MATCH_KEY]
+        picked = st.selectbox(
+            "Matches",
+            options,
+            index=None,
+            format_func=lambda symbol: labels.get(symbol, symbol),
+            placeholder="Choose a ticker",
+            key=SEARCH_MATCH_KEY,
+            label_visibility="collapsed",
+        )
+        if picked:
+            _auto_place(picked)
+    else:
+        st.session_state.pop(SEARCH_MATCH_KEY, None)
+        if len((query or "").strip()) >= SEARCH_MIN_CHARS:
+            st.caption("No directory matches — type a ticker or tap a category.")
 
     if use_fixtures:
         st.caption(
             "Fixture catalog: "
             + ", ".join(FIXTURE_TICKERS)
             + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or a category "
-            "(oil, AI, real estate, auto), then click a match or Use chip."
+            "(oil, AI, real estate, auto), then choose a match."
         )
     else:
         st.caption(
             "Live mode: the cached CMC RWA map is the directory. "
-            "Prefix-match ticker/name or tap a category, then click a match."
+            "Prefix-match ticker/name or tap a category, then choose a match."
         )
 
 
@@ -499,16 +542,28 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
 
 
 def _render_compare_card(
-    report: dict, *, selected: bool = False, slot_index: int = 0
+    report: dict,
+    *,
+    selected: bool = False,
+    company: str = "",
+    slot_index: int = 0,
 ) -> None:
-    """Ticker + one metric (score/band). No progress bars or expanders."""
+    """Ticker · company · score · LIVE/FIXTURE · pillar dots / weakest."""
     del slot_index
     ticker = str(report.get("ticker") or "")
-    if selected:
-        ticker = f"● {ticker}"
-    band = str(report.get("band_label") or report.get("band") or "")
+    title = f"● {ticker}" if selected else ticker
     score = float(report.get("score") or 0)
-    st.metric(ticker, f"{score:.1f}", band)
+    company = company or short_company_name(str(report.get("issuer") or ""))
+    cue = mode_cue(report)
+    st.metric(title, f"{score:.1f}", f"{company} · {cue}")
+    dots = pillar_dots(report)
+    weak = weakest_pillar_line(report)
+    if dots and weak:
+        st.caption(f"{dots}  {weak}")
+    elif weak:
+        st.caption(weak)
+    elif dots:
+        st.caption(dots)
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:
@@ -525,14 +580,39 @@ def _render_empty_slot(*, selected: bool = False) -> None:
     st.caption("Pick a ticker to compare here.")
 
 
+def _render_selected_slot_detail(report: dict, *, slot_index: int = 0) -> None:
+    """Active-slot pillars under the row — no empty right gutter."""
+    subs = report.get("subscores") or {}
+    bits = [
+        f"**{PILLARS[key]['label']}** {subs[key]:.0f}"
+        for key in WEIGHTS
+        if key in subs
+    ]
+    if bits:
+        st.caption(" · ".join(bits))
+    with st.expander("Share score card", expanded=False):
+        _render_share_controls(report, slot_index=slot_index)
+
+
 st.markdown(
-    """
+    f"""
     <style>
-      /* Minimal light Search border — no score-card HTML, no anchor CSS. */
-      div[data-testid="stTextInput"] [data-baseweb="input"] {
+      /* Compact Search + attached dropdown. Light 1px border, not full-bleed. */
+      div[data-testid="stTextInput"],
+      div[data-testid="stSelectbox"] {{
+        max-width: {SEARCH_FIELD_MAX};
+        position: relative;
+        z-index: 40;
+      }}
+      div[data-testid="stTextInput"] [data-baseweb="input"],
+      div[data-testid="stSelectbox"] [data-baseweb="select"] > div {{
         border: 1px solid rgba(250, 250, 250, 0.2) !important;
         box-shadow: none !important;
-      }
+      }}
+      [data-baseweb="popover"],
+      [data-baseweb="menu"] {{
+        z-index: 1000 !important;
+      }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -589,8 +669,8 @@ _ensure_slot_state()
 
 st.subheader("Score / Compare")
 st.caption(
-    "Browse a category, type a ticker or name (3+ chars), then click a match "
-    "or a Use chip. Click a slot to choose which one the next pick replaces."
+    "Browse a category, type a ticker or name (3+ chars), then choose a match. "
+    "Click a slot to choose which one the next pick replaces."
 )
 
 catalog = _ticker_catalog(scorer)
@@ -632,6 +712,7 @@ results = _score_slots(scorer, list(st.session_state.slots))
 
 # Hide empty compare boxes until a ticker is assigned; filled slots stay in one row.
 if any(symbol for symbol, _report, _error in results):
+    company_names = {opt.symbol: short_company_name(opt.name) for opt in catalog}
     compare_cols = st.columns(MAX_COMPARE_SLOTS, gap="small")
     for col, (symbol, report, error), index in zip(
         compare_cols, results, range(MAX_COMPARE_SLOTS)
@@ -643,7 +724,16 @@ if any(symbol for symbol, _report, _error in results):
             elif error or report is None:
                 _render_slot_error(symbol, error or "Could not score this ticker.", selected=selected)
             else:
-                _render_compare_card(report, selected=selected, slot_index=index)
+                _render_compare_card(
+                    report,
+                    selected=selected,
+                    company=company_names.get(symbol, ""),
+                    slot_index=index,
+                )
+    if 0 <= target < len(results):
+        _sel_symbol, sel_report, sel_error = results[target]
+        if sel_report is not None and not sel_error:
+            _render_selected_slot_detail(sel_report, slot_index=target)
 
 ok_reports = [report for _symbol, report, error in results if report is not None and not error]
 if ok_reports:
