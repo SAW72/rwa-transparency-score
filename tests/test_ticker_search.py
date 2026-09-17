@@ -280,6 +280,10 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "st.selectbox" in picker
     assert "index=None" in picker
     assert "_auto_place(picked)" in picker
+    assert "_install_search_typeahead" in picker
+    assert "on_change=_on_search_query_change" in picker
+    assert picker.index("st.text_input") < picker.index("_install_search_typeahead")
+    assert picker.index("_install_search_typeahead") < picker.index("search_tickers")
     assert "max-width" in source
     assert "stSelectbox" in source
     assert "z-index: 40" in source
@@ -313,6 +317,11 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "pending_ticker_query" not in source
     assert 'st.expander("Why this score?"' in source
     assert "st.form" not in source
+    assert demo_app.SEARCH_TYPEAHEAD_DEBOUNCE_MS == 150
+    assert "addEventListener(\"input\"" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "keypress" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "_install_search_typeahead" in source
+    assert "search_typeahead_script" in source
 
     shown = demo_app.browse_categories(catalog)
     assert [cat.id for cat in shown] == ["ai_tech", "oil_energy", "real_estate", "auto_ev"]
@@ -328,6 +337,59 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.next_place_index(["NVDA", "TSLA", "AAPL", "META"], 0, "NVDA") == 0
     assert demo_app.default_active_slot(["NVDA", "TSLA", "AAPL", "META"]) == 0
     assert demo_app.default_active_slot(["NVDA", "", "AAPL", "META"]) == 1
+
+
+def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> None:
+    """Matches must mount from typed 3+ chars — no category click, no Enter."""
+    import app as demo_app
+
+    catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
+    for query in ("NVD", "NVDA", "nvd", "nvda"):
+        hits = demo_app.search_tickers(query, catalog)
+        assert [opt.symbol for opt in hits] == ["NVDA"], query
+        assert "Nvidia" in demo_app.format_option(hits[0])
+
+    # Empty-state copy is reserved for a real miss, not a pending category click.
+    assert demo_app.search_tickers("zzz", catalog) == []
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    picker = source.split("def _render_search_picker", 1)[1]
+    assert "No directory matches — type a ticker or tap a category." in picker
+    assert "len((query or \"\").strip()) >= SEARCH_MIN_CHARS" in picker
+    assert "if matches:" in picker
+    assert "cat_chip_" not in picker.split("st.text_input", 1)[1].split("if matches", 1)[0]
+
+    script = demo_app.search_typeahead_script()
+    assert str(demo_app.SEARCH_TYPEAHEAD_DEBOUNCE_MS) in script
+    assert "__DEBOUNCE_MS__" not in script
+    assert "addEventListener(\"input\"" in script
+    assert "Enter" in script
+    assert "st.form" not in source
+
+    # Category chips still pre-fill Search with the documented keyword.
+    assert demo_app.chip_query(CATEGORIES[0]) == "ai"
+    assert "st.session_state.ticker_query = chip_query(cat)" in source
+
+
+def test_search_query_change_clears_stale_match_pick(monkeypatch) -> None:
+    import app as demo_app
+
+    class _FakeSS(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    monkeypatch.setattr(
+        demo_app.st,
+        "session_state",
+        _FakeSS({demo_app.SEARCH_MATCH_KEY: "NVDA"}),
+    )
+    demo_app._on_search_query_change()
+    assert demo_app.SEARCH_MATCH_KEY not in demo_app.st.session_state
 
 
 def test_select_niv_match_fills_slot_same_path_as_use_chip() -> None:
