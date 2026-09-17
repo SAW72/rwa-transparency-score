@@ -8,6 +8,12 @@
 # set RWA_USE_FIXTURES=1.
 # Optional: POLYGON_RPC_URL / BASE_RPC_URL / ETH_RPC_URL in the dashboard
 # (public no-key fallbacks are used when unset).
+#
+# Start Command: the dashboard value is independent of this file unless the
+# service is Blueprint-synced. It MUST stay `python -m rwa_score.health …`.
+# `streamlit run app.py` serves Streamlit SPA HTML at GET /health, /privacy,
+# and /terms (content-type text/html). `/_stcore/health` is Streamlit's own
+# probe and will still return `ok` in that case — that is not this payload.
 
 services:
   - type: web

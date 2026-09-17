@@ -3,8 +3,10 @@
 Launch (fixtures, no API key):
     RWA_USE_FIXTURES=1 streamlit run app.py
 
-Render binds 0.0.0.0:$PORT via render.yaml and starts with
+Render binds 0.0.0.0:$PORT via render.yaml and must start with
 ``python -m rwa_score.health`` so GET /health is registered before the SPA.
+The dashboard Start Command must match that launcher — ``streamlit run app.py``
+leaves cold-start ``/health`` as Streamlit HTML.
 """
 
 from __future__ import annotations

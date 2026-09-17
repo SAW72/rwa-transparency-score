@@ -1,15 +1,24 @@
 """Live-mode health payload and Streamlit ``GET /health`` route.
 
-Streamlit 1.39 serves unknown paths as the SPA (``index.html``), so a real
-JSON ``/health`` has to be registered on Tornado *before* ``Server._create_app``
-runs. ``python -m rwa_score.health`` does that, then launches Streamlit.
-The same hook registers HTML ``/privacy`` and ``/terms``.
-``app.py`` also installs the route and stops UI rendering if ``/health``
-(or ``?health``) is requested after the script is already running.
+Streamlit 1.39+ serves unknown paths as the SPA (``index.html``). Tornado
+attach itself is fine — the failure mode is *when* the patch runs:
+
+- ``python -m rwa_score.health`` patches ``Server._create_app`` / Tornado
+  ``Application.__init__`` *before* Streamlit builds the app, so ``GET /health``
+  is JSON on a cold start (same for ``/privacy`` and ``/terms``).
+- ``streamlit run app.py`` builds that app first. ``app.py`` is not imported
+  until a browser WebSocket session (or script-health-check) starts, so the
+  first ``curl /health`` after a Free Render spin-up is the SPA. Live Render
+  matching ``text/html`` + the Streamlit ``index.html`` etag means the
+  dashboard Start Command is ``streamlit run``, not this launcher.
+
+The Render dashboard Start Command is independent of ``render.yaml`` unless
+the service is Blueprint-synced. It must match the blueprint.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,11 +192,49 @@ def _attach_custom_routes(app: Any) -> None:
     attach_legal_handlers(app)
 
 
+def _custom_route_specs() -> list[tuple[str, type]]:
+    from .legal import _legal_handler_class
+
+    return [
+        (r"/health/?", _health_handler_class()),
+        (r"/privacy/?", _legal_handler_class("privacy")),
+        (r"/terms/?", _legal_handler_class("terms")),
+    ]
+
+
+def _patch_tornado_application() -> None:
+    """Prepend custom routes when Tornado builds the app (before the SPA)."""
+    try:
+        from tornado.web import Application
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(Application, "_rwa_health_patched", False):
+        return
+    original_init = Application.__init__
+
+    def _init(self, handlers=None, default_host=None, transforms=None, **settings):
+        merged = [*_custom_route_specs(), *(handlers or [])]
+        original_init(
+            self,
+            merged,
+            default_host=default_host,
+            transforms=transforms,
+            **settings,
+        )
+        self._rwa_health_attached = True
+        self._rwa_legal_attached = True
+
+    Application.__init__ = _init  # type: ignore[method-assign]
+    Application._rwa_health_patched = True
+
+
 def install_health_route() -> None:
     """Patch Streamlit so ``GET /health``, ``/privacy``, and ``/terms`` are real routes."""
+    _patch_tornado_application()
     try:
         from streamlit.web.server.server import Server
     except Exception:  # noqa: BLE001
+        _attach_to_running_server()
         return
     if not getattr(Server, "_rwa_health_patched", False):
         original = Server._create_app
@@ -204,6 +251,7 @@ def install_health_route() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """Patch ``/health`` plus legal HTML routes, then ``streamlit run app.py``."""
+    os.environ["RWA_HEALTH_LAUNCHER"] = "1"
     install_health_route()
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--":
