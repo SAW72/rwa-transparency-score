@@ -29,6 +29,15 @@ class ApiSettings:
     max_compare_tickers: int = 8
     max_watchlist_tickers: int = 50
     webhook_timeout_seconds: float = 5.0
+    # Future hook only — Store does not open this URL (no hosted Postgres).
+    database_url: str = ""
+
+    @property
+    def db_backend(self) -> str:
+        raw = (self.database_url or "").strip().lower()
+        if raw.startswith("postgres://") or raw.startswith("postgresql://"):
+            return "postgres"
+        return "sqlite"
 
     @classmethod
     def from_env(cls) -> ApiSettings:
@@ -45,4 +54,5 @@ class ApiSettings:
             attestation_contract=_env("RWA_ATTESTATION_CONTRACT"),
             attestation_chain=_env("RWA_ATTESTATION_CHAIN") or "base-sepolia",
             attestation_chain_id=int(chain_id) if chain_id else BASE_SEPOLIA_CHAIN_ID,
+            database_url=_env("RWA_API_DATABASE_URL") or _env("DATABASE_URL"),
         )

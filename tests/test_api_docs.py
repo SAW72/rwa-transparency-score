@@ -152,3 +152,5 @@ def test_render_blueprint_does_not_host_paid_api() -> None:
     assert "plan: free" in text
     assert "RWA_USE_FIXTURES" in text
     assert 'value: "0"' in text
+    assert "postgres" not in text.lower()
+    assert "database" not in text.lower()

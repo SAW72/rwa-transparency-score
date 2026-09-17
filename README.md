@@ -262,7 +262,7 @@ RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures
 
 Pass `--contract` and `--rpc-url` (or `RWA_ATTESTATION_CONTRACT` / `BASE_SEPOLIA_RPC_URL`) to read the chain. The client never needs a private key.
 
-SQLite (`RWA_API_DB_PATH`, default `data/rat_api.sqlite`) is v1. Render’s filesystem is ephemeral — use a disk or Postgres before relying on keys in production.
+SQLite (`RWA_API_DB_PATH`, default `data/rat_api.sqlite`) is v1. Versioned migrations live in `rwa_score/api/migrations` (SQLite applied on boot; `python -m rwa_score.api.migrations --dialect postgres` prints a future self-hosted script). Render’s filesystem is ephemeral — use a disk or **self-hosted** Postgres before relying on keys in production. This repo does **not** provision paid Render Postgres. Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
 
 ## Tests
 
