@@ -6,6 +6,8 @@ import pytest
 
 from rwa_score.chainlink_por import (
     HEALTH_POR_FEED,
+    XSTOCKS_DATALINK_POR,
+    XSTOCKS_POR_FEEDS,
     decode_int256,
     decode_latest_round,
     decode_uint256,
@@ -14,6 +16,7 @@ from rwa_score.chainlink_por import (
     resolve_por_feed,
     rpc_urls_for_chain,
     scale_answer,
+    xstocks_datalink_por,
 )
 
 
@@ -50,6 +53,35 @@ def test_health_feed_is_backed_bib01() -> None:
     assert resolve_por_feed("IB01") == HEALTH_POR_FEED
     body = eth_call_payload(HEALTH_POR_FEED.proxy, "0xfeaf968c")
     assert body["params"][0]["to"] == HEALTH_POR_FEED.proxy
+
+
+def test_xstocks_have_no_published_aggregator_proxy() -> None:
+    """A2: DataLink stream names exist; AggregatorV3 proxies do not. Do not invent."""
+    assert XSTOCKS_POR_FEEDS == ()
+    for symbol in ("TSLA", "TSLAx", "AAPL", "AAPLx", "META", "METAx", "GOOGL", "COIN"):
+        assert resolve_por_feed(symbol) is None
+    # Catalog is names-only — empty proxy string, never a 0x address.
+    assert XSTOCKS_DATALINK_POR
+    for row in XSTOCKS_DATALINK_POR:
+        assert row["proxy"] == ""
+        assert "0x" not in row["proxy"]
+        assert "Datalink" in row["stream"] or "Data" in row["channel"]
+    tsla = xstocks_datalink_por("TSLAx")
+    assert tsla is not None
+    assert tsla["proxy"] == ""
+    assert resolve_por_feed("TSLAx") is None
+
+
+def test_nvda_alias_stays_on_published_btoken_not_datalink() -> None:
+    """NVDAx still maps to the Backed bNVDA Polygon proxy — not an invented xStock feed."""
+    feed = resolve_por_feed("NVDAx")
+    assert feed is not None
+    assert feed.symbol == "bNVDA"
+    assert feed.proxy.startswith("0x")
+    datalink = xstocks_datalink_por("NVDAx")
+    assert datalink is not None
+    assert datalink["proxy"] == ""
+    assert datalink["proxy"] != feed.proxy
 
 
 def test_scale_and_round_trip() -> None:

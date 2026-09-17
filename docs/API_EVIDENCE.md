@@ -98,7 +98,7 @@ content-type: application/json
   "explanations": {
     "backing": "Heuristic: issuer 'Backed Finance' matched the fully-backed name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode — live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
     "reserves": "Heuristic: issuer 'Backed Finance' matched the independent-PoR name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode — live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "redemption": "Heuristic: issuer 'Backed Finance' matched the redeemable name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' redemption rights via name list (live redemption verifier pending). heuristic fallback TODO: redemption attestation verifier Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "redemption": "Heuristic: issuer 'Backed Finance' matched the redeemable name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode — live redemption verifier skipped). heuristic fallback Fixture/offline mode — live redemption verifier skipped. Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
     "price": "24h change +0.80%; score = max(20, 100 − |Δ| × 2) = 98.4. Verification: self-reported. Evidence: CMC crypto quote crypto_id=36992; 24hΔ=0.8 verification=self-reported",
     "disclosure": "SEC CIK 0001045810 present on the RWA info record. Verification: self-reported. Evidence: SEC CIK 0001045810 on CMC RWA info record. verification=self-reported",
     "basis": "3 wrappers; spread 0.21% (NVDAx 118.4500 vs NVDAxst 118.7000); score = max(15, 100 − |spread| × 10) = 97.9. Verification: self-reported. Evidence: CMC market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7). verification=self-reported"
@@ -140,11 +140,11 @@ content-type: application/json
     },
     "redemption": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' redemption rights via name list (live redemption verifier pending).",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode — live redemption verifier skipped).",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
-        "TODO: redemption attestation verifier",
+        "Fixture/offline mode — live redemption verifier skipped.",
         "Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations."
       ],
       "ok": true,
@@ -199,7 +199,7 @@ content-type: application/json
     "Scores below use bundled DEMO FIXTURE data, not live CoinMarketCap API responses.",
     "Live attestation verifiers skipped (fixture/offline); backing/reserves use heuristic fallback.",
     "heuristic fallback",
-    "TODO: redemption attestation verifier"
+    "Fixture/offline mode — live redemption verifier skipped."
   ],
   "heuristics": {
     "backed": true,
