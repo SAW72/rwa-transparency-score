@@ -123,6 +123,8 @@ python -m rwa_score --fixtures NVDA TSLA AAPL
 
 Fixture catalog: `NVDA` (solid / Backed Finance, tight wrapper spread), `AAPL` (mid / xStocks, moderate spread), `TSLA` (thin wrapper, wide cross-issuer gap), `META` (Ondo, tight spread). Demo `market_pairs` samples live next to the other CMC-shaped fixtures so offline judging still scores the sixth pillar.
 
+A fixture client **cannot** turn on live HTTP verifiers unless `allow_live_on_fixtures=True` (tests only). The Streamlit sidebar **How scores are labeled** lists leftover heuristics: name-list fallback, self-reported price/disclosure/basis, and xStocks without a published PoR proxy. Scores set `verification_mode` to `offline_heuristic` or `live`.
+
 ### Live CMC
 
 ```bash

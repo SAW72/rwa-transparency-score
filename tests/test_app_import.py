@@ -272,6 +272,29 @@ def test_score_slots_empty_symbol_does_not_score(fixture_scorer) -> None:
     assert results[2][0] == "AAPL"
 
 
+def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
+    import app as demo_app
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "How scores are labeled" in source
+    assert "heuristic_legend_lines" in source
+    assert "selected_slot_verification_lines" in source
+    assert "Remaining heuristics stay labeled" in source
+
+    lines = demo_app.heuristic_legend_lines()
+    assert any("self-reported CMC" in line for line in lines)
+    assert any("heuristic fallback" in line for line in lines)
+    assert any("not financial advice" in line.lower() or "Educational demo" in line for line in lines)
+
+    report = fixture_scorer.score("NVDA")
+    slot = demo_app.selected_slot_verification_lines(report)
+    assert len(slot) == 6
+    assert any("heuristic fallback" in line for line in slot)
+    assert any("Cross-issuer basis" in line for line in slot)
+    labeled = demo_app.heuristic_legend_lines(report)
+    assert any("fixture" in line.lower() for line in labeled)
+
+
 def test_ui_surfaces_sixth_pillar_badge(fixture_scorer) -> None:
     import app as demo_app
     from rwa_score.scorer import PILLARS, WEIGHTS
