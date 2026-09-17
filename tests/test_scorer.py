@@ -356,6 +356,58 @@ def test_backed_redemption_docs_error_is_not_silent() -> None:
     assert any("verifier failure" in f.lower() or "503" in f for f in report["flags"])
 
 
+def test_fixture_scorer_never_calls_http() -> None:
+    class BoomSession:
+        def get(self, *args, **kwargs):
+            raise AssertionError("fixture path must not HTTP GET")
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("fixture path must not HTTP POST")
+
+    from rwa_score.client import FixtureClient
+
+    scorer = TransparencyScorer(FixtureClient(), session=BoomSession())
+    report = scorer.score("NVDA")
+    assert report["data_source"] == "fixture"
+    assert report["live_verifiers"] is False
+    assert report["verification_mode"] == "offline_heuristic"
+    assert report["verification"]["backing"]["source"] == "heuristic_fallback"
+    assert report["verification"]["reserves"]["source"] == "heuristic_fallback"
+    assert report["verification"]["redemption"]["source"] == "heuristic_fallback"
+
+
+def test_fixture_client_blocks_live_verifiers_unless_opted_in() -> None:
+    from rwa_score.client import FixtureClient
+
+    blocked = TransparencyScorer(FixtureClient(), use_live_verifiers=True)
+    assert blocked.use_live_verifiers is False
+    assert blocked._fixture_live_blocked is True
+    report = blocked.score("AAPL")
+    assert report["live_verifiers"] is False
+    assert any("blocked live verifiers" in n for n in report["notes"])
+
+    allowed = TransparencyScorer(
+        FixtureClient(), use_live_verifiers=True, allow_live_on_fixtures=True
+    )
+    assert allowed.use_live_verifiers is True
+    assert allowed._fixture_live_blocked is False
+
+
+def test_remaining_heuristic_paths_label_self_reported() -> None:
+    from rwa_score.scorer import remaining_heuristic_paths
+
+    report = TransparencyScorer(RecordingClient(), use_live_verifiers=False).score("NVDA")
+    rows = remaining_heuristic_paths(
+        report["verification"],
+        data_source=report["data_source"],
+        live_verifiers=False,
+    )
+    kinds = {row["kind"] for row in rows}
+    assert "heuristic_fallback" in kinds
+    assert "self-reported" in kinds
+    assert "offline_skip" in kinds
+
+
 def test_failed_verifier_is_not_silently_dropped() -> None:
     from rwa_score.verifiers import BackedVerifier
     from tests.test_verifiers import FakeRpcSession

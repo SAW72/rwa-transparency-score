@@ -252,6 +252,8 @@ content-type: application/json
   "cik": "0001045810",
   "issuer_note": "Equity-backed token (Backed Finance / xStocks): claims 1:1 share custody with a public on-chain proof of reserves.",
   "summary": "Backed Finance — 0 risk flag(s).",
+  "verification_mode": "offline_heuristic",
+  "live_verifiers": false,
   "confidence": {
     "score": 0.4,
     "label": "low"
