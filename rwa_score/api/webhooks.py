@@ -198,5 +198,6 @@ def apply_score_side_effects(
         band=str(report["band"]),
         payload_json=history_json(report),
         payload_hash=digest,
+        key_id=key_id,
     )
     notify_crossings(store, report, key_id=key_id, poster=poster, timeout=timeout)

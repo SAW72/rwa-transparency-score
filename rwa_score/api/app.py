@@ -264,8 +264,10 @@ def create_app(
         limit: int = Query(default=30, ge=1, le=200),
         key: ApiKey = Depends(require_paid),
     ) -> dict[str, Any]:
-        del key
-        return {"ticker": ticker.upper(), "history": db.get_history(ticker, limit=limit)}
+        return {
+            "ticker": ticker.upper(),
+            "history": db.get_history(ticker, limit=limit, key_id=key.id),
+        }
 
     @app.post("/v1/webhooks")
     def create_webhook(body: WebhookBody, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:

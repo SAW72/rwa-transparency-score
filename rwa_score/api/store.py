@@ -1,4 +1,8 @@
-"""SQLite persistence for keys, usage, history, watchlists, and webhooks."""
+"""SQLite persistence for keys, usage, history, watchlists, and webhooks.
+
+Schema lives in ``rwa_score.api.migrations`` (SQLite now, Postgres SQL dump
+for a later self-hosted apply). This class does not open a hosted database.
+"""
 
 from __future__ import annotations
 
@@ -11,73 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS api_keys (
-    id INTEGER PRIMARY KEY,
-    key_hash TEXT UNIQUE NOT NULL,
-    key_prefix TEXT NOT NULL,
-    name TEXT NOT NULL,
-    tier TEXT NOT NULL CHECK (tier IN ('free', 'paid')),
-    created_at TEXT NOT NULL,
-    revoked_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS usage_events (
-    id INTEGER PRIMARY KEY,
-    key_id INTEGER NOT NULL REFERENCES api_keys(id),
-    ts REAL NOT NULL,
-    path TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_usage_key_ts ON usage_events(key_id, ts);
-
-CREATE TABLE IF NOT EXISTS score_history (
-    id INTEGER PRIMARY KEY,
-    ticker TEXT NOT NULL,
-    scored_at REAL NOT NULL,
-    score REAL NOT NULL,
-    band TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    payload_hash TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_history_ticker ON score_history(ticker, scored_at);
-
-CREATE TABLE IF NOT EXISTS watchlist_items (
-    id INTEGER PRIMARY KEY,
-    key_id INTEGER NOT NULL REFERENCES api_keys(id),
-    ticker TEXT NOT NULL,
-    UNIQUE(key_id, ticker)
-);
-
-CREATE TABLE IF NOT EXISTS webhooks (
-    id INTEGER PRIMARY KEY,
-    key_id INTEGER NOT NULL REFERENCES api_keys(id),
-    url TEXT NOT NULL,
-    secret TEXT NOT NULL,
-    ticker TEXT,
-    trigger TEXT NOT NULL DEFAULT 'band_cross',
-    created_at TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS last_bands (
-    key_id INTEGER NOT NULL REFERENCES api_keys(id),
-    ticker TEXT NOT NULL,
-    band TEXT NOT NULL,
-    score REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (key_id, ticker)
-);
-
-CREATE TABLE IF NOT EXISTS webhook_deliveries (
-    id INTEGER PRIMARY KEY,
-    webhook_id INTEGER NOT NULL REFERENCES webhooks(id),
-    ticker TEXT NOT NULL,
-    event TEXT NOT NULL,
-    status_code INTEGER,
-    delivered_at REAL NOT NULL,
-    ok INTEGER NOT NULL
-);
-"""
+from .migrations import SQLITE_001 as SCHEMA, apply_sqlite_migrations
 
 
 def hash_key(raw: str) -> str:
@@ -164,7 +102,7 @@ class Store:
 
     def _init(self) -> None:
         with self._lock:
-            self._conn.executescript(SCHEMA)
+            apply_sqlite_migrations(self._conn)
             self._migrate_last_bands()
             self._conn.commit()
 
@@ -326,24 +264,41 @@ class Store:
         payload_json: str,
         payload_hash: str,
         scored_at: float | None = None,
+        key_id: int | None = None,
     ) -> None:
         stamped = time.time() if scored_at is None else scored_at
         with self._lock:
             self._conn.execute(
                 "INSERT INTO score_history "
-                "(ticker, scored_at, score, band, payload_json, payload_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (ticker.upper(), stamped, score, band, payload_json, payload_hash),
+                "(ticker, scored_at, score, band, payload_json, payload_hash, key_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ticker.upper(), stamped, score, band, payload_json, payload_hash, key_id),
             )
             self._conn.commit()
 
-    def get_history(self, ticker: str, *, limit: int = 30) -> list[dict[str, Any]]:
+    def get_history(
+        self,
+        ticker: str,
+        *,
+        limit: int = 30,
+        key_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        symbol = ticker.upper()
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT ticker, scored_at, score, band, payload_hash "
-                "FROM score_history WHERE ticker = ? ORDER BY scored_at DESC LIMIT ?",
-                (ticker.upper(), limit),
-            ).fetchall()
+            if key_id is None:
+                rows = self._conn.execute(
+                    "SELECT ticker, scored_at, score, band, payload_hash, key_id "
+                    "FROM score_history WHERE ticker = ? "
+                    "ORDER BY scored_at DESC LIMIT ?",
+                    (symbol, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT ticker, scored_at, score, band, payload_hash, key_id "
+                    "FROM score_history WHERE ticker = ? AND key_id = ? "
+                    "ORDER BY scored_at DESC LIMIT ?",
+                    (symbol, key_id, limit),
+                ).fetchall()
         return [
             {
                 "ticker": r["ticker"],
@@ -351,6 +306,7 @@ class Store:
                 "score": r["score"],
                 "band": r["band"],
                 "payload_hash": r["payload_hash"],
+                "key_id": r["key_id"],
             }
             for r in rows
         ]
