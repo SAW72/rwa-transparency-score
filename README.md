@@ -294,6 +294,12 @@ Optional RPC overrides (no keys): `POLYGON_RPC_URL`, `BASE_RPC_URL`, `ETH_RPC_UR
 
 **Render (blueprint):** `render.yaml` starts via `python -m rwa_score.health` on `0.0.0.0:$PORT` so `GET /health` is registered before Streamlit's SPA catch-all.
 
+**Dashboard Start Command must match `render.yaml`.** A dashboard-edited Start Command is **not** overwritten by this file unless the service is Blueprint-synced. `streamlit run app.py` starts Streamlit *before* `app.py` can patch Tornado, so a cold-start `GET /health` (and `/privacy`, `/terms`) is the SPA (`text/html`). `/_stcore/health` returning `ok` only proves Streamlit is up — it is not `build_health_payload`. Confirm **Settings → Start Command** is exactly:
+
+```text
+python -m rwa_score.health --server.port $PORT --server.address 0.0.0.0 --server.headless true
+```
+
 ```text
 New Web Service → this repo → Build: pip install -r requirements.txt
 Start: python -m rwa_score.health --server.port $PORT --server.address 0.0.0.0 --server.headless true
