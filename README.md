@@ -13,7 +13,7 @@ RWA_USE_FIXTURES=1 streamlit run app.py
 
 **Paid API evidence:** [`docs/API_EVIDENCE.md`](docs/API_EVIDENCE.md) — redacted `GET /v1/score/NVDA` with `X-API-Key: <REDACTED>` plus a real JSON body captured from the paid API locally under `RWA_USE_FIXTURES=1` (**fixture-backed, not live CMC**).
 
-Then open the local URL Streamlit prints. Type a prefix like `NIV` to pick **NVDA / Nvidia**, or a category like `oil`, `AI`, or `real estate`. Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
+Then open the local URL Streamlit prints. Type a prefix like `NIV` or `NVD` (3+ characters — Matches appear as you type, no Enter) to pick **NVDA / Nvidia**, or a category like `oil`, `AI`, or `real estate`. Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
 
 **Search categories** (case-insensitive keywords; rows come from the CMC/fixture directory, bucketed by `industry` / `sector` plus name hints):
 

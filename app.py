@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from rwa_score.client import create_client, env_flag
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
@@ -139,6 +140,98 @@ MAX_COMPARE_SLOTS = 4
 CANDIDATE_STRIP_LIMIT = 4
 SEARCH_MATCH_KEY = "search_match_pick"
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
+# Streamlit 1.39 text_input commits on Enter/blur only. Debounced input
+# events commit the same widget so Matches update as the user types.
+SEARCH_TYPEAHEAD_DEBOUNCE_MS = 150
+SEARCH_TYPEAHEAD_JS = r"""
+(function () {
+  var win = window.parent;
+  var doc = win.document;
+  var DELAY = __DEBOUNCE_MS__;
+  var BOUND = "data-rwa-typeahead";
+
+  function setKeepFocus(on) {
+    win.__rwaSearchKeepFocus = !!on;
+    try {
+      if (on) win.sessionStorage.setItem("rwaSearchKeepFocus", "1");
+      else win.sessionStorage.removeItem("rwaSearchKeepFocus");
+    } catch (err) {}
+  }
+
+  function keepFocus() {
+    if (win.__rwaSearchKeepFocus) return true;
+    try { return win.sessionStorage.getItem("rwaSearchKeepFocus") === "1"; }
+    catch (err) { return false; }
+  }
+
+  function findSearchInput() {
+    var blocks = doc.querySelectorAll('[data-testid="stTextInput"]');
+    var i;
+    for (i = 0; i < blocks.length; i++) {
+      var label = blocks[i].querySelector("label");
+      if (label && String(label.textContent || "").trim() === "Search") {
+        return blocks[i].querySelector("input");
+      }
+    }
+    return doc.querySelector('[data-testid="stTextInput"] input');
+  }
+
+  function commitTypedValue(input) {
+    if (!input || doc.activeElement !== input) return;
+    try {
+      input.dispatchEvent(new KeyboardEvent("keypress", {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true
+      }));
+    } catch (err) {}
+    input.blur();
+  }
+
+  function bind(input) {
+    if (!input || input.getAttribute(BOUND) === "1") return;
+    input.setAttribute(BOUND, "1");
+    var timer = null;
+    input.addEventListener("input", function () {
+      setKeepFocus(true);
+      if (timer) win.clearTimeout(timer);
+      timer = win.setTimeout(function () { commitTypedValue(input); }, DELAY);
+    });
+  }
+
+  function restoreFocus(input) {
+    if (!input || !keepFocus()) return;
+    input.focus();
+    try {
+      var len = (input.value || "").length;
+      input.setSelectionRange(len, len);
+    } catch (err) {}
+  }
+
+  function attach() {
+    var input = findSearchInput();
+    if (!input) return;
+    bind(input);
+    restoreFocus(input);
+  }
+
+  if (!win.__rwaTypeaheadInstalled) {
+    win.__rwaTypeaheadInstalled = true;
+    doc.addEventListener("mousedown", function (ev) {
+      var t = ev.target;
+      if (t && t.closest && t.closest('[data-testid="stTextInput"]')) return;
+      setKeepFocus(false);
+    }, true);
+    attach();
+    new win.MutationObserver(attach).observe(doc.body, { childList: true, subtree: true });
+  } else {
+    attach();
+  }
+})();
+"""
 # Process-local fallback when session_state is unavailable (unit tests).
 _score_memo: dict[str, dict] = {}
 _COMPANY_SUFFIXES = frozenset({"corp", "inc", "ltd", "llc", "co", "the", "plc", "sa"})
@@ -401,13 +494,34 @@ def _auto_place(ticker: str) -> None:
     _maybe_rerun()
 
 
+def _on_search_query_change() -> None:
+    """Drop a stale Matches pick when Search text changes (type-ahead or Enter)."""
+    st.session_state.pop(SEARCH_MATCH_KEY, None)
+
+
+def search_typeahead_script(debounce_ms: int = SEARCH_TYPEAHEAD_DEBOUNCE_MS) -> str:
+    """JS that commits the Search box on input so Matches update without Enter."""
+    delay = max(0, int(debounce_ms))
+    return SEARCH_TYPEAHEAD_JS.replace("__DEBOUNCE_MS__", str(delay))
+
+
+def _install_search_typeahead() -> None:
+    """Bridge Streamlit's Enter/blur-only text_input to live-as-you-type search."""
+    components.html(
+        f"<script>{search_typeahead_script()}</script>",
+        height=0,
+        scrolling=False,
+    )
+
+
 def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
     """Categories → compact Search + attached match dropdown.
 
     Chip click writes ``ticker_query`` before the Search box is created so
     matches appear on this run — no Enter, no extra rerun.
-    After a successful place, ``_clear_search`` empties the box first so
-    the match dropdown is not created.
+    Typed queries commit on each keystroke (debounced) so Matches appear at
+    3+ characters without Enter. After a successful place, ``_clear_search``
+    empties the box first so the match dropdown is not created.
     """
     if st.session_state.get("_clear_search"):
         st.session_state["_clear_search"] = False
@@ -432,7 +546,9 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         placeholder="Ticker, name, or category",
         label_visibility="visible",
         key="ticker_query",
+        on_change=_on_search_query_change,
     )
+    _install_search_typeahead()
     matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
     if matches:
         options = [opt.symbol for opt in matches]
@@ -698,6 +814,18 @@ st.markdown(
       [data-baseweb="popover"],
       [data-baseweb="menu"] {{
         z-index: 1000 !important;
+      }}
+      /* Typeahead bridge is a 0-height iframe — do not leave a gap under Search. */
+      div[data-testid="stIFrame"]:has(iframe[height="0"]),
+      iframe[height="0"] {{
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        border: 0 !important;
+        position: absolute !important;
+        width: 0 !important;
       }}
     </style>
     """,
