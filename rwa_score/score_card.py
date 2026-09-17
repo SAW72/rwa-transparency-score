@@ -20,6 +20,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .scorer import PILLARS, WEIGHTS
+from .x_client import X_POST_UNAVAILABLE_MESSAGE, user_facing_x_skip_message
 
 SIGNING_SECRET_ENV = "SCORE_CARD_SIGNING_SECRET"
 UNSIGNED_FINGERPRINT = "UNSIGNED"
@@ -364,11 +365,12 @@ def share_score_card(
         result = client.post_image(card.png_bytes, card.caption)
         card.x_posted = bool(getattr(result, "posted", False))
         card.x_url = getattr(result, "url", None)
-        card.x_message = getattr(result, "message", "") or (
+        raw = getattr(result, "message", "") or (
             f"Posted to X: {card.x_url}" if card.x_posted else "X post skipped."
         )
-    except Exception as exc:  # noqa: BLE001 — never crash the demo
+        card.x_message = raw if card.x_posted else user_facing_x_skip_message(raw)
+    except Exception:  # noqa: BLE001 — never crash the demo
         card.x_posted = False
         card.x_url = None
-        card.x_message = f"X post skipped: {exc}"
+        card.x_message = X_POST_UNAVAILABLE_MESSAGE
     return card

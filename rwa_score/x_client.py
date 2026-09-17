@@ -38,6 +38,28 @@ MISSING_CREDS_MESSAGE = (
     "X_ACCESS_TOKEN_SECRET (Render dashboard / Bitwarden) to publish. "
     "The PNG is still available to download."
 )
+X_POST_UNAVAILABLE_MESSAGE = (
+    "X post skipped. The score card PNG is still available to download."
+)
+_POLISHED_SKIP_MESSAGES = frozenset(
+    {
+        MISSING_CREDS_MESSAGE,
+        X_POST_UNAVAILABLE_MESSAGE,
+        "X post skipped (disabled).",
+        "X post skipped.",
+        "X post skipped: score card image was empty.",
+    }
+)
+
+
+def user_facing_x_skip_message(message: str | None = None) -> str:
+    """Polished skip copy for the UI. Never forwards raw X API errors."""
+    text = (message or "").strip()
+    if not text:
+        return X_POST_UNAVAILABLE_MESSAGE
+    if text in _POLISHED_SKIP_MESSAGES or text.startswith("Posted to X:"):
+        return text
+    return X_POST_UNAVAILABLE_MESSAGE
 
 
 def _first_env(*names: str) -> str:
@@ -337,11 +359,11 @@ class XClient:
         try:
             media_id = self.upload_png(png_bytes)
             tweet_id, url = self.create_post(text, media_id)
-        except Exception as exc:  # noqa: BLE001 — caller / UI must not crash
+        except Exception:  # noqa: BLE001 — caller / UI must not crash
             return XPostResult(
                 posted=False,
-                skipped=False,
-                message=f"X post skipped: {exc}",
+                skipped=True,
+                message=X_POST_UNAVAILABLE_MESSAGE,
             )
         return XPostResult(
             posted=True,

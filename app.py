@@ -41,7 +41,7 @@ from rwa_score.ticker_search import (
     search_tickers,
 )
 from rwa_score.verifiers import VerificationLevel
-from rwa_score.x_client import x_credentials_ready
+from rwa_score.x_client import user_facing_x_skip_message, x_credentials_ready
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
 # Per-symbol wall-clock cache for the explainer — process-local dict.
@@ -517,10 +517,42 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
             key=f"share_dl_{slot_index}_{ticker}",
         )
     st.caption(f"Signature fingerprint: `{bundle.fingerprint}`")
+    status = _user_facing_share_status(bundle)
     if bundle.x_posted:
-        st.success(bundle.x_message)
-    elif bundle.x_message:
-        st.info(bundle.x_message)
+        st.success(status)
+    elif status:
+        st.info(status)
+
+
+def _render_why_this_score(report: dict, *, slot_index: int = 0) -> None:
+    """Collapsed 'Why this score?' control. xAI runs only after the user asks.
+
+    Streamlit still executes expander bodies when collapsed, so the explanation
+    stays behind Show explanation. Missing ``XAI_API_KEY`` uses the templated
+    fallback — this helper must never raise.
+    """
+    ticker = str(report.get("ticker") or "UNK")
+    why_key = f"explain_{slot_index}_{ticker}"
+    with st.expander("Why this score?", expanded=False):
+        if st.session_state.get(why_key):
+            st.write(_cached_explanation(report))
+            st.caption(AI_FOOTNOTE)
+        elif st.button(
+            "Show explanation",
+            key=f"explain_btn_{slot_index}_{ticker}",
+        ):
+            st.session_state[why_key] = True
+            st.write(_cached_explanation(report))
+            st.caption(AI_FOOTNOTE)
+
+
+def _user_facing_share_status(bundle: object) -> str:
+    """Posted caption, or a polished skip — never raw X API errors."""
+    posted = bool(getattr(bundle, "x_posted", False))
+    message = str(getattr(bundle, "x_message", "") or "")
+    if posted:
+        return message
+    return user_facing_x_skip_message(message)
 
 
 def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
@@ -587,8 +619,7 @@ def _render_compare_card(
     company: str = "",
     slot_index: int = 0,
 ) -> None:
-    """Ticker · company · score · LIVE/FIXTURE · pillar dots / weakest."""
-    del slot_index
+    """Ticker · company · score · LIVE/FIXTURE · pillar dots / Why this score?"""
     ticker = str(report.get("ticker") or "")
     title = f"● {ticker}" if selected else ticker
     score = float(report.get("score") or 0)
@@ -603,6 +634,7 @@ def _render_compare_card(
         st.caption(weak)
     elif dots:
         st.caption(dots)
+    _render_why_this_score(report, slot_index=slot_index)
 
 
 def _render_slot_error(ticker: str, message: str, *, selected: bool = False) -> None:

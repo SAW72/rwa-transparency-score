@@ -311,7 +311,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert 'st.session_state.ticker_query = ""' in source
     assert "_clear_search" in source
     assert "pending_ticker_query" not in source
-    assert "Why this score?" not in source
+    assert 'st.expander("Why this score?"' in source
     assert "st.form" not in source
 
     shown = demo_app.browse_categories(catalog)

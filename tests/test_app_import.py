@@ -163,14 +163,21 @@ def test_why_this_score_copy_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     import app as demo_app
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert "Why this score?" not in source
+    assert 'st.expander("Why this score?"' in source
+    assert "Show explanation" in source
+    why = source.split("def _render_why_this_score", 1)[1].split(
+        "def _user_facing_share_status", 1
+    )[0]
+    assert "_cached_explanation" in why
+    assert "AI_FOOTNOTE" in why
+    assert "st.expander" in why
+    assert "Share score card" not in why
     card = source.split("def _render_compare_card", 1)[1].split(
         "def _render_slot_error", 1
     )[0]
-    assert "_cached_explanation" not in card
+    assert "_render_why_this_score" in card
     assert "_render_card_details" not in card
     assert "st.progress" not in card
-    assert "st.expander" not in card
     assert "Share score card" not in card
     assert "mode_cue" in card
     assert "weakest_pillar_line" in card
@@ -192,14 +199,44 @@ def test_why_this_score_copy_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     assert first == second == "explained AAPL"
     assert calls["n"] == 1
 
+    demo_app._explain_cache.clear()
+
+    def boom(_result):
+        raise RuntimeError("xAI down")
+
+    monkeypatch.setattr(demo_app, "explain_score", boom)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    text = demo_app._cached_explanation({"ticker": "TSLA", "score": 10, "band": "RED"})
+    assert "Explanation unavailable" in text
+    assert "not financial advice" in text.lower()
+
+
+def test_cached_explanation_uses_templated_fallback_without_xai_key(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app as demo_app
+
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    demo_app._explain_cache.clear()
+    report = fixture_scorer.score("NVDA")
+    text = demo_app._cached_explanation(report)
+    assert "NVDA" in text
+    assert "not financial advice" in text.lower()
+    assert "XAI_API_KEY" not in text
+    assert "Traceback" not in text
+
 
 def test_share_score_card_is_button_gated() -> None:
     import app as demo_app
+    from types import SimpleNamespace
+
+    from rwa_score.x_client import X_POST_UNAVAILABLE_MESSAGE
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "Share score card" in source
     assert "share_score_card" in source
     assert "_render_share_controls" in source
+    assert "_user_facing_share_status" in source
     assert "if st.button(" in source
     button_idx = source.index('st.button("Share score card"')
     call_idx = source.index("share_score_card(report)")
@@ -209,6 +246,17 @@ def test_share_score_card_is_button_gated() -> None:
     # Streamlit 1.39 image API — use_container_width crashes st.image.
     assert "st.image(bundle.png_bytes, use_container_width=" not in source
     assert "st.image(bundle.png_bytes, use_column_width=True)" in source
+
+    raw = SimpleNamespace(
+        x_posted=False,
+        x_message="X post skipped: X media INIT failed (400): boom",
+    )
+    assert demo_app._user_facing_share_status(raw) == X_POST_UNAVAILABLE_MESSAGE
+    posted = SimpleNamespace(
+        x_posted=True,
+        x_message="Posted to X: https://x.com/i/web/status/1",
+    )
+    assert demo_app._user_facing_share_status(posted).startswith("Posted to X:")
 
 
 def test_compare_row_is_native_streamlit_not_html() -> None:
@@ -223,14 +271,14 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     assert source.count("unsafe_allow_html") <= 1
     assert "Pick a ticker to compare here" in source
     assert "Assign a ticker" not in source
-    assert "Why this score?" not in source
+    assert 'st.expander("Why this score?"' in source
     render = source.split("def _render_compare_card", 1)[1].split(
         "def _render_slot_error", 1
     )[0]
     assert "unsafe_allow_html" not in render
     assert "st.metric" in render
     assert "st.progress" not in render
-    assert "st.expander" not in render
+    assert "_render_why_this_score" in render
     assert "st.caption" in render
     assert "share_score_card" not in render
     assert "Share score card" not in render
