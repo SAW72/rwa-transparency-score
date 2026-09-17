@@ -9,6 +9,7 @@ import pytest
 from rwa_score.x_client import (
     MEDIA_UPLOAD_URL,
     MISSING_CREDS_MESSAGE,
+    X_POST_UNAVAILABLE_MESSAGE,
     TWEET_URL,
     XClient,
     XCredentials,
@@ -16,6 +17,7 @@ from rwa_score.x_client import (
     oauth1_sign,
     oauth1_signature_base,
     percent_encode,
+    user_facing_x_skip_message,
     x_credentials_ready,
 )
 
@@ -201,9 +203,27 @@ def test_post_image_http_error_does_not_raise() -> None:
     client = XClient(_full_creds(), session=session)
     result = client.post_image(b"\x89PNG fake", "hi")
     assert result.posted is False
-    assert result.skipped is False
-    assert "403" in result.message
-    assert "forbidden" in result.message
+    assert result.skipped is True
+    assert result.message == X_POST_UNAVAILABLE_MESSAGE
+    assert "403" not in result.message
+    assert "forbidden" not in result.message
+    assert "INIT" not in result.message
+
+
+def test_user_facing_skip_hides_raw_x_api_errors() -> None:
+    raw = "X post skipped: X media INIT failed (400): {\"errors\":[{\"message\":\"bad\"}]}"
+    polished = user_facing_x_skip_message(raw)
+    assert polished == X_POST_UNAVAILABLE_MESSAGE
+    assert "400" not in polished
+    assert "INIT" not in polished
+    assert "errors" not in polished
+    assert user_facing_x_skip_message(MISSING_CREDS_MESSAGE) == MISSING_CREDS_MESSAGE
+    assert user_facing_x_skip_message("X post skipped (disabled).") == (
+        "X post skipped (disabled)."
+    )
+    assert user_facing_x_skip_message("Posted to X: https://x.com/i/web/status/1").startswith(
+        "Posted to X:"
+    )
 
 
 def test_empty_png_skips_without_http() -> None:

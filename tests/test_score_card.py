@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from rwa_score.x_client import X_POST_UNAVAILABLE_MESSAGE, user_facing_x_skip_message
 from rwa_score.score_card import (
     CARD_HEIGHT,
     CARD_WIDTH,
@@ -212,7 +213,30 @@ def test_share_survives_x_client_raise() -> None:
     )
     assert card.png_bytes
     assert card.x_posted is False
-    assert "timeout" in card.x_message
+    assert card.x_message == X_POST_UNAVAILABLE_MESSAGE
+    assert "timeout" not in card.x_message
+    assert "400" not in card.x_message
+
+
+def test_share_polishes_raw_x_api_skip_message() -> None:
+    client = RecordingXClient(
+        FakeXResult(
+            posted=False,
+            message="X post skipped: X media INIT failed (400): {\"title\":\"Bad Request\"}",
+        )
+    )
+    card = share_score_card(
+        SAMPLE_REPORT,
+        secret=TEST_SECRET,
+        timestamp=FIXED_TS,
+        x_client=client,
+    )
+    assert card.png_bytes.startswith(b"\x89PNG")
+    assert card.x_posted is False
+    assert card.x_message == X_POST_UNAVAILABLE_MESSAGE
+    assert "400" not in card.x_message
+    assert "INIT" not in card.x_message
+    assert user_facing_x_skip_message(card.x_message) == X_POST_UNAVAILABLE_MESSAGE
 
 
 def test_share_disabled_does_not_call_x() -> None:
@@ -240,6 +264,8 @@ def test_readme_documents_share_and_secrets() -> None:
     assert "Bitwarden" in text
     assert "HMAC-SHA256" in text
     assert "does **not** run on page load" in text
+    assert "polished skip message" in text
+    assert "never raw X API" in text
     assert "Not financial advice" in text
     assert "MIT" in text
     assert "not a hunter or auto-poster" in text
