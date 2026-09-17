@@ -17,12 +17,19 @@ from rwa_score.chainlink_por import (
     scale_answer,
 )
 from rwa_score.verifiers import (
+    BACKED_INKIND_DOCS_URL,
+    BACKED_REDEMPTION_DOCS_URL,
+    CASH_REDEMPTION_SCORE,
+    DINARI_DSHARE_DOCS_URL,
     DINARI_DSHARES_URL,
+    INKIND_REDEMPTION_SCORE,
     RESERVES_ONLY_POR_SCORE,
     BackedVerifier,
     DinariVerifier,
     RobinhoodVerifier,
     VerificationLevel,
+    parse_backed_redemption_docs,
+    parse_dinari_redemption_docs,
     por_ratio_is_plausible,
     por_score_from_ratio,
     resolve_verifier_id,
@@ -332,3 +339,142 @@ def test_backed_feeds_are_public_polygon_proxies() -> None:
         assert feed.chain == "polygon"
         assert feed.proxy.startswith("0x")
         assert len(feed.proxy) == 42
+
+
+BACKED_OVERVIEW_MD = """
+# Issuance and Redemption
+xStocks enter and exit circulation through issuance and redemption
+interactions with the issuer primary market of the underlying equity.
+Access requires KYC and AML. Wallets must be whitelisted.
+"""
+
+BACKED_INKIND_MD = """
+# xPort - In-Kind Flow
+xStock tokens can be redeemed back into shares at any time for use within Alpaca.
+Redemption Flow (Tokens to Shares): the issuer notifies Alpaca and Alpaca
+returns the corresponding underlying shares.
+"""
+
+DINARI_DSHARE_MD = """
+# What are dShares
+A mint (aka issuance) or a burn (aka redemption) only occurs when a
+corresponding order is complete on a brokerage account.
+Burn dShares. Transfer funds.
+"""
+
+
+def test_parse_backed_redemption_docs_requires_language() -> None:
+    empty = parse_backed_redemption_docs("Welcome to the product catalog.")
+    assert empty["documented"] is False
+    assert "redemption / redeem language" in empty["missing"]
+    ok = parse_backed_redemption_docs(BACKED_OVERVIEW_MD)
+    assert ok["documented"] is True
+    assert ok["has_kyc"] is True
+    assert ok["in_kind_to_shares"] is False
+    in_kind = parse_backed_redemption_docs(BACKED_INKIND_MD)
+    assert in_kind["in_kind_to_shares"] is True
+
+
+def test_parse_dinari_redemption_docs_requires_burn() -> None:
+    empty = parse_dinari_redemption_docs("Welcome to Dinari.")
+    assert empty["documented"] is False
+    ok = parse_dinari_redemption_docs(DINARI_DSHARE_MD)
+    assert ok["documented"] is True
+    assert ok["has_burn"] is True
+    assert ok["has_redemption"] is True
+
+
+def test_backed_verifier_redemption_live_docs() -> None:
+    session = FakeSession(
+        {
+            BACKED_REDEMPTION_DOCS_URL: FakeResponse(200, text=BACKED_OVERVIEW_MD),
+            BACKED_INKIND_DOCS_URL: FakeResponse(200, text=BACKED_INKIND_MD),
+        }
+    )
+    v = BackedVerifier(session=session)
+    result = v.verify_redemption(ticker="NVDA", issuer_name="Backed Finance")
+    assert result.ok is True
+    assert result.source == "backed_redemption_docs"
+    assert result.level == VerificationLevel.SELF_REPORTED
+    assert result.score == INKIND_REDEMPTION_SCORE
+    assert "in-kind" in result.evidence.lower()
+    assert "heuristic fallback" not in result.evidence.lower()
+    assert result.meta["in_kind_to_shares"] is True
+    # Cache: second call must not re-fetch.
+    again = v.verify_redemption(ticker="TSLA", issuer_name="xStocks")
+    assert again.score == INKIND_REDEMPTION_SCORE
+    assert session.calls.count(BACKED_REDEMPTION_DOCS_URL) == 1
+
+
+def test_backed_verifier_redemption_cash_only_when_inkind_missing() -> None:
+    session = FakeSession(
+        {
+            BACKED_REDEMPTION_DOCS_URL: FakeResponse(200, text=BACKED_OVERVIEW_MD),
+            BACKED_INKIND_DOCS_URL: FakeResponse(200, text="# unrelated page"),
+        }
+    )
+    result = BackedVerifier(session=session).verify_redemption(
+        ticker="AAPL", issuer_name="xStocks"
+    )
+    assert result.source == "backed_redemption_docs"
+    assert result.score == CASH_REDEMPTION_SCORE
+    assert result.meta["in_kind_to_shares"] is False
+    assert "not treated as in-kind" in result.evidence
+
+
+def test_backed_verifier_redemption_fails_closed_on_http_error() -> None:
+    session = FakeSession(
+        {BACKED_REDEMPTION_DOCS_URL: FakeResponse(503, text="down")}
+    )
+    result = BackedVerifier(session=session).verify_redemption(
+        ticker="NVDA", issuer_name="Backed Finance"
+    )
+    assert result.source == "heuristic_fallback"
+    assert result.ok is False
+    assert result.error
+    assert "heuristic fallback" in result.evidence
+    assert result.score == 85.0  # Backed Finance is on the redeemable name list
+
+
+def test_backed_verifier_redemption_fails_closed_when_claims_missing() -> None:
+    session = FakeSession(
+        {
+            BACKED_REDEMPTION_DOCS_URL: FakeResponse(200, text="No claims here."),
+            BACKED_INKIND_DOCS_URL: FakeResponse(200, text="still nothing"),
+        }
+    )
+    result = BackedVerifier(session=session).verify_redemption(
+        ticker="NVDA", issuer_name="Backed Finance"
+    )
+    assert result.source == "heuristic_fallback"
+    assert result.error
+    assert "incomplete redemption signals" in (result.error or "")
+    assert "heuristic fallback" in result.evidence
+
+
+def test_dinari_verifier_redemption_live_docs() -> None:
+    session = FakeSession({DINARI_DSHARE_DOCS_URL: FakeResponse(200, text=DINARI_DSHARE_MD)})
+    result = DinariVerifier(session=session).verify_redemption(
+        ticker="AAPL", issuer_name="Dinari"
+    )
+    assert result.ok is True
+    assert result.source == "dinari_redemption_docs"
+    assert result.score == CASH_REDEMPTION_SCORE
+    assert "burn" in result.evidence.lower()
+    assert "not treated as in-kind" in result.evidence
+    assert result.meta["in_kind_to_shares"] is False
+
+
+def test_dinari_verifier_redemption_fails_closed() -> None:
+    down = DinariVerifier(
+        session=FakeSession({DINARI_DSHARE_DOCS_URL: FakeResponse(500, text="nope")})
+    ).verify_redemption(ticker="AAPL", issuer_name="Dinari")
+    assert down.source == "heuristic_fallback"
+    assert down.error
+    assert down.score == 25.0  # Dinari is not on the redeemable name list
+
+    incomplete = DinariVerifier(
+        session=FakeSession({DINARI_DSHARE_DOCS_URL: FakeResponse(200, text="Welcome.")})
+    ).verify_redemption(ticker="AAPL", issuer_name="Dinari")
+    assert incomplete.source == "heuristic_fallback"
+    assert "incomplete redemption signals" in (incomplete.error or "")

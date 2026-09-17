@@ -91,8 +91,9 @@ def test_readme_chainlink_por_coverage_for_judges() -> None:
     assert "bTokens on Polygon only" in text
     assert "no published Chainlink PoR / SmartData aggregator yet" in text
     assert "That is expected, not a bug" in text
-    assert "Next upgrade:" in text
-    assert "no on-chain Chainlink PoR / SmartData proxy addresses for the xStocks line" in text
+    assert "no aggregator `proxyAddress`" in text
+    assert "docs/XSTOCKS_CHAINLINK_POR.md" in text
+    assert "do not invent addresses" in text.lower()
     assert "Reserves-only score 90" in text
     assert "must not be scored as undercollateralized PoR" in text
 
@@ -270,6 +271,29 @@ def test_score_slots_empty_symbol_does_not_score(fixture_scorer) -> None:
     assert results[0][1] is not None
     assert results[1] == ("", None, "Empty slot.")
     assert results[2][0] == "AAPL"
+
+
+def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
+    import app as demo_app
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "How scores are labeled" in source
+    assert "heuristic_legend_lines" in source
+    assert "selected_slot_verification_lines" in source
+    assert "Remaining heuristics stay labeled" in source
+
+    lines = demo_app.heuristic_legend_lines()
+    assert any("self-reported CMC" in line for line in lines)
+    assert any("heuristic fallback" in line for line in lines)
+    assert any("not financial advice" in line.lower() or "Educational demo" in line for line in lines)
+
+    report = fixture_scorer.score("NVDA")
+    slot = demo_app.selected_slot_verification_lines(report)
+    assert len(slot) == 6
+    assert any("heuristic fallback" in line for line in slot)
+    assert any("Cross-issuer basis" in line for line in slot)
+    labeled = demo_app.heuristic_legend_lines(report)
+    assert any("fixture" in line.lower() for line in labeled)
 
 
 def test_ui_surfaces_sixth_pillar_badge(fixture_scorer) -> None:

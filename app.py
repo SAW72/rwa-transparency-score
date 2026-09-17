@@ -20,7 +20,14 @@ from rwa_score.client import create_client, env_flag
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import share_score_card
-from rwa_score.scorer import PILLARS, WEIGHTS, ScoreError, TransparencyScorer, band_code
+from rwa_score.scorer import (
+    PILLARS,
+    WEIGHTS,
+    ScoreError,
+    TransparencyScorer,
+    band_code,
+    remaining_heuristic_paths,
+)
 from rwa_score.ticker_search import (
     CATEGORIES,
     SEARCH_MIN_CHARS,
@@ -92,6 +99,36 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
     else:
         badge = f"Verification: {level}"
     return badge, evidence
+
+
+def heuristic_legend_lines(report: dict | None = None) -> list[str]:
+    """Educational leftover-heuristic lines. Never invents a live path."""
+    base = [
+        "GREEN/YELLOW/ORANGE/RED bands are automated heuristics — not audited attestations.",
+        "Price, disclosure, and cross-issuer basis are always self-reported CMC (or fixture) fields.",
+        "Backing / reserves / redemption are live only when a verifier hits a published source; otherwise **heuristic fallback** (labeled, never silent).",
+        "xStocks names without a published Chainlink PoR aggregator stay heuristic — that is expected coverage, not a failed probe.",
+        "Fixture mode uses bundled demo data and skips live attestation / PoR / redemption HTTP.",
+        "Educational demo — not financial advice.",
+    ]
+    if not report:
+        return base
+    rows = remaining_heuristic_paths(
+        report.get("verification") or {},
+        data_source=str(report.get("data_source") or ""),
+        live_verifiers=bool(report.get("live_verifiers")),
+    )
+    extra = [f"{row['label']}: {row['kind']}" for row in rows]
+    return base + extra
+
+
+def selected_slot_verification_lines(report: dict) -> list[str]:
+    """Compact per-pillar verification labels for the active compare slot."""
+    lines: list[str] = []
+    for key in WEIGHTS:
+        badge, _evidence = _verification_badge_label(key, report)
+        lines.append(f"{PILLARS[key]['label']} — {badge}")
+    return lines
 
 
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
@@ -590,6 +627,21 @@ def _render_selected_slot_detail(report: dict, *, slot_index: int = 0) -> None:
     ]
     if bits:
         st.caption(" · ".join(bits))
+    for line in selected_slot_verification_lines(report):
+        st.caption(line)
+    if report.get("data_source") == "fixture" or not report.get("live_verifiers", True):
+        st.caption("Offline/fixture path — live attestation hooks skipped; leftover pillars are heuristic or self-reported.")
+    leftover = [
+        row
+        for row in remaining_heuristic_paths(
+            report.get("verification") or {},
+            data_source=str(report.get("data_source") or ""),
+            live_verifiers=bool(report.get("live_verifiers")),
+        )
+        if row["kind"] in {"heuristic_fallback", "offline_skip", "fixture"}
+    ]
+    for row in leftover:
+        st.caption(f"Heuristic note · {row['label']}: {row['kind']}")
     with st.expander("Share score card", expanded=False):
         _render_share_controls(report, slot_index=slot_index)
 
@@ -647,6 +699,10 @@ with st.sidebar:
         st.write(f"**{PILLARS[key]['label']}** — {weight:.0%}")
         st.caption(PILLARS[key]["what"])
 
+    st.markdown("### How scores are labeled")
+    for line in heuristic_legend_lines():
+        st.caption(line)
+
     st.markdown("### Disclaimer")
     st.write(DISCLAIMER)
 
@@ -656,6 +712,11 @@ with st.sidebar:
 
 mode_label = "Fixture" if use_fixtures else "Live"
 st.caption(f"Mode: {mode_label}")
+st.caption(
+    "Remaining heuristics stay labeled: name-list fallback, self-reported CMC "
+    "price/disclosure/basis, and xStocks without a published PoR proxy. "
+    "Educational demo — not financial advice."
+)
 
 try:
     scorer = _cached_scorer(use_fixtures)

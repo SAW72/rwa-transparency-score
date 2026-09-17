@@ -2,7 +2,9 @@
 
 Live sources (no paid APIs, ``requests`` only):
   - Backed / xStocks via Chainlink Proof of Reserve (on-chain AggregatorV3)
+  - Backed / xStocks redemption via public issuer docs (markdown, no JS)
   - Dinari dShares marketing page scrape (attestation pending — no signed URL yet)
+  - Dinari redemption via public dShare docs (mint/burn = issuance/redemption)
 
 Failed verifiers never fail silently: the scorer must surface the error and
 fall back to the name heuristic labeled **"heuristic fallback"**.
@@ -28,6 +30,20 @@ from .chainlink_por import (
 from .issuer_registry import HEURISTIC_NOTE, classify
 
 DINARI_DSHARES_URL = "https://dinari.com/dshares"
+# Public markdown — not the JS marketing shells. Do not invent claims.
+BACKED_REDEMPTION_DOCS_URL = (
+    "https://docs.xstocks.fi/docs/issuance-and-redemption.md"
+)
+BACKED_INKIND_DOCS_URL = (
+    "https://docs.xstocks.fi/docs/issuance-and-redemption/in-kind-flow-xport.md"
+)
+DINARI_DSHARE_DOCS_URL = "https://docs.dinari.com/docs/what-is-dshare.md"
+
+# Documented cash / burn-on-sell redemption is not in-kind share delivery.
+CASH_REDEMPTION_SCORE = 80.0
+INKIND_REDEMPTION_SCORE = 85.0
+
+DOCS_USER_AGENT = "rwa-transparency-score/0.3 (+hackathon demo)"
 
 CACHE_TTL_SECONDS = 3600.0
 REQUEST_TIMEOUT = 15
@@ -100,6 +116,8 @@ class Verifier(Protocol):
     def verify_backing(self, *, ticker: str, issuer_name: str) -> VerificationResult: ...
 
     def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult: ...
+
+    def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult: ...
 
 
 def _heuristic_scores(issuer_name: str) -> dict[str, float]:
@@ -182,6 +200,90 @@ def por_ratio_is_plausible(ratio: float) -> bool:
     return ratio >= MIN_PLAUSIBLE_POR_RATIO
 
 
+def visible_text(payload: str) -> str:
+    """Strip tags / collapse whitespace so markdown and HTML share one parser."""
+    text = re.sub(r"<[^>]+>", " ", payload or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def fetch_public_text(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: float = REQUEST_TIMEOUT,
+) -> str:
+    """GET a public URL. Raises on non-200 or empty body — caller fails closed."""
+    resp = session.get(
+        url,
+        timeout=timeout,
+        headers={"User-Agent": DOCS_USER_AGENT},
+    )
+    status = int(getattr(resp, "status_code", 0) or 0)
+    if status != 200:
+        raise RuntimeError(f"{url} HTTP {status}")
+    text = resp.text or ""
+    if not text.strip():
+        raise RuntimeError(f"{url} returned empty body")
+    return text
+
+
+def parse_backed_redemption_docs(text: str) -> dict[str, Any]:
+    """Require explicit primary-market redemption language. Never infer it."""
+    blob = visible_text(text).lower()
+    has_redemption = bool(re.search(r"\bredemption\b|\bredeem(?:able|ed|s)?\b", blob))
+    has_primary_market = "primary market" in blob
+    has_underlying = "underlying" in blob
+    has_kyc = "kyc" in blob
+    has_whitelist = "whitelist" in blob
+    has_in_kind_heading = bool(re.search(r"\bin-kind\b|\bin kind\b", blob))
+    in_kind_to_shares = bool(
+        re.search(
+            r"redeemed back into shares|tokens to shares|underlying shares",
+            blob,
+        )
+    )
+    documented = bool(has_redemption and (has_primary_market or has_underlying))
+    missing: list[str] = []
+    if not has_redemption:
+        missing.append("redemption / redeem language")
+    if not (has_primary_market or has_underlying):
+        missing.append("primary market or underlying-asset language")
+    return {
+        "documented": documented,
+        "has_redemption": has_redemption,
+        "has_primary_market": has_primary_market,
+        "has_underlying": has_underlying,
+        "has_kyc": has_kyc,
+        "has_whitelist": has_whitelist,
+        "has_in_kind_heading": has_in_kind_heading,
+        "in_kind_to_shares": in_kind_to_shares,
+        "missing": missing,
+    }
+
+
+def parse_dinari_redemption_docs(text: str) -> dict[str, Any]:
+    """Require mint/burn documented as issuance/redemption. Never infer it."""
+    blob = visible_text(text).lower()
+    has_redemption = "redemption" in blob
+    has_burn = bool(re.search(r"\bburn\b", blob))
+    has_issuance = "issuance" in blob or bool(re.search(r"\bmint\b", blob))
+    has_brokerage = "brokerage" in blob or "alpaca" in blob
+    documented = bool(has_redemption and has_burn)
+    missing: list[str] = []
+    if not has_redemption:
+        missing.append("redemption language")
+    if not has_burn:
+        missing.append("burn-as-redemption language")
+    return {
+        "documented": documented,
+        "has_redemption": has_redemption,
+        "has_burn": has_burn,
+        "has_issuance": has_issuance,
+        "has_brokerage": has_brokerage,
+        "missing": missing,
+    }
+
+
 class BackedVerifier:
     """Chainlink Proof of Reserve (on-chain AggregatorV3) for Backed / xStocks."""
 
@@ -203,6 +305,7 @@ class BackedVerifier:
         self.client = client or ChainlinkPorClient(session=self.session, timeout=timeout)
         # ticker -> (monotonic_ts, reading_or_exc)
         self._cache: dict[str, tuple[float, Any]] = {}
+        self._docs_cache: dict[str, tuple[float, Any]] = {}
 
     def _read_por(self, ticker: str) -> PorReading:
         key = (ticker or "").strip().upper()
@@ -338,6 +441,108 @@ class BackedVerifier:
     def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult:
         return self._from_por(ticker=ticker, issuer_name=issuer_name, pillar="reserves")
 
+    def _fetch_doc(self, url: str) -> str:
+        now = time.monotonic()
+        hit = self._docs_cache.get(url)
+        if hit is not None and (now - hit[0]) <= self.cache_ttl:
+            cached = hit[1]
+            if isinstance(cached, Exception):
+                raise cached
+            return cached
+        try:
+            text = fetch_public_text(self.session, url, timeout=self.timeout)
+            self._docs_cache[url] = (now, text)
+            return text
+        except Exception as exc:  # noqa: BLE001 — cache + re-raise for fallback
+            wrapped = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            self._docs_cache[url] = (now, wrapped)
+            raise wrapped
+
+    def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        """Live hook: public xStocks/Backed issuance + redemption markdown.
+
+        Fails closed into labeled heuristic fallback. Does not claim in-kind
+        share delivery unless that language is actually on the fetched page.
+        """
+        try:
+            overview = self._fetch_doc(BACKED_REDEMPTION_DOCS_URL)
+            claims = parse_backed_redemption_docs(overview)
+            in_kind_error: str | None = None
+            try:
+                in_kind_text = self._fetch_doc(BACKED_INKIND_DOCS_URL)
+                in_kind_claims = parse_backed_redemption_docs(in_kind_text)
+                if in_kind_claims["in_kind_to_shares"]:
+                    claims["in_kind_to_shares"] = True
+            except Exception as exc:  # noqa: BLE001 — optional page
+                in_kind_error = str(exc)
+        except Exception as exc:  # noqa: BLE001 — never silent
+            return heuristic_result(
+                "redemption",
+                issuer_name,
+                reason=(
+                    f"Backed / xStocks redemption docs fetch failed for {ticker}."
+                ),
+                error=str(exc),
+            )
+
+        if not claims["documented"]:
+            missing = ", ".join(claims["missing"]) or "required redemption language"
+            return heuristic_result(
+                "redemption",
+                issuer_name,
+                reason=(
+                    "Backed / xStocks docs fetched but missing required "
+                    f"redemption language: {missing}."
+                ),
+                error=f"incomplete redemption signals: {missing}",
+            )
+
+        in_kind = bool(claims["in_kind_to_shares"])
+        score = INKIND_REDEMPTION_SCORE if in_kind else CASH_REDEMPTION_SCORE
+        bits = [
+            "public docs: primary-market issuance and redemption",
+        ]
+        if claims["has_kyc"] or claims["has_whitelist"]:
+            bits.append("onboarding / KYC / whitelist required (not a free on-chain claim)")
+        if in_kind:
+            bits.append("xPort in-kind flow: tokens redeemable back into shares (Alpaca)")
+        else:
+            bits.append(
+                "cash / stablecoin settlement on the documented market flow "
+                "— not treated as in-kind share delivery"
+            )
+        evidence = (
+            f"Backed / xStocks redemption docs for {ticker}: " + "; ".join(bits) + ". "
+            f"Sources: {BACKED_REDEMPTION_DOCS_URL}"
+            + (f"; {BACKED_INKIND_DOCS_URL}" if in_kind else "")
+        )
+        notes = [
+            f"verification={VerificationLevel.SELF_REPORTED.value}",
+            "live redemption hook: issuer public docs",
+            f"evidence source: {BACKED_REDEMPTION_DOCS_URL}",
+        ]
+        if in_kind:
+            notes.append(f"in-kind source: {BACKED_INKIND_DOCS_URL}")
+        elif in_kind_error:
+            notes.append(f"In-kind docs not confirmed (not dropped): {in_kind_error}")
+        return VerificationResult(
+            score=score,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence=evidence,
+            source="backed_redemption_docs",
+            notes=notes,
+            ok=True,
+            meta={
+                "ticker": ticker,
+                "issuer": issuer_name,
+                "docs_url": BACKED_REDEMPTION_DOCS_URL,
+                "in_kind_docs_url": BACKED_INKIND_DOCS_URL if in_kind else None,
+                "in_kind_to_shares": in_kind,
+                "kyc_or_whitelist": bool(claims["has_kyc"] or claims["has_whitelist"]),
+                "settlement": "in-kind-shares" if in_kind else "cash-or-stablecoin",
+            },
+        )
+
 
 class DinariVerifier:
     """Scrape Dinari dShares page for audit / custody / 1:1 claims.
@@ -358,6 +563,7 @@ class DinariVerifier:
         self.cache_ttl = cache_ttl
         self.timeout = timeout
         self._cache: tuple[float, str] | None = None
+        self._docs_cache: dict[str, tuple[float, Any]] = {}
 
     def _fetch_html(self) -> str:
         now = time.monotonic()
@@ -465,6 +671,81 @@ class DinariVerifier:
 
     def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult:
         return self._verify_pillar(ticker=ticker, issuer_name=issuer_name, pillar="reserves")
+
+    def _fetch_doc(self, url: str) -> str:
+        now = time.monotonic()
+        hit = self._docs_cache.get(url)
+        if hit is not None and (now - hit[0]) <= self.cache_ttl:
+            cached = hit[1]
+            if isinstance(cached, Exception):
+                raise cached
+            return cached
+        try:
+            text = fetch_public_text(self.session, url, timeout=self.timeout)
+            self._docs_cache[url] = (now, text)
+            return text
+        except Exception as exc:  # noqa: BLE001 — cache + re-raise for fallback
+            wrapped = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            self._docs_cache[url] = (now, wrapped)
+            raise wrapped
+
+    def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        """Live hook: Dinari public dShare docs (burn = redemption).
+
+        Fails closed into labeled heuristic fallback. Does not claim in-kind
+        share delivery — the published flow burns tokens and transfers funds.
+        """
+        try:
+            text = self._fetch_doc(DINARI_DSHARE_DOCS_URL)
+            claims = parse_dinari_redemption_docs(text)
+        except Exception as exc:  # noqa: BLE001 — never silent
+            return heuristic_result(
+                "redemption",
+                issuer_name,
+                reason=f"Dinari dShare redemption docs fetch failed for {ticker}.",
+                error=str(exc),
+            )
+
+        if not claims["documented"]:
+            missing = ", ".join(claims["missing"]) or "required redemption language"
+            return heuristic_result(
+                "redemption",
+                issuer_name,
+                reason=(
+                    "Dinari docs fetched but missing required redemption language: "
+                    f"{missing}."
+                ),
+                error=f"incomplete redemption signals: {missing}",
+            )
+
+        evidence = (
+            f"Dinari dShare docs for {ticker}: mint (issuance) / burn (redemption) "
+            "only after a brokerage fill; sell burns dShares and transfers funds. "
+            "Cash/proceeds settlement — not treated as in-kind share delivery. "
+            f"Source: {DINARI_DSHARE_DOCS_URL}"
+        )
+        notes = [
+            f"verification={VerificationLevel.SELF_REPORTED.value}",
+            "live redemption hook: issuer public docs",
+            f"evidence source: {DINARI_DSHARE_DOCS_URL}",
+            "Burn-on-sell / funds transfer — not in-kind share delivery.",
+        ]
+        return VerificationResult(
+            score=CASH_REDEMPTION_SCORE,
+            level=VerificationLevel.SELF_REPORTED,
+            evidence=evidence,
+            source="dinari_redemption_docs",
+            notes=notes,
+            ok=True,
+            meta={
+                "ticker": ticker,
+                "issuer": issuer_name,
+                "docs_url": DINARI_DSHARE_DOCS_URL,
+                "settlement": "cash-or-funds",
+                "in_kind_to_shares": False,
+                **{k: claims[k] for k in ("has_redemption", "has_burn", "has_issuance", "has_brokerage")},
+            },
+        )
 
 
 class RobinhoodVerifier:

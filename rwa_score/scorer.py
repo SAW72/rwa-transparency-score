@@ -6,9 +6,9 @@ why a token landed where it did.
 
 Backing and reserves prefer live attestation / PoR verifiers when the issuer
 is known. Redemption uses ``verify_redemption`` when that method exists
-(Robinhood); Backed and Dinari stay on the name heuristic. Failed verifiers
-are never dropped silently — errors are appended to notes/flags and labeled
-**heuristic fallback**.
+(Robinhood debt wrapper; Backed / xStocks and Dinari public docs). Failed
+verifiers are never dropped silently — errors are appended to notes/flags and
+labeled **heuristic fallback**.
 """
 
 from __future__ import annotations
@@ -229,6 +229,62 @@ def basis_score_from_spread(pct_spread: float) -> float:
     return max(BASIS_SCORE_FLOOR, 100.0 - abs(float(pct_spread)) * BASIS_SPREAD_PENALTY)
 
 
+ALWAYS_SELF_REPORTED = ("price", "disclosure", "basis")
+LIVE_OR_HEURISTIC = ("backing", "reserves", "redemption")
+
+
+def remaining_heuristic_paths(
+    verification: dict[str, Any],
+    *,
+    data_source: str,
+    live_verifiers: bool,
+) -> list[dict[str, str]]:
+    """Labeled leftover heuristic / self-reported paths for UI + API notes."""
+    rows: list[dict[str, str]] = []
+    if data_source == "fixture":
+        rows.append(
+            {
+                "key": "data_source",
+                "label": "CMC / directory",
+                "kind": "fixture",
+                "note": "Bundled demo fixtures — not a live CoinMarketCap API response.",
+            }
+        )
+    if not live_verifiers:
+        rows.append(
+            {
+                "key": "verifiers",
+                "label": "Live verifiers",
+                "kind": "offline_skip",
+                "note": "Fixture/offline mode skipped live attestation / PoR / redemption hooks.",
+            }
+        )
+    for key in LIVE_OR_HEURISTIC:
+        block = verification.get(key) or {}
+        source = str(block.get("source") or "")
+        evidence = str(block.get("evidence") or "")
+        if source == "heuristic_fallback" or "heuristic fallback" in evidence.lower():
+            rows.append(
+                {
+                    "key": key,
+                    "label": PILLARS[key]["label"],
+                    "kind": "heuristic_fallback",
+                    "note": evidence or "Name-list heuristic fallback — not an audited attestation.",
+                }
+            )
+    for key in ALWAYS_SELF_REPORTED:
+        block = verification.get(key) or {}
+        rows.append(
+            {
+                "key": key,
+                "label": PILLARS[key]["label"],
+                "kind": "self-reported",
+                "note": str(block.get("evidence") or "Self-reported CMC/fixture field — not independent PoR."),
+            }
+        )
+    return rows
+
+
 def _append_verification_notes(
     explanation: str,
     result: VerificationResult,
@@ -254,6 +310,7 @@ class TransparencyScorer:
         session: requests.Session | None = None,
         verifiers: dict[str, Verifier] | None = None,
         use_live_verifiers: bool | None = None,
+        allow_live_on_fixtures: bool = False,
     ) -> None:
         self.client = client
         self._map_cache: dict[str, int] | None = None
@@ -263,10 +320,17 @@ class TransparencyScorer:
         self._session = session
         self._verifiers = verifiers if verifiers is not None else build_default_verifiers(session)
         # Fixture / offline demos skip network attestation calls.
+        source = getattr(client, "source", "")
         if use_live_verifiers is None:
-            self.use_live_verifiers = getattr(client, "source", "") != "fixture"
+            self.use_live_verifiers = source != "fixture"
         else:
-            self.use_live_verifiers = use_live_verifiers
+            self.use_live_verifiers = bool(use_live_verifiers)
+        # Fail closed: a fixture client must not hit live HTTP unless a test
+        # explicitly opts in. Judges running RWA_USE_FIXTURES=1 stay offline.
+        self._fixture_live_blocked = False
+        if source == "fixture" and self.use_live_verifiers and not allow_live_on_fixtures:
+            self.use_live_verifiers = False
+            self._fixture_live_blocked = True
 
     def _resolve(self, ticker: str) -> int:
         if self._map_cache is None:
@@ -504,22 +568,23 @@ class TransparencyScorer:
         )
 
     def _heuristic_redemption(self, issuer_name: str) -> VerificationResult:
-        """Name-list redemption for issuers that do not implement verify_redemption."""
-        result = heuristic_result(
-            "redemption",
-            issuer_name,
-            reason="Redemption verifier not wired yet (TODO hook); using name heuristic.",
-        )
-        # Redemption heuristic is intentional, not a failed live call.
+        """Name-list redemption when no live hook ran (unknown issuer or offline)."""
+        if self.use_live_verifiers:
+            reason = (
+                "No live redemption verifier registered for this issuer; "
+                "using name heuristic."
+            )
+            skip_note = "No live redemption verifier for this issuer."
+        else:
+            reason = "Fixture/offline mode — live redemption verifier skipped."
+            skip_note = "Fixture/offline mode — live redemption verifier skipped."
+        result = heuristic_result("redemption", issuer_name, reason=reason)
+        # Intentional skip / unknown issuer — not a failed live call.
         result.ok = True
-        result.notes = [
-            "heuristic fallback",
-            "TODO: redemption attestation verifier",
-            HEURISTIC_NOTE,
-        ]
+        result.notes = ["heuristic fallback", skip_note, HEURISTIC_NOTE]
         result.evidence = (
             f"heuristic fallback: issuer '{issuer_name or 'unknown'}' redemption "
-            f"rights via name list (live redemption verifier pending)."
+            f"rights via name list ({reason.rstrip('.')})."
         )
         return result
 
@@ -634,14 +699,18 @@ class TransparencyScorer:
             ),
             reserves_v,
         )
-        redemption_why = _append_verification_notes(
-            (
+        if redemption_v.source == "heuristic_fallback":
+            redemption_lead = (
                 f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the redeemable name list."
                 if flags["redeemable"]
-                else f"Heuristic: issuer '{issuer_name or 'unknown'}' treated as sell-only (no redemption match)."
-            ),
-            redemption_v,
-        )
+                else (
+                    f"Heuristic: issuer '{issuer_name or 'unknown'}' treated as "
+                    "sell-only (no redemption match)."
+                )
+            )
+        else:
+            redemption_lead = f"Live redemption check for '{issuer_name or 'unknown'}'."
+        redemption_why = _append_verification_notes(redemption_lead, redemption_v)
 
         price_score, price_meta, price_flags, price_why = self._price_score(token.get("crypto_id"))
         price_v = VerificationResult(
@@ -760,6 +829,11 @@ class TransparencyScorer:
                 "Live attestation verifiers skipped (fixture/offline); "
                 "backing/reserves use heuristic fallback."
             )
+        if self._fixture_live_blocked:
+            notes.append(
+                "Fixture client blocked live verifiers "
+                "(allow_live_on_fixtures=False) — labeled heuristic fallback."
+            )
         for result in (backing_v, reserves_v, redemption_v):
             for note in result.notes:
                 if note not in notes:
@@ -806,4 +880,6 @@ class TransparencyScorer:
             "cik": cik,
             "issuer_note": issuer_note(issuer_name),
             "summary": f"{issuer_name or 'Unknown issuer'} — {len(risk_flags)} risk flag(s).",
+            "verification_mode": "live" if self.use_live_verifiers else "offline_heuristic",
+            "live_verifiers": bool(self.use_live_verifiers),
         }
