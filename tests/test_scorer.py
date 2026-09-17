@@ -250,16 +250,110 @@ def test_robinhood_live_path_uses_verifier_not_heuristic() -> None:
     assert report["verification"]["basis"]["source"] == "cmc_market_pairs"
 
 
-def test_backed_keeps_heuristic_redemption() -> None:
-    from rwa_score.verifiers import BackedVerifier, VerificationLevel
-    from tests.test_verifiers import _bnvda_rpc
+def test_backed_live_redemption_uses_docs_hook() -> None:
+    from rwa_score.verifiers import (
+        BACKED_INKIND_DOCS_URL,
+        BACKED_REDEMPTION_DOCS_URL,
+        INKIND_REDEMPTION_SCORE,
+        BackedVerifier,
+        VerificationLevel,
+    )
+    from tests.test_verifiers import (
+        BACKED_INKIND_MD,
+        BACKED_OVERVIEW_MD,
+        FakeResponse,
+        FakeSession,
+        _bnvda_rpc,
+    )
+
+    class CombinedSession:
+        def __init__(self) -> None:
+            self.rpc = _bnvda_rpc()
+            self.http = FakeSession(
+                {
+                    BACKED_REDEMPTION_DOCS_URL: FakeResponse(200, text=BACKED_OVERVIEW_MD),
+                    BACKED_INKIND_DOCS_URL: FakeResponse(200, text=BACKED_INKIND_MD),
+                }
+            )
+
+        def post(self, *args, **kwargs):
+            return self.rpc.post(*args, **kwargs)
+
+        def get(self, *args, **kwargs):
+            return self.http.get(*args, **kwargs)
 
     client = RecordingClient()
-    verifiers = {"backed": BackedVerifier(session=_bnvda_rpc())}
+    verifiers = {"backed": BackedVerifier(session=CombinedSession())}
     report = TransparencyScorer(client, verifiers=verifiers, use_live_verifiers=True).score("NVDA")
     assert report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert report["verification"]["redemption"]["source"] == "backed_redemption_docs"
+    assert report["subscores"]["redemption"] == INKIND_REDEMPTION_SCORE
+    assert "heuristic fallback" not in report["verification"]["redemption"]["evidence"].lower()
+    assert "Live redemption check" in report["explanations"]["redemption"]
+
+
+def test_dinari_live_redemption_uses_docs_hook() -> None:
+    from rwa_score.verifiers import (
+        CASH_REDEMPTION_SCORE,
+        DINARI_DSHARE_DOCS_URL,
+        DINARI_DSHARES_URL,
+        DinariVerifier,
+    )
+    from tests.test_verifiers import DINARI_DSHARE_MD, FakeResponse, FakeSession
+
+    html = """
+    <html><body>
+    <p>dShares are backed 1:1 by the underlying securities.</p>
+    <p>Custody lives at Alpaca Securities LLC.</p>
+    <p>Reserve audits are performed by an independent Big 4 accounting firm.</p>
+    </body></html>
+    """
+    session = FakeSession(
+        {
+            DINARI_DSHARES_URL: FakeResponse(200, text=html),
+            DINARI_DSHARE_DOCS_URL: FakeResponse(200, text=DINARI_DSHARE_MD),
+        }
+    )
+    client = RecordingClient(
+        assets=[{"symbol": "AAPL", "rwa_id": 16}],
+        info={16: {"symbol": "AAPL", "cik": "0000320193", "issuer": {"name": "Dinari"}}},
+        issuers=[{"issuer_id": "dn", "name": "Dinari"}],
+        issuer_details={"dn": {"name": "Dinari", "tokens": [{"rwa_id": 16, "crypto_id": 99}]}},
+    )
+    report = TransparencyScorer(
+        client, verifiers={"dinari": DinariVerifier(session=session)}, use_live_verifiers=True
+    ).score("AAPL")
+    assert report["verification"]["redemption"]["source"] == "dinari_redemption_docs"
+    assert report["subscores"]["redemption"] == CASH_REDEMPTION_SCORE
+    assert report["verification"]["reserves"]["source"] == "dinari_dshares"
+    assert "Live redemption check" in report["explanations"]["redemption"]
+
+
+def test_backed_redemption_docs_error_is_not_silent() -> None:
+    from rwa_score.verifiers import BACKED_REDEMPTION_DOCS_URL, BackedVerifier
+    from tests.test_verifiers import FakeResponse, FakeSession, _bnvda_rpc
+
+    class CombinedSession:
+        def __init__(self) -> None:
+            self.rpc = _bnvda_rpc()
+            self.http = FakeSession(
+                {BACKED_REDEMPTION_DOCS_URL: FakeResponse(503, text="down")}
+            )
+
+        def post(self, *args, **kwargs):
+            return self.rpc.post(*args, **kwargs)
+
+        def get(self, *args, **kwargs):
+            return self.http.get(*args, **kwargs)
+
+    report = TransparencyScorer(
+        RecordingClient(),
+        verifiers={"backed": BackedVerifier(session=CombinedSession())},
+        use_live_verifiers=True,
+    ).score("NVDA")
     assert report["verification"]["redemption"]["source"] == "heuristic_fallback"
-    assert "heuristic fallback" in report["verification"]["redemption"]["evidence"].lower()
+    assert report["verification"]["redemption"]["error"]
+    assert any("verifier failure" in f.lower() or "503" in f for f in report["flags"])
 
 
 def test_failed_verifier_is_not_silently_dropped() -> None:
