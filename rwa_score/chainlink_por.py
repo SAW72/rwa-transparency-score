@@ -9,6 +9,11 @@ Feed addresses are the public Chainlink proxy contracts Backed already
 publishes (Polygon today). Source:
 https://docs.chain.link/data-feeds/smartdata/addresses
 https://reference-data-directory.vercel.app/feeds-matic-mainnet.json
+
+xStocks line: **no AggregatorV3 / SmartData proxyAddress** is published.
+DataLink PoR streams exist (``proxyAddress: null``) — see
+``XSTOCKS_DATALINK_POR`` and ``docs/XSTOCKS_CHAINLINK_POR.md``. Do not invent
+proxy addresses or score those streams as on-chain PoR.
 """
 
 from __future__ import annotations
@@ -22,6 +27,13 @@ import requests
 CHAINLINK_SMARTDATA_DOCS = "https://docs.chain.link/data-feeds/smartdata/addresses"
 CHAINLINK_REFERENCE_MATIC = (
     "https://reference-data-directory.vercel.app/feeds-matic-mainnet.json"
+)
+CHAINLINK_REFERENCE_ETH = (
+    "https://reference-data-directory.vercel.app/feeds-mainnet.json"
+)
+XSTOCKS_REST_POR_DOCS = (
+    "https://docs.xstocks.fi/apis/openapi/proof-of-reserves/"
+    "get_public_proof_of_reserves_by_symbol"
 )
 
 # AggregatorV3Interface selectors (first 4 bytes of keccak256).
@@ -134,6 +146,92 @@ BACKED_POR_FEEDS: tuple[PorFeed, ...] = (
 # Canonical feed used by GET /health (Backed + Chainlink announcement pair).
 HEALTH_POR_FEED = BACKED_POR_FEEDS[1]  # bIB01
 
+# Re-checked 2026-09-17. Chainlink SmartData lists xStocks *DataLink* PoR
+# streams (deliveryChannelCode=DS, serviceLevel=Datalink) with
+# ``proxyAddress: null``. Reference-data JSON catalogs on Ethereum / Polygon /
+# Solana / Avalanche / BSC have **no** AggregatorV3 proxy for TSLAx / AAPLx /
+# METAx / …  Empty on purpose — do not invent addresses.
+XSTOCKS_POR_FEEDS: tuple[PorFeed, ...] = ()
+
+# Catalog of DataLink stream *names* only (not wired). Proxy is unpublished.
+XSTOCKS_DATALINK_POR: tuple[dict[str, str], ...] = (
+    {
+        "symbol": "TSLAx",
+        "stream": "TSLAx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "AAPLx",
+        "stream": "AAPLx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "NVDAx",
+        "stream": "NVDAx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "METAx",
+        "stream": "METAx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "GOOGLx",
+        "stream": "GOOGLx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "COINx",
+        "stream": "COINx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "QQQx",
+        "stream": "QQQx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "SPYx",
+        "stream": "SPYx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "MSTRx",
+        "stream": "MSTRx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+    {
+        "symbol": "CRCLx",
+        "stream": "CRCLx/POR-Datalink-ProofOfReserves-mainnet-production",
+        "proxy": "",
+        "channel": "Data Streams / Datalink",
+    },
+)
+
+
+def xstocks_datalink_por(ticker: str) -> dict[str, str] | None:
+    """Return the unpublished DataLink PoR catalog row, if any.
+
+    Presence of a stream *name* is not a public aggregator proxy. Callers must
+    not treat this as an on-chain PoR feed.
+    """
+    key = normalize_ticker(ticker)
+    if not key:
+        return None
+    for row in XSTOCKS_DATALINK_POR:
+        if key == row["symbol"].upper():
+            return dict(row)
+    return None
+
 
 @dataclass(frozen=True)
 class LatestRound:
@@ -203,12 +301,18 @@ def normalize_ticker(ticker: str) -> str:
 
 
 def resolve_por_feed(ticker: str, feeds: tuple[PorFeed, ...] | None = None) -> PorFeed | None:
-    """Map NVDA / NVDAx / bNVDA (etc.) onto a published Chainlink PoR feed."""
+    """Map NVDA / NVDAx / bNVDA (etc.) onto a published Chainlink PoR feed.
+
+    Only ``PorFeed`` rows with a real proxy are returned. xStocks DataLink
+    stream names (``proxyAddress: null``) are intentionally excluded.
+    """
     key = normalize_ticker(ticker)
     if not key:
         return None
-    catalog = feeds if feeds is not None else BACKED_POR_FEEDS
+    catalog = feeds if feeds is not None else BACKED_POR_FEEDS + XSTOCKS_POR_FEEDS
     for feed in catalog:
+        if not feed.proxy:
+            continue
         names = {feed.symbol.upper(), *feed.aliases}
         if key in names:
             return feed

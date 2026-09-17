@@ -91,8 +91,9 @@ def test_readme_chainlink_por_coverage_for_judges() -> None:
     assert "bTokens on Polygon only" in text
     assert "no published Chainlink PoR / SmartData aggregator yet" in text
     assert "That is expected, not a bug" in text
-    assert "Next upgrade:" in text
-    assert "no on-chain Chainlink PoR / SmartData proxy addresses for the xStocks line" in text
+    assert "no aggregator `proxyAddress`" in text
+    assert "docs/XSTOCKS_CHAINLINK_POR.md" in text
+    assert "do not invent addresses" in text.lower()
     assert "Reserves-only score 90" in text
     assert "must not be scored as undercollateralized PoR" in text
 
