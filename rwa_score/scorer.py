@@ -6,9 +6,9 @@ why a token landed where it did.
 
 Backing and reserves prefer live attestation / PoR verifiers when the issuer
 is known. Redemption uses ``verify_redemption`` when that method exists
-(Robinhood); Backed and Dinari stay on the name heuristic. Failed verifiers
-are never dropped silently — errors are appended to notes/flags and labeled
-**heuristic fallback**.
+(Robinhood debt wrapper; Backed / xStocks and Dinari public docs). Failed
+verifiers are never dropped silently — errors are appended to notes/flags and
+labeled **heuristic fallback**.
 """
 
 from __future__ import annotations
@@ -504,22 +504,23 @@ class TransparencyScorer:
         )
 
     def _heuristic_redemption(self, issuer_name: str) -> VerificationResult:
-        """Name-list redemption for issuers that do not implement verify_redemption."""
-        result = heuristic_result(
-            "redemption",
-            issuer_name,
-            reason="Redemption verifier not wired yet (TODO hook); using name heuristic.",
-        )
-        # Redemption heuristic is intentional, not a failed live call.
+        """Name-list redemption when no live hook ran (unknown issuer or offline)."""
+        if self.use_live_verifiers:
+            reason = (
+                "No live redemption verifier registered for this issuer; "
+                "using name heuristic."
+            )
+            skip_note = "No live redemption verifier for this issuer."
+        else:
+            reason = "Fixture/offline mode — live redemption verifier skipped."
+            skip_note = "Fixture/offline mode — live redemption verifier skipped."
+        result = heuristic_result("redemption", issuer_name, reason=reason)
+        # Intentional skip / unknown issuer — not a failed live call.
         result.ok = True
-        result.notes = [
-            "heuristic fallback",
-            "TODO: redemption attestation verifier",
-            HEURISTIC_NOTE,
-        ]
+        result.notes = ["heuristic fallback", skip_note, HEURISTIC_NOTE]
         result.evidence = (
             f"heuristic fallback: issuer '{issuer_name or 'unknown'}' redemption "
-            f"rights via name list (live redemption verifier pending)."
+            f"rights via name list ({reason.rstrip('.')})."
         )
         return result
 
@@ -634,14 +635,18 @@ class TransparencyScorer:
             ),
             reserves_v,
         )
-        redemption_why = _append_verification_notes(
-            (
+        if redemption_v.source == "heuristic_fallback":
+            redemption_lead = (
                 f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the redeemable name list."
                 if flags["redeemable"]
-                else f"Heuristic: issuer '{issuer_name or 'unknown'}' treated as sell-only (no redemption match)."
-            ),
-            redemption_v,
-        )
+                else (
+                    f"Heuristic: issuer '{issuer_name or 'unknown'}' treated as "
+                    "sell-only (no redemption match)."
+                )
+            )
+        else:
+            redemption_lead = f"Live redemption check for '{issuer_name or 'unknown'}'."
+        redemption_why = _append_verification_notes(redemption_lead, redemption_v)
 
         price_score, price_meta, price_flags, price_why = self._price_score(token.get("crypto_id"))
         price_v = VerificationResult(
