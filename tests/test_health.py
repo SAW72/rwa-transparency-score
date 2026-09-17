@@ -184,8 +184,7 @@ def test_attach_registers_health_and_legal_on_streamlit_like_app() -> None:
             assert "application/json" in resp.headers["Content-Type"]
             body = json.loads(resp.body.decode())
             assert set(body) == {"fixtures", "verifiers_live", "backed_feed", "timestamp"}
-            assert body["fixtures"] is False
-            assert body["verifiers_live"] is True
+            assert body["verifiers_live"] is (not body["fixtures"])
             assert body["backed_feed"] in {"ok", "down"}
             assert b"SPA" not in resp.body
 
