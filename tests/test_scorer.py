@@ -418,3 +418,81 @@ def test_failed_verifier_is_not_silently_dropped() -> None:
     assert any("verifier failure" in f.lower() or "network down" in f.lower() for f in report["flags"])
     assert any("heuristic fallback" in n.lower() for n in report["notes"])
     assert report["verification"]["reserves"]["error"]
+
+
+def test_live_bnvda_reaches_on_chain_por_badge() -> None:
+    """Picking the Backed bToken (not the CMC NVDA row) hits Chainlink PoR."""
+    from rwa_score.verifiers import VerificationLevel, build_default_verifiers
+    from tests.test_verifiers import _bnvda_rpc
+
+    client = RecordingClient()
+    session = _bnvda_rpc()
+    verifiers = build_default_verifiers(session=session)
+    report = TransparencyScorer(
+        client, verifiers=verifiers, use_live_verifiers=True
+    ).score("bNVDA")
+    assert report["ticker"] == "bNVDA"
+    assert report["issuer"] == "Backed Finance"
+    assert report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert report["verification"]["backing"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert report["verification"]["reserves"]["source"] == "chainlink_por"
+    assert report["verification"]["reserves"]["meta"]["symbol"] == "bNVDA"
+    assert "Chainlink PoR" in report["verification"]["reserves"]["evidence"]
+    assert any("underlying" in n.lower() and "NVDA" in n for n in report["notes"])
+
+
+def test_live_bnvda_uses_backed_verifier_even_if_map_issuer_is_not_backed() -> None:
+    from rwa_score.verifiers import VerificationLevel, build_default_verifiers
+    from tests.test_verifiers import _bnvda_rpc
+
+    client = RecordingClient(
+        assets=[{"symbol": "NVDA", "rwa_id": 2}],
+        info={2: {"symbol": "NVDA", "cik": "0001045810", "issuer": {"name": "Ondo"}}},
+        issuers=[{"issuer_id": "ondo", "name": "Ondo"}],
+        issuer_details={
+            "ondo": {"name": "Ondo", "tokens": [{"rwa_id": 2, "crypto_id": 99}]},
+        },
+    )
+    verifiers = build_default_verifiers(session=_bnvda_rpc())
+    report = TransparencyScorer(
+        client, verifiers=verifiers, use_live_verifiers=True
+    ).score("BNVDA")
+    assert report["ticker"] == "bNVDA"
+    assert report["issuer"] == "Backed Finance"
+    assert report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+
+
+def test_fixture_catalog_only_btoken_stays_labeled_heuristic(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    """bIB01 is searchable; fixtures have no IB01 row — do not invent CMC metrics."""
+    report = fixture_scorer.score("bIB01")
+    assert report["ticker"] == "bIB01"
+    assert report["rwa_id"] is None
+    assert report["verification"]["reserves"]["source"] == "heuristic_fallback"
+    assert report["verification"]["reserves"]["level"] == "self-reported"
+    assert report["verification"]["reserves"]["meta"]["published_por_feed"] == "bIB01"
+    assert "live RPC skipped" in report["verification"]["reserves"]["evidence"]
+    assert report["subscores"]["disclosure"] == 20.0
+    assert any("BACKED_POR_FEEDS" in n for n in report["notes"])
+
+
+def test_live_catalog_only_btoken_hits_on_chain_por() -> None:
+    from rwa_score.chainlink_por import BACKED_POR_FEEDS
+    from rwa_score.verifiers import VerificationLevel, build_default_verifiers
+    from tests.test_verifiers import FakeRpcSession, encode_latest_round
+
+    bib01 = next(feed for feed in BACKED_POR_FEEDS if feed.symbol == "bIB01")
+    session = FakeRpcSession(
+        {bib01.proxy.lower(): encode_latest_round(answer=80 * 10**bib01.decimals)}
+    )
+    client = RecordingClient(assets=[{"symbol": "NVDA", "rwa_id": 2}])
+    verifiers = build_default_verifiers(session=session)
+    report = TransparencyScorer(
+        client, verifiers=verifiers, use_live_verifiers=True
+    ).score("bIB01")
+    assert report["ticker"] == "bIB01"
+    assert report["rwa_id"] is None
+    assert report["verification"]["reserves"]["level"] == VerificationLevel.ON_CHAIN_POR.value
+    assert report["verification"]["reserves"]["source"] == "chainlink_por"
+    assert report["verification"]["reserves"]["meta"]["symbol"] == "bIB01"

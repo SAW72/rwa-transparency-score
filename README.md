@@ -15,7 +15,9 @@ RWA_USE_FIXTURES=1 streamlit run app.py
 
 Then open the local URL Streamlit prints. Type a prefix like `NIV` or `NVD` (3+ characters — Matches appear as you type, no Enter) to pick **NVDA / Nvidia**, or a category like `oil`, `AI`, or `real estate`. Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
 
-**Search categories** (case-insensitive keywords; rows come from the CMC/fixture directory, bucketed by `industry` / `sector` plus name hints):
+Search also lists published Backed **bToken** symbols from `BACKED_POR_FEEDS` (`bNVDA`, `bIB01`, `bCSPX`, `bC3M`, `bIBTA`) as first-class Matches — type `bNV` / `bNVDA` (or a feed alias such as `NVDAx`). The CMC/fixture underlying row (`NVDA`) still ranks first when you type `NVDA`; the bToken is an extra match so you can land a card that is eligible for the **on-chain PoR** badge. Tickers with no published proxy (most xStocks) stay on the labeled **heuristic fallback**.
+
+**Search categories** (case-insensitive keywords; rows come from the CMC/fixture directory plus published Backed bTokens, bucketed by `industry` / `sector` plus name hints):
 
 | Category | Type | Fixture examples |
 |---|---|---|
@@ -69,7 +71,7 @@ Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** bel
 
 **Do not expect every ticker to hit the oracle.**
 
-Chainlink Proof of Reserve currently covers Backed **bTokens on Polygon only**. The wired feeds in `rwa_score/chainlink_por.py` are **bNVDA**, **bIB01**, **bCSPX**, **bC3M**, and **bIBTA** (aliases such as `NVDA` / `NVDAx` map to bNVDA).
+Chainlink Proof of Reserve currently covers Backed **bTokens on Polygon only**. The wired feeds in `rwa_score/chainlink_por.py` are **bNVDA**, **bIB01**, **bCSPX**, **bC3M**, and **bIBTA** (aliases such as `NVDA` / `NVDAx` map to bNVDA). Those bToken symbols are in the Search / directory catalog (not only the CMC/fixture map). In **Live** mode, scoring `bNVDA` hits the Polygon feed and the card badge is **on-chain PoR** when `latestRoundData` resolves. Fixture/offline mode does **not** pretend to have read the chain — backing/reserves stay **heuristic fallback** with an explicit “published Chainlink PoR … live RPC skipped” label.
 
 Most **xStocks** symbols (`TSLAx`, `AAPLx`, `METAx`, …) have **no published Chainlink PoR / SmartData aggregator yet**. Live backing/reserves for those names use the labeled **heuristic fallback**. That is expected, not a bug.
 
@@ -150,7 +152,7 @@ pages/terms.py         Terms of Service (Streamlit; URL `/terms`)
 PRIVACY.md             Privacy Policy source (Steward of the King LLC / Ohio)
 TERMS.md               Terms of Service source
 rwa_score/legal.py     Privacy/Terms markdown loader + HTML /privacy and /terms
-rwa_score/ticker_search.py  Prefix + category picker over the RWA map (no extra API)
+rwa_score/ticker_search.py  Prefix + category picker over the RWA map plus Backed bTokens (no extra API)
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
 rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
 rwa_score/chainlink_por.py  Chainlink AggregatorV3 PoR reader (JSON-RPC eth_call, requests only)

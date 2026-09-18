@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from rwa_score.chainlink_por import BACKED_POR_FEEDS
 from rwa_score.client import FixtureClient
 from rwa_score.ticker_search import (
+    BACKED_SEARCH_SOURCE,
     CATEGORIES,
     CATEGORY_DOC,
     SEARCH_MIN_CHARS,
     TickerOption,
+    catalog_from_por_feeds,
     catalog_from_rwa_map,
     classify_categories,
     format_option,
     load_search_catalog,
+    merge_search_catalog,
     normalize_ticker,
     prefix_matches,
     resolve_assign_symbol,
@@ -21,6 +25,8 @@ from rwa_score.ticker_search import (
     search_tickers,
 )
 from tests.conftest import RecordingClient
+
+BACKED_BTOKEN_SYMBOLS = {"bNVDA", "bIB01", "bCSPX", "bC3M", "bIBTA"}
 
 
 def _fixture_catalog() -> list[TickerOption]:
@@ -64,7 +70,9 @@ def test_niv_prefix_matches_nvda_nvidia_in_fixture_directory() -> None:
 
 def test_prefix_matches_ticker_symbol_and_common_name() -> None:
     catalog = _fixture_catalog()
-    assert [opt.symbol for opt in search_tickers("nvd", catalog)] == ["NVDA"]
+    nvd = [opt.symbol for opt in search_tickers("nvd", catalog)]
+    assert nvd[0] == "NVDA"
+    assert "bNVDA" in nvd
     assert [opt.symbol for opt in search_tickers("tes", catalog)] == ["TSLA"]
     assert [opt.symbol for opt in search_tickers("aap", catalog)] == ["AAPL"]
     assert [opt.symbol for opt in search_tickers("meta", catalog)] == ["META"]
@@ -123,7 +131,9 @@ def test_load_search_catalog_survives_map_errors() -> None:
         def rwa_map(self, symbol=None):
             raise RuntimeError("map down")
 
-    assert load_search_catalog(Boom()) == []
+    catalog = load_search_catalog(Boom())
+    assert {opt.symbol for opt in catalog} == BACKED_BTOKEN_SYMBOLS
+    assert all(opt.source == BACKED_SEARCH_SOURCE for opt in catalog)
 
 
 def test_live_directory_is_whatever_rwa_map_already_loads() -> None:
@@ -148,6 +158,9 @@ def test_readme_documents_search_categories() -> None:
     assert "| Real Estate |" in text
     assert "`oil`" in text or "oil" in text
     assert "real estate" in text.lower()
+    assert "bNVDA" in text
+    assert "BACKED_POR_FEEDS" in text
+    assert "first-class Matches" in text or "first-class" in text
 
 
 def test_category_taxonomy_is_documented() -> None:
@@ -346,8 +359,9 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
     catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
     for query in ("NVD", "NVDA", "nvd", "nvda"):
         hits = demo_app.search_tickers(query, catalog)
-        assert [opt.symbol for opt in hits] == ["NVDA"], query
+        assert hits[0].symbol == "NVDA", query
         assert "Nvidia" in demo_app.format_option(hits[0])
+        assert "bNVDA" in {opt.symbol for opt in hits}
 
     # Empty-state copy is reserved for a real miss, not a pending category click.
     assert demo_app.search_tickers("zzz", catalog) == []
@@ -540,3 +554,77 @@ def test_place_and_auto_place_do_not_score(monkeypatch) -> None:
     assert demo_app.st.session_state.slots[0] == "XOM"
     assert demo_app.st.session_state.active_slot == 1
     assert demo_app.st.session_state["_clear_search"] is True
+
+
+def test_backed_btokens_are_first_class_search_rows() -> None:
+    catalog = _fixture_catalog()
+    by_symbol = {opt.symbol: opt for opt in catalog}
+    assert BACKED_BTOKEN_SYMBOLS <= set(by_symbol)
+    assert {f.symbol for f in BACKED_POR_FEEDS} == BACKED_BTOKEN_SYMBOLS
+    for symbol in BACKED_BTOKEN_SYMBOLS:
+        opt = by_symbol[symbol]
+        assert opt.source == BACKED_SEARCH_SOURCE
+        assert "Chainlink PoR" in opt.name
+        assert "Backed" in opt.aliases
+        assert "finance" not in opt.categories
+
+    bnv = [opt.symbol for opt in search_tickers("bNV", catalog)]
+    assert bnv == ["bNVDA"]
+    assert "bNVDA" in format_option(search_tickers("bNVDA", catalog)[0])
+    assert "Chainlink PoR" in format_option(search_tickers("bnvda", catalog)[0])
+
+    nvdax = [opt.symbol for opt in search_tickers("NVDAx", catalog)]
+    assert nvdax == ["bNVDA"]
+    nvda = [opt.symbol for opt in search_tickers("NVDA", catalog)]
+    assert nvda[0] == "NVDA"
+    assert "bNVDA" in nvda
+
+    # Empty XSTOCKS_POR_FEEDS must not inject invented xStock rows.
+    extra = catalog_from_por_feeds(())
+    assert extra == []
+    merged = merge_search_catalog(catalog, catalog_from_por_feeds())
+    assert {opt.symbol for opt in merged if opt.symbol in BACKED_BTOKEN_SYMBOLS} == (
+        BACKED_BTOKEN_SYMBOLS
+    )
+
+
+def test_backed_btoken_typeahead_places_slot() -> None:
+    import app as demo_app
+
+    catalog = demo_app._ticker_catalog(demo_app._cached_scorer(True))
+    hits = demo_app.search_tickers("bNV", catalog)
+    assert [opt.symbol for opt in hits] == ["bNVDA"]
+    slots, active = demo_app.place_search_match(
+        list(demo_app.DEFAULT_SLOTS), 0, hits[0].symbol
+    )
+    assert slots[0] == "BNVDA"
+    assert active == 1
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "bNVDA" in source
+    assert "published Backed bToken" in source
+    assert "bNV → bNVDA" in source
+
+
+def test_fixture_backed_symbol_scores_with_published_por_label(fixture_scorer) -> None:
+    import app as demo_app
+
+    catalog = demo_app._ticker_catalog(fixture_scorer)
+    assert "bNVDA" in {opt.symbol for opt in demo_app.search_tickers("bNVDA", catalog)}
+    report = demo_app._score_one(fixture_scorer, "bNVDA")
+    assert report["ticker"] == "bNVDA"
+    assert report["data_source"] == "fixture"
+    reserves = report["verification"]["reserves"]
+    assert reserves["source"] == "heuristic_fallback"
+    assert reserves["level"] != "on-chain PoR"
+    assert reserves["meta"]["published_por_feed"] == "bNVDA"
+    assert reserves["meta"]["por_path"] == "fixture_labeled_skip"
+    assert "live RPC skipped" in reserves["evidence"]
+    badge, evidence = demo_app._verification_badge_label("reserves", report)
+    assert "published Chainlink PoR" in badge
+    assert "bNVDA" in badge
+    assert "fixture/offline skip" in badge
+    assert "live RPC skipped" in evidence
+    # xStocks without a proxy stay on the unlabeled-heuristic path.
+    tsla = fixture_scorer.score("TSLA")
+    assert tsla["verification"]["reserves"]["source"] == "heuristic_fallback"
+    assert not (tsla["verification"]["reserves"].get("meta") or {}).get("published_por_feed")

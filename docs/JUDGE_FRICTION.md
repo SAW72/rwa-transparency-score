@@ -68,7 +68,7 @@ Render hosts the **Streamlit** UI + `/health` (and `/privacy`, `/terms`). It doe
 ## Do not expect
 
 - A hosted paid API or keep-alive (spend hold)
-- Every ticker to hit Chainlink PoR (Backed bTokens on Polygon only; most xStocks use **heuristic fallback**)
+- Every ticker to hit Chainlink PoR (Backed bTokens on Polygon only — search `bNV` / `bNVDA` for a card that can show the on-chain badge; most xStocks use **heuristic fallback**)
 - Instant first load on Free Render after idle
 
 Product disclaimer stays on the README. This page does not replace it.

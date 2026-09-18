@@ -97,8 +97,16 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
     level = block.get("level") or VerificationLevel.SELF_REPORTED.value
     source = block.get("source") or ""
     evidence = block.get("evidence") or "No evidence citation."
+    meta = block.get("meta") or {}
+    published = meta.get("published_por_feed")
     if source == "heuristic_fallback" or "heuristic fallback" in (evidence or "").lower():
-        badge = f"Verification: heuristic fallback · {level}"
+        if published and meta.get("por_path") == "fixture_labeled_skip":
+            badge = (
+                f"Verification: heuristic fallback · published Chainlink PoR "
+                f"({published}, fixture/offline skip)"
+            )
+        else:
+            badge = f"Verification: heuristic fallback · {level}"
     else:
         badge = f"Verification: {level}"
     return badge, evidence
@@ -576,18 +584,20 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         st.caption(
             "Fixture catalog: "
             + ", ".join(FIXTURE_TICKERS)
-            + " + XOM, PLD. Prefix (NIV → NVDA / Nvidia) or a category "
+            + " + XOM, PLD + Backed bTokens (bNVDA, bIB01, bCSPX, bC3M, bIBTA). "
+            "Prefix (NIV → NVDA / Nvidia, bNV → bNVDA) or a category "
             "(oil, AI, real estate, auto), then choose a match."
         )
     else:
         st.caption(
-            "Live mode: the cached CMC RWA map is the directory. "
-            "Prefix-match ticker/name or tap a category, then choose a match."
+            "Live mode: the cached CMC RWA map plus published Backed bToken "
+            "PoR symbols (bNVDA, …). Prefix-match ticker/name or tap a "
+            "category, then choose a match."
         )
 
 
 def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
-    """Directory the scorer already loads (live CMC map or fixture map)."""
+    """CMC/fixture map plus published Backed bToken PoR symbols."""
     cached = getattr(scorer, "_search_catalog", None)
     if cached is not None:
         return cached

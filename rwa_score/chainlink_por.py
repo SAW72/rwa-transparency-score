@@ -319,6 +319,47 @@ def resolve_por_feed(ticker: str, feeds: tuple[PorFeed, ...] | None = None) -> P
     return None
 
 
+def canonical_backed_por_feed(
+    ticker: str,
+    feeds: tuple[PorFeed, ...] | None = None,
+) -> PorFeed | None:
+    """Return the feed only when ``ticker`` *is* the published bToken symbol.
+
+    ``NVDA`` / ``NVDAx`` still resolve via ``resolve_por_feed`` for the verifier
+    alias path. Search/scoring treat ``bNVDA`` as a first-class row so we do
+    not pretend an underlying CMC ticker *is* the bToken.
+    """
+    key = normalize_ticker(ticker)
+    if not key:
+        return None
+    catalog = feeds if feeds is not None else BACKED_POR_FEEDS
+    for feed in catalog:
+        if feed.proxy and key == feed.symbol.upper():
+            return feed
+    return None
+
+
+def backed_map_candidates(feed: PorFeed) -> tuple[str, ...]:
+    """CMC / fixture map symbols that may carry the bToken's underlying row."""
+    seen = {feed.symbol.upper()}
+    out: list[str] = []
+    for raw in (feed.unit, *feed.aliases):
+        key = normalize_ticker(raw)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return tuple(out)
+
+
+def fixture_por_skip_note(feed: PorFeed) -> str:
+    """Honest fixture/offline label — not an on-chain PoR badge."""
+    return (
+        f"Published Chainlink PoR feed {feed.symbol} on {feed.chain} "
+        f"({feed.proxy}) — live RPC skipped in fixture/offline mode."
+    )
+
+
 def rpc_urls_for_chain(chain: str) -> list[str]:
     """Env URLs first, then public no-key fallbacks. Deduped, no secrets."""
     urls: list[str] = []
