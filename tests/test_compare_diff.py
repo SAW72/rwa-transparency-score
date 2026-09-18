@@ -232,15 +232,22 @@ def test_compare_callout_and_card_wire_into_app() -> None:
         "def _render_slot_error", 1
     )[0]
     assert "band" in card
+    assert "band_chip_html" in card
     assert "delta_color=\"off\"" in card
     assert "card_contrast_line" in card
     assert "verification_differs" in card
     assert "Verify:" in card
-    assert "unsafe_allow_html" not in card
+    assert "_render_card_details" in card
     assert "st.progress" not in card
     assert "mode_cue" in card
     assert "weakest_pillar_line" in card
     assert "pillar_dots" in card
+    details = source.split("def _render_card_details", 1)[1].split(
+        "def _render_compare_card", 1
+    )[0]
+    assert 'st.expander("Pillar evidence"' in details
+    assert "_cached_explanation" not in details
+    assert "Share score card" not in details
     detail = source.split("def _render_selected_slot_detail", 1)[1].split(
         "st.markdown(", 1
     )[0]

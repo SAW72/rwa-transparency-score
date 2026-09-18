@@ -81,6 +81,12 @@ Unknown issuers stay on the name-match path in `rwa_score/issuer_registry.py`. M
 
 `ISSUER_NOTES` on the score payload is a short equity-vs-debt line (Robinhood = debt / creditors of Robinhood Assets Jersey; Backed, Dinari, Ondo, and others when the name matches). The AI explainer reads that field.
 
+### Band chip + pillar evidence
+
+Each scored compare card shows a colored **band chip** (GREEN / YELLOW / ORANGE / RED) using the published thresholds — not a new metric. The selected slot’s chip has a stronger outline.
+
+Open the collapsed **Pillar evidence** expander on a card to read each pillar’s existing verification badge and evidence citation (same `_verification_badge_label` / score-report fields already computed). Fixture `bNVDA` Proof of reserves cites the published Chainlink PoR feed and **live RPC skipped**; `NVDA` / `TSLA` stay on labeled **heuristic fallback**. This is not a new feed. Educational disclaimer stays on the page.
+
 ### AI explainer (“Why this score?”)
 
 Each scored compare card has a collapsed **Why this score?** expander. Opening it and clicking **Show explanation** loads the blurb (xAI is not called on page load). When `XAI_API_KEY` is set, `rwa_score/explainer.py` POSTs the score, band, pillar notes, evidence, and issuer note to `https://api.x.ai/v1/chat/completions` (`grok-4.1-fast`, `max_tokens` 300, `requests` only). Missing key or any failure uses a templated fallback from the same pillar notes — the UI never crashes.
