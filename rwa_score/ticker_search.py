@@ -7,6 +7,11 @@ The Streamlit bar is exact-assign unless the query opens a picker:
 Categories are a documented taxonomy. A directory row is bucketed from
 ``industry`` / ``sector`` fields already on the map or fixture ``rwa_info``,
 plus a small name/symbol hint list — not a new paid API or invented universe.
+
+Published Backed **bToken** symbols from ``BACKED_POR_FEEDS`` are merged in as
+first-class picker rows so ``bNV`` / ``bNVDA`` (and feed aliases) can land a
+card that is eligible for the on-chain PoR badge. xStocks DataLink names with
+no proxy are not injected.
 """
 
 from __future__ import annotations
@@ -14,6 +19,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
+
+from .chainlink_por import (
+    BACKED_POR_FEEDS,
+    XSTOCKS_POR_FEEDS,
+    PorFeed,
+    canonical_backed_por_feed,
+)
 
 SEARCH_MIN_CHARS = 3
 CATEGORY_MIN_CHARS = 2
@@ -81,8 +93,12 @@ CATEGORY_DOC = (
     "- Real Estate — real estate, reit, realty, property, estate\n"
     "- Auto/EV — auto, ev, vehicle, automotive, motor\n"
     "- Finance — finance, bank, financial, insurance\n"
-    "Rows are bucketed from CMC/fixture industry or sector fields, then name hints."
+    "Rows are bucketed from CMC/fixture industry or sector fields, then name hints.\n"
+    "Directory also lists published Backed bTokens (bNVDA, bIB01, bCSPX, bC3M, "
+    "bIBTA) from BACKED_POR_FEEDS so on-chain PoR cards are searchable."
 )
+
+BACKED_SEARCH_SOURCE = "backed_por_feeds"
 
 
 @dataclass(frozen=True)
@@ -94,6 +110,7 @@ class TickerOption:
     aliases: tuple[str, ...] = ()
     industry: str = ""
     categories: tuple[str, ...] = ()
+    source: str = "rwa_map"
 
     def match_keys(self) -> tuple[str, ...]:
         keys = [self.symbol, self.name, *self.aliases]
@@ -104,7 +121,14 @@ class TickerOption:
 
 
 def normalize_ticker(raw: str) -> str:
-    return (raw or "").strip().upper()
+    """Uppercase CMC tickers; keep published bToken casing (``bNVDA``)."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    feed = canonical_backed_por_feed(text)
+    if feed is not None:
+        return feed.symbol
+    return text.upper()
 
 
 def normalize_query(raw: str) -> str:
@@ -273,23 +297,79 @@ def catalog_from_rwa_map(
                 aliases=aliases,
                 industry=industry,
                 categories=categories,
+                source="rwa_map",
             )
         )
     return options
 
 
-def load_search_catalog(client: Any) -> list[TickerOption]:
-    """Read the directory the app already uses. Failures yield an empty catalog.
+def catalog_from_por_feeds(feeds: Sequence[PorFeed] | None = None) -> list[TickerOption]:
+    """First-class picker rows for published Chainlink PoR bTokens.
 
-    Fixture info is joined for ``industry`` (local JSON). Live mode does **not**
-    call ``rwa_info`` per ticker — that would burn Basic-plan credits.
+    Only feeds with a real proxy are included. Names and aliases come from the
+    existing ``PorFeed`` catalog — no invented tickers or proxy addresses.
     """
+    options: list[TickerOption] = []
+    seen: set[str] = set()
+    for feed in feeds if feeds is not None else BACKED_POR_FEEDS + XSTOCKS_POR_FEEDS:
+        if not feed.proxy:
+            continue
+        symbol = str(feed.symbol or "").strip()
+        key = symbol.upper()
+        if not symbol or key in seen:
+            continue
+        seen.add(key)
+        # Do not put "Finance" in the display name — that would dump every
+        # bToken into the Finance category via the documented keyword list.
+        aliases = tuple(a for a in (*feed.aliases, feed.unit, "Backed", "bToken") if a)
+        name = f"Backed {feed.symbol} (Chainlink PoR)"
+        categories = classify_categories(
+            symbol=symbol, name=name, industry="", aliases=aliases
+        )
+        options.append(
+            TickerOption(
+                symbol=symbol,
+                name=name,
+                aliases=aliases,
+                industry="",
+                categories=categories,
+                source=BACKED_SEARCH_SOURCE,
+            )
+        )
+    return options
+
+
+def merge_search_catalog(
+    base: Sequence[TickerOption],
+    extra: Sequence[TickerOption],
+) -> list[TickerOption]:
+    """Append extra rows whose symbols are not already in ``base`` (case-insensitive)."""
+    merged = list(base)
+    seen = {opt.symbol.upper() for opt in merged if opt.symbol}
+    for opt in extra:
+        key = (opt.symbol or "").upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(opt)
+    return merged
+
+
+def load_search_catalog(client: Any) -> list[TickerOption]:
+    """Read the CMC/fixture map, then merge published Backed bToken rows.
+
+    Map failures still return the Backed PoR catalog so ``bNVDA`` remains
+    searchable. Fixture info is joined for ``industry`` (local JSON). Live
+    mode does **not** call ``rwa_info`` per ticker — that would burn
+    Basic-plan credits.
+    """
+    assets: Sequence[dict[str, Any]] | None = None
     try:
         assets = client.rwa_map()
     except Exception:  # noqa: BLE001 — search must not take down scoring
-        return []
+        assets = None
     info_by_id: dict[int, dict[str, Any]] = {}
-    if getattr(client, "source", "") == "fixture":
+    if assets is not None and getattr(client, "source", "") == "fixture":
         for row in assets or []:
             if not isinstance(row, dict) or row.get("rwa_id") is None:
                 continue
@@ -300,7 +380,9 @@ def load_search_catalog(client: Any) -> list[TickerOption]:
                 continue
             if info:
                 info_by_id[rid] = info
-    return catalog_from_rwa_map(assets, info_by_id=info_by_id)
+    base = catalog_from_rwa_map(assets, info_by_id=info_by_id) if assets is not None else []
+    extra = catalog_from_por_feeds()
+    return merge_search_catalog(base, extra)
 
 
 def _adjacent_transposition(left: str, right: str) -> bool:

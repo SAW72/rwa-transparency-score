@@ -5,13 +5,17 @@ from __future__ import annotations
 import pytest
 
 from rwa_score.chainlink_por import (
+    BACKED_POR_FEEDS,
     HEALTH_POR_FEED,
     XSTOCKS_DATALINK_POR,
     XSTOCKS_POR_FEEDS,
+    backed_map_candidates,
+    canonical_backed_por_feed,
     decode_int256,
     decode_latest_round,
     decode_uint256,
     eth_call_payload,
+    fixture_por_skip_note,
     parse_rpc_result,
     resolve_por_feed,
     rpc_urls_for_chain,
@@ -82,6 +86,29 @@ def test_nvda_alias_stays_on_published_btoken_not_datalink() -> None:
     assert datalink is not None
     assert datalink["proxy"] == ""
     assert datalink["proxy"] != feed.proxy
+
+
+def test_canonical_backed_feed_is_btoken_only() -> None:
+    """Underlying aliases help the verifier, not the first-class bToken identity."""
+    assert canonical_backed_por_feed("bNVDA") is not None
+    assert canonical_backed_por_feed("BNVDA") is not None
+    assert canonical_backed_por_feed("nvda") is None
+    assert canonical_backed_por_feed("NVDAx") is None
+    assert canonical_backed_por_feed("TSLAx") is None
+    bnvda = canonical_backed_por_feed("bNVDA")
+    assert bnvda is not None
+    assert "NVDA" in backed_map_candidates(bnvda)
+    assert "BNVDA" not in backed_map_candidates(bnvda)
+    note = fixture_por_skip_note(bnvda)
+    assert "bNVDA" in note
+    assert "live RPC skipped" in note
+    assert {feed.symbol for feed in BACKED_POR_FEEDS} == {
+        "bNVDA",
+        "bIB01",
+        "bCSPX",
+        "bC3M",
+        "bIBTA",
+    }
 
 
 def test_scale_and_round_trip() -> None:

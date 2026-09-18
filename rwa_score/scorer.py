@@ -17,6 +17,12 @@ from typing import Any
 
 import requests
 
+from .chainlink_por import (
+    PorFeed,
+    backed_map_candidates,
+    canonical_backed_por_feed,
+    fixture_por_skip_note,
+)
 from .client import RWAClient, parse_market_pairs_payload
 from .issuer_registry import HEURISTIC_NOTE, classify, issuer_note
 from .verifiers import (
@@ -26,6 +32,7 @@ from .verifiers import (
     build_default_verifiers,
     get_verifier_for_issuer,
     heuristic_result,
+    resolve_verifier_id,
 )
 
 WEIGHTS: dict[str, float] = {
@@ -332,7 +339,7 @@ class TransparencyScorer:
             self.use_live_verifiers = False
             self._fixture_live_blocked = True
 
-    def _resolve(self, ticker: str) -> int:
+    def _load_map_cache(self) -> dict[str, int]:
         if self._map_cache is None:
             try:
                 assets = self.client.rwa_map()
@@ -343,9 +350,33 @@ class TransparencyScorer:
                 for a in assets
                 if a.get("symbol") and a.get("rwa_id") is not None
             }
-        rwa_id = self._map_cache.get(ticker.upper())
-        if rwa_id is None:
+        return self._map_cache
+
+    def _resolve_score_target(self, ticker: str) -> tuple[int | None, PorFeed | None]:
+        """Map a ticker to a CMC/fixture row and/or a canonical Backed bToken.
+
+        Canonical bTokens (``bNVDA``) may reuse the underlying unit's map row
+        when one exists. If the map has no underlying, ``rwa_id`` is ``None``
+        and scoring uses labeled missing-field defaults — never invented
+        prices or CIKs.
+        """
+        cache = self._load_map_cache()
+        feed = canonical_backed_por_feed(ticker)
+        rwa_id = cache.get(ticker.upper())
+        if rwa_id is None and feed is not None:
+            for cand in backed_map_candidates(feed):
+                mapped = cache.get(cand)
+                if mapped is not None:
+                    return mapped, feed
+        if rwa_id is None and feed is None:
             raise ScoreError(f"{ticker} not found in RWA map")
+        return rwa_id, feed
+
+    def _resolve(self, ticker: str) -> int:
+        rwa_id, feed = self._resolve_score_target(ticker)
+        if rwa_id is None:
+            symbol = feed.symbol if feed is not None else ticker
+            raise ScoreError(f"{symbol} not found in RWA map")
         return rwa_id
 
     def _ensure_issuer_index(self) -> None:
@@ -461,7 +492,7 @@ class TransparencyScorer:
                 continue
         return names
 
-    def _basis_score(self, rwa_id: int) -> tuple[float, dict[str, Any], list[str], str]:
+    def _basis_score(self, rwa_id: int | None) -> tuple[float, dict[str, Any], list[str], str]:
         """Cross-issuer wrapper spread. Never swallow fetch errors silently."""
         flags: list[str] = []
         empty_meta: dict[str, Any] = {
@@ -472,6 +503,17 @@ class TransparencyScorer:
             "max_price": None,
             "wrappers": [],
         }
+        if rwa_id is None:
+            flags.append(
+                "No CMC/fixture RWA row for this Backed bToken — cross-issuer basis unverified."
+            )
+            return (
+                MISSING_BASIS_SCORE,
+                empty_meta,
+                flags,
+                "Catalog-only Backed bToken (no map row); assigned the missing-pairs default "
+                f"({MISSING_BASIS_SCORE:.0f}).",
+            )
         try:
             raw = self.client.market_pairs(rwa_id=rwa_id)
         except Exception as exc:  # noqa: BLE001 — record, do not hide
@@ -588,6 +630,37 @@ class TransparencyScorer:
         )
         return result
 
+    def _annotate_fixture_por_skip(
+        self,
+        result: VerificationResult,
+        ticker: str,
+    ) -> VerificationResult:
+        """Label a published bToken feed when live RPC is skipped. Not on-chain PoR."""
+        feed = canonical_backed_por_feed(ticker)
+        if feed is None:
+            return result
+        note = fixture_por_skip_note(feed)
+        if note not in result.notes:
+            result.notes.append(note)
+        if note not in result.evidence:
+            result.evidence = f"{result.evidence} {note}"
+        result.meta = {
+            **result.meta,
+            "published_por_feed": feed.symbol,
+            "por_proxy": feed.proxy,
+            "por_chain": feed.chain,
+            "por_path": "fixture_labeled_skip",
+        }
+        return result
+
+    def _verifier_for_ticker(self, ticker: str, issuer_name: str) -> Verifier | None:
+        """Issuer registry first; canonical Backed bTokens always use BackedVerifier."""
+        verifier = get_verifier_for_issuer(issuer_name, self._verifiers)
+        if canonical_backed_por_feed(ticker) is None:
+            return verifier
+        backed = (self._verifiers or {}).get("backed")
+        return backed if backed is not None else verifier
+
     def _verify_pillar(
         self,
         pillar: str,
@@ -598,7 +671,9 @@ class TransparencyScorer:
         """Run the issuer's verifier, or heuristic for unknown / offline."""
         if not self.use_live_verifiers:
             if pillar == "redemption":
-                return self._heuristic_redemption(issuer_name)
+                return self._annotate_fixture_por_skip(
+                    self._heuristic_redemption(issuer_name), ticker
+                )
             result = heuristic_result(
                 pillar,
                 issuer_name,
@@ -606,9 +681,9 @@ class TransparencyScorer:
             )
             # Fixture path is an intentional skip, keep labeled but ok=True for UX.
             result.ok = True
-            return result
+            return self._annotate_fixture_por_skip(result, ticker)
 
-        verifier = get_verifier_for_issuer(issuer_name, self._verifiers)
+        verifier = self._verifier_for_ticker(ticker, issuer_name)
         if pillar == "redemption":
             method = getattr(verifier, "verify_redemption", None) if verifier is not None else None
             if callable(method):
@@ -650,22 +725,36 @@ class TransparencyScorer:
         )
 
     def score(self, ticker: str) -> dict[str, Any]:
-        rwa_id = self._resolve(ticker)
-        try:
-            info = self.client.rwa_info(rwa_id)
-        except Exception as exc:  # noqa: BLE001
-            raise ScoreError(f"Could not load RWA info for {ticker}: {exc}") from exc
-        if not info:
-            raise ScoreError(f"No RWA info returned for {ticker} (rwa_id={rwa_id})")
+        rwa_id, backed_feed = self._resolve_score_target(ticker)
+        catalog_only = rwa_id is None
+        if catalog_only:
+            assert backed_feed is not None
+            info = {
+                "symbol": backed_feed.symbol,
+                "name": backed_feed.name,
+                "issuer": {"name": "Backed Finance"},
+                "cik": None,
+            }
+            token: dict[str, Any] = {"issuer_name": "Backed Finance", "crypto_id": None}
+            issuer_name = "Backed Finance"
+        else:
+            try:
+                info = self.client.rwa_info(rwa_id)
+            except Exception as exc:  # noqa: BLE001
+                raise ScoreError(f"Could not load RWA info for {ticker}: {exc}") from exc
+            if not info:
+                raise ScoreError(f"No RWA info returned for {ticker} (rwa_id={rwa_id})")
 
-        token = self._token_for(rwa_id)
-        issuer_name = (
-            token.get("issuer_name")
-            or (info.get("issuer") or {}).get("name")
-            or ""
-        )
+            token = self._token_for(rwa_id)
+            issuer_name = (
+                token.get("issuer_name")
+                or (info.get("issuer") or {}).get("name")
+                or ""
+            )
+            if backed_feed is not None and resolve_verifier_id(issuer_name) != "backed":
+                issuer_name = "Backed Finance"
         flags = classify(issuer_name)
-        symbol = ticker.upper()
+        symbol = backed_feed.symbol if backed_feed is not None else ticker.upper()
 
         backing_v = self._verify_pillar("backing", ticker=symbol, issuer_name=issuer_name)
         reserves_v = self._verify_pillar("reserves", ticker=symbol, issuer_name=issuer_name)
@@ -823,6 +912,16 @@ class TransparencyScorer:
         if source == "fixture":
             notes.append(
                 "Scores below use bundled DEMO FIXTURE data, not live CoinMarketCap API responses."
+            )
+        if backed_feed is not None and catalog_only:
+            notes.append(
+                f"{backed_feed.symbol} is a published Backed bToken from BACKED_POR_FEEDS; "
+                "no CMC/fixture underlying row — price, disclosure, and basis use missing defaults."
+            )
+        elif backed_feed is not None and rwa_id is not None:
+            notes.append(
+                f"Scored {backed_feed.symbol} using the CMC/fixture row for underlying "
+                f"{backed_feed.unit} (rwa_id={rwa_id})."
             )
         if not self.use_live_verifiers:
             notes.append(

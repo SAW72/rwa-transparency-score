@@ -24,6 +24,8 @@ REST PoR is self-reported issuer JSON, not Chainlink on-chain PoR. It is also **
 
 `NVDA` / `NVDAx` already alias to the published **bNVDA** Polygon proxy (Backed bToken). That is the bToken feed, not an xStocks DataLink stream. `TSLAx` / `AAPLx` / `METAx` have no bToken proxy and stay heuristic.
 
+Search / directory rows now include the Backed **bToken** symbols themselves (`bNVDA`, `bIB01`, `bCSPX`, `bC3M`, `bIBTA`) from `BACKED_POR_FEEDS`, so typing `bNV` / `bNVDA` (or a feed alias) can pick a card that is eligible for the **on-chain PoR** badge. Underlying CMC/fixture names such as `NVDA` still appear as their own row — the alias helps discovery, it does not relabel an xStock without a proxy as on-chain PoR. Fixture/offline scoring of a bToken keeps the **heuristic fallback** badge plus a published-feed skip note; it does not fabricate a live RPC read.
+
 ## When to add feeds
 
 If Chainlink publishes a non-null SmartData `proxyAddress` for an xStock, add a `PorFeed` to `XSTOCKS_POR_FEEDS` (or `BACKED_POR_FEEDS`) with that exact address. Do not copy DataLink stream IDs into `proxy`.
