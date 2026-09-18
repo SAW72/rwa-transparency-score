@@ -12,6 +12,7 @@ leaves cold-start ``/health`` as Streamlit HTML.
 from __future__ import annotations
 
 import base64
+import html
 import os
 import time
 from pathlib import Path
@@ -80,6 +81,13 @@ BAND_COLORS = {
     "YELLOW": "#F5C542",
     "ORANGE": "#F08A24",
     "RED": "#E5484D",
+}
+# Dark ink on bright chips; white on RED so the label stays readable.
+_BAND_CHIP_INK = {
+    "GREEN": "#0D1117",
+    "YELLOW": "#0D1117",
+    "ORANGE": "#0D1117",
+    "RED": "#FFFFFF",
 }
 
 
@@ -462,6 +470,71 @@ def catalog_company(ticker: str, catalog: list[TickerOption]) -> str:
 def mode_cue(report: dict) -> str:
     """LIVE vs fixture badge for a compare card."""
     return "FIXTURE" if report.get("data_source") == "fixture" else "LIVE"
+
+
+def normalize_band(band: str | None, *, score: float | None = None) -> str:
+    """Canonical GREEN/YELLOW/ORANGE/RED. Never invents a new band name."""
+    code = str(band or "").strip().upper()
+    if code in BAND_COLORS:
+        return code
+    if score is not None:
+        return band_code(float(score))
+    return ""
+
+
+def band_chip_spec(band: str | None, *, score: float | None = None) -> dict[str, str]:
+    """Color + label for the band pill. Empty when the band is unknown."""
+    code = normalize_band(band, score=score)
+    if code not in BAND_COLORS:
+        return {"band": "", "label": "", "color": "", "text_color": ""}
+    return {
+        "band": code,
+        "label": code,
+        "color": BAND_COLORS[code],
+        "text_color": _BAND_CHIP_INK[code],
+    }
+
+
+def band_chip_html(
+    band: str | None,
+    *,
+    score: float | None = None,
+    selected: bool = False,
+) -> str:
+    """Colored GREEN/YELLOW/ORANGE/RED pill. Empty string if band is unknown."""
+    spec = band_chip_spec(band, score=score)
+    if not spec["band"]:
+        return ""
+    extra = " rat-band-chip-selected" if selected else ""
+    label = html.escape(spec["band"])
+    return (
+        f'<span class="rat-band-chip rat-band-{spec["band"].lower()}{extra}" '
+        f'style="background:{spec["color"]};color:{spec["text_color"]}">'
+        f"{label}</span>"
+    )
+
+
+def pillar_evidence_rows(report: dict) -> list[dict]:
+    """Existing per-pillar badge + evidence. No new feeds or invented metrics."""
+    subs = report.get("subscores") or {}
+    explanations = report.get("explanations") or {}
+    rows: list[dict] = []
+    for key in WEIGHTS:
+        badge, evidence = _verification_badge_label(key, report)
+        meta = PILLARS[key]
+        rows.append(
+            {
+                "key": key,
+                "label": meta["label"],
+                "what": meta["what"],
+                "score": float(subs.get(key) or 0),
+                "weight": float(WEIGHTS[key]),
+                "badge": badge,
+                "evidence": evidence,
+                "explanation": str(explanations.get(key) or ""),
+            }
+        )
+    return rows
 
 
 def pillar_dots(report: dict) -> str:
@@ -944,60 +1017,56 @@ def _user_facing_share_status(bundle: object) -> str:
 
 
 def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
-    """Share + explainer + pillars — unused on Score/Compare this PR."""
-    if report.get("data_source") == "fixture":
-        st.caption("Demo fixture data — not a live CoinMarketCap API response.")
-    else:
-        st.caption("Live CoinMarketCap data.")
+    """Collapsed pillar evidence on the compare card. xAI / share stay gated elsewhere."""
+    del slot_index  # kept for call-site compatibility with share / explainer helpers
+    with st.expander("Pillar evidence", expanded=False):
+        if report.get("data_source") == "fixture":
+            st.caption("Demo fixture data — not a live CoinMarketCap API response.")
+        else:
+            st.caption("Live CoinMarketCap data.")
 
-    st.caption(
-        "Backing / reserves / redemption use **issuer-name heuristics** when live "
-        "attestation/PoR is unavailable — labeled **heuristic fallback**, not audited attestations."
-    )
-
-    basis_meta = report.get("basis") or {}
-    if basis_meta.get("available"):
-        spread = basis_meta.get("percent_spread")
-        count = basis_meta.get("wrapper_count")
         st.caption(
-            f"Cross-issuer basis: **{spread:.2f}%** spread across {count} wrappers "
-            "(self-reported CMC market-pairs)."
-        )
-    elif basis_meta.get("wrapper_count") == 1:
-        st.caption(
-            "Cross-issuer basis: only one wrapper on CMC market-pairs — no issuer compare."
+            "Backing / reserves / redemption use **issuer-name heuristics** when live "
+            "attestation/PoR is unavailable — labeled **heuristic fallback**, not audited attestations."
         )
 
-    flags = report.get("flags") or []
-    if flags:
-        for flag in flags:
-            st.warning(flag)
-    else:
-        st.caption("No risk flags on this pass.")
-
-    _render_share_controls(report, slot_index=slot_index)
-
-    st.write(_cached_explanation(report))
-    st.caption(AI_FOOTNOTE)
-
-    with st.expander("Pillar detail", expanded=False):
-        for key in WEIGHTS:
-            meta = PILLARS[key]
-            badge_label, evidence = _verification_badge_label(key, report)
-            st.markdown(
-                f"**{meta['label']}** — {report['subscores'][key]:.0f}/100 "
-                f"(weight {WEIGHTS[key]:.0%})"
+        basis_meta = report.get("basis") or {}
+        if basis_meta.get("available"):
+            spread = basis_meta.get("percent_spread")
+            count = basis_meta.get("wrapper_count")
+            st.caption(
+                f"Cross-issuer basis: **{spread:.2f}%** spread across {count} wrappers "
+                "(self-reported CMC market-pairs)."
             )
-            st.caption(badge_label)
-            st.caption(meta["what"])
-            st.caption(f"Evidence: {evidence}")
-            st.write(report["explanations"][key])
+        elif basis_meta.get("wrapper_count") == 1:
+            st.caption(
+                "Cross-issuer basis: only one wrapper on CMC market-pairs — no issuer compare."
+            )
+
+        flags = report.get("flags") or []
+        if flags:
+            for flag in flags:
+                st.warning(flag)
+        else:
+            st.caption("No risk flags on this pass.")
+
+        for row in pillar_evidence_rows(report):
+            st.markdown(
+                f"**{row['label']}** — {row['score']:.0f}/100 "
+                f"(weight {row['weight']:.0%})"
+            )
+            st.caption(row["badge"])
+            st.caption(row["what"])
+            st.caption(f"Evidence: {row['evidence']}")
+            if row["explanation"]:
+                st.write(row["explanation"])
 
         notes = report.get("notes") or []
         if notes:
             st.markdown("**Notes**")
             for note in notes:
                 st.info(note)
+        st.caption("Educational demo — existing verification evidence, not a new metric.")
 
 
 def _render_compare_card(
@@ -1008,19 +1077,24 @@ def _render_compare_card(
     slot_index: int = 0,
     diff: dict | None = None,
 ) -> None:
-    """Ticker · band · issuer · score · LIVE/FIXTURE · pillar gap / Why this score?"""
+    """Ticker · band chip · issuer · score · LIVE/FIXTURE · pillar evidence / Why this score?"""
     ticker = str(report.get("ticker") or "")
     title = f"● {ticker}" if selected else ticker
     score = float(report.get("score") or 0)
-    band = str(report.get("band") or band_code(score))
+    band = normalize_band(report.get("band"), score=score) or str(
+        report.get("band") or band_code(score)
+    )
     issuer = short_company_name(str(report.get("issuer") or "")) or company
     cue = mode_cue(report)
     st.metric(
         title,
         f"{score:.1f}",
-        f"{band} · {issuer} · {cue}",
+        f"{issuer} · {cue}",
         delta_color="off",
     )
+    chip = band_chip_html(band, score=score, selected=selected)
+    if chip:
+        st.markdown(chip, unsafe_allow_html=True)
     dots = pillar_dots(report)
     weak = weakest_pillar_line(report)
     if dots and weak:
@@ -1035,6 +1109,7 @@ def _render_compare_card(
     contrast = card_contrast_line(ticker, diff)
     if contrast:
         st.caption(contrast)
+    _render_card_details(report, slot_index=slot_index)
     _render_why_this_score(report, slot_index=slot_index)
 
 
@@ -1127,6 +1202,21 @@ st.markdown(
         border: 0 !important;
         position: absolute !important;
         width: 0 !important;
+      }}
+      /* Score-band pill — stronger than metric-delta text. */
+      .rat-band-chip {{
+        display: inline-block;
+        padding: 0.22rem 0.7rem;
+        border-radius: 999px;
+        font-weight: 800;
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        line-height: 1.25;
+        text-transform: uppercase;
+        vertical-align: middle;
+      }}
+      .rat-band-chip-selected {{
+        box-shadow: 0 0 0 2px rgba(250, 250, 250, 0.95), 0 0 0 4px currentColor;
       }}
     </style>
     """,
