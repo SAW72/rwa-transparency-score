@@ -26,7 +26,10 @@ from dotenv import load_dotenv
 
 TWEET_URL = "https://api.x.com/2/tweets"
 MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
+MEDIA_INITIALIZE_URL = f"{MEDIA_UPLOAD_URL}/initialize"
 DEFAULT_TIMEOUT = 20.0
+STATUS_MAX_POLLS = 8
+STATUS_MAX_WAIT_SECS = 5.0
 
 API_KEY_ENVS = ("X_API_KEY", "TWITTER_API_KEY", "TWITTER_CONSUMER_KEY")
 API_SECRET_ENVS = ("X_API_SECRET", "TWITTER_API_SECRET", "TWITTER_CONSUMER_SECRET")
@@ -50,12 +53,48 @@ _POLISHED_SKIP_MESSAGES = frozenset(
         "X post skipped: score card image was empty.",
     }
 )
+_RAW_API_MARKERS = (
+    "INIT failed",
+    "APPEND failed",
+    "FINALIZE failed",
+    "initialize failed",
+    "command=INIT",
+    "media_category rejected",
+    '"errors"',
+    '"title"',
+    "{",
+    "}",
+)
+
+
+def media_append_url(media_id: str) -> str:
+    return f"{MEDIA_UPLOAD_URL}/{media_id}/append"
+
+
+def media_finalize_url(media_id: str) -> str:
+    return f"{MEDIA_UPLOAD_URL}/{media_id}/finalize"
+
+
+def media_status_url(media_id: str) -> str:
+    return f"{MEDIA_UPLOAD_URL}?command=STATUS&media_id={media_id}"
+
+
+def _looks_like_raw_x_api(text: str) -> bool:
+    """True when copy still carries HTTP/JSON/INIT internals."""
+    if any(marker in text for marker in _RAW_API_MARKERS):
+        return True
+    lowered = text.lower()
+    if "failed (" in lowered and any(ch.isdigit() for ch in text):
+        return True
+    return False
 
 
 def user_facing_x_skip_message(message: str | None = None) -> str:
     """Polished skip copy for the UI. Never forwards raw X API errors."""
     text = (message or "").strip()
     if not text:
+        return X_POST_UNAVAILABLE_MESSAGE
+    if _looks_like_raw_x_api(text):
         return X_POST_UNAVAILABLE_MESSAGE
     if text in _POLISHED_SKIP_MESSAGES or text.startswith("Posted to X:"):
         return text
@@ -224,6 +263,18 @@ def _tweet_id_from(payload: dict[str, Any]) -> str:
     return str(value) if value else ""
 
 
+def _processing_info(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    info = data.get("processing_info") if isinstance(data, dict) else None
+    return info if isinstance(info, dict) else {}
+
+
+def _media_http_error(stage: str, response: Any) -> RuntimeError:
+    status = getattr(response, "status_code", "?")
+    body = (getattr(response, "text", "") or "")[:240]
+    return RuntimeError(f"X media {stage} failed ({status}): {body}")
+
+
 class XClient:
     """Thin OAuth 1.0a wrapper around X API v2 media + tweets."""
 
@@ -284,49 +335,77 @@ class XClient:
             timeout=self.timeout,
         )
 
+    def _get(self, url: str) -> Any:
+        req_headers = self._signed_headers("GET", url)
+        return self.session.get(url, headers=req_headers, timeout=self.timeout)
+
+    def _wait_for_media_processing(
+        self,
+        media_id: str,
+        payload: dict[str, Any],
+        *,
+        sleeper: Any = time.sleep,
+    ) -> None:
+        """Poll STATUS only when finalize returns processing_info."""
+        info = _processing_info(payload)
+        for _ in range(STATUS_MAX_POLLS):
+            state = str(info.get("state") or "").lower()
+            if not state or state == "succeeded":
+                return
+            if state == "failed":
+                raise RuntimeError("X media processing failed")
+            wait = info.get("check_after_secs")
+            try:
+                delay = float(wait)
+            except (TypeError, ValueError):
+                delay = 1.0
+            delay = max(0.0, min(delay, STATUS_MAX_WAIT_SECS))
+            if delay:
+                sleeper(delay)
+            status_resp = self._get(media_status_url(media_id))
+            if getattr(status_resp, "status_code", 0) >= 400:
+                raise _media_http_error("status", status_resp)
+            info = _processing_info(_json_payload(status_resp))
+        raise RuntimeError("X media processing timed out")
+
     def upload_png(self, png_bytes: bytes) -> str:
-        """Chunked v2 media upload (INIT / APPEND / FINALIZE). Returns media id."""
-        init_data = {
-            "command": "INIT",
-            "total_bytes": str(len(png_bytes)),
+        """v2 chunked upload: initialize / append / finalize. Returns media id.
+
+        X rejected command=INIT form fields on POST /2/media/upload. The
+        documented flow uses dedicated paths and a JSON initialize body.
+        """
+        init_body = {
             "media_type": "image/png",
+            "total_bytes": len(png_bytes),
             "media_category": "tweet_image",
         }
-        init_resp = self._post(MEDIA_UPLOAD_URL, data=init_data)
+        init_resp = self._post(
+            MEDIA_INITIALIZE_URL,
+            json_body=init_body,
+            headers={"Content-Type": "application/json"},
+        )
         init_payload = _json_payload(init_resp)
         if getattr(init_resp, "status_code", 0) >= 400:
-            raise RuntimeError(
-                f"X media INIT failed ({init_resp.status_code}): "
-                f"{(getattr(init_resp, 'text', '') or '')[:240]}"
-            )
+            raise _media_http_error("initialize", init_resp)
         media_id = _media_id_from(init_payload)
         if not media_id:
-            raise RuntimeError(f"X media INIT returned no media id: {init_payload!r}")
+            raise RuntimeError("X media initialize returned no media id")
 
         files = {"media": ("score-card.png", png_bytes, "image/png")}
-        append_data = {
-            "command": "APPEND",
-            "media_id": media_id,
-            "segment_index": "0",
-        }
-        append_resp = self._post(MEDIA_UPLOAD_URL, data=append_data, files=files)
-        if getattr(append_resp, "status_code", 0) >= 400:
-            raise RuntimeError(
-                f"X media APPEND failed ({append_resp.status_code}): "
-                f"{(getattr(append_resp, 'text', '') or '')[:240]}"
-            )
-
-        fin_resp = self._post(
-            MEDIA_UPLOAD_URL,
-            data={"command": "FINALIZE", "media_id": media_id},
+        append_resp = self._post(
+            media_append_url(media_id),
+            data={"segment_index": "0"},
+            files=files,
         )
+        if getattr(append_resp, "status_code", 0) >= 400:
+            raise _media_http_error("append", append_resp)
+
+        fin_resp = self._post(media_finalize_url(media_id))
+        fin_payload = _json_payload(fin_resp)
         if getattr(fin_resp, "status_code", 0) >= 400:
-            raise RuntimeError(
-                f"X media FINALIZE failed ({fin_resp.status_code}): "
-                f"{(getattr(fin_resp, 'text', '') or '')[:240]}"
-            )
-        finalized = _media_id_from(_json_payload(fin_resp)) or media_id
-        return finalized
+            raise _media_http_error("finalize", fin_resp)
+        self._wait_for_media_processing(media_id, fin_payload)
+        return _media_id_from(fin_payload) or media_id
 
     def create_post(self, text: str, media_id: str) -> tuple[str, str | None]:
         body = {"text": text, "media": {"media_ids": [media_id]}}
