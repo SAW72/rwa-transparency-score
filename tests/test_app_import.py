@@ -277,6 +277,7 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     )[0]
     assert "unsafe_allow_html" not in render
     assert "st.metric" in render
+    assert "delta_color=\"off\"" in render
     assert "st.progress" not in render
     assert "_render_why_this_score" in render
     assert "st.caption" in render

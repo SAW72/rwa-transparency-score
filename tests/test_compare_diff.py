@@ -232,6 +232,7 @@ def test_compare_callout_and_card_wire_into_app() -> None:
         "def _render_slot_error", 1
     )[0]
     assert "band" in card
+    assert "delta_color=\"off\"" in card
     assert "card_contrast_line" in card
     assert "verification_differs" in card
     assert "Verify:" in card

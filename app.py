@@ -1015,7 +1015,12 @@ def _render_compare_card(
     band = str(report.get("band") or band_code(score))
     issuer = short_company_name(str(report.get("issuer") or "")) or company
     cue = mode_cue(report)
-    st.metric(title, f"{score:.1f}", f"{band} · {issuer} · {cue}")
+    st.metric(
+        title,
+        f"{score:.1f}",
+        f"{band} · {issuer} · {cue}",
+        delta_color="off",
+    )
     dots = pillar_dots(report)
     weak = weakest_pillar_line(report)
     if dots and weak:
