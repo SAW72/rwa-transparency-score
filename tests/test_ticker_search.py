@@ -36,6 +36,8 @@ def _fixture_catalog() -> list[TickerOption]:
 def test_normalize_ticker_strips_and_uppercases() -> None:
     assert normalize_ticker("  niv  ") == "NIV"
     assert normalize_ticker("nvda") == "NVDA"
+    assert normalize_ticker("bnvda") == "bNVDA"
+    assert normalize_ticker("BNVDA") == "bNVDA"
     assert normalize_ticker("") == ""
     assert normalize_ticker(None) == ""  # type: ignore[arg-type]
 
@@ -597,7 +599,7 @@ def test_backed_btoken_typeahead_places_slot() -> None:
     slots, active = demo_app.place_search_match(
         list(demo_app.DEFAULT_SLOTS), 0, hits[0].symbol
     )
-    assert slots[0] == "BNVDA"
+    assert slots[0] == "bNVDA"
     assert active == 1
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "bNVDA" in source

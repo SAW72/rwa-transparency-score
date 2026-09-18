@@ -20,7 +20,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from .chainlink_por import BACKED_POR_FEEDS, XSTOCKS_POR_FEEDS, PorFeed
+from .chainlink_por import (
+    BACKED_POR_FEEDS,
+    XSTOCKS_POR_FEEDS,
+    PorFeed,
+    canonical_backed_por_feed,
+)
 
 SEARCH_MIN_CHARS = 3
 CATEGORY_MIN_CHARS = 2
@@ -116,7 +121,14 @@ class TickerOption:
 
 
 def normalize_ticker(raw: str) -> str:
-    return (raw or "").strip().upper()
+    """Uppercase CMC tickers; keep published bToken casing (``bNVDA``)."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    feed = canonical_backed_por_feed(text)
+    if feed is not None:
+        return feed.symbol
+    return text.upper()
 
 
 def normalize_query(raw: str) -> str:
