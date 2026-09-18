@@ -24,6 +24,7 @@ from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import share_score_card
 from rwa_score.scorer import (
+    LIVE_OR_HEURISTIC,
     PILLARS,
     WEIGHTS,
     ScoreError,
@@ -145,6 +146,17 @@ def selected_slot_verification_lines(report: dict) -> list[str]:
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
+# Pillar / score gaps below these stay unlabeled — do not invent a "driver".
+COMPARE_MIN_SCORE_DELTA = 5.0
+COMPARE_MIN_PILLAR_DELTA = 8.0
+COMPARE_MIN_WEIGHTED_DELTA = 1.2
+_VERIFICATION_RANK = {
+    VerificationLevel.ON_CHAIN_POR.value: 4,
+    VerificationLevel.ATTESTED.value: 3,
+    VerificationLevel.EXAMINED.value: 2,
+    "heuristic fallback": 1,
+    VerificationLevel.SELF_REPORTED.value: 0,
+}
 CANDIDATE_STRIP_LIMIT = 4
 SEARCH_MATCH_KEY = "search_match_pick"
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
@@ -469,6 +481,256 @@ def weakest_pillar_line(report: dict) -> str:
     return f"Weakest: {PILLARS[key]['label']} {float(subs.get(key) or 0):.0f}"
 
 
+def _join_tickers(tickers: list[str]) -> str:
+    """Compact ticker list for captions (max three names)."""
+    names = [str(t).strip() for t in tickers if str(t).strip()]
+    if not names:
+        return ""
+    if len(names) <= 3:
+        return "/".join(names)
+    return f"{names[0]}/{names[1]}…"
+
+
+def pillar_verification_kind(pillar_key: str, report: dict) -> str:
+    """Normalize one pillar to a compact badge kind. Never invents a live path."""
+    block = (report.get("verification") or {}).get(pillar_key) or {}
+    level = str(block.get("level") or VerificationLevel.SELF_REPORTED.value)
+    source = str(block.get("source") or "")
+    evidence = str(block.get("evidence") or "")
+    if source == "heuristic_fallback" or "heuristic fallback" in evidence.lower():
+        return "heuristic fallback"
+    return level
+
+
+def verification_cue(report: dict) -> str:
+    """Strongest backing/reserves/redemption badge for a compare card."""
+    kinds = [pillar_verification_kind(key, report) for key in LIVE_OR_HEURISTIC]
+    if not kinds:
+        return VerificationLevel.SELF_REPORTED.value
+    return max(kinds, key=lambda kind: _VERIFICATION_RANK.get(kind, 0))
+
+
+def _empty_compare_diff() -> dict:
+    return {
+        "available": False,
+        "headline": "",
+        "lines": [],
+        "score_spread": 0.0,
+        "bands": {},
+        "largest_delta": None,
+        "verification_groups": {},
+        "verification_differs": False,
+        "cards": {},
+    }
+
+
+def _band_summary(reports: list[dict]) -> str:
+    grouped: dict[str, list[str]] = {}
+    for report in reports:
+        band = str(report.get("band") or band_code(float(report.get("score") or 0)))
+        ticker = str(report.get("ticker") or "")
+        if ticker:
+            grouped.setdefault(band, []).append(ticker)
+    parts = []
+    for band in ("GREEN", "YELLOW", "ORANGE", "RED"):
+        names = grouped.get(band) or []
+        if names:
+            parts.append(f"{band} {_join_tickers(names)}")
+    return " · ".join(parts)
+
+
+def _largest_pillar_delta(reports: list[dict]) -> dict | None:
+    """Pillar that contributes most to the score gap (delta × published weight)."""
+    best: dict | None = None
+    best_weighted = -1.0
+    for key in WEIGHTS:
+        values: list[tuple[str, float]] = []
+        for report in reports:
+            ticker = str(report.get("ticker") or "")
+            if not ticker:
+                continue
+            subs = report.get("subscores") or {}
+            if key not in subs:
+                continue
+            values.append((ticker, float(subs.get(key) or 0)))
+        if len(values) < 2:
+            continue
+        high_val = max(item[1] for item in values)
+        low_val = min(item[1] for item in values)
+        spread = high_val - low_val
+        weighted = spread * float(WEIGHTS[key])
+        if weighted < best_weighted:
+            continue
+        if weighted == best_weighted and best is not None:
+            continue
+        best_weighted = weighted
+        best = {
+            "pillar": key,
+            "label": PILLARS[key]["label"],
+            "high": high_val,
+            "low": low_val,
+            "spread": spread,
+            "weighted": weighted,
+            "high_tickers": [t for t, val in values if val == high_val],
+            "low_tickers": [t for t, val in values if val == low_val],
+        }
+    if best is None:
+        return None
+    if (
+        float(best["spread"]) < COMPARE_MIN_PILLAR_DELTA
+        or float(best["weighted"]) < COMPARE_MIN_WEIGHTED_DELTA
+    ):
+        return None
+    return best
+
+
+def compare_differentiation(reports: list[dict] | None) -> dict:
+    """Why 2–4 scored slots differ — headline, lines, per-card contrast.
+
+    Uses only published scores, bands, weights, and verification badges.
+    """
+    scored = [
+        report
+        for report in (reports or [])
+        if report and str(report.get("ticker") or "").strip()
+    ]
+    if len(scored) < 2:
+        return _empty_compare_diff()
+
+    ranked = sorted(scored, key=lambda row: float(row.get("score") or 0), reverse=True)
+    high, low = ranked[0], ranked[-1]
+    high_ticker = str(high.get("ticker") or "")
+    low_ticker = str(low.get("ticker") or "")
+    score_spread = float(high.get("score") or 0) - float(low.get("score") or 0)
+    bands = {
+        str(report.get("ticker") or ""): str(
+            report.get("band") or band_code(float(report.get("score") or 0))
+        )
+        for report in scored
+        if report.get("ticker")
+    }
+    largest = _largest_pillar_delta(scored)
+
+    groups: dict[str, list[str]] = {}
+    for report in scored:
+        ticker = str(report.get("ticker") or "")
+        groups.setdefault(verification_cue(report), []).append(ticker)
+    verification_differs = len(groups) > 1
+
+    issuers: dict[str, list[str]] = {}
+    for report in scored:
+        ticker = str(report.get("ticker") or "")
+        issuer = short_company_name(str(report.get("issuer") or "")) or "unknown"
+        issuers.setdefault(issuer, []).append(ticker)
+    issuers_differ = len(issuers) > 1
+
+    headline_bits: list[str] = []
+    if score_spread >= COMPARE_MIN_SCORE_DELTA and high_ticker and low_ticker:
+        headline_bits.append(
+            f"{low_ticker} trails {high_ticker} by {score_spread:.1f}"
+        )
+    elif len(set(bands.values())) > 1:
+        headline_bits.append(f"Bands split {_band_summary(scored)}")
+    else:
+        headline_bits.append("Scores are close")
+    if largest is not None:
+        headline_bits.append(
+            f"{largest['label']} drives the gap "
+            f"({largest['high']:.0f} vs {largest['low']:.0f})"
+        )
+    headline = " — ".join(headline_bits) + "."
+
+    lines: list[str] = []
+    if largest is not None:
+        lines.append(
+            f"Largest pillar gap: {largest['label']} "
+            f"{largest['high']:.0f} ({_join_tickers(largest['high_tickers'])}) vs "
+            f"{largest['low']:.0f} ({_join_tickers(largest['low_tickers'])})."
+        )
+    band_line = _band_summary(scored)
+    if band_line:
+        lines.append(f"Bands: {band_line}.")
+    if verification_differs:
+        ordered = sorted(
+            groups.items(),
+            key=lambda item: _VERIFICATION_RANK.get(item[0], 0),
+            reverse=True,
+        )
+        bits = [f"{kind} ({_join_tickers(names)})" for kind, names in ordered]
+        lines.append(f"Verification: {' · '.join(bits)}.")
+    elif groups:
+        kind = next(iter(groups))
+        lines.append(
+            f"Verification: all {kind} — labeled, not an audited attestation."
+        )
+    if issuers_differ and len(lines) < 4:
+        issuer_bits = [
+            f"{_join_tickers(names)} {issuer}" for issuer, names in issuers.items()
+        ]
+        lines.append(f"Issuers: {' · '.join(issuer_bits)}.")
+
+    cards: dict[str, dict] = {}
+    for report in scored:
+        ticker = str(report.get("ticker") or "")
+        score = float(report.get("score") or 0)
+        band = bands.get(ticker) or band_code(score)
+        cue = verification_cue(report)
+        contrast = ""
+        role = ""
+        if largest is not None:
+            label = str(largest["label"])
+            if ticker in largest["high_tickers"]:
+                peer = _join_tickers(largest["low_tickers"])
+                contrast = (
+                    f"▲ {label} {largest['high']:.0f} vs {peer} {largest['low']:.0f}"
+                )
+                role = "high"
+            elif ticker in largest["low_tickers"]:
+                peer = _join_tickers(largest["high_tickers"])
+                contrast = (
+                    f"▼ {label} {largest['low']:.0f} vs {peer} {largest['high']:.0f}"
+                )
+                role = "low"
+        if ticker == high_ticker:
+            row_role = f"Highest in this row ({score:.1f} {band})."
+        elif ticker == low_ticker:
+            row_role = f"Lowest in this row ({score:.1f} {band})."
+        else:
+            gap = float(high.get("score") or 0) - score
+            row_role = f"{score:.1f} {band} · {gap:.1f} below {high_ticker}."
+        cards[ticker] = {
+            "band": band,
+            "verification": cue,
+            "contrast": contrast,
+            "delta_role": role,
+            "row_role": row_role,
+        }
+
+    return {
+        "available": True,
+        "headline": headline,
+        "lines": lines[:4],
+        "score_spread": round(score_spread, 1),
+        "bands": bands,
+        "largest_delta": largest,
+        "verification_groups": groups,
+        "verification_differs": verification_differs,
+        "cards": cards,
+    }
+
+
+def card_contrast_line(ticker: str, diff: dict | None) -> str:
+    """Per-card high/low pillar cue from ``compare_differentiation``."""
+    row = ((diff or {}).get("cards") or {}).get(str(ticker or "")) or {}
+    return str(row.get("contrast") or "")
+
+
+def selected_slot_contrast_line(ticker: str, diff: dict | None) -> str:
+    """One-line rank of the active slot against the rest of the row."""
+    row = ((diff or {}).get("cards") or {}).get(str(ticker or "")) or {}
+    return str(row.get("row_role") or "")
+
+
 def _maybe_rerun() -> None:
     """Rerun only inside a live Streamlit script (no-op in unit tests)."""
     try:
@@ -744,14 +1006,16 @@ def _render_compare_card(
     selected: bool = False,
     company: str = "",
     slot_index: int = 0,
+    diff: dict | None = None,
 ) -> None:
-    """Ticker · company · score · LIVE/FIXTURE · pillar dots / Why this score?"""
+    """Ticker · band · issuer · score · LIVE/FIXTURE · pillar gap / Why this score?"""
     ticker = str(report.get("ticker") or "")
     title = f"● {ticker}" if selected else ticker
     score = float(report.get("score") or 0)
-    company = company or short_company_name(str(report.get("issuer") or ""))
+    band = str(report.get("band") or band_code(score))
+    issuer = short_company_name(str(report.get("issuer") or "")) or company
     cue = mode_cue(report)
-    st.metric(title, f"{score:.1f}", f"{company} · {cue}")
+    st.metric(title, f"{score:.1f}", f"{band} · {issuer} · {cue}")
     dots = pillar_dots(report)
     weak = weakest_pillar_line(report)
     if dots and weak:
@@ -760,6 +1024,12 @@ def _render_compare_card(
         st.caption(weak)
     elif dots:
         st.caption(dots)
+    card = ((diff or {}).get("cards") or {}).get(ticker) or {}
+    if (diff or {}).get("verification_differs") and card.get("verification"):
+        st.caption(f"Verify: {card['verification']}")
+    contrast = card_contrast_line(ticker, diff)
+    if contrast:
+        st.caption(contrast)
     _render_why_this_score(report, slot_index=slot_index)
 
 
@@ -777,8 +1047,24 @@ def _render_empty_slot(*, selected: bool = False) -> None:
     st.caption("Pick a ticker to compare here.")
 
 
-def _render_selected_slot_detail(report: dict, *, slot_index: int = 0) -> None:
+def _render_compare_callout(diff: dict) -> None:
+    """Short 'why these differ' strip — only when 2+ slots scored."""
+    if not diff.get("available") or not diff.get("headline"):
+        return
+    st.markdown("#### Why these differ")
+    st.info(diff["headline"])
+    for line in diff.get("lines") or []:
+        st.caption(line)
+    st.caption("Educational compare — heuristic scores, not financial advice.")
+
+
+def _render_selected_slot_detail(
+    report: dict, *, slot_index: int = 0, diff: dict | None = None
+) -> None:
     """Active-slot pillars under the row — no empty right gutter."""
+    rank = selected_slot_contrast_line(str(report.get("ticker") or ""), diff)
+    if rank:
+        st.caption(rank)
     subs = report.get("subscores") or {}
     bits = [
         f"**{PILLARS[key]['label']}** {subs[key]:.0f}"
@@ -942,6 +1228,10 @@ else:
     )
 
 results = _score_slots(scorer, list(st.session_state.slots))
+ok_reports = [
+    report for _symbol, report, error in results if report is not None and not error
+]
+diff = compare_differentiation(ok_reports)
 
 # Hide empty compare boxes until a ticker is assigned; filled slots stay in one row.
 if any(symbol for symbol, _report, _error in results):
@@ -962,13 +1252,16 @@ if any(symbol for symbol, _report, _error in results):
                     selected=selected,
                     company=company_names.get(symbol, ""),
                     slot_index=index,
+                    diff=diff,
                 )
+    _render_compare_callout(diff)
     if 0 <= target < len(results):
         _sel_symbol, sel_report, sel_error = results[target]
         if sel_report is not None and not sel_error:
-            _render_selected_slot_detail(sel_report, slot_index=target)
+            _render_selected_slot_detail(
+                sel_report, slot_index=target, diff=diff
+            )
 
-ok_reports = [report for _symbol, report, error in results if report is not None and not error]
 if ok_reports:
     rows = []
     for report in ok_reports:
