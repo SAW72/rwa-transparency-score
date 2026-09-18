@@ -151,6 +151,20 @@ def selected_slot_verification_lines(report: dict) -> list[str]:
     return lines
 
 
+def sidebar_legend_markdown(lines: list[str] | None = None) -> str:
+    """One markdown block for the labeling expander — not N caption widgets."""
+    rows = lines if lines is not None else heuristic_legend_lines()
+    return "\n".join(f"- {line}" for line in rows)
+
+
+def sidebar_weights_markdown() -> str:
+    """Compact pillar list: label, weight, and what — one line each."""
+    return "\n".join(
+        f"- **{PILLARS[key]['label']}** — {weight:.0%} — {PILLARS[key]['what']}"
+        for key, weight in WEIGHTS.items()
+    )
+
+
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
@@ -1016,6 +1030,43 @@ def _user_facing_share_status(bundle: object) -> str:
     return user_facing_x_skip_message(message)
 
 
+def _render_sidebar_controls(default_fixtures: bool) -> bool:
+    """Dense sidebar: Live/fixture + labeling stay visible; help collapses.
+
+    Exact Disclaimer text is preserved inside the expander. Privacy / Terms
+    links stay on the sidebar (and footer) — layout is compressed, not meaning.
+    """
+    with st.sidebar:
+        use_fixtures = st.toggle(
+            "Use demo fixtures",
+            value=default_fixtures,
+            help="Bypass the live CMC API. Required if you do not have CMC_API_KEY.",
+        )
+        if use_fixtures:
+            st.caption("Fixture mode — bundled **demo data**, not live CMC.")
+        elif not os.getenv("CMC_API_KEY"):
+            st.error(
+                "CMC_API_KEY is not set. Switch fixtures on, or add the key in the host env."
+            )
+        else:
+            st.caption(
+                "Live mode — CMC_API_KEY set. Issuer directory cached; Basic 429s retried."
+            )
+
+        with st.expander("How scores are labeled", expanded=False):
+            st.markdown(sidebar_legend_markdown())
+
+        with st.expander("Pillar weights", expanded=False):
+            st.markdown(sidebar_weights_markdown())
+
+        with st.expander("Disclaimer", expanded=False):
+            st.write(DISCLAIMER)
+
+        st.markdown("[Privacy Policy](/privacy) · [Terms of Service](/terms)")
+        st.caption("These do not replace the Disclaimer.")
+    return use_fixtures
+
+
 def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
     """Collapsed pillar evidence on the compare card. xAI / share stay gated elsewhere."""
     del slot_index  # kept for call-site compatibility with share / explainer helpers
@@ -1218,6 +1269,34 @@ st.markdown(
       .rat-band-chip-selected {{
         box-shadow: 0 0 0 2px rgba(250, 250, 250, 0.95), 0 0 0 4px currentColor;
       }}
+      /* Sidebar density: drop empty vertical gap; keep expanders scannable. */
+      section[data-testid="stSidebar"] > div:first-child,
+      section[data-testid="stSidebar"] [data-testid="stSidebarContent"],
+      section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
+        padding-top: 0.55rem !important;
+        padding-bottom: 0.75rem !important;
+      }}
+      section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {{
+        gap: 0.35rem !important;
+      }}
+      section[data-testid="stSidebar"] [data-testid="stExpander"] details {{
+        border: 1px solid rgba(250, 250, 250, 0.14);
+        border-radius: 0.4rem;
+      }}
+      section[data-testid="stSidebar"] [data-testid="stExpander"] summary {{
+        padding: 0.28rem 0.55rem !important;
+      }}
+      section[data-testid="stSidebar"] [data-testid="stExpander"] [data-testid="stExpanderDetails"],
+      section[data-testid="stSidebar"] [data-testid="stExpander"] .streamlit-expanderContent {{
+        padding: 0.35rem 0.55rem 0.5rem !important;
+      }}
+      section[data-testid="stSidebar"] .stAlert {{
+        padding: 0.4rem 0.65rem !important;
+      }}
+      section[data-testid="stSidebarNav"],
+      [data-testid="stSidebarNav"] {{
+        display: none !important;
+      }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -1228,40 +1307,7 @@ st.caption(BRAND_SUB)
 st.caption(TAGLINE)
 
 default_fixtures = env_flag("RWA_USE_FIXTURES") or not os.getenv("CMC_API_KEY")
-
-with st.sidebar:
-    st.header("Demo controls")
-    use_fixtures = st.toggle(
-        "Use demo fixtures",
-        value=default_fixtures,
-        help="Bypass the live CMC API. Required if you do not have CMC_API_KEY.",
-    )
-    if use_fixtures:
-        st.warning("Fixture mode is on. Scores are from bundled **demo data**, not live CMC.")
-    else:
-        if not os.getenv("CMC_API_KEY"):
-            st.error("CMC_API_KEY is not set. Switch fixtures on, or add the key in the host env.")
-        else:
-            st.success(
-                "Live mode: CMC_API_KEY is set. Issuer directory is cached for this "
-                "process. Basic plan 429s are retried; wait a minute if it still fails."
-            )
-
-    st.markdown("### Pillar weights")
-    for key, weight in WEIGHTS.items():
-        st.write(f"**{PILLARS[key]['label']}** — {weight:.0%}")
-        st.caption(PILLARS[key]["what"])
-
-    st.markdown("### How scores are labeled")
-    for line in heuristic_legend_lines():
-        st.caption(line)
-
-    st.markdown("### Disclaimer")
-    st.write(DISCLAIMER)
-
-    st.markdown("### Legal")
-    st.markdown("[Privacy Policy](/privacy) · [Terms of Service](/terms)")
-    st.caption("These do not replace the Disclaimer.")
+use_fixtures = _render_sidebar_controls(default_fixtures)
 
 mode_label = "Fixture" if use_fixtures else "Live"
 st.caption(f"Mode: {mode_label}")
