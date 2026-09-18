@@ -325,6 +325,49 @@ def test_score_slots_empty_symbol_does_not_score(fixture_scorer) -> None:
     assert results[2][0] == "AAPL"
 
 
+def test_sidebar_density_keeps_required_copy() -> None:
+    import app as demo_app
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    sidebar = source.split("def _render_sidebar_controls", 1)[1].split(
+        "def _render_card_details", 1
+    )[0]
+    assert "Use demo fixtures" in sidebar
+    assert "st.toggle(" in sidebar
+    assert 'st.expander("How scores are labeled"' in sidebar
+    assert 'st.expander("Pillar weights"' in sidebar
+    assert 'st.expander("Disclaimer"' in sidebar
+    assert "st.write(DISCLAIMER)" in sidebar
+    assert "[Privacy Policy](/privacy)" in sidebar
+    assert "[Terms of Service](/terms)" in sidebar
+    assert "These do not replace the Disclaimer." in sidebar
+    assert "sidebar_legend_markdown" in sidebar
+    assert "sidebar_weights_markdown" in sidebar
+    assert 'st.header("Demo controls")' not in source
+    assert 'st.markdown("### Legal")' not in source
+    assert "st.warning(" not in sidebar
+    assert "st.success(" not in sidebar
+    assert "CMC_API_KEY is not set" in sidebar
+
+    legend = demo_app.sidebar_legend_markdown()
+    assert "self-reported CMC" in legend
+    assert "heuristic fallback" in legend
+    assert "Educational demo" in legend
+    assert legend.count("\n- ") + 1 == len(demo_app.heuristic_legend_lines())
+
+    weights = demo_app.sidebar_weights_markdown()
+    for key, weight in demo_app.WEIGHTS.items():
+        assert demo_app.PILLARS[key]["label"] in weights
+        assert demo_app.PILLARS[key]["what"] in weights
+        assert f"{weight:.0%}" in weights
+    assert "Cross-issuer basis" in weights
+
+    config = (Path(__file__).resolve().parents[1] / ".streamlit" / "config.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "showSidebarNavigation = false" in config
+
+
 def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
     import app as demo_app
 
