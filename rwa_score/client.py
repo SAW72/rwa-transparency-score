@@ -321,11 +321,17 @@ def parse_rwa_quotes_payload(data: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _directory_asset_type(row: dict[str, Any]) -> str:
-    """Official CMC class from a map / list row. Empty when unknown."""
+    """CMC class from a map / list row.
+
+    Canonicalize known aliases to the official enum. Preserve an unknown
+    live string — do not drop it. Empty only when CMC omitted the field.
+    """
     raw = row.get("asset_type")
     if raw in (None, ""):
         raw = row.get("assetType")
-    return canonical_asset_type(raw)
+    if raw in (None, ""):
+        return ""
+    return canonical_asset_type(raw) or str(raw).strip()
 
 
 def _normalize_directory_row(row: dict[str, Any]) -> dict[str, Any]:

@@ -454,12 +454,16 @@ def test_canonical_asset_type_maps_treasury_aliases() -> None:
             "rwa_assets": [
                 {"symbol": "USTB", "rwa_id": 30, "asset_type": "treasury"},
                 {"symbol": "OUSG", "rwa_id": 31, "assetType": "Government Security"},
+                {"symbol": "TBILL", "rwa_id": 32, "asset_type": "etf"},
+                {"symbol": "FOO", "rwa_id": 33, "asset_type": "not-a-class"},
             ]
         }
     )
     assert [row["asset_type"] for row in parsed["rwa_assets"]] == [
         "government_security",
         "government_security",
+        "etf",
+        "not-a-class",
     ]
 
 
