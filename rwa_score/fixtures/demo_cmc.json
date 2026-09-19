@@ -3,7 +3,7 @@
     "kind": "demo_fixture",
     "label": "DEMO FIXTURE DATA — not live CoinMarketCap API responses",
     "generated_for": "CMC Build-a-thon offline judging",
-    "note": "Payload shapes follow public CMC Pro RWA docs. Values are synthetic so the demo runs without an API key and without burning credits."
+    "note": "Payload shapes follow public CMC Pro RWA docs. Values are synthetic so the demo runs without an API key and without burning credits. rwa_quotes / assets_list match /v5/real-world-assets/quotes/latest and /assets/list — still demo_fixture, never live CMC."
   },
   "map": [
     {
@@ -247,6 +247,316 @@
           "rwa_id": 22
         }
       ]
+    }
+  },
+  "assets_list": [
+    {
+      "name": "Nvidia Corp",
+      "symbol": "NVDA",
+      "slug": "nvidia",
+      "rwa_id": 2,
+      "asset_type": "stock",
+      "rwa_rank": 2,
+      "has_tokens": true,
+      "industry": "Semiconductors & Related Devices",
+      "average_tokenized_price": 118.55,
+      "tokenized_market_cap": 8500000.0,
+      "tokenized_volume_24h": 7600000.0
+    },
+    {
+      "name": "Apple Inc",
+      "symbol": "AAPL",
+      "slug": "apple",
+      "rwa_id": 16,
+      "asset_type": "stock",
+      "rwa_rank": 3,
+      "has_tokens": true,
+      "industry": "Electronic Computers",
+      "average_tokenized_price": 226.87,
+      "tokenized_market_cap": 4100000.0,
+      "tokenized_volume_24h": 3800000.0
+    },
+    {
+      "name": "Meta Platforms Inc",
+      "symbol": "META",
+      "slug": "meta-platforms",
+      "rwa_id": 18,
+      "asset_type": "stock",
+      "rwa_rank": 6,
+      "has_tokens": true,
+      "industry": "Services-Computer Programming, Data Processing",
+      "average_tokenized_price": 513.1,
+      "tokenized_market_cap": 6200000.0,
+      "tokenized_volume_24h": 4000000.0
+    },
+    {
+      "name": "Tesla Inc",
+      "symbol": "TSLA",
+      "slug": "tesla",
+      "rwa_id": 15,
+      "asset_type": "stock",
+      "rwa_rank": 8,
+      "has_tokens": true,
+      "industry": "Motor Vehicles",
+      "average_tokenized_price": 219.5,
+      "tokenized_market_cap": 180000.0,
+      "tokenized_volume_24h": 20000.0
+    },
+    {
+      "name": "Exxon Mobil Corp",
+      "symbol": "XOM",
+      "slug": "exxon-mobil",
+      "rwa_id": 21,
+      "asset_type": "stock",
+      "rwa_rank": 12,
+      "has_tokens": true,
+      "industry": "Petroleum Refining",
+      "average_tokenized_price": 118.2,
+      "tokenized_market_cap": 2100000.0,
+      "tokenized_volume_24h": 900000.0
+    },
+    {
+      "name": "Prologis Inc",
+      "symbol": "PLD",
+      "slug": "prologis",
+      "rwa_id": 22,
+      "asset_type": "stock",
+      "rwa_rank": 18,
+      "has_tokens": true,
+      "industry": "Real Estate Investment Trusts",
+      "average_tokenized_price": 112.8,
+      "tokenized_market_cap": 1800000.0,
+      "tokenized_volume_24h": 640000.0
+    }
+  ],
+  "rwa_quotes": {
+    "2": {
+      "name": "Nvidia Corp",
+      "symbol": "NVDA",
+      "slug": "nvidia",
+      "rwa_id": 2,
+      "asset_type": "stock",
+      "rwa_rank": 2,
+      "has_tokens": true,
+      "average_tokenized_price": 118.55,
+      "tokenized_market_cap": 8500000.0,
+      "tokenized_volume_24h": 7600000.0,
+      "tokens": [
+        {
+          "symbol": "NVDAx",
+          "name": "NVIDIA tokenized stock (Backed) [FIXTURE]",
+          "price": 118.45,
+          "crypto_id": 36992,
+          "issuer_id": "6878977dcbbf471de3366e85",
+          "issuer_name": "Backed Finance",
+          "market_cap": 8500000.0,
+          "volume_24h": 4200000.0
+        },
+        {
+          "symbol": "NVDAon",
+          "name": "NVIDIA tokenized stock (Ondo) [FIXTURE]",
+          "price": 118.55,
+          "crypto_id": 37001,
+          "issuer_id": "6f6e646f00000000000000d2",
+          "issuer_name": "Ondo",
+          "market_cap": 3200000.0,
+          "volume_24h": 1900000.0
+        },
+        {
+          "symbol": "NVDAxst",
+          "name": "NVIDIA tokenized stock (xStocks) [FIXTURE]",
+          "price": 118.70,
+          "crypto_id": 37002,
+          "issuer_id": "69af7c7fef8bc60199c88622",
+          "issuer_name": "xStocks",
+          "market_cap": 2100000.0,
+          "volume_24h": 1500000.0
+        }
+      ],
+      "tradfi_markets": [
+        {
+          "exchange": {"slug": "nasdaq", "name": "Nasdaq", "exchange_id": null},
+          "ticker": "NVDA",
+          "market_url": "https://www.nasdaq.com/market-activity/stocks/nvda"
+        }
+      ]
+    },
+    "15": {
+      "name": "Tesla Inc",
+      "symbol": "TSLA",
+      "slug": "tesla",
+      "rwa_id": 15,
+      "asset_type": "stock",
+      "rwa_rank": 8,
+      "has_tokens": true,
+      "average_tokenized_price": 219.5,
+      "tokenized_market_cap": 180000.0,
+      "tokenized_volume_24h": 20000.0,
+      "tokens": [
+        {
+          "symbol": "TSLAn",
+          "name": "Tesla wrapped note (NoteVault) [FIXTURE]",
+          "price": 241.0,
+          "crypto_id": 90015,
+          "issuer_id": "64656d6f00000000000000d1",
+          "issuer_name": "NoteVault Demo Issuer",
+          "market_cap": 180000.0,
+          "volume_24h": 12000.0
+        },
+        {
+          "symbol": "TSLAx",
+          "name": "Tesla tokenized stock (shadow) [FIXTURE]",
+          "price": 198.0,
+          "crypto_id": 90016,
+          "issuer_id": null,
+          "issuer_name": "",
+          "market_cap": 90000.0,
+          "volume_24h": 8000.0
+        }
+      ],
+      "tradfi_markets": [
+        {
+          "exchange": {"slug": "nasdaq", "name": "Nasdaq", "exchange_id": null},
+          "ticker": "TSLA",
+          "market_url": "https://www.nasdaq.com/market-activity/stocks/tsla"
+        }
+      ]
+    },
+    "16": {
+      "name": "Apple Inc",
+      "symbol": "AAPL",
+      "slug": "apple",
+      "rwa_id": 16,
+      "asset_type": "stock",
+      "rwa_rank": 3,
+      "has_tokens": true,
+      "average_tokenized_price": 226.87,
+      "tokenized_market_cap": 4100000.0,
+      "tokenized_volume_24h": 3800000.0,
+      "tokens": [
+        {
+          "symbol": "AAPLx",
+          "name": "Apple tokenized stock (xStocks) [FIXTURE]",
+          "price": 226.1,
+          "crypto_id": 36993,
+          "issuer_id": "69af7c7fef8bc60199c88622",
+          "issuer_name": "xStocks",
+          "market_cap": 4100000.0,
+          "volume_24h": 1800000.0
+        },
+        {
+          "symbol": "AAPLb",
+          "name": "Apple tokenized stock (Backed) [FIXTURE]",
+          "price": 230.0,
+          "crypto_id": 37011,
+          "issuer_id": "6878977dcbbf471de3366e85",
+          "issuer_name": "Backed Finance",
+          "market_cap": 1800000.0,
+          "volume_24h": 900000.0
+        },
+        {
+          "symbol": "AAPLd",
+          "name": "Apple tokenized stock (Dinari) [FIXTURE]",
+          "price": 224.5,
+          "crypto_id": 37012,
+          "issuer_id": null,
+          "issuer_name": "Dinari",
+          "market_cap": 1500000.0,
+          "volume_24h": 1100000.0
+        }
+      ],
+      "tradfi_markets": [
+        {
+          "exchange": {"slug": "nasdaq", "name": "Nasdaq", "exchange_id": null},
+          "ticker": "AAPL",
+          "market_url": "https://www.nasdaq.com/market-activity/stocks/aapl"
+        }
+      ]
+    },
+    "18": {
+      "name": "Meta Platforms Inc",
+      "symbol": "META",
+      "slug": "meta-platforms",
+      "rwa_id": 18,
+      "asset_type": "stock",
+      "rwa_rank": 6,
+      "has_tokens": true,
+      "average_tokenized_price": 513.1,
+      "tokenized_market_cap": 6200000.0,
+      "tokenized_volume_24h": 4000000.0,
+      "tokens": [
+        {
+          "symbol": "METAx",
+          "name": "Meta tokenized stock (Ondo) [FIXTURE]",
+          "price": 512.2,
+          "crypto_id": 36994,
+          "issuer_id": "6f6e646f00000000000000d2",
+          "issuer_name": "Ondo",
+          "market_cap": 6200000.0,
+          "volume_24h": 2600000.0
+        },
+        {
+          "symbol": "METAxst",
+          "name": "Meta tokenized stock (xStocks) [FIXTURE]",
+          "price": 514.0,
+          "crypto_id": 37021,
+          "issuer_id": "69af7c7fef8bc60199c88622",
+          "issuer_name": "xStocks",
+          "market_cap": 2100000.0,
+          "volume_24h": 1400000.0
+        }
+      ],
+      "tradfi_markets": []
+    },
+    "21": {
+      "name": "Exxon Mobil Corp",
+      "symbol": "XOM",
+      "slug": "exxon-mobil",
+      "rwa_id": 21,
+      "asset_type": "stock",
+      "rwa_rank": 12,
+      "has_tokens": true,
+      "average_tokenized_price": 118.2,
+      "tokenized_market_cap": 2100000.0,
+      "tokenized_volume_24h": 900000.0,
+      "tokens": [
+        {
+          "symbol": "XOMx",
+          "name": "Exxon tokenized stock (Backed) [FIXTURE]",
+          "price": 118.2,
+          "crypto_id": 36995,
+          "issuer_id": "6878977dcbbf471de3366e85",
+          "issuer_name": "Backed Finance",
+          "market_cap": 2100000.0,
+          "volume_24h": 900000.0
+        }
+      ],
+      "tradfi_markets": []
+    },
+    "22": {
+      "name": "Prologis Inc",
+      "symbol": "PLD",
+      "slug": "prologis",
+      "rwa_id": 22,
+      "asset_type": "stock",
+      "rwa_rank": 18,
+      "has_tokens": true,
+      "average_tokenized_price": 112.8,
+      "tokenized_market_cap": 1800000.0,
+      "tokenized_volume_24h": 640000.0,
+      "tokens": [
+        {
+          "symbol": "PLDx",
+          "name": "Prologis tokenized stock (Ondo) [FIXTURE]",
+          "price": 112.8,
+          "crypto_id": 36996,
+          "issuer_id": "6f6e646f00000000000000d2",
+          "issuer_name": "Ondo",
+          "market_cap": 1800000.0,
+          "volume_24h": 640000.0
+        }
+      ],
+      "tradfi_markets": []
     }
   },
   "quotes": {

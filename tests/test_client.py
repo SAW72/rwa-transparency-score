@@ -104,6 +104,17 @@ def test_fixture_client_requires_no_api_key(monkeypatch: pytest.MonkeyPatch) -> 
     nvda_pairs = client.market_pairs(rwa_id=2)
     assert nvda_pairs["symbol"] == "NVDA"
     assert len(nvda_pairs["market_pairs"]) >= 2
+    quotes = client.rwa_quotes(rwa_id=2)
+    assert quotes["symbol"] == "NVDA"
+    assert quotes["average_tokenized_price"] == 118.55
+    assert any(tok["issuer_name"] == "Backed Finance" for tok in quotes["tokens"])
+    listed = client.assets_list(asset_type="stock")
+    assert {row["symbol"] for row in listed["rwa_assets"]} >= {"NVDA", "TSLA", "AAPL"}
+    assert listed["rwa_assets"][0]["rwa_rank"] <= listed["rwa_assets"][-1]["rwa_rank"]
+    log = client.call_log()
+    assert log
+    assert all(row["source"] == "fixture" for row in log)
+    assert all(row["via"] == "fixture" for row in log)
 
 
 def test_fixture_map_filters_symbol() -> None:
@@ -244,7 +255,28 @@ def test_issuer_list_called_once_across_multiple_scores() -> None:
                     ],
                 }
             ),
-            cmc_ok({"99": {"quote": {"USD": {"percent_change_24h": 1.0, "price": 10.0}}}}),
+            cmc_ok(
+                {
+                    "rwa_assets": [
+                        {
+                            "rwa_id": 2,
+                            "symbol": "NVDA",
+                            "average_tokenized_price": 10.0,
+                            "tokenized_market_cap": 1000.0,
+                            "tokenized_volume_24h": 100.0,
+                            "tokens": [
+                                {
+                                    "symbol": "NVDAx",
+                                    "price": 10.0,
+                                    "crypto_id": 99,
+                                    "issuer_name": "Backed Finance",
+                                }
+                            ],
+                            "tradfi_markets": [],
+                        }
+                    ]
+                }
+            ),
             cmc_ok(
                 {
                     "rwa_id": 2,
@@ -254,7 +286,28 @@ def test_issuer_list_called_once_across_multiple_scores() -> None:
                 }
             ),
             cmc_ok({"rwa_assets": [{"symbol": "AAPL", "rwa_id": 3, "cik": "0000320193"}]}),
-            cmc_ok({"100": {"quote": {"USD": {"percent_change_24h": 2.0, "price": 20.0}}}}),
+            cmc_ok(
+                {
+                    "rwa_assets": [
+                        {
+                            "rwa_id": 3,
+                            "symbol": "AAPL",
+                            "average_tokenized_price": 20.0,
+                            "tokenized_market_cap": 2000.0,
+                            "tokenized_volume_24h": 200.0,
+                            "tokens": [
+                                {
+                                    "symbol": "AAPLx",
+                                    "price": 20.0,
+                                    "crypto_id": 100,
+                                    "issuer_name": "Backed Finance",
+                                }
+                            ],
+                            "tradfi_markets": [],
+                        }
+                    ]
+                }
+            ),
             cmc_ok(
                 {
                     "rwa_id": 3,
@@ -276,7 +329,11 @@ def test_issuer_list_called_once_across_multiple_scores() -> None:
     assert paths.count("/v5/real-world-assets/map") == 1
     assert paths.count("/v5/real-world-assets/info") == 2
     assert paths.count("/v5/real-world-assets/market-pairs/list") == 2
+    assert paths.count("/v5/real-world-assets/quotes/latest") == 2
+    assert "/v2/cryptocurrency/quotes/latest" not in paths
     assert "basis" in nvda["subscores"]
+    assert nvda["verification"]["price"]["source"] == "cmc_rwa_quotes"
+    assert nvda["cmc_calls"]["live"] is True
 
 
 def test_info_cache_short_ttl_expires(monkeypatch: pytest.MonkeyPatch) -> None:

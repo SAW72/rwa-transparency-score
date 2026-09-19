@@ -1,6 +1,15 @@
 """RAT Score (RWA Transparency Score) — risk radar for tokenized stocks."""
 
-from .client import CMCClient, CMCError, FixtureClient, create_client, parse_market_pairs_payload, use_fixtures
+from .client import (
+    CMCClient,
+    CMCError,
+    FixtureClient,
+    create_client,
+    parse_assets_list_payload,
+    parse_market_pairs_payload,
+    parse_rwa_quotes_payload,
+    use_fixtures,
+)
 from .scorer import (
     PILLARS,
     WEIGHTS,

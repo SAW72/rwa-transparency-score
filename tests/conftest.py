@@ -4,7 +4,20 @@ from typing import Any
 
 import pytest
 
-from rwa_score.client import FixtureClient, create_client
+from rwa_score.client import (
+    ENDPOINT_ASSETS_LIST,
+    ENDPOINT_CRYPTO_QUOTE,
+    ENDPOINT_INFO,
+    ENDPOINT_ISSUERS,
+    ENDPOINT_ISSUERS_LIST,
+    ENDPOINT_MAP,
+    ENDPOINT_MARKET_PAIRS,
+    ENDPOINT_QUOTES,
+    FixtureClient,
+    create_client,
+    parse_assets_list_payload,
+    parse_rwa_quotes_payload,
+)
 from rwa_score.scorer import TransparencyScorer
 
 
@@ -32,6 +45,10 @@ class RecordingClient:
         issuer_details: dict[str, dict[str, Any]] | None = None,
         quotes: dict[int, dict[str, Any]] | None = None,
         quote_error: Exception | None = None,
+        rwa_quotes: dict[int | str, dict[str, Any]] | None = None,
+        rwa_quotes_error: Exception | None = None,
+        assets_list: list[dict[str, Any]] | None = None,
+        assets_list_error: Exception | None = None,
         market_pairs: dict[int | str, dict[str, Any]] | None = None,
         market_pairs_error: Exception | None = None,
     ) -> None:
@@ -52,38 +69,110 @@ class RecordingClient:
             99: {"quote": {"USD": {"percent_change_24h": 1.0, "price": 100.0}}},
         }
         self.quote_error = quote_error
+        self.rwa_quote_rows = rwa_quotes or {}
+        self.rwa_quotes_error = rwa_quotes_error
+        self.listed_assets = assets_list
+        self.assets_list_error = assets_list_error
         self.pairs = market_pairs or {}
         self.market_pairs_error = market_pairs_error
+        self._journal: list[dict[str, Any]] = []
         self.calls = {
             "rwa_map": 0,
             "rwa_info": 0,
             "issuers_list": 0,
             "issuer": 0,
             "crypto_quote": 0,
+            "rwa_quotes": 0,
+            "assets_list": 0,
             "market_pairs": 0,
         }
 
+    def begin_run(self) -> None:
+        self._journal = []
+
+    def call_log(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._journal]
+
+    def _record(self, endpoint: str) -> None:
+        self._journal.append(
+            {
+                "endpoint": endpoint,
+                "source": "live" if self.source != "fixture" else "fixture",
+                "via": "network",
+                "cached": False,
+            }
+        )
+
     def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
         self.calls["rwa_map"] += 1
+        self._record(ENDPOINT_MAP)
         return list(self.assets)
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         self.calls["rwa_info"] += 1
+        self._record(ENDPOINT_INFO)
         return dict(self.info.get(rwa_id) or {})
 
     def issuers_list(self) -> list[dict[str, Any]]:
         self.calls["issuers_list"] += 1
+        self._record(ENDPOINT_ISSUERS_LIST)
         return list(self.issuers)
 
     def issuer(self, issuer_id: str) -> dict[str, Any]:
         self.calls["issuer"] += 1
+        self._record(ENDPOINT_ISSUERS)
         return dict(self.issuer_details.get(issuer_id) or {})
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
         self.calls["crypto_quote"] += 1
+        self._record(ENDPOINT_CRYPTO_QUOTE)
         if self.quote_error:
             raise self.quote_error
         return dict(self.quotes.get(crypto_id) or {})
+
+    def rwa_quotes(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        self.calls["rwa_quotes"] += 1
+        self._record(ENDPOINT_QUOTES)
+        if self.rwa_quotes_error:
+            raise self.rwa_quotes_error
+        if rwa_id is not None:
+            hit = self.rwa_quote_rows.get(int(rwa_id))
+            if hit is None:
+                hit = self.rwa_quote_rows.get(str(int(rwa_id)))
+            return parse_rwa_quotes_payload(hit or {})
+        if symbol:
+            wanted = symbol.strip().upper()
+            for payload in self.rwa_quote_rows.values():
+                if (payload.get("symbol") or "").upper() == wanted:
+                    return parse_rwa_quotes_payload(payload)
+        return parse_rwa_quotes_payload({})
+
+    def assets_list(
+        self,
+        *,
+        asset_type: str | None = None,
+        start: int = 1,
+        limit: int = 100,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]:
+        self.calls["assets_list"] += 1
+        self._record(ENDPOINT_ASSETS_LIST)
+        if self.assets_list_error:
+            raise self.assets_list_error
+        rows = list(self.listed_assets or [])
+        kind = (asset_type or "").strip().lower()
+        if kind:
+            rows = [row for row in rows if (row.get("asset_type") or "").lower() == kind]
+        _ = (start, limit, sort, sort_dir)
+        return parse_assets_list_payload(
+            {"rwa_assets": rows, "total_size": len(rows), "has_more": False}
+        )
 
     def market_pairs(
         self,
@@ -92,6 +181,7 @@ class RecordingClient:
         symbol: str | None = None,
     ) -> dict[str, Any]:
         self.calls["market_pairs"] += 1
+        self._record(ENDPOINT_MARKET_PAIRS)
         if self.market_pairs_error:
             raise self.market_pairs_error
         if rwa_id is not None:

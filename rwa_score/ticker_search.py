@@ -3,10 +3,12 @@
 The Streamlit bar is exact-assign unless the query opens a picker:
   - ticker / name / alias prefix after ``SEARCH_MIN_CHARS``
   - category keywords (``AI``, ``oil``, ``real estate``, …) even when short
+  - CMC ``asset_type`` browse (``stock``, ``commodity``, ``etf``, …) from
+    ``assets/list`` when the client exposes it
 
 Categories are a documented taxonomy. A directory row is bucketed from
 ``industry`` / ``sector`` fields already on the map or fixture ``rwa_info``,
-plus a small name/symbol hint list — not a new paid API or invented universe.
+plus CMC ``asset_type`` and a small name/symbol hint list — not invented tickers.
 
 Published Backed **bToken** symbols from ``BACKED_POR_FEEDS`` are merged in as
 first-class picker rows so ``bNV`` / ``bNVDA`` (and feed aliases) can land a
@@ -17,7 +19,7 @@ no proxy are not injected.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Sequence
 
 from .chainlink_por import (
@@ -81,6 +83,31 @@ CATEGORIES: tuple[Category, ...] = (
         keywords=("finance", "bank", "financial", "insurance"),
         name_hints=("jpmorgan", "goldman", "visa", "berkshire"),
     ),
+    Category(
+        id="type_stock",
+        label="Stocks",
+        keywords=("stock", "stocks", "equity", "equities"),
+    ),
+    Category(
+        id="type_commodity",
+        label="Commodities",
+        keywords=("commodity", "commodities"),
+    ),
+    Category(
+        id="type_etf",
+        label="ETFs",
+        keywords=("etf", "etfs"),
+    ),
+    Category(
+        id="type_currency",
+        label="Currencies",
+        keywords=("currency", "currencies", "fx"),
+    ),
+    Category(
+        id="type_gov",
+        label="Gov securities",
+        keywords=("government_security", "treasury", "treasuries"),
+    ),
 )
 
 CATEGORY_BY_ID = {cat.id: cat for cat in CATEGORIES}
@@ -94,11 +121,14 @@ CATEGORY_DOC = (
     "- Auto/EV — auto, ev, vehicle, automotive, motor\n"
     "- Finance — finance, bank, financial, insurance\n"
     "Rows are bucketed from CMC/fixture industry or sector fields, then name hints.\n"
+    "CMC asset_type browse (from assets/list when available): stock, commodity, "
+    "etf, currency, government_security.\n"
     "Directory also lists published Backed bTokens (bNVDA, bIB01, bCSPX, bC3M, "
     "bIBTA) from BACKED_POR_FEEDS so on-chain PoR cards are searchable."
 )
 
 BACKED_SEARCH_SOURCE = "backed_por_feeds"
+ASSETS_LIST_SOURCE = "rwa_assets_list"
 
 
 @dataclass(frozen=True)
@@ -111,6 +141,8 @@ class TickerOption:
     industry: str = ""
     categories: tuple[str, ...] = ()
     source: str = "rwa_map"
+    asset_type: str = ""
+    rwa_rank: int | None = None
 
     def match_keys(self) -> tuple[str, ...]:
         keys = [self.symbol, self.name, *self.aliases]
@@ -139,9 +171,15 @@ def normalize_query(raw: str) -> str:
 def format_option(option: TickerOption) -> str:
     name = (option.name or "").strip()
     label = f"{option.symbol} — {name}" if name else option.symbol
-    cats = option.category_labels()
-    if cats:
-        label = f"{label} · {cats[0]}"
+    sector = [
+        CATEGORY_LABELS[cid]
+        for cid in option.categories
+        if cid in CATEGORY_LABELS and not cid.startswith("type_")
+    ]
+    if sector:
+        label = f"{label} · {sector[0]}"
+    elif option.asset_type:
+        label = f"{label} · {option.asset_type}"
     return label
 
 
@@ -215,10 +253,11 @@ def classify_categories(
     name: str = "",
     industry: str = "",
     aliases: Sequence[str] = (),
+    asset_type: str = "",
 ) -> tuple[str, ...]:
     """Return category ids for one directory row."""
     haystack = " ".join(
-        part for part in (industry, name, symbol, *aliases) if part
+        part for part in (industry, name, symbol, asset_type, *aliases) if part
     ).lower()
     hits: list[str] = []
     for cat in CATEGORIES:
@@ -287,8 +326,20 @@ def catalog_from_rwa_map(
         except (TypeError, ValueError):
             info = None
         industry = _row_industry(row, info)
+        asset_type = str(row.get("asset_type") or (info or {}).get("asset_type") or "").strip()
+        raw_rank = row.get("rwa_rank")
+        if raw_rank is None and info:
+            raw_rank = info.get("rwa_rank")
+        try:
+            rwa_rank = int(raw_rank) if raw_rank is not None else None
+        except (TypeError, ValueError):
+            rwa_rank = None
         categories = classify_categories(
-            symbol=symbol, name=name, industry=industry, aliases=aliases
+            symbol=symbol,
+            name=name,
+            industry=industry,
+            aliases=aliases,
+            asset_type=asset_type,
         )
         options.append(
             TickerOption(
@@ -298,9 +349,20 @@ def catalog_from_rwa_map(
                 industry=industry,
                 categories=categories,
                 source="rwa_map",
+                asset_type=asset_type,
+                rwa_rank=rwa_rank,
             )
         )
     return options
+
+
+def catalog_from_assets_list(payload: Any) -> list[TickerOption]:
+    """Picker rows from CMC / fixture ``assets/list`` (ranked, asset_type)."""
+    if isinstance(payload, dict):
+        rows = payload.get("rwa_assets") or []
+    else:
+        rows = payload or []
+    return [replace(opt, source=ASSETS_LIST_SOURCE) for opt in catalog_from_rwa_map(rows)]
 
 
 def catalog_from_por_feeds(feeds: Sequence[PorFeed] | None = None) -> list[TickerOption]:
@@ -355,13 +417,49 @@ def merge_search_catalog(
     return merged
 
 
+def enrich_catalog_from_assets_list(
+    base: Sequence[TickerOption],
+    listed: Sequence[TickerOption],
+) -> list[TickerOption]:
+    """Overlay ``assets/list`` rank / asset_type onto map rows; append new symbols."""
+    by_listed = {opt.symbol.upper(): opt for opt in listed if opt.symbol}
+    out: list[TickerOption] = []
+    seen: set[str] = set()
+    for opt in base:
+        key = opt.symbol.upper()
+        extra = by_listed.get(key)
+        if extra is None:
+            out.append(opt)
+        else:
+            categories = tuple(dict.fromkeys((*opt.categories, *extra.categories)))
+            out.append(
+                replace(
+                    opt,
+                    name=opt.name or extra.name,
+                    industry=opt.industry or extra.industry,
+                    asset_type=opt.asset_type or extra.asset_type,
+                    rwa_rank=opt.rwa_rank if opt.rwa_rank is not None else extra.rwa_rank,
+                    categories=categories,
+                )
+            )
+        if key:
+            seen.add(key)
+    for extra in listed:
+        key = (extra.symbol or "").upper()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(extra)
+    return out
+
+
 def load_search_catalog(client: Any) -> list[TickerOption]:
-    """Read the CMC/fixture map, then merge published Backed bToken rows.
+    """Read the CMC/fixture map, enrich from ``assets/list``, then Backed bTokens.
 
     Map failures still return the Backed PoR catalog so ``bNVDA`` remains
     searchable. Fixture info is joined for ``industry`` (local JSON). Live
     mode does **not** call ``rwa_info`` per ticker — that would burn
-    Basic-plan credits.
+    Basic-plan credits. ``assets/list`` is one cached page (rank + asset_type).
     """
     assets: Sequence[dict[str, Any]] | None = None
     try:
@@ -381,6 +479,15 @@ def load_search_catalog(client: Any) -> list[TickerOption]:
             if info:
                 info_by_id[rid] = info
     base = catalog_from_rwa_map(assets, info_by_id=info_by_id) if assets is not None else []
+    listed: list[TickerOption] = []
+    fetch_list = getattr(client, "assets_list", None)
+    if callable(fetch_list):
+        try:
+            listed = catalog_from_assets_list(fetch_list())
+        except Exception:  # noqa: BLE001 — search stays up without the ranked page
+            listed = []
+    if listed:
+        base = enrich_catalog_from_assets_list(base, listed)
     extra = catalog_from_por_feeds()
     return merge_search_catalog(base, extra)
 
@@ -424,7 +531,7 @@ def category_matches(query: str, option: TickerOption) -> bool:
     return bool(wanted) and bool(wanted.intersection(option.categories))
 
 
-def _rank(option: TickerOption, query: str) -> tuple[int, int, int, int, int, int, str]:
+def _rank(option: TickerOption, query: str) -> tuple[int, int, int, int, int, int, int, str]:
     q = query.lower()
     symbol = option.symbol.lower()
     name = (option.name or "").lower()
@@ -435,7 +542,8 @@ def _rank(option: TickerOption, query: str) -> tuple[int, int, int, int, int, in
     name_prefix = 0 if name.startswith(q) or any(a.startswith(q) for a in alias_keys) else 1
     is_prefix = 0 if prefix_matches(q, option) else 1
     is_category = 0 if category_matches(q, option) else 1
-    return (is_prefix, exact_symbol, symbol_prefix, exact_name, name_prefix, is_category, symbol)
+    rank = option.rwa_rank if option.rwa_rank is not None else 10**9
+    return (is_prefix, exact_symbol, symbol_prefix, exact_name, name_prefix, is_category, rank, symbol)
 
 
 def search_tickers(

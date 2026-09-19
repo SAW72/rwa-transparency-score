@@ -1,6 +1,8 @@
 [server]
 headless = true
 enableXsrfProtection = true
+# Render Start Command must be `python -m rwa_score.health …`, not `streamlit run`.
+# `streamlit run app.py` leaves cold-start GET /health as Streamlit SPA HTML.
 
 [client]
 # Privacy / Terms stay reachable via sidebar + footer links (and /privacy, /terms).

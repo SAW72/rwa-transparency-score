@@ -339,12 +339,19 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search_typeahead_script" in source
 
     shown = demo_app.browse_categories(catalog)
-    assert [cat.id for cat in shown] == ["ai_tech", "oil_energy", "real_estate", "auto_ev"]
+    assert [cat.id for cat in shown] == [
+        "ai_tech",
+        "oil_energy",
+        "real_estate",
+        "auto_ev",
+        "type_stock",
+    ]
     finance_row = TickerOption(
         symbol="JPM", name="JPMorgan", categories=("finance",)
     )
     expanded = demo_app.browse_categories([*catalog, finance_row])
-    assert [cat.id for cat in expanded][-1] == "finance"
+    assert "finance" in [cat.id for cat in expanded]
+    assert "type_stock" in [cat.id for cat in expanded]
 
     assert demo_app.next_place_index(["", "TSLA", "AAPL", "META"], 2) == 0
     assert demo_app.next_place_index(["NVDA", "", "AAPL", "META"], 0) == 1

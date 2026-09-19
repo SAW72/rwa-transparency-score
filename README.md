@@ -26,6 +26,7 @@ Search also lists published Backed **bToken** symbols from `BACKED_POR_FEEDS` (`
 | Real Estate | `real estate`, `reit`, `realty`, `property` | PLD |
 | Auto/EV | `auto`, `ev`, `vehicle`, `motor` | TSLA |
 | Finance | `finance`, `bank`, `financial` | live directory only |
+| Stocks / Commodities / ETFs / … | CMC `asset_type` (`stock`, `commodity`, `etf`, `currency`, `government_security`) from ranked `assets/list` | fixture stocks; live directory grows |
 
 CLI equivalent:
 
@@ -47,13 +48,15 @@ This tool rates a tokenized stock on how its public CMC/issuer signals look unde
 | Backing model | Real shares with a regulated custodian vs. a thin debt note | 20% | on-chain PoR / attested when a verifier is registered; else **heuristic fallback** |
 | Proof of reserves | Independent PoR or attestation vs. a promise | 20% | on-chain PoR (Chainlink / Backed) or attested (Dinari); else **heuristic fallback** |
 | Redemption rights | Redeemable for the underlying share vs. sell-only | 15% | Live hook when registered: Robinhood (debt wrapper), Backed/xStocks (public issuance/redemption docs), Dinari (public dShare burn-as-redemption docs). Fail closed to **heuristic fallback** — never a silent miss |
-| Price integrity | Token 24h drift stays contained | 15% | self-reported (CMC quote) |
+| Price integrity | Issuer tokens track CMC `average_tokenized_price` (RWA `quotes/latest`); crypto 24hΔ is the labeled fallback | 15% | self-reported (CMC RWA quotes, else crypto quote) |
 | Disclosure | Real, matchable SEC CIK vs. missing | 15% | self-reported (CMC RWA info) |
-| Cross-issuer basis | Same underlying ticker, different wrapper prices (xStocks / Ondo / Dinari / …) | 15% | self-reported (CMC RWA market-pairs) |
+| Cross-issuer basis | Same underlying ticker, different issuer token prices (RWA `tokens[]` plus market-pairs) | 15% | self-reported (CMC RWA quotes + market-pairs) |
 
 Weights sum to **100%**. The sixth pillar took 5 points each from backing, reserves, and redemption (25/25/20 → 20/20/15). Price and disclosure stay at 15%. Heuristic and attestation paths for the first five pillars are unchanged.
 
-**Basis math:** group CMC market-pairs by wrapper `crypto_id` (one product across venues), take a volume-weighted USD price per wrapper, then `spread% = (max − min) / mid × 100`. Score is `max(15, 100 − |spread%| × 10)` so a 0.5% gap → 95, 5% → 50, ≥8.5% → 15. One wrapper or a missing pairs payload is labeled unverified (defaults 55 / 50) — never treated as a measured tight market.
+**Price integrity math:** prefer `GET /v5/real-world-assets/quotes/latest`. Score is `max(20, 100 − |max token vs average_tokenized_price %| × 2)`. `tokenized_market_cap` / `tokenized_volume_24h` are cited as evidence; volume `0` caps the score at 45. TradFi rows are venue identity only (CMC does not return a TradFi last price — we do not invent one). If RWA quotes have no priced `tokens[]`, fall back to `GET /v2/cryptocurrency/quotes/latest` 24h change with the same formula, labeled **fallback**.
+
+**Basis math:** merge priced `tokens[]` from RWA quotes (issuer_name + price) with CMC market-pairs grouped by wrapper `crypto_id` (volume-weighted USD price per wrapper). Then `spread% = (max − min) / mid × 100`. Score is `max(15, 100 − |spread%| × 10)` so a 0.5% gap → 95, 5% → 50, ≥8.5% → 15. One wrapper or a missing payload is labeled unverified (defaults 55 / 50) — never treated as a measured tight market.
 
 Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** below 25.
 
@@ -145,7 +148,7 @@ RWA_USE_FIXTURES=0 streamlit run app.py
 
 Get a free Basic key at [coinmarketcap.com/api](https://coinmarketcap.com/api/).
 
-**Basic plan rate limits:** CMC Basic keys allow only a few HTTP requests per minute (`HTTP 429` / `error_code 1008`, *“You've exceeded your API Key's HTTP request rate limit. Rate limits reset every minute”*). The live client retries those with exponential backoff and jitter (honors `Retry-After`, waits ~60s total), then raises a clear error. Issuer `list` + per-issuer detail are cached for the process lifetime; map/info use a short TTL so Streamlit widget reruns do not re-fetch. The demo keeps one client/scorer via `@st.cache_resource`.
+**Basic plan rate limits:** CMC Basic keys allow only a few HTTP requests per minute (`HTTP 429` / `error_code 1008`, *“You've exceeded your API Key's HTTP request rate limit. Rate limits reset every minute”*). The live client retries those with exponential backoff and jitter (honors `Retry-After`, waits ~60s total), then raises a clear error. Issuer `list` + per-issuer detail are cached for the process lifetime; map/info/quotes/assets-list/market-pairs/crypto-quote use a short TTL so Streamlit widget reruns do not re-fetch. The demo keeps one client/scorer via `@st.cache_resource`.
 
 If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://coinmarketcap.com/api/) unlocks a higher request rate (and more credits) than Basic.
 
@@ -176,10 +179,14 @@ scripts/verify_attestation.py   Re-hash a live score and optionally read the cha
 Live data flow (CMC Basic):
 
 1. `GET /v5/real-world-assets/map` — ticker → `rwa_id` (0 credits)
-2. `GET /v5/real-world-assets/info` — issuer metadata + **SEC CIK**
-3. `GET /v5/real-world-assets/issuers/list` then `/issuers` — who mints the token, on-chain `crypto_id` (cached for the process lifetime)
-4. `GET /v2/cryptocurrency/quotes/latest` — token 24h change for price integrity
-5. `GET /v5/real-world-assets/market-pairs/list` — wrapper venues/prices for the **cross-issuer basis** pillar (short TTL cache; first page, `limit=100`)
+2. `GET /v5/real-world-assets/assets/list` — ranked directory + `asset_type` browse (1 credit / 250; short TTL; default page 100)
+3. `GET /v5/real-world-assets/info` — issuer metadata + **SEC CIK**
+4. `GET /v5/real-world-assets/issuers/list` then `/issuers` — who mints the token, on-chain `crypto_id` (cached for the process lifetime)
+5. `GET /v5/real-world-assets/quotes/latest` — `average_tokenized_price`, tokenized mcap/vol, `tokens[]` (issuer_name/prices), `tradfi_markets[]` for **price integrity** and to strengthen **basis**
+6. `GET /v5/real-world-assets/market-pairs/list` — wrapper venues/prices merged into basis (short TTL cache; first page, `limit=100`)
+7. `GET /v2/cryptocurrency/quotes/latest` — labeled **fallback** for price integrity when RWA quotes have no priced `tokens[]`
+
+The Streamlit UI shows a **CMC calls this run** strip: each endpoint plus **live** vs **fixture** (and cache vs network on live). Fixture mode never claims live.
 
 ## Paid API (verdict + history + attestation)
 
@@ -226,20 +233,20 @@ curl -sS -H "X-API-Key: <REDACTED>" http://127.0.0.1:8000/v1/score/NVDA
 {
   "ticker": "NVDA",
   "issuer": "Backed Finance",
-  "score": 90.2,
+  "score": 90.4,
   "band": "GREEN",
   "data_source": "fixture",
   "subscores": {
     "backing": 90.0,
     "reserves": 90.0,
     "redemption": 85.0,
-    "price": 98.4,
+    "price": 99.7,
     "disclosure": 80.0,
     "basis": 97.9
   },
   "confidence": { "score": 0.4, "label": "low" },
   "attestation": {
-    "score_hash": "0x0060941adfb0dc745e24dde266180cb127afbe6cdfb63513f492cc703f213953",
+    "score_hash": "0x41ba52792b6162ce75f02131ddd1845292cfab019b7c1537adfd9d5d2bbd5406",
     "algo": "sha256"
   }
 }
@@ -302,7 +309,7 @@ Optional RPC overrides (no keys): `POLYGON_RPC_URL`, `BASE_RPC_URL`, `ETH_RPC_UR
 
 **Render (blueprint):** `render.yaml` starts via `python -m rwa_score.health` on `0.0.0.0:$PORT` so `GET /health` is registered before Streamlit's SPA catch-all.
 
-**Dashboard Start Command must match `render.yaml`.** A dashboard-edited Start Command is **not** overwritten by this file unless the service is Blueprint-synced. `streamlit run app.py` starts Streamlit *before* `app.py` can patch Tornado, so a cold-start `GET /health` (and `/privacy`, `/terms`) is the SPA (`text/html`). `/_stcore/health` returning `ok` only proves Streamlit is up — it is not `build_health_payload`. Confirm **Settings → Start Command** is exactly:
+**Dashboard Start Command must match `render.yaml`.** A dashboard-edited Start Command is **not** overwritten by this file unless the service is Blueprint-synced. This repo **cannot** change the Render dashboard. `streamlit run app.py` starts Streamlit *before* `app.py` can patch Tornado, so a cold-start `GET /health` (and `/privacy`, `/terms`) is the SPA (`text/html`). `/_stcore/health` returning `ok` only proves Streamlit is up — it is not `build_health_payload`. Confirm **Settings → Start Command** is exactly:
 
 ```text
 python -m rwa_score.health --server.port $PORT --server.address 0.0.0.0 --server.headless true

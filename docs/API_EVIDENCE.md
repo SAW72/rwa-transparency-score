@@ -50,14 +50,14 @@ content-type: application/json
   "ticker": "NVDA",
   "rwa_id": 2,
   "issuer": "Backed Finance",
-  "score": 90.2,
+  "score": 90.4,
   "band": "GREEN",
-  "band_label": "GREEN — heuristic: stronger transparency signals (still verify)",
+  "band_label": "GREEN \u2014 heuristic: stronger transparency signals (still verify)",
   "subscores": {
     "backing": 90.0,
     "reserves": 90.0,
     "redemption": 85.0,
-    "price": 98.4,
+    "price": 99.7,
     "disclosure": 80.0,
     "basis": 97.9
   },
@@ -84,7 +84,7 @@ content-type: application/json
     },
     "price": {
       "label": "Price integrity",
-      "what": "On-chain token tracks the stock without wild 24h drift."
+      "what": "Issuer tokens track CMC average_tokenized_price; crypto 24h\u0394 is the labeled fallback."
     },
     "disclosure": {
       "label": "Disclosure",
@@ -92,21 +92,21 @@ content-type: application/json
     },
     "basis": {
       "label": "Cross-issuer basis",
-      "what": "Same underlying ticker, different wrapper prices — spread is wrapper risk."
+      "what": "Same ticker, different issuer token prices (RWA quotes tokens[] plus market-pairs)."
     }
   },
   "explanations": {
-    "backing": "Heuristic: issuer 'Backed Finance' matched the fully-backed name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode — live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "reserves": "Heuristic: issuer 'Backed Finance' matched the independent-PoR name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode — live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "redemption": "Heuristic: issuer 'Backed Finance' matched the redeemable name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode — live redemption verifier skipped). heuristic fallback Fixture/offline mode — live redemption verifier skipped. Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "price": "24h change +0.80%; score = max(20, 100 − |Δ| × 2) = 98.4. Verification: self-reported. Evidence: CMC crypto quote crypto_id=36992; 24hΔ=0.8 verification=self-reported",
+    "backing": "Heuristic: issuer 'Backed Finance' matched the fully-backed name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode \u2014 live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "reserves": "Heuristic: issuer 'Backed Finance' matched the independent-PoR name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode \u2014 live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "redemption": "Heuristic: issuer 'Backed Finance' matched the redeemable name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode \u2014 live redemption verifier skipped). heuristic fallback Fixture/offline mode \u2014 live redemption verifier skipped. Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "price": "CMC RWA quotes/latest: 3 priced token(s) vs CMC average_tokenized_price 118.5500; max |token\u2212avg|/avg = 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s) listed (no TradFi last price in CMC). score = max(20, 100 \u2212 |dev%| \u00d7 2) = 99.7. Verification: self-reported. Evidence: CMC RWA quotes/latest: avg=118.55; max token deviation 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s). verification=self-reported",
     "disclosure": "SEC CIK 0001045810 present on the RWA info record. Verification: self-reported. Evidence: SEC CIK 0001045810 on CMC RWA info record. verification=self-reported",
-    "basis": "3 wrappers; spread 0.21% (NVDAx 118.4500 vs NVDAxst 118.7000); score = max(15, 100 − |spread| × 10) = 97.9. Verification: self-reported. Evidence: CMC market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7). verification=self-reported"
+    "basis": "CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (NVDAx 118.4500 vs NVDAxst 118.7000); 1 TradFi venue(s) listed (no TradFi last price). score = max(15, 100 \u2212 |spread| \u00d7 10) = 97.9. Verification: self-reported. Evidence: CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7). verification=self-reported"
   },
   "verification": {
     "backing": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode — live attestation verifiers skipped.",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode \u2014 live attestation verifiers skipped.",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
@@ -123,7 +123,7 @@ content-type: application/json
     },
     "reserves": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode — live attestation verifiers skipped.",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode \u2014 live attestation verifiers skipped.",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
@@ -140,11 +140,11 @@ content-type: application/json
     },
     "redemption": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode — live redemption verifier skipped).",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode \u2014 live redemption verifier skipped).",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
-        "Fixture/offline mode — live redemption verifier skipped.",
+        "Fixture/offline mode \u2014 live redemption verifier skipped.",
         "Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations."
       ],
       "ok": true,
@@ -158,15 +158,15 @@ content-type: application/json
     },
     "price": {
       "level": "self-reported",
-      "evidence": "CMC crypto quote crypto_id=36992; 24hΔ=0.8",
-      "source": "cmc_quote",
+      "evidence": "CMC RWA quotes/latest: avg=118.55; max token deviation 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s).",
+      "source": "cmc_rwa_quotes",
       "notes": [
         "verification=self-reported"
       ],
       "ok": true,
       "error": null,
       "meta": {},
-      "score": 98.4
+      "score": 99.7
     },
     "disclosure": {
       "level": "self-reported",
@@ -182,8 +182,8 @@ content-type: application/json
     },
     "basis": {
       "level": "self-reported",
-      "evidence": "CMC market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7).",
-      "source": "cmc_market_pairs",
+      "evidence": "CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7).",
+      "source": "cmc_rwa_quotes+market_pairs",
       "notes": [
         "verification=self-reported"
       ],
@@ -199,7 +199,7 @@ content-type: application/json
     "Scores below use bundled DEMO FIXTURE data, not live CoinMarketCap API responses.",
     "Live attestation verifiers skipped (fixture/offline); backing/reserves use heuristic fallback.",
     "heuristic fallback",
-    "Fixture/offline mode — live redemption verifier skipped."
+    "Fixture/offline mode \u2014 live redemption verifier skipped."
   ],
   "heuristics": {
     "backed": true,
@@ -211,10 +211,57 @@ content-type: application/json
   "data_source": "fixture",
   "price": {
     "available": true,
+    "source": "cmc_rwa_quotes",
+    "fallback": false,
     "crypto_id": 36992,
-    "percent_change_24h": 0.8,
-    "price": 118.45,
-    "volume_24h": 4200000.0
+    "percent_change_24h": null,
+    "price": 118.55,
+    "average_tokenized_price": 118.55,
+    "tokenized_market_cap": 8500000.0,
+    "tokenized_volume_24h": 7600000.0,
+    "max_deviation_pct": 0.12652889076339577,
+    "avg_basis": "CMC average_tokenized_price",
+    "tokens": [
+      {
+        "crypto_id": 36992,
+        "symbol": "NVDAx",
+        "price": 118.45,
+        "volume_24h": 4200000.0,
+        "venues": 1,
+        "issuer": "Backed Finance",
+        "source": "cmc_rwa_quotes"
+      },
+      {
+        "crypto_id": 37001,
+        "symbol": "NVDAon",
+        "price": 118.55,
+        "volume_24h": 1900000.0,
+        "venues": 1,
+        "issuer": "Ondo",
+        "source": "cmc_rwa_quotes"
+      },
+      {
+        "crypto_id": 37002,
+        "symbol": "NVDAxst",
+        "price": 118.7,
+        "volume_24h": 1500000.0,
+        "venues": 1,
+        "issuer": "xStocks",
+        "source": "cmc_rwa_quotes"
+      }
+    ],
+    "tradfi_markets": [
+      {
+        "exchange": {
+          "slug": "nasdaq",
+          "name": "Nasdaq",
+          "exchange_id": null
+        },
+        "ticker": "NVDA",
+        "market_url": "https://www.nasdaq.com/market-activity/stocks/nvda"
+      }
+    ],
+    "tradfi_venue_count": 1
   },
   "basis": {
     "available": true,
@@ -229,7 +276,8 @@ content-type: application/json
         "price": 118.45,
         "volume_24h": 4200000.0,
         "venues": 1,
-        "issuer": "Backed Finance"
+        "issuer": "Backed Finance",
+        "source": "cmc_rwa_quotes+market_pairs"
       },
       {
         "crypto_id": 37001,
@@ -237,7 +285,8 @@ content-type: application/json
         "price": 118.55,
         "volume_24h": 1900000.0,
         "venues": 1,
-        "issuer": ""
+        "issuer": "Ondo",
+        "source": "cmc_rwa_quotes+market_pairs"
       },
       {
         "crypto_id": 37002,
@@ -245,21 +294,77 @@ content-type: application/json
         "price": 118.7,
         "volume_24h": 1500000.0,
         "venues": 1,
-        "issuer": ""
+        "issuer": "xStocks",
+        "source": "cmc_rwa_quotes+market_pairs"
+      }
+    ],
+    "source": "cmc_rwa_quotes+market_pairs",
+    "tradfi_markets": [
+      {
+        "exchange": {
+          "slug": "nasdaq",
+          "name": "Nasdaq",
+          "exchange_id": null
+        },
+        "ticker": "NVDA",
+        "market_url": "https://www.nasdaq.com/market-activity/stocks/nvda"
       }
     ]
   },
   "cik": "0001045810",
   "issuer_note": "Equity-backed token (Backed Finance / xStocks): claims 1:1 share custody with a public on-chain proof of reserves.",
-  "summary": "Backed Finance — 0 risk flag(s).",
+  "summary": "Backed Finance \u2014 0 risk flag(s).",
   "verification_mode": "offline_heuristic",
   "live_verifiers": false,
+  "cmc_calls": {
+    "source": "fixture",
+    "live": false,
+    "label": "bundled DEMO FIXTURES \u2014 not live CoinMarketCap",
+    "endpoints": [
+      {
+        "endpoint": "/v5/real-world-assets/map",
+        "source": "fixture",
+        "via": "fixture",
+        "cached": false
+      },
+      {
+        "endpoint": "/v5/real-world-assets/info",
+        "source": "fixture",
+        "via": "fixture",
+        "cached": false
+      },
+      {
+        "endpoint": "/v5/real-world-assets/issuers/list",
+        "source": "fixture",
+        "via": "fixture",
+        "cached": false
+      },
+      {
+        "endpoint": "/v5/real-world-assets/issuers",
+        "source": "fixture",
+        "via": "fixture",
+        "cached": false
+      },
+      {
+        "endpoint": "/v5/real-world-assets/quotes/latest",
+        "source": "fixture",
+        "via": "fixture",
+        "cached": false
+      },
+      {
+        "endpoint": "/v5/real-world-assets/market-pairs/list",
+        "source": "fixture",
+        "via": "fixture",
+        "cached": false
+      }
+    ]
+  },
   "confidence": {
     "score": 0.4,
     "label": "low"
   },
   "attestation": {
-    "score_hash": "0x0060941adfb0dc745e24dde266180cb127afbe6cdfb63513f492cc703f213953",
+    "score_hash": "0x41ba52792b6162ce75f02131ddd1845292cfab019b7c1537adfd9d5d2bbd5406",
     "algo": "sha256",
     "fields": [
       "ticker",

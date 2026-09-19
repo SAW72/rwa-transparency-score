@@ -60,8 +60,15 @@ def test_fixture_nvda_is_green(fixture_scorer: TransparencyScorer) -> None:
     assert "backing" in report["explanations"]
     assert "heuristic" in report["explanations"]["backing"].lower()
     assert "basis" in report["subscores"]
-    assert report["verification"]["basis"]["source"] == "cmc_market_pairs"
+    assert report["verification"]["basis"]["source"] == "cmc_rwa_quotes+market_pairs"
     assert report["basis"]["available"] is True
+    assert report["verification"]["price"]["source"] == "cmc_rwa_quotes"
+    assert report["price"]["source"] == "cmc_rwa_quotes"
+    assert report["cmc_calls"]["source"] == "fixture"
+    assert report["cmc_calls"]["live"] is False
+    endpoints = {row["endpoint"] for row in report["cmc_calls"]["endpoints"]}
+    assert "/v5/real-world-assets/quotes/latest" in endpoints
+    assert all(row["source"] == "fixture" for row in report["cmc_calls"]["endpoints"])
 
 
 def test_fixture_tsla_is_thin_wrapper(fixture_scorer: TransparencyScorer) -> None:
@@ -71,7 +78,9 @@ def test_fixture_tsla_is_thin_wrapper(fixture_scorer: TransparencyScorer) -> Non
     assert any("CIK" in f for f in report["flags"])
     assert any("proof of reserves" in f.lower() for f in report["flags"])
     assert report["price"]["available"] is True
-    assert abs(report["price"]["percent_change_24h"]) > 20
+    assert report["price"]["source"] == "cmc_rwa_quotes"
+    assert report["price"]["max_deviation_pct"] is not None
+    assert report["price"]["max_deviation_pct"] > 5
 
 
 def test_fixture_aapl_is_mid_tier(fixture_scorer: TransparencyScorer) -> None:

@@ -397,14 +397,14 @@ def test_ui_surfaces_sixth_pillar_badge(fixture_scorer) -> None:
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "Cross-issuer basis" in source
-    assert "self-reported CMC market-pairs" in source
+    assert "CMC RWA quotes/market-pairs" in source or "cmc_rwa_quotes" in source
     assert "basis" in WEIGHTS
     assert PILLARS["basis"]["label"] == "Cross-issuer basis"
 
     report = fixture_scorer.score("NVDA")
     badge, evidence = demo_app._verification_badge_label("basis", report)
     assert "self-reported" in badge
-    assert "CMC market-pairs" in evidence
+    assert "quotes" in evidence.lower() or "market-pairs" in evidence.lower()
     results = demo_app._score_slots(fixture_scorer, ["NVDA", "TSLA", "AAPL", "META"])
     assert all(row[1] is not None for row in results)
     assert all("basis" in row[1]["subscores"] for row in results)
@@ -417,4 +417,30 @@ def test_readme_documents_basis_weight_table() -> None:
     assert "20%" in text
     assert "15%" in text
     assert "market-pairs" in text
+    assert "quotes/latest" in text
+    assert "assets/list" in text
     assert "Weights sum to **100%**" in text
+
+
+def test_health_launcher_reminder_and_cmc_calls_strip(fixture_scorer) -> None:
+    import app as demo_app
+
+    assert demo_app.health_launcher_reminder(launcher_set=True) is None
+    warning = demo_app.health_launcher_reminder(launcher_set=False)
+    assert warning is not None
+    assert "streamlit run app.py" in warning
+    assert "python -m rwa_score.health" in warning
+    assert "cannot change the Render dashboard" in warning
+
+    report = fixture_scorer.score("NVDA")
+    block = demo_app.collect_cmc_calls([report], fixture_scorer.client)
+    assert block["live"] is False
+    lines = demo_app.format_cmc_calls_lines(block)
+    assert lines[0].startswith("CMC calls this run — Fixture")
+    assert "not" in lines[0].lower() and "live" in lines[0].lower()
+    assert any("quotes/latest" in line for line in lines)
+    assert not any(" · live" in line for line in lines)
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "CMC calls this run" in source
+    assert "health_launcher_reminder" in source

@@ -116,6 +116,21 @@ def test_readme_documents_dashboard_start_command_must_match() -> None:
     assert "python -m rwa_score.health --server.port $PORT --server.address 0.0.0.0 --server.headless true" in text
     assert "streamlit run app.py" in text
     assert "/_stcore/health" in text
+    assert "cannot" in text.lower() and "dashboard" in text.lower()
+
+
+def test_health_docs_and_app_remind_start_command_drift() -> None:
+    app = (ROOT / "app.py").read_text(encoding="utf-8")
+    friction = (ROOT / "docs/JUDGE_FRICTION.md").read_text(encoding="utf-8")
+    render = (ROOT / "render.yaml").read_text(encoding="utf-8")
+    config = (ROOT / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+    assert "health_launcher_reminder" in app
+    assert "cannot change the Render dashboard" in app
+    assert "X-RWA-Health" in friction
+    assert "cannot edit the Render dashboard" in friction or "cannot change" in friction
+    assert "This repo cannot change the Render dashboard" in render
+    assert "python -m rwa_score.health" in config
+    assert "streamlit run" in config
 
 
 def test_application_init_patch_registers_health_ahead_of_spa() -> None:
@@ -142,6 +157,7 @@ def test_application_init_patch_registers_health_ahead_of_spa() -> None:
             assert "application/json" in resp.headers["Content-Type"]
             body = json.loads(resp.body.decode())
             assert set(body) >= {"fixtures", "verifiers_live", "backed_feed"}
+            assert resp.headers.get("X-RWA-Health") == "json"
             assert b"SPA" not in resp.body
 
     suite = _InitPatchHTTP("test_health")
@@ -186,6 +202,7 @@ def test_attach_registers_health_and_legal_on_streamlit_like_app() -> None:
             assert set(body) == {"fixtures", "verifiers_live", "backed_feed", "timestamp"}
             assert body["verifiers_live"] is (not body["fixtures"])
             assert body["backed_feed"] in {"ok", "down"}
+            assert resp.headers.get("X-RWA-Health") == "json"
             assert b"SPA" not in resp.body
 
         def test_privacy_html(self) -> None:

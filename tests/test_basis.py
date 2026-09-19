@@ -87,8 +87,8 @@ def test_fixture_nvda_has_tight_basis(fixture_scorer: TransparencyScorer) -> Non
     assert "basis" in report["explanations"]
     assert "basis" in report["weights"]
     assert report["verification"]["basis"]["level"] == "self-reported"
-    assert report["verification"]["basis"]["source"] == "cmc_market_pairs"
-    assert "CMC market-pairs" in report["verification"]["basis"]["evidence"]
+    assert report["verification"]["basis"]["source"] == "cmc_rwa_quotes+market_pairs"
+    assert "quotes" in report["verification"]["basis"]["evidence"].lower()
     assert report["basis"]["available"] is True
     assert report["basis"]["wrapper_count"] == 3
     assert report["subscores"]["basis"] >= 90
