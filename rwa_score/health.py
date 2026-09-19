@@ -30,6 +30,11 @@ from .client import use_fixtures
 HEALTH_POR_SYMBOL = HEALTH_POR_FEED.symbol
 HEALTH_TIMEOUT_SECONDS = 2.0
 HEALTH_PATH = "/health"
+# Locked Share UX canary. GET /health + boot log prove the running tip.
+SHARE_UX = "scorecard-preview-first"
+GIT_SHA_ENV_KEYS = ("RENDER_GIT_COMMIT", "SOURCE_VERSION", "GIT_COMMIT")
+GIT_SHA_SHORT_LEN = 7
+UNKNOWN_GIT_SHA = "unknown"
 
 GetFn = Callable[..., Any]
 PostFn = Callable[..., Any]
@@ -70,6 +75,29 @@ def probe_backed_feed(
     return "down"
 
 
+def deploy_git_sha() -> str:
+    """Short SHA from Render (or similar). Missing env is ``unknown``."""
+    for key in GIT_SHA_ENV_KEYS:
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return raw[:GIT_SHA_SHORT_LEN]
+    return UNKNOWN_GIT_SHA
+
+
+def deploy_canary_fields() -> dict[str, str]:
+    """Deploy identity. Always present so stale-cache deploys are visible."""
+    return {"git_sha": deploy_git_sha(), "share_ux": SHARE_UX}
+
+
+def deploy_canary_log_line() -> str:
+    return f"RWA_DEPLOY sha={deploy_git_sha()} share_ux={SHARE_UX}"
+
+
+def log_deploy_canary() -> None:
+    """Stdout line Render logs can grep after boot."""
+    print(deploy_canary_log_line(), flush=True)
+
+
 def build_health_payload(
     *,
     getter: GetFn | None = None,
@@ -87,6 +115,7 @@ def build_health_payload(
         "verifiers_live": not fixtures,
         "backed_feed": backed,
         "timestamp": utc_timestamp(now),
+        **deploy_canary_fields(),
     }
 
 
@@ -135,6 +164,7 @@ def _health_handler_class() -> type:
                     "verifiers_live": not use_fixtures(),
                     "backed_feed": "down",
                     "timestamp": utc_timestamp(),
+                    **deploy_canary_fields(),
                 }
             self.set_header("Content-Type", "application/json")
             self.set_header("X-RWA-Health", "json")
@@ -254,6 +284,7 @@ def install_health_route() -> None:
 def main(argv: list[str] | None = None) -> None:
     """Patch ``/health`` plus legal HTML routes, then ``streamlit run app.py``."""
     os.environ["RWA_HEALTH_LAUNCHER"] = "1"
+    log_deploy_canary()
     install_health_route()
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--":

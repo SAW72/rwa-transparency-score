@@ -66,6 +66,7 @@ from rwa_score.ticker_search import (
 )
 from rwa_score.verifiers import VerificationLevel
 from rwa_score.source_label import source_kind
+from rwa_score.health import SHARE_UX
 from rwa_score.x_client import (
     MISSING_CREDS_MESSAGE,
     user_facing_x_skip_message,

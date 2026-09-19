@@ -13,7 +13,12 @@ from rwa_score.chainlink_por import (
     LATEST_ROUND_DATA_SELECTOR,
     eth_call_payload,
 )
-from rwa_score.health import build_health_payload
+from rwa_score.health import (
+    SHARE_UX,
+    build_health_payload,
+    deploy_canary_log_line,
+    deploy_git_sha,
+)
 from tests.test_verifiers import FakeResponse, encode_latest_round
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,8 +76,44 @@ def test_health_payload_fixtures_false_when_env_off(
     assert payload["verifiers_live"] is True
     assert payload["backed_feed"] == "ok"
     assert payload["timestamp"] == "2026-09-10T01:13:00Z"
-    assert set(payload) == {"fixtures", "verifiers_live", "backed_feed", "timestamp"}
+    assert set(payload) == {
+        "fixtures",
+        "verifiers_live",
+        "backed_feed",
+        "timestamp",
+        "git_sha",
+        "share_ux",
+    }
+    assert payload["share_ux"] == SHARE_UX
     assert called
+
+
+def test_health_payload_includes_deploy_canary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stale-cache deploys are visible: git_sha + locked Share UX label."""
+    monkeypatch.setenv("RWA_USE_FIXTURES", "1")
+    monkeypatch.setenv(
+        "RENDER_GIT_COMMIT", "a5cf6ed3a7907271ea2cacd176582752e07fb4c4"
+    )
+    monkeypatch.delenv("SOURCE_VERSION", raising=False)
+    monkeypatch.delenv("GIT_COMMIT", raising=False)
+
+    def boom(_url: str, json=None, timeout: float | None = None, **_kwargs):
+        raise OSError("offline")
+
+    payload = build_health_payload(poster=boom)
+    assert payload["git_sha"] == "a5cf6ed"
+    assert payload["share_ux"] == SHARE_UX == "scorecard-preview-first"
+    assert deploy_canary_log_line() == "RWA_DEPLOY sha=a5cf6ed share_ux=scorecard-preview-first"
+
+    import app as demo_app
+
+    assert demo_app.SHARE_UX == SHARE_UX
+
+    monkeypatch.delenv("RENDER_GIT_COMMIT", raising=False)
+    assert deploy_git_sha() == "unknown"
+    unknown = build_health_payload(poster=boom)
+    assert unknown["git_sha"] == "unknown"
+    assert unknown["share_ux"] == "scorecard-preview-first"
 
 
 def test_health_payload_backed_feed_down_on_error(
@@ -199,7 +240,16 @@ def test_attach_registers_health_and_legal_on_streamlit_like_app() -> None:
             assert resp.code == 200
             assert "application/json" in resp.headers["Content-Type"]
             body = json.loads(resp.body.decode())
-            assert set(body) == {"fixtures", "verifiers_live", "backed_feed", "timestamp"}
+            assert set(body) == {
+                "fixtures",
+                "verifiers_live",
+                "backed_feed",
+                "timestamp",
+                "git_sha",
+                "share_ux",
+            }
+            assert body["share_ux"] == SHARE_UX
+            assert body["git_sha"]
             assert body["verifiers_live"] is (not body["fixtures"])
             assert body["backed_feed"] in {"ok", "down"}
             assert resp.headers.get("X-RWA-Health") == "json"

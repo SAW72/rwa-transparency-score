@@ -363,10 +363,10 @@ curl -sS -o /dev/null -w "%{http_code}\n" https://rwa-transparency-score.onrende
 Expected when Render is live:
 
 ```json
-{"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "2026-09-10T01:13:00Z"}
+{"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "2026-09-10T01:13:00Z", "git_sha": "a5cf6ed", "share_ux": "scorecard-preview-first"}
 ```
 
-`backed_feed` is `"ok"` if the canonical Backed Chainlink PoR feed (bIB01 **bToken** on Polygon) answers `latestRoundData` over JSON-RPC, otherwise `"down"`. This probe does **not** mean every scored ticker has an oracle feed — xStocks symbols without a published proxy still score via **heuristic fallback**. The handler always returns JSON — a down feed does not crash `/health` and does not change the health JSON shape. Local demos can still run `RWA_USE_FIXTURES=1 streamlit run app.py`. For a process-start `/health` route locally, use the same launcher as Render: `python -m rwa_score.health`.
+`backed_feed` is `"ok"` if the canonical Backed Chainlink PoR feed (bIB01 **bToken** on Polygon) answers `latestRoundData` over JSON-RPC, otherwise `"down"`. This probe does **not** mean every scored ticker has an oracle feed — xStocks symbols without a published proxy still score via **heuristic fallback**. The handler always returns JSON — a down feed does not crash `/health`. `git_sha` is the short `RENDER_GIT_COMMIT` (or `unknown`) and `share_ux` is the locked Share control (`scorecard-preview-first`). A mismatch vs GitHub tip means Render served a stale build cache — clear-cache redeploy; do not treat deploy metadata alone as proof. Local demos can still run `RWA_USE_FIXTURES=1 streamlit run app.py`. For a process-start `/health` route locally, use the same launcher as Render: `python -m rwa_score.health`.
 
 **Streamlit Community Cloud:** deploy `app.py` from the repo root. Secrets: leave `CMC_API_KEY` empty and set `RWA_USE_FIXTURES=1`, or add a key and set `RWA_USE_FIXTURES=0` for live mode.
 
