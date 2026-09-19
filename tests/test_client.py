@@ -10,13 +10,18 @@ from rwa_score.client import (
     BASE_URL,
     CMCClient,
     CMCError,
+    CMCPlanBlockedError,
     ENDPOINT_ASSETS_LIST,
     ENDPOINT_MAP,
+    ENDPOINT_MARKET_PAIRS,
     FixtureClient,
+    PLAN_BLOCKED_LABEL,
     canonical_asset_type,
     create_client,
     directory_has_more,
     env_flag,
+    is_cmc_plan_blocked,
+    is_market_pairs_plan_block,
     parse_market_pairs_payload,
     parse_rwa_map_payload,
     use_fixtures,
@@ -636,6 +641,73 @@ def test_fixture_map_filters_asset_type() -> None:
     assert {row["symbol"] for row in gold} == {"GOLD"}
     stocks = client.rwa_map(asset_type="stock")
     assert {"NVDA", "TSLA", "AAPL"} <= {row["symbol"] for row in stocks}
+
+
+def cmc_1006(
+    *,
+    http_status: int = 403,
+    message: str = "Your API Key subscription plan doesn't support this endpoint.",
+) -> FakeResponse:
+    return FakeResponse(
+        http_status,
+        {"status": {"error_code": 1006, "error_message": message}},
+    )
+
+
+def test_is_cmc_plan_blocked_detects_1006_and_plan_403() -> None:
+    assert is_cmc_plan_blocked(
+        403, {"status": {"error_code": 1006, "error_message": "plan"}}
+    )
+    assert is_cmc_plan_blocked(
+        403,
+        {
+            "status": {
+                "error_code": 0,
+                "error_message": "Your API Key subscription plan doesn't support this endpoint.",
+            }
+        },
+    )
+    assert not is_cmc_plan_blocked(500, {"status": {"error_code": 0}})
+    assert is_market_pairs_plan_block(403, None, ENDPOINT_MARKET_PAIRS)
+    assert not is_market_pairs_plan_block(403, None, ENDPOINT_MAP)
+
+
+def test_live_market_pairs_1006_degrades_without_raising() -> None:
+    session = FakeSession([cmc_1006()])
+    client = _live(session)
+    first = client.market_pairs(rwa_id=2)
+    second = client.market_pairs(rwa_id=2)
+    assert first["plan_blocked"] is True
+    assert first["unavailable_reason"] == "plan-blocked"
+    assert first["market_pairs"] == []
+    assert first["available"] is False
+    assert PLAN_BLOCKED_LABEL in first["error_message"] or "not live" in first["error_message"]
+    assert first == second
+    assert session.paths() == [ENDPOINT_MARKET_PAIRS]
+
+
+def test_live_market_pairs_http_403_without_json_degrades() -> None:
+    session = FakeSession([FakeResponse(403, text="Forbidden")])
+    payload = _live(session).market_pairs(symbol="NVDA")
+    assert payload["plan_blocked"] is True
+    assert payload["market_pairs"] == []
+    assert session.paths() == [ENDPOINT_MARKET_PAIRS]
+
+
+def test_live_market_pairs_1006_on_http_200_degrades() -> None:
+    session = FakeSession([cmc_1006(http_status=200)])
+    payload = _live(session).market_pairs(rwa_id=2)
+    assert payload["plan_blocked"] is True
+    assert payload["error_code"] == 1006
+
+
+def test_plan_block_on_other_endpoint_still_raises() -> None:
+    session = FakeSession([cmc_1006()])
+    with pytest.raises(CMCPlanBlockedError, match="1006") as excinfo:
+        _live(session).rwa_info(2)
+    assert excinfo.value.error_code == 1006
+    assert excinfo.value.status_code == 403
+    assert len(session.calls) == 1
 
 
 def test_fixture_market_pairs_by_symbol() -> None:

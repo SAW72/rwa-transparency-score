@@ -7,7 +7,7 @@ Live endpoints used (Basic plan):
   - GET /v5/real-world-assets/issuers            -> single issuer + tokens (1 credit)
   - GET /v5/real-world-assets/quotes/latest      -> tokenized avg/mcap/vol, tokens[], tradfi
   - GET /v5/real-world-assets/assets/list        -> ranked directory / asset_type browse
-  - GET /v5/real-world-assets/market-pairs/list  -> wrapper markets for one RWA
+  - GET /v5/real-world-assets/market-pairs/list  -> wrapper markets (1006 / 403 plan-block degrades)
   - GET /v2/cryptocurrency/quotes/latest         -> token 24hΔ fallback when RWA quotes lack it
 """
 
@@ -35,9 +35,25 @@ TRUE_VALUES = {"1", "true", "yes", "on"}
 # CMC Basic: HTTP 429 and status.error_code 1008 share the same per-minute cap.
 RATE_LIMIT_HTTP = 429
 RATE_LIMIT_CMC_CODES = {1008, "1008"}
+# CMC error 1006 / HTTP 403: this API key's plan does not include the endpoint.
+PLAN_BLOCK_HTTP = 403
+PLAN_BLOCK_CMC_CODES = {1006, "1006"}
+PLAN_BLOCK_REASON = "plan-blocked"
+PLAN_BLOCKED_LABEL = "plan-blocked / unavailable"
+_PLAN_BLOCK_MESSAGE_NEEDLES = (
+    "subscription plan",
+    "doesn't support this endpoint",
+    "does not support this endpoint",
+    "not available on your plan",
+    "upgrade your plan",
+    "your api key's plan",
+    "plan doesn't have access",
+    "plan does not have access",
+    "your api key subscription plan",
+)
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_MAX_WAIT_SECONDS = 60.0
-# Map / info / market-pairs / RWA quotes / assets list can refresh; issuer directory
+# Map / info / market-pairs (or its 1006 degrade) / RWA quotes / assets list can refresh; issuer directory
 # is process-lifetime (no TTL). Short TTLs absorb Streamlit widget reruns.
 DEFAULT_MAP_TTL_SECONDS = 120.0
 DEFAULT_INFO_TTL_SECONDS = 120.0
@@ -126,6 +142,27 @@ ENDPOINT_CRYPTO_QUOTE = "/v2/cryptocurrency/quotes/latest"
 
 class CMCError(RuntimeError):
     """Raised when the live CMC API cannot be used or returns an error."""
+
+
+class CMCPlanBlockedError(CMCError):
+    """CMC subscription/plan does not include this endpoint (error 1006 / HTTP 403)."""
+
+    def __init__(
+        self,
+        path: str = "",
+        status_code: int = PLAN_BLOCK_HTTP,
+        payload: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.path = path or ENDPOINT_MARKET_PAIRS
+        self.status_code = int(status_code)
+        self.payload = payload
+        self.error_code = _cmc_error_code(payload)
+        if self.error_code in (None, 0, "0"):
+            self.error_code = 1006
+        super().__init__(
+            message or _plan_block_message(self.path, self.status_code, payload)
+        )
 
 
 class RWAClient(Protocol):
@@ -230,6 +267,100 @@ def _cmc_error_code(payload: dict[str, Any] | None) -> Any:
     if not payload:
         return None
     return (payload.get("status") or {}).get("error_code")
+
+
+def _cmc_error_message(payload: dict[str, Any] | None) -> str:
+    if not payload:
+        return ""
+    return str((payload.get("status") or {}).get("error_message") or "")
+
+
+def is_cmc_plan_blocked(
+    status_code: int, payload: dict[str, Any] | None
+) -> bool:
+    """True for CMC error 1006 or a 403 whose body says the plan lacks the endpoint."""
+    if _cmc_error_code(payload) in PLAN_BLOCK_CMC_CODES:
+        return True
+    if int(status_code) != PLAN_BLOCK_HTTP:
+        return False
+    lowered = _cmc_error_message(payload).lower()
+    return any(needle in lowered for needle in _PLAN_BLOCK_MESSAGE_NEEDLES)
+
+
+def is_market_pairs_plan_block(
+    status_code: int,
+    payload: dict[str, Any] | None,
+    path: str | None = None,
+) -> bool:
+    """Plan-block on market-pairs: error 1006, or a related HTTP 403 on that path."""
+    if is_cmc_plan_blocked(status_code, payload):
+        return True
+    return path == ENDPOINT_MARKET_PAIRS and int(status_code) == PLAN_BLOCK_HTTP
+
+
+def market_pairs_plan_blocked(data: dict[str, Any] | None) -> bool:
+    """True when a market-pairs payload is the labeled plan-block degrade."""
+    if not isinstance(data, dict):
+        return False
+    return bool(
+        data.get("plan_blocked") or data.get("unavailable_reason") == PLAN_BLOCK_REASON
+    )
+
+
+def _plan_block_message(
+    path: str, status_code: int, payload: dict[str, Any] | None
+) -> str:
+    code = _cmc_error_code(payload)
+    if code in (None, 0, "0"):
+        code = 1006
+    detail = _cmc_error_message(payload)
+    extra = f" {detail}" if detail else ""
+    return (
+        f"{path} is not on this CoinMarketCap plan "
+        f"(HTTP {status_code}, error_code {code}).{extra} "
+        f"Cross-issuer market-pairs are {PLAN_BLOCKED_LABEL} until the plan is upgraded. "
+        "This is not live market-pairs data."
+    )
+
+
+def plan_blocked_market_pairs_payload(
+    *,
+    rwa_id: int | None = None,
+    symbol: str | None = None,
+    status_code: int | None = None,
+    error_code: Any = 1006,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    """Empty market-pairs shape labeled plan-blocked — never live pair rows."""
+    parsed = parse_market_pairs_payload(
+        {
+            "rwa_id": rwa_id,
+            "symbol": symbol or "",
+            "num_market_pairs": 0,
+            "market_pairs": [],
+        }
+    )
+    parsed["plan_blocked"] = True
+    parsed["unavailable"] = True
+    parsed["available"] = False
+    parsed["unavailable_reason"] = PLAN_BLOCK_REASON
+    parsed["status_code"] = status_code
+    parsed["error_code"] = error_code if error_code not in (None, 0, "0") else 1006
+    parsed["error_message"] = error_message or (
+        f"CMC market-pairs {PLAN_BLOCKED_LABEL} — not live market-pairs data."
+    )
+    return parsed
+
+
+def _error_looks_like_pairs_plan_block(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        isinstance(exc, CMCPlanBlockedError)
+        or "1006" in text
+        or "http 403" in text
+        or PLAN_BLOCK_REASON in text
+        or any(needle in text for needle in _PLAN_BLOCK_MESSAGE_NEEDLES)
+    )
 
 
 def _optional_float(raw: Any) -> float | None:
@@ -652,6 +783,11 @@ class CMCClient:
                     continue
                 raise CMCError(_rate_limit_message(path, resp.status_code, last_payload))
 
+            if is_market_pairs_plan_block(
+                resp.status_code, last_payload, path
+            ) or is_cmc_plan_blocked(resp.status_code, last_payload):
+                raise CMCPlanBlockedError(path, resp.status_code, last_payload)
+
             if resp.status_code != 200:
                 raise CMCError(f"{path} -> HTTP {resp.status_code}: {last_text[:400]}")
             if last_payload is None:
@@ -968,6 +1104,9 @@ class CMCClient:
 
         Requires exactly one of ``rwa_id`` or ``symbol``. Cached on a short TTL
         so Streamlit widget reruns do not re-burn the Basic-plan credit.
+
+        CMC error 1006 and related HTTP 403 plan-blocks return a labeled empty
+        payload instead of raising — callers must not treat that as live pairs.
         """
         if rwa_id is None and not symbol:
             raise CMCError("market_pairs requires rwa_id or symbol")
@@ -989,7 +1128,21 @@ class CMCClient:
         if cached is not None:
             self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
             return cached
-        data = self._get(ENDPOINT_MARKET_PAIRS, params)
+        try:
+            data = self._get(ENDPOINT_MARKET_PAIRS, params)
+        except CMCError as exc:
+            if not _error_looks_like_pairs_plan_block(exc):
+                raise
+            parsed = plan_blocked_market_pairs_payload(
+                rwa_id=rwa_id,
+                symbol=symbol,
+                status_code=getattr(exc, "status_code", PLAN_BLOCK_HTTP),
+                error_code=getattr(exc, "error_code", 1006),
+                error_message=str(exc),
+            )
+            self._cache.set(key, parsed)
+            self._record(ENDPOINT_MARKET_PAIRS, via="network")
+            return copy.deepcopy(parsed)
         parsed = parse_market_pairs_payload(data.get("data") or {})
         self._cache.set(key, parsed)
         self._record(ENDPOINT_MARKET_PAIRS, via="network")

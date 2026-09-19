@@ -38,10 +38,12 @@ from rwa_score.scorer import (
     ALWAYS_SELF_REPORTED,
     LIVE_OR_HEURISTIC,
     PILLARS,
+    PLAN_BLOCKED_LABEL,
     WEIGHTS,
     ScoreError,
     TransparencyScorer,
     band_code,
+    basis_is_plan_blocked,
     remaining_heuristic_paths,
 )
 from rwa_score.ticker_search import (
@@ -133,6 +135,10 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
     evidence = block.get("evidence") or "No evidence citation."
     meta = block.get("meta") or {}
     published = meta.get("published_por_feed")
+    if pillar_key == "basis" and basis_is_plan_blocked(
+        report.get("basis") or {}, verification=report.get("verification") or {}
+    ):
+        return PLAN_BLOCKED_LABEL, evidence
     if pillar_key in ALWAYS_SELF_REPORTED:
         # LIVE/FIXTURE is the data source, not an oracle. Do not label CMC-only
         # pillars as the card's overall "Verification:" line.
@@ -655,6 +661,34 @@ def band_chip_html(
         f'style="background:{spec["color"]};color:{spec["text_color"]}">'
         f"{label}</span>"
     )
+
+
+def basis_status_caption(basis_meta: dict | None) -> str | None:
+    """Honest Cross-issuer basis caption. Plan-block is never shown as live pairs."""
+    meta = basis_meta if isinstance(basis_meta, dict) else {}
+    if meta.get("plan_blocked"):
+        return (
+            f"Cross-issuer basis: **{PLAN_BLOCKED_LABEL}** "
+            "(CMC market-pairs not on this plan — not live market-pairs data)."
+        )
+    if meta.get("available"):
+        spread = meta.get("percent_spread")
+        count = meta.get("wrapper_count")
+        basis_src = meta.get("source") or "cmc_market_pairs"
+        try:
+            spread_txt = f"{float(spread):.2f}%"
+        except (TypeError, ValueError):
+            spread_txt = "n/a"
+        return (
+            f"Cross-issuer basis: **{spread_txt}** spread across {count} wrappers "
+            f"(self-reported {basis_src})."
+        )
+    if meta.get("wrapper_count") == 1:
+        return (
+            "Cross-issuer basis: only one wrapper on CMC RWA quotes/market-pairs "
+            "— no issuer compare."
+        )
+    return None
 
 
 def pillar_evidence_rows(report: dict) -> list[dict]:
@@ -1508,20 +1542,9 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
             "attestation/PoR is unavailable — labeled **heuristic fallback**, not audited attestations."
         )
 
-        basis_meta = report.get("basis") or {}
-        if basis_meta.get("available"):
-            spread = basis_meta.get("percent_spread")
-            count = basis_meta.get("wrapper_count")
-            basis_src = basis_meta.get("source") or "cmc_market_pairs"
-            st.caption(
-                f"Cross-issuer basis: **{spread:.2f}%** spread across {count} wrappers "
-                f"(self-reported {basis_src})."
-            )
-        elif basis_meta.get("wrapper_count") == 1:
-            st.caption(
-                "Cross-issuer basis: only one wrapper on CMC RWA quotes/market-pairs "
-                "— no issuer compare."
-            )
+        caption = basis_status_caption(report.get("basis") or {})
+        if caption:
+            st.caption(caption)
 
         flags = report.get("flags") or []
         if flags:

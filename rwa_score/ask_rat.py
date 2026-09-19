@@ -17,11 +17,17 @@ from typing import Any, Callable
 
 import requests
 
-from .client import summarize_call_log
+from .client import (
+    CMCPlanBlockedError,
+    PLAN_BLOCKED_LABEL,
+    market_pairs_plan_blocked,
+    summarize_call_log,
+)
 from .explainer import AI_FOOTNOTE, XAI_CHAT_URL, XAI_MODEL
 from .scorer import (
     ALWAYS_SELF_REPORTED,
     PILLARS,
+    SOURCE_MARKET_PAIRS_PLAN_BLOCKED,
     WEIGHTS,
     ScoreError,
     TransparencyScorer,
@@ -556,15 +562,23 @@ def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
         level = str(block.get("level") or "")
         source = str(block.get("source") or "")
         if key in ALWAYS_SELF_REPORTED or level == "self-reported":
-            kind = (
-                "CMC field (self-reported)"
-                if key in ALWAYS_SELF_REPORTED
-                else (
-                    "heuristic fallback (self-reported)"
-                    if source == "heuristic_fallback"
-                    else "self-reported"
+            basis_meta = report.get("basis") or {}
+            if key == "basis" and (
+                basis_meta.get("plan_blocked")
+                or (block.get("meta") or {}).get("plan_blocked")
+                or source == SOURCE_MARKET_PAIRS_PLAN_BLOCKED
+            ):
+                kind = PLAN_BLOCKED_LABEL
+            else:
+                kind = (
+                    "CMC field (self-reported)"
+                    if key in ALWAYS_SELF_REPORTED
+                    else (
+                        "heuristic fallback (self-reported)"
+                        if source == "heuristic_fallback"
+                        else "self-reported"
+                    )
                 )
-            )
             self_reported.append({"pillar": key, "label": PILLARS[key]["label"], "kind": kind})
     compact_ver = {}
     for key, block in verification.items():
@@ -608,6 +622,13 @@ def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
     por = _por_summary(compact)
     if por:
         compact["por"] = por
+    basis = report.get("basis") or {}
+    compact["basis"] = {
+        "plan_blocked": bool(basis.get("plan_blocked")),
+        "available": basis.get("available"),
+        "source": basis.get("source"),
+        "label": PLAN_BLOCKED_LABEL if basis.get("plan_blocked") else None,
+    }
     return compact
 
 
@@ -707,14 +728,49 @@ def _run_quotes_latest(
     }
 
 
+def _plan_blocked_pairs_result(
+    source: str,
+    *,
+    symbol: str | None = None,
+    rwa_id: int | None = None,
+    data: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    payload = data if isinstance(data, dict) else {}
+    return {
+        "ok": False,
+        "tool": TOOL_MARKET_PAIRS,
+        "data_source": source,
+        "plan_blocked": True,
+        "unavailable": True,
+        "label": PLAN_BLOCKED_LABEL,
+        "symbol": payload.get("symbol") or symbol,
+        "rwa_id": payload.get("rwa_id") if payload.get("rwa_id") is not None else rwa_id,
+        "num_market_pairs": 0,
+        "sample_pairs": [],
+        "error": error
+        or payload.get("error_message")
+        or f"CMC market-pairs {PLAN_BLOCKED_LABEL} — not live market-pairs data.",
+    }
+
+
 def _run_market_pairs(
     client: object, *, symbol: str | None = None, rwa_id: int | None = None
 ) -> dict[str, Any]:
     source = client_source(client)
-    if rwa_id is not None:
-        data = client.market_pairs(rwa_id=int(rwa_id))
-    else:
-        data = client.market_pairs(symbol=normalize_ticker(symbol or ""))
+    try:
+        if rwa_id is not None:
+            data = client.market_pairs(rwa_id=int(rwa_id))
+        else:
+            data = client.market_pairs(symbol=normalize_ticker(symbol or ""))
+    except CMCPlanBlockedError as exc:
+        return _plan_blocked_pairs_result(
+            source, symbol=symbol, rwa_id=rwa_id, error=str(exc)
+        )
+    if market_pairs_plan_blocked(data):
+        return _plan_blocked_pairs_result(
+            source, symbol=symbol, rwa_id=rwa_id, data=data
+        )
     pairs = data.get("market_pairs") or []
     sample = []
     if isinstance(pairs, list):
@@ -926,12 +982,19 @@ def execute_tool(
                     }
             return _run_score_ticker(scorer, ticker, score_fn)
     except Exception as exc:  # noqa: BLE001 — chat must stay up
-        return {
+        payload = {
             "ok": False,
             "tool": name,
             "data_source": client_source(client),
             "error": str(exc),
         }
+        if isinstance(exc, CMCPlanBlockedError) or (
+            name == TOOL_MARKET_PAIRS and "1006" in str(exc)
+        ):
+            payload["plan_blocked"] = True
+            payload["unavailable"] = True
+            payload["label"] = PLAN_BLOCKED_LABEL
+        return payload
     return {
         "ok": False,
         "tool": name,
@@ -986,11 +1049,21 @@ def _self_reported_line(compact: dict[str, Any]) -> str:
     if not rows:
         return f"No self-reported pillars recorded on {compact.get('ticker')}."
     always = [row["label"] for row in rows if row.get("kind") == "CMC field (self-reported)"]
-    other = [row["label"] for row in rows if row.get("kind") != "CMC field (self-reported)"]
+    blocked = [row["label"] for row in rows if row.get("kind") == PLAN_BLOCKED_LABEL]
+    other = [
+        row["label"]
+        for row in rows
+        if row.get("kind") not in {"CMC field (self-reported)", PLAN_BLOCKED_LABEL}
+    ]
     bits = []
     if always:
         bits.append(
             "Always CMC field (self-reported): " + ", ".join(always) + "."
+        )
+    if blocked:
+        bits.append(
+            "Cross-issuer basis is plan-blocked / unavailable "
+            "(CMC market-pairs not on this plan — not live market-pairs data)."
         )
     if other:
         bits.append(

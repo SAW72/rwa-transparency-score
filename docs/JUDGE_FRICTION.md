@@ -30,6 +30,9 @@ CMC **Basic** keys allow only a few HTTP requests per minute.
 | `HTTP 429` | HTTP request rate limit |
 | `error_code` **1008** | Same cap, sometimes on HTTP 200 |
 | Message | *You've exceeded your API Key's HTTP request rate limit. Rate limits reset every minute.* |
+| `error_code` **1006** / related `HTTP 403` | Current CMC plan does not include `/v5/real-world-assets/market-pairs/list` |
+
+**Market-pairs plan-block:** a live 1006 / related 403 on market-pairs does **not** crash the score card or Ask RAT. Cross-issuer basis is labeled **plan-blocked / unavailable** (not live market-pairs data). Other pillars keep scoring. Upgrade the CMC plan to restore pairs; until then the degrade is honest.
 
 **What to do:** wait about **one minute** and retry. The live client already retries 429 / 1008 with exponential backoff and jitter (honors `Retry-After`, waits ~60s total), then raises a clear error.
 
