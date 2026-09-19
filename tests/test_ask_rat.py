@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,10 @@ from rwa_score.ask_rat import (
     fallback_answer,
     format_ask_cmc_lines,
     honesty_line,
+    invented_scored_subjects,
+    is_compare_question,
+    requested_pillars,
+    wants_por,
 )
 from rwa_score.explainer import AI_FOOTNOTE, XAI_CHAT_URL, XAI_MODEL
 from rwa_score.scorer import ALWAYS_SELF_REPORTED, PILLARS, TransparencyScorer
@@ -48,6 +54,24 @@ def test_extract_tickers_keeps_bnvda_and_nvda_distinct() -> None:
     assert "NVDA" in found
     assert extract_tickers(ASK_RAT_CHIPS[1]) == ["TSLA"]
     assert extract_tickers(ASK_RAT_CHIPS[2]) == ["NVDA"]
+
+
+COMPARE_BNVDA_TSLA = "Compare bNVDA vs TSLA redemption / basis"
+POR_BNVDA = "What's PoR on bNVDA?"
+GREENER_POR_BNVDA = "Why is bNVDA greener… / what’s PoR on bNVDA?"
+
+
+def test_extract_tickers_compare_does_not_invent_vs_or_basis() -> None:
+    catalog = ["bNVDA", "TSLA", "VS", "NVDA", "BASIS"]
+    found = extract_tickers(COMPARE_BNVDA_TSLA, catalog)
+    assert found == ["bNVDA", "TSLA"]
+    assert "VS" not in found
+    assert "BASIS" not in found
+    assert is_compare_question(COMPARE_BNVDA_TSLA)
+    assert requested_pillars(COMPARE_BNVDA_TSLA) == ["redemption", "basis"]
+    assert wants_por(POR_BNVDA)
+    assert wants_por(GREENER_POR_BNVDA)
+    assert invented_scored_subjects("VS scores 34.0", {"bNVDA", "TSLA"}) == ["VS"]
 
 
 def test_honesty_line_never_claims_live_on_fixture() -> None:
@@ -288,6 +312,255 @@ def test_unknown_ticker_does_not_crash(fixture_scorer) -> None:
     assert result.answer
     assert "FIXTURE" in result.answer
     assert "not financial advice" in result.answer.lower()
+
+
+def test_score_ticker_refuses_symbol_not_in_allowlist(fixture_scorer) -> None:
+    payload = execute_tool(
+        TOOL_SCORE_TICKER,
+        {"symbol": "VS"},
+        scorer=fixture_scorer,
+        allowed_symbols={"bNVDA", "TSLA"},
+    )
+    assert payload["ok"] is False
+    assert payload["ticker"] == "VS"
+    assert "Refusing to score VS" in payload["error"]
+
+
+def test_compare_bnvda_tsla_never_invents_third_symbol(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ask RAT film gate (a): compare only the named tickers."""
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    catalog = ["bNVDA", "TSLA", "VS", "NVDA", "BASIS"]
+    result = ask(COMPARE_BNVDA_TSLA, fixture_scorer, catalog_symbols=catalog)
+    assert result.polished is False
+    assert "bNVDA" in result.answer
+    assert "TSLA" in result.answer
+    assert not re.search(r"\bVS\b", result.answer)
+    assert "VS scores" not in result.answer
+    assert "BASIS scores" not in result.answer
+    assert "Comparing only bNVDA and TSLA" in result.answer
+    assert "Redemption" in result.answer
+    assert "Cross-issuer basis" in result.answer
+    assert TOOL_SCORE_TICKER in result.tools_used
+    # Do not regress the weakest-on-TSLA chip.
+    weakest = ask(ASK_RAT_CHIPS[1], fixture_scorer)
+    assert "Cross-issuer basis" in weakest.answer
+    assert "TSLA" in weakest.answer
+
+
+def test_compare_model_vs_hallucination_falls_back(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "test-key-not-secret")
+
+    class InventVS:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.calls.append({"url": url, "json": json, "timeout": timeout})
+            if len(self.calls) == 1:
+                return FakeResponse(
+                    200,
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_vs",
+                                            "type": "function",
+                                            "function": {
+                                                "name": TOOL_SCORE_TICKER,
+                                                "arguments": '{"symbol": "VS"}',
+                                            },
+                                        },
+                                        {
+                                            "id": "call_b",
+                                            "type": "function",
+                                            "function": {
+                                                "name": TOOL_SCORE_TICKER,
+                                                "arguments": '{"symbol": "bNVDA"}',
+                                            },
+                                        },
+                                        {
+                                            "id": "call_t",
+                                            "type": "function",
+                                            "function": {
+                                                "name": TOOL_SCORE_TICKER,
+                                                "arguments": '{"symbol": "TSLA"}',
+                                            },
+                                        },
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                )
+            return FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "VS scores 34.0. Ignore bNVDA and TSLA."
+                            }
+                        }
+                    ]
+                },
+            )
+
+    session = InventVS()
+    result = ask(
+        COMPARE_BNVDA_TSLA,
+        fixture_scorer,
+        session=session,
+        catalog_symbols=["bNVDA", "TSLA", "VS"],
+    )
+    assert result.polished is False
+    assert result.skipped_reason
+    assert "invent" in result.skipped_reason.lower() or "drift" in result.skipped_reason.lower()
+    assert "VS scores" not in result.answer
+    assert not re.search(r"\bVS\b", result.answer)
+    assert "bNVDA" in result.answer
+    assert "TSLA" in result.answer
+    refuse = session.calls[1]["json"]["messages"]
+    assert any("Refusing to score VS" in (msg.get("content") or "") for msg in refuse)
+
+
+def test_bnvda_por_question_surfaces_payload_por(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ask RAT film gate (b): fixture score card PoR must be cited."""
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    scored = execute_tool(
+        TOOL_SCORE_TICKER, {"symbol": "bNVDA"}, scorer=fixture_scorer
+    )
+    assert scored["ok"] is True
+    assert scored["por"]["present"] is True
+    assert scored["por"]["feed"] == "bNVDA"
+    assert scored["verification"]["reserves"]["published_por_feed"] == "bNVDA"
+    assert scored["verification"]["reserves"]["por_path"] == "fixture_labeled_skip"
+    assert scored["verification"]["reserves"]["por_proxy"]
+
+    result = ask(POR_BNVDA, fixture_scorer)
+    assert "bNVDA" in result.answer
+    assert "Chainlink PoR" in result.answer
+    assert "published" in result.answer.lower()
+    assert "live RPC skipped" in result.answer or "not an on-chain read" in result.answer
+
+    greener = ask(GREENER_POR_BNVDA, fixture_scorer)
+    assert "bNVDA" in greener.answer
+    assert "Chainlink PoR" in greener.answer
+    assert not re.search(r"\bVS\b", greener.answer)
+
+
+def test_bnvda_por_from_live_score_payload(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On-chain PoR fields on the score payload must reach the reply."""
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    proxy = "0x0fB2beD999da86Cb1Fdd97E746600A96141EeA09"
+
+    def live_por_score(symbol: str) -> dict[str, Any]:
+        report = copy.deepcopy(fixture_scorer.score(symbol))
+        if symbol == "bNVDA":
+            report["live_verifiers"] = True
+            report["verification"]["reserves"] = {
+                "level": "on-chain PoR",
+                "source": "chainlink_por",
+                "evidence": (
+                    f"Chainlink PoR bNVDA on polygon ({proxy}): "
+                    "reserves=26.0 NVDA. Oracle-verified reserves via AggregatorV3."
+                ),
+                "ok": True,
+                "notes": ["verification=on-chain PoR"],
+                "error": None,
+                "meta": {
+                    "symbol": "bNVDA",
+                    "chain": "polygon",
+                    "proxy": proxy,
+                    "reserves": 26.0,
+                    "unit": "NVDA",
+                },
+            }
+        return report
+
+    payload = execute_tool(
+        TOOL_SCORE_TICKER,
+        {"symbol": "bNVDA"},
+        scorer=fixture_scorer,
+        score_fn=live_por_score,
+    )
+    assert payload["por"]["on_chain"] is True
+    assert payload["por"]["proxy"] == proxy
+    assert payload["verification"]["reserves"]["level"] == "on-chain PoR"
+
+    result = ask(
+        "Why is bNVDA greener… / what’s PoR on bNVDA?",
+        fixture_scorer,
+        score_fn=live_por_score,
+    )
+    assert "on-chain PoR" in result.answer
+    assert "Chainlink" in result.answer
+    assert "bNVDA" in result.answer
+    assert proxy in result.answer or "polygon" in result.answer.lower()
+
+
+def test_por_model_omission_falls_back_to_template(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "test-key-not-secret")
+
+    class OmitPoR:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.calls.append({"json": json})
+            if len(self.calls) == 1:
+                return FakeResponse(
+                    200,
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": TOOL_SCORE_TICKER,
+                                                "arguments": '{"symbol": "bNVDA"}',
+                                            },
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    },
+                )
+            return FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "bNVDA is greener because the band is GREEN."
+                            }
+                        }
+                    ]
+                },
+            )
+
+    result = ask(POR_BNVDA, fixture_scorer, session=OmitPoR())
+    assert result.polished is False
+    assert result.skipped_reason
+    assert "PoR" in result.skipped_reason or "por" in result.skipped_reason.lower()
+    assert "Chainlink PoR" in result.answer
 
 
 def test_app_wires_collapsed_chat_no_tts() -> None:
