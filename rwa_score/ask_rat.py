@@ -102,11 +102,119 @@ SYSTEM_PROMPT = (
     "You are Ask RAT, a text-only helper for RWA transparency scores. "
     "Use the provided tools (lookup/map/info, assets/list, quotes/latest, "
     "market-pairs, issuers, score_ticker). Do not invent HTTP endpoints or "
-    "numbers. If a tool result says data_source=fixture, you MUST say the "
-    "answer uses bundled demo fixtures and must NOT claim live CoinMarketCap. "
-    "If data_source=live, say LIVE CMC (not fixtures). Be concise (under 180 "
-    "words). Not financial advice. No voice or TTS."
+    "numbers. Only discuss tickers named in the user question or returned by "
+    "tools — never invent symbols. Do not treat comparison words (vs, versus, "
+    "compare) or pillar names (redemption, basis, PoR) as tickers. Compare "
+    "prompts must score and explain only the named tickers on the requested "
+    "pillars. When a score_ticker payload includes Chainlink / on-chain PoR "
+    "fields (published_por_feed, por_path, por_proxy, level=on-chain PoR), "
+    "you MUST cite that PoR evidence — do not omit it for greener / backing / "
+    "PoR questions. If a tool result says data_source=fixture, you MUST say "
+    "the answer uses bundled demo fixtures and must NOT claim live "
+    "CoinMarketCap. If data_source=live, say LIVE CMC (not fixtures). Be "
+    "concise (under 180 words). Not financial advice. No voice or TTS."
 )
+
+# Comparison / pillar words that look like tickers ("vs" → VS, "basis" → BASIS).
+_QUESTION_NOISE = frozenset(
+    {
+        "VS",
+        "VERSUS",
+        "COMPARE",
+        "COMPARISON",
+        "REDEMPTION",
+        "BASIS",
+        "POR",
+        "PROOF",
+        "RESERVE",
+        "RESERVES",
+        "BACKING",
+        "BACKED",
+        "PILLAR",
+        "PILLARS",
+        "RIGHTS",
+        "MODEL",
+        "GREENER",
+        "WEAKEST",
+        "CHAINLINK",
+        "ONCHAIN",
+        "TOKENIZED",
+        "STOCK",
+        "STOCKS",
+        "ONLY",
+        "ABOUT",
+        "FROM",
+        "THIS",
+        "THAT",
+        "WITH",
+        "AGAINST",
+        "BETWEEN",
+        "THAN",
+        "LIVE",
+        "FIXTURE",
+        "CMC",
+        "RWA",
+        "RPC",
+        "FEED",
+        "SCORES",
+        "ISSUER",
+        "CROSS",
+    }
+)
+_PILLAR_WORDS = frozenset(
+    {
+        "BASIS",
+        "REDEMPTION",
+        "BACKING",
+        "RESERVES",
+        "RESERVE",
+        "DISCLOSURE",
+        "PRICE",
+        "POR",
+        "PROOF",
+        "INTEGRITY",
+    }
+)
+# Answer-side noise for invented-ticker checks. Do NOT include VS — "VS scores"
+# is the film-gate hallucination we must reject.
+_INVENTED_IGNORE = _STOP_WORDS | _PILLAR_WORDS | frozenset(
+    {
+        "THIS",
+        "THAT",
+        "PASS",
+        "MODE",
+        "LIVE",
+        "CHAIN",
+        "READ",
+        "FEED",
+        "GREEN",
+        "YELLOW",
+        "ORANGE",
+        "RED",
+        "SAME",
+        "BAND",
+        "DEMO",
+        "DATA",
+        "NOT",
+        "THE",
+        "AND",
+        "FOR",
+        "HAS",
+        "HAD",
+        "DOES",
+        "DID",
+    }
+)
+_SCORED_SUBJECT = re.compile(
+    r"(?<![A-Za-z0-9])(b[A-Za-z]{2,6}|[A-Za-z]{2,5}x?)\s+"
+    r"(?:scores?|is|has|was|are|scored)\b",
+    re.IGNORECASE,
+)
+_ON_SUBJECT = re.compile(
+    r"\b(?:on|for)\s+(b[A-Za-z]{2,6}|[A-Za-z]{2,5}x?)\b",
+    re.IGNORECASE,
+)
+ON_CHAIN_POR_LEVEL = "on-chain PoR"
 
 
 @dataclass
@@ -127,6 +235,7 @@ class AskResult:
 class _ToolRun:
     used: list[str] = field(default_factory=list)
     results: dict[str, Any] = field(default_factory=dict)
+    drifted: str | None = None
 
 
 def client_source(client: object) -> str:
@@ -178,7 +287,7 @@ def extract_tickers(
         symbol = normalize_ticker(raw)
         if not symbol or symbol in seen:
             return
-        if symbol.upper() in _STOP_WORDS:
+        if symbol.upper() in _STOP_WORDS or symbol.upper() in _QUESTION_NOISE:
             return
         seen.add(symbol)
         found.append(symbol)
@@ -202,6 +311,215 @@ def extract_tickers(
     for match in _TICKER_TOKEN.finditer(text):
         _add(match.group(1))
     return found
+
+
+def is_compare_question(question: str) -> bool:
+    """True when the user asked to compare named tickers (vs / versus / compare)."""
+    text = f" {(question or '').lower()} "
+    return bool(
+        " vs " in text
+        or " vs. " in text
+        or " versus " in text
+        or re.search(r"\bcompar(?:e|ing|ison)\b", text)
+    )
+
+
+def requested_pillars(question: str) -> list[str]:
+    """Pillars named in the question. Empty means no pillar filter."""
+    text = (question or "").lower()
+    found: list[str] = []
+    checks = (
+        ("redemption", ("redemption", "redeem")),
+        ("basis", ("cross-issuer", "cross issuer", "basis")),
+        ("reserves", ("proof of reserve", "por", "reserves", "reserve")),
+        ("backing", ("backing", "backed")),
+        ("disclosure", ("disclosure",)),
+        ("price", ("price integrity", "price")),
+    )
+    for key, needles in checks:
+        if any(needle in text for needle in needles):
+            found.append(key)
+    return found
+
+
+def wants_por(question: str) -> bool:
+    """Greener / backing / PoR questions must surface score-card PoR when present."""
+    text = (question or "").lower()
+    return any(
+        needle in text
+        for needle in (
+            "por",
+            "proof of reserve",
+            "on-chain",
+            "on chain",
+            "chainlink",
+            "backing",
+            "greener",
+            "green",
+        )
+    )
+
+
+def _por_summary(compact: dict[str, Any]) -> dict[str, Any]:
+    """Chainlink / on-chain PoR fields from a compact score_ticker payload."""
+    existing = compact.get("por")
+    if isinstance(existing, dict) and existing.get("present"):
+        return existing
+    reserves = (compact.get("verification") or {}).get("reserves") or {}
+    if not isinstance(reserves, dict):
+        return {}
+    feed = reserves.get("published_por_feed")
+    path = reserves.get("por_path")
+    proxy = reserves.get("por_proxy")
+    chain = reserves.get("por_chain")
+    level = str(reserves.get("level") or "")
+    source = str(reserves.get("source") or "")
+    on_chain = level == ON_CHAIN_POR_LEVEL or (
+        source == "chainlink_por" and path != "fixture_labeled_skip"
+    )
+    if not feed and not on_chain and path != "fixture_labeled_skip":
+        return {}
+    return {
+        "present": True,
+        "on_chain": bool(on_chain),
+        "level": level,
+        "source": source,
+        "feed": feed,
+        "path": path,
+        "proxy": proxy,
+        "chain": chain,
+        "reserves": reserves.get("por_reserves"),
+        "unit": reserves.get("por_unit"),
+        "evidence": (reserves.get("evidence") or "")[:240],
+    }
+
+
+def _por_line(compact: dict[str, Any]) -> str:
+    """Templated PoR sentence. Empty when the payload has no PoR fields."""
+    por = _por_summary(compact)
+    if not por:
+        return ""
+    ticker = compact.get("ticker")
+    feed = por.get("feed") or ticker
+    chain = por.get("chain") or ""
+    proxy = por.get("proxy") or ""
+    loc = f" on {chain}" if chain else ""
+    proxy_bit = f" ({proxy})" if proxy else ""
+    if por.get("on_chain"):
+        extra = ""
+        reserves = por.get("reserves")
+        unit = por.get("unit") or ""
+        if reserves is not None:
+            extra = f" Reserves reading {reserves}" + (f" {unit}" if unit else "") + "."
+        return (
+            f"{ticker} Proof of reserves is on-chain PoR via Chainlink "
+            f"{feed}{loc}{proxy_bit}.{extra}"
+        )
+    if por.get("path") == "fixture_labeled_skip":
+        return (
+            f"{ticker} has a published Chainlink PoR feed ({feed}{loc}{proxy_bit}) "
+            "— live RPC skipped in fixture/offline mode (not an on-chain read)."
+        )
+    evidence = str(por.get("evidence") or "")
+    if "chainlink" in evidence.lower() or "por" in evidence.lower():
+        return f"{ticker} PoR evidence: {evidence[:220]}"
+    return f"{ticker} published Chainlink PoR feed: {feed}{loc}{proxy_bit}."
+
+
+def _append_por_lines(parts: list[str], scores: dict[str, dict[str, Any]]) -> None:
+    for compact in scores.values():
+        line = _por_line(compact)
+        if line and line not in parts:
+            parts.append(line)
+
+
+def _compare_lines(
+    scores: dict[str, dict[str, Any]], pillars: list[str]
+) -> str:
+    """Deterministic compare of only the named/scored tickers."""
+    names = [str(compact.get("ticker") or key) for key, compact in scores.items()]
+    head = "Comparing only " + " and ".join(names)
+    keys = [key for key in pillars if key in WEIGHTS] or []
+    if keys:
+        labels = [PILLARS[key]["label"] for key in keys]
+        head += " on " + " / ".join(labels)
+    head += "."
+    bits = [head]
+    for key in keys or list(WEIGHTS):
+        label = PILLARS[key]["label"]
+        pieces = []
+        for compact in scores.values():
+            subs = compact.get("subscores") or {}
+            raw = subs.get(key)
+            ver = (compact.get("verification") or {}).get(key) or {}
+            level = ver.get("level") or ""
+            score_bit = f"{float(raw):.1f}" if raw is not None else "n/a"
+            extra = f" ({level})" if level else ""
+            pieces.append(f"{compact.get('ticker')} {score_bit}{extra}")
+        bits.append(f"{label}: " + " vs ".join(pieces) + ".")
+    return " ".join(bits)
+
+
+def invented_scored_subjects(answer: str, allowed: set[str]) -> list[str]:
+    """Tickers the answer treats as subjects that were not named / tool-returned."""
+    allowed_norm = {normalize_ticker(symbol) for symbol in allowed if symbol}
+    extra: list[str] = []
+    seen: set[str] = set()
+    for regex in (_SCORED_SUBJECT, _ON_SUBJECT):
+        for match in regex.finditer(answer or ""):
+            symbol = normalize_ticker(match.group(1))
+            if not symbol:
+                continue
+            upper = symbol.upper()
+            if upper in _INVENTED_IGNORE:
+                continue
+            if symbol in allowed_norm:
+                continue
+            if symbol not in seen:
+                seen.add(symbol)
+                extra.append(symbol)
+    return extra
+
+
+def _answer_cites_por(answer: str) -> bool:
+    text = (answer or "").lower()
+    return any(
+        token in text
+        for token in (
+            "on-chain por",
+            "on chain por",
+            "chainlink por",
+            "proof of reserve",
+            "published chainlink",
+            "published por",
+        )
+    )
+
+
+def _symbols_from_payload(payload: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    if not isinstance(payload, dict):
+        return found
+    for key in ("ticker", "symbol"):
+        if payload.get(key):
+            found.append(str(payload[key]))
+    for nest in ("map", "info"):
+        block = payload.get(nest) or {}
+        if isinstance(block, dict) and block.get("symbol"):
+            found.append(str(block["symbol"]))
+    for row in payload.get("rwa_assets") or []:
+        if isinstance(row, dict) and row.get("symbol"):
+            found.append(str(row["symbol"]))
+    for symbol in payload.get("token_symbols") or []:
+        found.append(str(symbol))
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in found:
+        token = normalize_ticker(raw)
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
 
 
 def _log_start(client: object) -> int:
@@ -253,15 +571,22 @@ def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(block, dict):
             continue
         meta = block.get("meta") or {}
+        feed = meta.get("published_por_feed")
+        if not feed and key == "reserves":
+            feed = meta.get("symbol")
         compact_ver[key] = {
             "level": block.get("level"),
             "source": block.get("source"),
             "evidence": (block.get("evidence") or "")[:240],
-            "published_por_feed": meta.get("published_por_feed"),
+            "published_por_feed": feed,
             "por_path": meta.get("por_path"),
+            "por_proxy": meta.get("por_proxy") or meta.get("proxy"),
+            "por_chain": meta.get("por_chain") or meta.get("chain"),
+            "por_reserves": meta.get("reserves"),
+            "por_unit": meta.get("unit"),
         }
     data_source = "fixture" if report.get("data_source") == "fixture" else "live"
-    return {
+    compact = {
         "ticker": report.get("ticker"),
         "issuer": report.get("issuer"),
         "score": report.get("score"),
@@ -280,6 +605,10 @@ def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
         "flags": list(report.get("flags") or [])[:4],
         "notes": [str(n) for n in (report.get("notes") or [])[:4]],
     }
+    por = _por_summary(compact)
+    if por:
+        compact["por"] = por
+    return compact
 
 
 def _json_ok(payload: dict[str, Any]) -> str:
@@ -533,7 +862,11 @@ XAI_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": TOOL_SCORE_TICKER,
-            "description": "Score a ticker with TransparencyScorer (six pillars + verification).",
+            "description": (
+                "Score a ticker named in the user question with TransparencyScorer "
+                "(six pillars + verification, including Chainlink PoR fields when "
+                "the report has them). Do not invent symbols; never score 'vs'."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"symbol": {"type": "string"}},
@@ -550,6 +883,7 @@ def execute_tool(
     *,
     scorer: TransparencyScorer,
     score_fn: Callable[[str], dict[str, Any]] | None = None,
+    allowed_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
     """Dispatch one tool onto the existing client / scorer. Never invents HTTP."""
     client = scorer.client
@@ -576,7 +910,21 @@ def execute_tool(
             issuer_id = args.get("issuer_id")
             return _run_issuers(client, str(issuer_id) if issuer_id else None)
         if name == TOOL_SCORE_TICKER:
-            return _run_score_ticker(scorer, str(args.get("symbol") or ""), score_fn)
+            ticker = normalize_ticker(str(args.get("symbol") or ""))
+            if allowed_symbols is not None:
+                allowed_norm = {normalize_ticker(item) for item in allowed_symbols if item}
+                if ticker not in allowed_norm:
+                    return {
+                        "ok": False,
+                        "tool": TOOL_SCORE_TICKER,
+                        "data_source": client_source(client),
+                        "ticker": ticker,
+                        "error": (
+                            f"Refusing to score {ticker}: not named in the user "
+                            "question or prior tool results."
+                        ),
+                    }
+            return _run_score_ticker(scorer, ticker, score_fn)
     except Exception as exc:  # noqa: BLE001 — chat must stay up
         return {
             "ok": False,
@@ -708,10 +1056,15 @@ def fallback_answer(
     source = client_source(scorer.client)
     journal = run or _ToolRun()
     tickers = extract_tickers(question, catalog_symbols)
+    allowed = set(tickers)
     scores: dict[str, dict[str, Any]] = {}
     for symbol in tickers:
         payload = execute_tool(
-            TOOL_SCORE_TICKER, {"symbol": symbol}, scorer=scorer, score_fn=score_fn
+            TOOL_SCORE_TICKER,
+            {"symbol": symbol},
+            scorer=scorer,
+            score_fn=score_fn,
+            allowed_symbols=allowed or None,
         )
         journal.used.append(TOOL_SCORE_TICKER)
         journal.results[symbol] = payload
@@ -719,9 +1072,21 @@ def fallback_answer(
             scores[symbol] = payload
     parts = [honesty_line(source)]
     q = (question or "").lower()
-    if "green" in q and len(scores) >= 2:
+    compare = is_compare_question(question)
+    pillars = requested_pillars(question)
+    if compare and scores:
+        if "green" in q and len(scores) >= 2:
+            ordered = list(scores.values())
+            parts.append(_greener_line(ordered[0], ordered[1]))
+        parts.append(_compare_lines(scores, pillars))
+        if wants_por(question):
+            _append_por_lines(parts, scores)
+        elif any(_por_summary(row) for row in scores.values()):
+            _append_por_lines(parts, scores)
+    elif "green" in q and len(scores) >= 2:
         ordered = list(scores.values())
         parts.append(_greener_line(ordered[0], ordered[1]))
+        _append_por_lines(parts, scores)
     elif "weak" in q and scores:
         first = next(iter(scores.values()))
         parts.append(_weakest_line(first))
@@ -739,6 +1104,20 @@ def fallback_answer(
                 "Price integrity, Disclosure, and Cross-issuer basis are always "
                 f"CMC field (self-reported): {', '.join(labels)}."
             )
+    elif wants_por(question) and scores:
+        for compact in scores.values():
+            parts.append(
+                f"{compact.get('ticker')} scores {compact.get('score')} "
+                f"({compact.get('band')})."
+            )
+            line = _por_line(compact)
+            if line:
+                parts.append(line)
+            else:
+                parts.append(
+                    f"No Chainlink / on-chain PoR fields on the "
+                    f"{compact.get('ticker')} score payload this pass."
+                )
     elif scores:
         for compact in scores.values():
             parts.append(
@@ -746,6 +1125,10 @@ def fallback_answer(
                 f"({compact.get('band')})."
             )
             parts.append(_weakest_line(compact))
+            if _por_summary(compact) and wants_por(question):
+                line = _por_line(compact)
+                if line:
+                    parts.append(line)
     elif tickers:
         parts.append(
             "Could not score "
@@ -797,12 +1180,29 @@ def _polished_answer(
     score_fn: Callable[[str], dict[str, Any]] | None,
     deadline: float,
     run: _ToolRun,
+    catalog_symbols: list[str] | None = None,
 ) -> str | None:
     source = client_source(scorer.client)
+    named = extract_tickers(question, catalog_symbols)
+    compare = is_compare_question(question)
+    allowed: set[str] | None = set(named) if named else None
+    grounded_scores: dict[str, dict[str, Any]] = {}
+    extra_system = ""
+    if compare and named:
+        extra_system = (
+            f" Compare only {', '.join(named)}. Never invent a third symbol "
+            "(including 'VS'). Cite redemption/basis/PoR from score_ticker when asked."
+        )
+    elif wants_por(question):
+        extra_system = (
+            " Cite Chainlink / on-chain PoR fields from score_ticker when present."
+        )
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": SYSTEM_PROMPT + f" Current client data_source={source}.",
+            "content": SYSTEM_PROMPT
+            + f" Current client data_source={source}."
+            + extra_system,
         },
         {"role": "user", "content": question},
     ]
@@ -831,7 +1231,11 @@ def _polished_answer(
                     return None
                 payload, tool_err = _call_with_timeout(
                     lambda n=name, a=args: execute_tool(
-                        n, a, scorer=scorer, score_fn=score_fn
+                        n,
+                        a,
+                        scorer=scorer,
+                        score_fn=score_fn,
+                        allowed_symbols=allowed,
                     ),
                     timeout=min(ASK_TOOL_TIMEOUT, remaining),
                 )
@@ -846,6 +1250,15 @@ def _polished_answer(
                     }
                 if name:
                     run.used.append(name)
+                if isinstance(payload, dict):
+                    if payload.get("ok") and name == TOOL_SCORE_TICKER:
+                        ticker = str(payload.get("ticker") or "")
+                        if ticker:
+                            run.results[ticker] = payload
+                            grounded_scores[ticker] = payload
+                    if allowed is not None and not compare:
+                        for symbol in _symbols_from_payload(payload):
+                            allowed.add(symbol)
                 messages.append(
                     {
                         "role": "tool",
@@ -855,6 +1268,38 @@ def _polished_answer(
                 )
             continue
         if content:
+            if (compare or wants_por(question)) and not grounded_scores:
+                run.drifted = (
+                    "Model skipped tools on a compare/PoR question — templated fallback."
+                )
+                return None
+            permit = set(named)
+            permit.update(grounded_scores)
+            if allowed:
+                permit.update(allowed)
+            invented = invented_scored_subjects(content, permit)
+            if invented:
+                run.drifted = (
+                    "Model invented ticker(s) "
+                    + ", ".join(invented)
+                    + " — templated fallback."
+                )
+                return None
+            needs_por = wants_por(question) and any(
+                _por_summary(row) for row in grounded_scores.values()
+            )
+            if needs_por and not _answer_cites_por(content):
+                run.drifted = (
+                    "Model omitted score-payload PoR — templated fallback."
+                )
+                return None
+            if compare and named:
+                extra = invented_scored_subjects(content, set(named))
+                if extra:
+                    run.drifted = (
+                        "Compare answer drifted off named tickers — templated fallback."
+                    )
+                    return None
             return content
         return None
     return None
@@ -899,10 +1344,13 @@ def ask(
                         score_fn=score_fn,
                         deadline=deadline,
                         run=run,
+                        catalog_symbols=catalog_symbols,
                     )
                     if polished_text:
                         answer = f"{honesty_line(source)} {polished_text}"
                         polished = True
+                    elif run.drifted:
+                        skipped = run.drifted
                     else:
                         skipped = "xAI skipped or timed out — templated fallback."
                 except Exception:  # noqa: BLE001
