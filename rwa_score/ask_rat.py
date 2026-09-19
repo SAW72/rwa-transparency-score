@@ -32,6 +32,7 @@ from .explainer import (
     xai_headers,
     xai_timeout,
 )
+from .source_label import source_kind
 from .scorer import (
     ALWAYS_SELF_REPORTED,
     PILLARS,
@@ -259,24 +260,29 @@ class _ToolRun:
 
 def client_source(client: object) -> str:
     """Canonical fixture vs live label from the existing client."""
-    return "fixture" if getattr(client, "source", "") == "fixture" else "live"
+    return source_kind(getattr(client, "source", ""))
 
 
 def honesty_line(source: str) -> str:
-    """First-line mode cue. Fixture never claims live CMC."""
-    if source == "fixture":
+    """First-line mode cue. Fixture/unknown never claim live CMC."""
+    kind = source_kind(source)
+    if kind == "fixture":
         return "FIXTURE (bundled demo data — not live CoinMarketCap)."
-    return "LIVE CoinMarketCap (not fixtures)."
+    if kind == "live":
+        return "LIVE CoinMarketCap (not fixtures)."
+    return "Data source not confirmed — not labeled as live CoinMarketCap."
 
 
 def format_ask_cmc_lines(block: dict[str, Any] | None) -> list[str]:
     """Evidence strip for this chat turn. Fixture never says live."""
     payload = block or {}
-    source = "fixture" if payload.get("source") == "fixture" else "live"
+    source = source_kind(payload.get("source"))
     if source == "fixture":
         header = "CMC calls this turn — Fixture (bundled demo, **not** live CMC)"
-    else:
+    elif source == "live":
         header = "CMC calls this turn — Live CMC (not fixtures)"
+    else:
+        header = "CMC calls this turn — source not confirmed (not labeled live CMC)"
     lines = [header]
     endpoints = payload.get("endpoints") or []
     if not endpoints:
@@ -284,12 +290,15 @@ def format_ask_cmc_lines(block: dict[str, Any] | None) -> list[str]:
         return lines
     for row in endpoints:
         endpoint = row.get("endpoint") or ""
-        via = row.get("via") or ("fixture" if source == "fixture" else "network")
-        tag = (
-            "fixture"
-            if source == "fixture"
-            else ("cache" if row.get("cached") or via == "cache" else "live")
-        )
+        raw_source = row.get("source")
+        row_kind = source_kind(raw_source) if raw_source else source
+        via = row.get("via") or ("fixture" if row_kind == "fixture" else "network")
+        if row_kind == "fixture" or source == "fixture":
+            tag = "fixture"
+        elif row_kind == "live" or source == "live":
+            tag = "cache" if row.get("cached") or via == "cache" else "live"
+        else:
+            tag = "unconfirmed"
         lines.append(f"`GET {endpoint}` · {tag}")
     return lines
 
@@ -612,7 +621,7 @@ def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
             "por_reserves": meta.get("reserves"),
             "por_unit": meta.get("unit"),
         }
-    data_source = "fixture" if report.get("data_source") == "fixture" else "live"
+    data_source = source_kind(report.get("data_source"))
     compact = {
         "ticker": report.get("ticker"),
         "issuer": report.get("issuer"),

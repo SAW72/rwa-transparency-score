@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from rwa_score.ask_rat import (
+    ASK_BUDGET_SECONDS,
     ASK_RAT_CHIPS,
     ASK_RAT_GREETING,
     ASK_XAI_TIMEOUT,
@@ -82,6 +83,9 @@ def test_honesty_line_never_claims_live_on_fixture() -> None:
     live = honesty_line("live")
     assert live.startswith("LIVE")
     assert "not fixtures" in live
+    unknown = honesty_line("mystery")
+    assert "LIVE" not in unknown
+    assert "not labeled" in unknown.lower()
 
 
 def test_tool_specs_cover_required_surface() -> None:
@@ -212,6 +216,8 @@ def test_ask_uses_xai_tools_when_key_present(
     read = timeout[1] if isinstance(timeout, tuple) else timeout
     assert read <= ASK_XAI_TIMEOUT
     assert call["headers"]["User-Agent"] == XAI_USER_AGENT
+    assert ASK_XAI_TIMEOUT >= 20.0
+    assert ASK_BUDGET_SECONDS >= 30.0
 
 
 def test_ask_http_error_is_not_generic_timeout(

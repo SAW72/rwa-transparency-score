@@ -569,6 +569,17 @@ def test_compare_card_helpers_short_name_mode_and_weakest() -> None:
     assert demo_app.catalog_company("XOM", catalog) == "Exxon Mobil"
     assert demo_app.mode_cue({"data_source": "fixture"}) == "FIXTURE"
     assert demo_app.mode_cue({"data_source": "live"}) == "LIVE"
+    assert demo_app.mode_cue({"data_source": "cmc"}) == "LIVE"
+    assert demo_app.mode_cue({}) == "UNCONFIRMED"
+    assert "live CoinMarketCap" not in demo_app.data_source_caption(
+        {"data_source": "fixture"}
+    ).lower()
+    assert "not a live" in demo_app.data_source_caption({"data_source": "fixture"}).lower()
+    live_cap = demo_app.data_source_caption({"data_source": "live"})
+    assert live_cap.startswith("Live CoinMarketCap directory/quotes")
+    assert "self-reported" in live_cap
+    assert "heuristic fallback" in live_cap
+    assert "not labeled as live" in demo_app.data_source_caption({})
     report = {
         "subscores": {
             "backing": 80,

@@ -16,6 +16,7 @@ import html
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -64,6 +65,7 @@ from rwa_score.ticker_search import (
     search_tickers,
 )
 from rwa_score.verifiers import VerificationLevel
+from rwa_score.source_label import source_kind
 from rwa_score.x_client import (
     MISSING_CREDS_MESSAGE,
     user_facing_x_skip_message,
@@ -72,6 +74,12 @@ from rwa_score.x_client import (
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
 CATALOG_CACHE_TTL_SECONDS = 1800.0
+SHARE_EXPANDER_LABEL = "Scorecard"
+SCORECARD_BUTTON_LABEL = "Scorecard"
+DOWNLOAD_PNG_LABEL = "download PNG"
+SHARE_BUTTON_LABEL = "Share"
+LIVE_SCORE_PAGE_URL = "https://rwa-transparency-score.onrender.com"
+X_POST_DISABLED_MESSAGE = "X post skipped (disabled)."
 # Per-symbol wall-clock cache for the explainer — process-local dict.
 _explain_cache: dict[str, tuple[float, str]] = {}
 # Session fallback when Streamlit context is missing (unit tests).
@@ -417,11 +425,13 @@ def collect_cmc_calls(reports: list[dict], client: object) -> dict:
 
 def format_cmc_calls_lines(block: dict) -> list[str]:
     """Human lines for the CMC-calls evidence strip. Fixture never says live."""
-    source = "fixture" if block.get("source") == "fixture" else "live"
+    source = source_kind(block.get("source"))
     if source == "fixture":
         header = "CMC calls this run — Fixture (bundled demo, **not** live CMC)"
-    else:
+    elif source == "live":
         header = "CMC calls this run — Live CMC (not fixtures)"
+    else:
+        header = "CMC calls this run — source not confirmed (not labeled live CMC)"
     lines = [header]
     endpoints = block.get("endpoints") or []
     if not endpoints:
@@ -429,8 +439,15 @@ def format_cmc_calls_lines(block: dict) -> list[str]:
         return lines
     for row in endpoints:
         endpoint = row.get("endpoint") or ""
-        via = row.get("via") or ("fixture" if source == "fixture" else "network")
-        tag = "fixture" if source == "fixture" else ("cache" if row.get("cached") or via == "cache" else "live")
+        raw_source = row.get("source")
+        row_kind = source_kind(raw_source) if raw_source else source
+        via = row.get("via") or ("fixture" if row_kind == "fixture" else "network")
+        if row_kind == "fixture" or source == "fixture":
+            tag = "fixture"
+        elif row_kind == "live" or source == "live":
+            tag = "cache" if row.get("cached") or via == "cache" else "live"
+        else:
+            tag = "unconfirmed"
         lines.append(f"`GET {endpoint}` · {tag}")
     return lines
 
@@ -619,8 +636,28 @@ def catalog_company(ticker: str, catalog: list[TickerOption]) -> str:
 
 
 def mode_cue(report: dict) -> str:
-    """LIVE vs fixture badge for a compare card."""
-    return "FIXTURE" if report.get("data_source") == "fixture" else "LIVE"
+    """LIVE vs fixture badge for a compare card. Unknown is never LIVE."""
+    kind = source_kind(report.get("data_source"))
+    if kind == "fixture":
+        return "FIXTURE"
+    if kind == "live":
+        return "LIVE"
+    return "UNCONFIRMED"
+
+
+def data_source_caption(report: dict) -> str:
+    """Card-level CMC honesty. Does not call heuristic pillars LIVE CMC."""
+    kind = source_kind(report.get("data_source"))
+    if kind == "fixture":
+        return "Demo fixture data — not a live CoinMarketCap API response."
+    if kind == "live":
+        return (
+            "Live CoinMarketCap directory/quotes. "
+            "Price, disclosure, and basis are self-reported CMC fields. "
+            "Backing / reserves / redemption are live only when a verifier "
+            "hits a published source — otherwise heuristic fallback."
+        )
+    return "Data source not confirmed — not labeled as live CoinMarketCap."
 
 
 def normalize_band(band: str | None, *, score: float | None = None) -> str:
@@ -1028,6 +1065,58 @@ def share_session_keys(slot_index: int, ticker: str) -> tuple[str, str]:
     )
 
 
+def score_page_url() -> str:
+    """Public HTTPS URL for this score page. Prefer Render/env, else known live host."""
+    for key in ("RENDER_EXTERNAL_URL", "APP_PUBLIC_URL"):
+        raw = (os.environ.get(key) or "").strip().rstrip("/")
+        if raw.startswith("https://"):
+            return raw
+    return LIVE_SCORE_PAGE_URL
+
+
+def is_https_url(url: str) -> bool:
+    raw = (url or "").strip()
+    if not raw.startswith("https://"):
+        return False
+    return not any(ch.isspace() or ch in "<>" for ch in raw)
+
+
+def is_x_status_url(url: str) -> bool:
+    """True only for a real https x.com/twitter.com status URL. Never invent one."""
+    if not is_https_url(url):
+        return False
+    parsed = urlparse(url.strip())
+    host = (parsed.netloc or "").lower()
+    if host not in {"x.com", "www.x.com", "twitter.com", "www.twitter.com"}:
+        return False
+    parts = [p for p in (parsed.path or "").split("/") if p]
+    return len(parts) >= 2 and parts[-2] == "status" and bool(parts[-1])
+
+
+def markdown_https_link(url: str, label: str) -> str:
+    """Clickable markdown link. Empty when the URL is not https."""
+    cleaned = (url or "").strip()
+    if not is_https_url(cleaned):
+        return ""
+    safe_label = (label or "Open link").replace("[", "").replace("]", "")
+    return f"[{safe_label}]({cleaned})"
+
+
+def share_footer_markdown(bundle: object) -> str:
+    """Bottom of share view: labeled links, never a raw HTTPS dump."""
+    lines: list[str] = []
+    page_link = markdown_https_link(score_page_url(), "Open score page")
+    if page_link:
+        lines.append(page_link)
+    if getattr(bundle, "x_posted", False):
+        x_url = str(getattr(bundle, "x_url", "") or "").strip()
+        if is_x_status_url(x_url):
+            tweet_link = markdown_https_link(x_url, "View post on X")
+            if tweet_link:
+                lines.append(tweet_link)
+    return "\n\n".join(lines)
+
+
 def share_card_preview_html(png_bytes: bytes, filename: str) -> str:
     """Self-contained PNG preview + download. No Streamlit media/component URLs."""
     b64 = base64.b64encode(png_bytes).decode("ascii")
@@ -1037,7 +1126,7 @@ def share_card_preview_html(png_bytes: bytes, filename: str) -> str:
         f'<img alt="RAT Score card" src="data:image/png;base64,{b64}" '
         'style="width:100%;height:auto;border-radius:8px;display:block;" />'
         '<p style="margin:0.65rem 0 0;">'
-        f'<a download="{safe_name}" href="data:image/png;base64,{b64}">Download PNG</a>'
+        f'<a download="{safe_name}" href="data:image/png;base64,{b64}">{DOWNLOAD_PNG_LABEL}</a>'
         "</p></div>"
     )
 
@@ -1302,49 +1391,71 @@ def chip_display_label(label: str) -> str:
 
 
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
-    """User-triggered signed PNG + optional X post. Never runs on page load.
+    """Scorecard preview first; only the bottom Share button may post to X.
 
-    PNG is stored first. Preview/download use ``st.markdown`` data URIs
-    (not ``st.image`` / ``st.download_button`` / ``components.html``) so no
-    ``/media``, ``/_stcore/download``, or ``/component`` URL is registered.
-    Do not ``st.rerun()`` after the click — that also trips Page not found.
+    The ``Scorecard`` control builds and shows the PNG only. That click must
+    not call ``attach_x_share`` / ``post_image`` / ``XClient``. After the
+    preview is visible, ``download PNG`` and the bottom ``Share`` button are
+    independent. Preview/download use ``st.markdown`` data URIs (not
+    ``st.image`` / ``st.download_button`` / ``components.html``). Do not
+    ``st.rerun()`` after a click. PNG bytes / caption are unchanged.
     """
     ticker = str(report.get("ticker") or "UNK")
     state_key, pending_key = share_session_keys(slot_index, ticker)
+    # pending_key is kept for session-key compat; it is not an auto-post latch.
     st.session_state.pop(pending_key, None)
-    if st.button("Share score card", key=f"share_btn_{slot_index}_{ticker}"):
+    if st.button(SCORECARD_BUTTON_LABEL, key=f"share_btn_{slot_index}_{ticker}"):
         try:
             bundle = share_score_card(report, post_to_x=False)
         except Exception as exc:  # noqa: BLE001 — card UI must stay up
             st.session_state[state_key] = None
             st.error(f"Could not build score card: {exc}")
             return
-        if bundle.png_bytes and x_credentials_ready():
-            st.session_state[state_key] = bundle
-            bundle = attach_x_share(bundle)
-        elif bundle.png_bytes:
-            bundle.x_message = MISSING_CREDS_MESSAGE
+        # Preview only — no X network on this click.
+        if bundle.png_bytes:
+            bundle.x_posted = False
+            bundle.x_url = None
+            bundle.x_message = ""
         st.session_state[state_key] = bundle
-    if not x_credentials_ready():
-        st.caption("X credentials not set — share still builds a downloadable PNG.")
+
     bundle = st.session_state.get(state_key)
     if bundle is None:
-        st.caption("Click Share score card to build a signed PNG preview.")
+        st.caption("Click Scorecard to preview the signed PNG. Nothing is posted to X.")
         return
     if not bundle.png_bytes:
         st.error(
             "Could not build the score card image. Download is unavailable — "
-            "try Share score card again."
+            "try Scorecard again."
         )
         raw = str(getattr(bundle, "x_message", "") or "")
         if raw.startswith(PNG_BUILD_FAILED_PREFIX) and "{" not in raw:
             st.caption(raw)
         return
+
+    # Preview renders here — still no X client / network.
     _show_share_png(bundle.png_bytes, bundle.filename)
     st.caption(f"Signature fingerprint: `{bundle.fingerprint}`")
+    footer = share_footer_markdown(bundle)
+    if footer:
+        st.markdown(footer)
+
+    # Bottom of the scorecard view. Only this button may post to X.
+    if st.button(SHARE_BUTTON_LABEL, key=f"share_x_btn_{slot_index}_{ticker}"):
+        if x_credentials_ready():
+            bundle = attach_x_share(bundle)
+        else:
+            bundle.x_posted = False
+            bundle.x_url = None
+            bundle.x_message = MISSING_CREDS_MESSAGE
+        st.session_state[state_key] = bundle
+
+    if not x_credentials_ready():
+        st.caption("X credentials not set — you can still download the PNG.")
+
     status = _user_facing_share_status(bundle)
     if bundle.x_posted:
         st.success(status)
+        st.caption("Download PNG and Share stay independent. The Share button stays Share.")
     elif status:
         st.info(status)
 
@@ -1376,11 +1487,13 @@ def _render_why_this_score(report: dict, *, slot_index: int = 0) -> None:
 
 
 def _user_facing_share_status(bundle: object) -> str:
-    """Posted caption, or a polished skip — never raw X API errors."""
+    """Posted caption, or a polished skip — never raw X API errors or URLs."""
     posted = bool(getattr(bundle, "x_posted", False))
     message = str(getattr(bundle, "x_message", "") or "")
     if posted:
-        return message
+        return "Posted to X."
+    if message in {"", X_POST_DISABLED_MESSAGE}:
+        return ""
     return user_facing_x_skip_message(message)
 
 
@@ -1517,13 +1630,28 @@ def _render_sidebar_controls(default_fixtures: bool) -> bool:
 
         with st.expander("Pillar weights", expanded=False):
             st.markdown(sidebar_weights_markdown())
+    return use_fixtures
 
+
+def _render_sidebar_tail(reports: list[dict], client: object | None) -> None:
+    """CMC call journal under weights, above disclaimer. Collapsed by default.
+
+    One source of truth for this-run CMC/fixture calls. Fixture journals
+    never claim LIVE endpoints.
+    """
+    block = collect_cmc_calls(reports, client) if client is not None else {
+        "source": "unknown",
+        "live": False,
+        "endpoints": [],
+    }
+    with st.sidebar:
+        with st.expander("CMC calls this run", expanded=False):
+            for line in format_cmc_calls_lines(block):
+                st.caption(line)
         with st.expander("Disclaimer", expanded=False):
             st.write(DISCLAIMER)
-
         st.markdown("[Privacy Policy](/privacy) · [Terms of Service](/terms)")
         st.caption("These do not replace the Disclaimer.")
-    return use_fixtures
 
 
 def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
@@ -1534,10 +1662,7 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
         expanded=False,
         key=f"pillar_ev_{slot_index}_{ticker}",
     ):
-        if report.get("data_source") == "fixture":
-            st.caption("Demo fixture data — not a live CoinMarketCap API response.")
-        else:
-            st.caption("Live CoinMarketCap data.")
+        st.caption(data_source_caption(report))
 
         st.caption(
             "Backing / reserves / redemption use **issuer-name heuristics** when live "
@@ -1681,7 +1806,7 @@ def _render_selected_slot_detail(
     except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
         has_share = False
     with open_expander(
-        "Share score card",
+        SHARE_EXPANDER_LABEL,
         expanded=has_share,
         key=f"share_exp_{slot_index}_{ticker}",
     ):
@@ -1732,6 +1857,22 @@ st.markdown(
       }}
       .rat-share-card p {{
         margin: 0.65rem 0 0;
+      }}
+      /* Expander chevron sits beside the label, not stranded at the far right
+         of a full-width row (Scorecard / why / ask / CMC calls). */
+      div[data-testid="stExpander"] summary,
+      div[data-testid="stExpander"] [class*="expanderHeader"] {{
+        display: inline-flex !important;
+        justify-content: flex-start !important;
+        align-items: center !important;
+        gap: 0.4rem !important;
+        width: max-content !important;
+        max-width: 100%;
+      }}
+      div[data-testid="stExpander"] summary svg,
+      div[data-testid="stExpander"] [data-testid="stExpanderToggleIcon"] {{
+        margin-left: 0.15rem !important;
+        flex: 0 0 auto !important;
       }}
       /* CMC RWA classes — horizontal wrapping pills, not tall column blocks. */
       .rat-cat-row {{
@@ -1835,6 +1976,7 @@ try:
     st.session_state.last_error = None
 except Exception as exc:  # noqa: BLE001
     st.session_state.last_error = str(exc)
+    _render_sidebar_tail([], None)
     st.error(str(exc))
     st.stop()
 
@@ -1931,10 +2073,7 @@ if ok_reports:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 _render_ask_rat(scorer, catalog=catalog)
-
-st.markdown("#### CMC calls this run")
-for line in format_cmc_calls_lines(collect_cmc_calls(ok_reports, scorer.client)):
-    st.caption(line)
+_render_sidebar_tail(ok_reports, scorer.client)
 
 st.divider()
 st.caption(DISCLAIMER)
