@@ -3,6 +3,8 @@
 from .client import (
     CMCClient,
     CMCError,
+    CMCPlanBlockedError,
+    PLAN_BLOCKED_LABEL,
     FixtureClient,
     create_client,
     parse_assets_list_payload,
@@ -27,6 +29,8 @@ __version__ = "0.4.0"
 __all__ = [
     "CMCClient",
     "CMCError",
+    "CMCPlanBlockedError",
+    "PLAN_BLOCKED_LABEL",
     "FixtureClient",
     "PILLARS",
     "ScoreError",

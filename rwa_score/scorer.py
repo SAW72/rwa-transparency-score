@@ -24,7 +24,11 @@ from .chainlink_por import (
     fixture_por_skip_note,
 )
 from .client import (
+    CMCPlanBlockedError,
+    PLAN_BLOCK_REASON,
+    PLAN_BLOCKED_LABEL,
     RWAClient,
+    market_pairs_plan_blocked,
     parse_market_pairs_payload,
     parse_rwa_quotes_payload,
     summarize_call_log,
@@ -83,6 +87,7 @@ QUOTE_ERROR_PRICE_SCORE = 50.0
 MISSING_BASIS_SCORE = 50.0
 SINGLE_WRAPPER_BASIS_SCORE = 55.0
 BASIS_ERROR_SCORE = 50.0
+PLAN_BLOCKED_BASIS_SCORE = 50.0
 BASIS_SCORE_FLOOR = 15.0
 BASIS_SPREAD_PENALTY = 10.0
 PRICE_SCORE_FLOOR = 20.0
@@ -92,6 +97,7 @@ SOURCE_RWA_QUOTES = "cmc_rwa_quotes"
 SOURCE_CRYPTO_QUOTE = "cmc_crypto_quote"
 SOURCE_MARKET_PAIRS = "cmc_market_pairs"
 SOURCE_RWA_AND_PAIRS = "cmc_rwa_quotes+market_pairs"
+SOURCE_MARKET_PAIRS_PLAN_BLOCKED = "cmc_market_pairs_plan_blocked"
 
 
 class ScoreError(RuntimeError):
@@ -379,6 +385,22 @@ def remaining_heuristic_paths(
             )
     for key in ALWAYS_SELF_REPORTED:
         block = verification.get(key) or {}
+        if key == "basis" and basis_verification_plan_blocked(block):
+            rows.append(
+                {
+                    "key": key,
+                    "label": PILLARS[key]["label"],
+                    "kind": "plan-blocked",
+                    "note": str(
+                        block.get("evidence")
+                        or (
+                            f"CMC market-pairs {PLAN_BLOCKED_LABEL} — "
+                            "not live market-pairs data."
+                        )
+                    ),
+                }
+            )
+            continue
         rows.append(
             {
                 "key": key,
@@ -388,6 +410,45 @@ def remaining_heuristic_paths(
             }
         )
     return rows
+
+
+def basis_verification_plan_blocked(block: dict[str, Any] | None) -> bool:
+    payload = block if isinstance(block, dict) else {}
+    if (payload.get("meta") or {}).get("plan_blocked"):
+        return True
+    if payload.get("source") == SOURCE_MARKET_PAIRS_PLAN_BLOCKED:
+        return True
+    evidence = str(payload.get("evidence") or "").lower()
+    return PLAN_BLOCKED_LABEL in evidence or PLAN_BLOCK_REASON in evidence
+
+
+def basis_is_plan_blocked(
+    basis_meta: dict[str, Any] | None = None,
+    *,
+    verification: dict[str, Any] | None = None,
+) -> bool:
+    meta = basis_meta if isinstance(basis_meta, dict) else {}
+    if meta.get("plan_blocked") or meta.get("unavailable_reason") == PLAN_BLOCK_REASON:
+        return True
+    block = (verification or {}).get("basis") if isinstance(verification, dict) else None
+    return basis_verification_plan_blocked(block)
+
+
+def _exception_is_plan_blocked(exc: BaseException) -> bool:
+    if isinstance(exc, CMCPlanBlockedError):
+        return True
+    text = str(exc).lower()
+    return "1006" in text or (
+        "http 403" in text
+        and ("plan" in text or "market-pairs" in text or "subscription" in text)
+    )
+
+
+def _stamp_basis_meta(meta: dict[str, Any], *, plan_blocked: bool) -> dict[str, Any]:
+    out = dict(meta)
+    out["plan_blocked"] = bool(plan_blocked)
+    out["unavailable_reason"] = PLAN_BLOCK_REASON if plan_blocked else None
+    return out
 
 
 def _append_verification_notes(
@@ -757,6 +818,8 @@ class TransparencyScorer:
             "wrappers": [],
             "source": None,
             "tradfi_markets": [],
+            "plan_blocked": False,
+            "unavailable_reason": None,
         }
         if rwa_id is None:
             flags.append(
@@ -774,38 +837,73 @@ class TransparencyScorer:
         tradfi = list((rwa_quotes or {}).get("tradfi_markets") or [])
         pair_error: str | None = None
         pair_wrappers: list[dict[str, Any]] = []
+        plan_blocked = False
+        plan_block_note = (
+            f"Cross-issuer basis: {PLAN_BLOCKED_LABEL} "
+            "(CMC market-pairs not on this plan — not live market-pairs data)."
+        )
         try:
             raw = self.client.market_pairs(rwa_id=rwa_id)
         except Exception as exc:  # noqa: BLE001 — record, do not hide
             pair_error = str(exc)
-            flags.append(f"Market-pairs lookup failed: {exc}")
+            if _exception_is_plan_blocked(exc):
+                plan_blocked = True
+                flags.append(plan_block_note)
+            else:
+                flags.append(f"Market-pairs lookup failed: {exc}")
         else:
-            payload = parse_market_pairs_payload(raw)
-            pair_wrappers = group_wrapper_quotes(payload.get("market_pairs") or [])
-            issuer_names = self._issuer_by_crypto_id()
-            for wrapper in pair_wrappers:
-                cid = wrapper.get("crypto_id")
-                if cid is not None and not wrapper.get("issuer"):
-                    wrapper["issuer"] = issuer_names.get(int(cid)) or ""
-                wrapper.setdefault("source", SOURCE_MARKET_PAIRS)
+            if market_pairs_plan_blocked(raw):
+                plan_blocked = True
+                flags.append(plan_block_note)
+            else:
+                payload = parse_market_pairs_payload(raw)
+                pair_wrappers = group_wrapper_quotes(payload.get("market_pairs") or [])
+                issuer_names = self._issuer_by_crypto_id()
+                for wrapper in pair_wrappers:
+                    cid = wrapper.get("crypto_id")
+                    if cid is not None and not wrapper.get("issuer"):
+                        wrapper["issuer"] = issuer_names.get(int(cid)) or ""
+                    wrapper.setdefault("source", SOURCE_MARKET_PAIRS)
 
         wrappers = merge_basis_wrappers(quote_wrappers, pair_wrappers)
         used_quotes = bool(quote_wrappers)
-        used_pairs = bool(pair_wrappers)
+        used_pairs = bool(pair_wrappers) and not plan_blocked
+        if plan_blocked:
+            used_pairs = False
         if used_quotes and used_pairs:
             source = SOURCE_RWA_AND_PAIRS
         elif used_quotes:
             source = SOURCE_RWA_QUOTES
         elif used_pairs:
             source = SOURCE_MARKET_PAIRS
+        elif plan_blocked:
+            source = SOURCE_MARKET_PAIRS_PLAN_BLOCKED
         else:
             source = None
 
         if not wrappers:
+            if plan_blocked:
+                return (
+                    PLAN_BLOCKED_BASIS_SCORE,
+                    _stamp_basis_meta(
+                        {
+                            **empty_meta,
+                            "tradfi_markets": tradfi,
+                            "source": SOURCE_MARKET_PAIRS_PLAN_BLOCKED,
+                        },
+                        plan_blocked=True,
+                    ),
+                    flags,
+                    f"{plan_block_note} Assigned the plan-blocked default "
+                    f"({PLAN_BLOCKED_BASIS_SCORE:.0f}).",
+                )
             if pair_error and not used_quotes:
                 return (
                     BASIS_ERROR_SCORE,
-                    {**empty_meta, "tradfi_markets": tradfi},
+                    _stamp_basis_meta(
+                        {**empty_meta, "tradfi_markets": tradfi},
+                        plan_blocked=False,
+                    ),
                     flags,
                     f"Market-pairs endpoint error; assigned the error default "
                     f"({BASIS_ERROR_SCORE:.0f}).",
@@ -816,7 +914,10 @@ class TransparencyScorer:
             )
             return (
                 MISSING_BASIS_SCORE,
-                {**empty_meta, "tradfi_markets": tradfi, "source": source},
+                _stamp_basis_meta(
+                    {**empty_meta, "tradfi_markets": tradfi, "source": source},
+                    plan_blocked=False,
+                ),
                 flags,
                 "No wrapper USD prices in RWA quotes tokens[] or market-pairs; "
                 f"assigned the missing-pairs default ({MISSING_BASIS_SCORE:.0f}).",
@@ -827,22 +928,30 @@ class TransparencyScorer:
             flags.append(
                 "Only one wrapper token on CMC RWA quotes/market-pairs — cannot compare issuers."
             )
-            meta = {
-                "available": False,
-                "wrapper_count": 1,
-                "percent_spread": None,
-                "min_price": only["price"],
-                "max_price": only["price"],
-                "wrappers": wrappers,
-                "source": source,
-                "tradfi_markets": tradfi,
-            }
+            meta = _stamp_basis_meta(
+                {
+                    "available": False,
+                    "wrapper_count": 1,
+                    "percent_spread": None,
+                    "min_price": only["price"],
+                    "max_price": only["price"],
+                    "wrappers": wrappers,
+                    "source": source,
+                    "tradfi_markets": tradfi,
+                },
+                plan_blocked=plan_blocked,
+            )
+            why = (
+                f"Single wrapper {only['symbol']} at {only['price']:.4f}; "
+                f"assigned the single-wrapper default ({SINGLE_WRAPPER_BASIS_SCORE:.0f})."
+            )
+            if plan_blocked:
+                why = f"{plan_block_note} {why}"
             return (
                 SINGLE_WRAPPER_BASIS_SCORE,
                 meta,
                 flags,
-                f"Single wrapper {only['symbol']} at {only['price']:.4f}; "
-                f"assigned the single-wrapper default ({SINGLE_WRAPPER_BASIS_SCORE:.0f}).",
+                why,
             )
 
         prices = [float(w["price"]) for w in wrappers]
@@ -851,16 +960,19 @@ class TransparencyScorer:
             flags.append("Could not compute a wrapper percent-spread from quotes/market-pairs.")
             return (
                 MISSING_BASIS_SCORE,
-                {
-                    "available": False,
-                    "wrapper_count": len(wrappers),
-                    "percent_spread": None,
-                    "min_price": min(prices) if prices else None,
-                    "max_price": max(prices) if prices else None,
-                    "wrappers": wrappers,
-                    "source": source,
-                    "tradfi_markets": tradfi,
-                },
+                _stamp_basis_meta(
+                    {
+                        "available": False,
+                        "wrapper_count": len(wrappers),
+                        "percent_spread": None,
+                        "min_price": min(prices) if prices else None,
+                        "max_price": max(prices) if prices else None,
+                        "wrappers": wrappers,
+                        "source": source,
+                        "tradfi_markets": tradfi,
+                    },
+                    plan_blocked=plan_blocked,
+                ),
                 flags,
                 f"Invalid spread inputs; assigned the missing default ({MISSING_BASIS_SCORE:.0f}).",
             )
@@ -869,34 +981,43 @@ class TransparencyScorer:
         low, high = min(wrappers, key=lambda w: w["price"]), max(
             wrappers, key=lambda w: w["price"]
         )
-        meta = {
-            "available": True,
-            "wrapper_count": len(wrappers),
-            "percent_spread": spread,
-            "min_price": low["price"],
-            "max_price": high["price"],
-            "wrappers": wrappers,
-            "source": source,
-            "tradfi_markets": tradfi,
-        }
+        meta = _stamp_basis_meta(
+            {
+                "available": True,
+                "wrapper_count": len(wrappers),
+                "percent_spread": spread,
+                "min_price": low["price"],
+                "max_price": high["price"],
+                "wrappers": wrappers,
+                "source": source,
+                "tradfi_markets": tradfi,
+            },
+            plan_blocked=plan_blocked,
+        )
         cheap = f"{low['symbol']} {low['price']:.4f}"
         dear = f"{high['symbol']} {high['price']:.4f}"
         source_note = {
             SOURCE_RWA_AND_PAIRS: "CMC RWA quotes tokens[] + market-pairs",
             SOURCE_RWA_QUOTES: "CMC RWA quotes tokens[]",
             SOURCE_MARKET_PAIRS: "CMC market-pairs",
+            SOURCE_MARKET_PAIRS_PLAN_BLOCKED: (
+                f"CMC market-pairs {PLAN_BLOCKED_LABEL} — not live market-pairs data"
+            ),
         }.get(source or "", "CMC wrapper prices")
+        why = (
+            f"{source_note}: {len(wrappers)} wrappers; spread {spread:.2f}% "
+            f"({cheap} vs {dear}); "
+            f"{len(tradfi)} TradFi venue(s) listed (no TradFi last price). "
+            f"score = max({BASIS_SCORE_FLOOR:.0f}, 100 − |spread| × "
+            f"{BASIS_SPREAD_PENALTY:.0f}) = {score:.1f}."
+        )
+        if plan_blocked:
+            why = f"{plan_block_note} {why}"
         return (
             score,
             meta,
             flags,
-            (
-                f"{source_note}: {len(wrappers)} wrappers; spread {spread:.2f}% "
-                f"({cheap} vs {dear}); "
-                f"{len(tradfi)} TradFi venue(s) listed (no TradFi last price). "
-                f"score = max({BASIS_SCORE_FLOOR:.0f}, 100 − |spread| × "
-                f"{BASIS_SPREAD_PENALTY:.0f}) = {score:.1f}."
-            ),
+            why,
         )
 
     def _heuristic_redemption(self, issuer_name: str) -> VerificationResult:
@@ -1157,13 +1278,35 @@ class TransparencyScorer:
         cheap = basis_meta.get("min_price")
         dear = basis_meta.get("max_price")
         spread_pct = basis_meta.get("percent_spread")
-        basis_source = str(basis_meta.get("source") or SOURCE_MARKET_PAIRS)
+        plan_blocked = bool(basis_meta.get("plan_blocked"))
+        default_source = (
+            SOURCE_MARKET_PAIRS_PLAN_BLOCKED if plan_blocked else SOURCE_MARKET_PAIRS
+        )
+        basis_source = str(basis_meta.get("source") or default_source)
         source_label = {
             SOURCE_RWA_AND_PAIRS: "CMC RWA quotes tokens[] + market-pairs",
             SOURCE_RWA_QUOTES: "CMC RWA quotes tokens[]",
             SOURCE_MARKET_PAIRS: "CMC market-pairs",
+            SOURCE_MARKET_PAIRS_PLAN_BLOCKED: (
+                f"CMC market-pairs {PLAN_BLOCKED_LABEL} — not live market-pairs data"
+            ),
         }.get(basis_source, "CMC wrapper prices")
-        if basis_meta.get("available"):
+        if plan_blocked:
+            basis_evidence = (
+                f"Cross-issuer basis: {PLAN_BLOCKED_LABEL} "
+                "(CMC market-pairs not on this plan — not live market-pairs data)."
+            )
+            if basis_meta.get("available") and spread_pct is not None:
+                basis_evidence += (
+                    f" Quotes-only spread {spread_pct:.2f}% "
+                    f"({basis_meta.get('wrapper_count')} wrappers)."
+                )
+            elif basis_meta.get("wrapper_count") == 1:
+                only = (basis_meta.get("wrappers") or [{}])[0]
+                basis_evidence += (
+                    f" Quotes-only single wrapper {only.get('symbol') or 'unknown'}."
+                )
+        elif basis_meta.get("available"):
             basis_evidence = (
                 f"{source_label}: {basis_meta.get('wrapper_count')} wrappers; "
                 f"spread {spread_pct:.2f}% "
@@ -1177,13 +1320,17 @@ class TransparencyScorer:
             )
         else:
             basis_evidence = "CMC RWA quotes / market-pairs unavailable — self-reported gap."
+        basis_notes = [f"verification={VerificationLevel.SELF_REPORTED.value}"]
+        if plan_blocked:
+            basis_notes.append(PLAN_BLOCKED_LABEL)
         basis_v = VerificationResult(
             score=basis_score,
             level=VerificationLevel.SELF_REPORTED,
             evidence=basis_evidence,
             source=basis_source,
-            notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
-            ok=bool(basis_meta.get("available")),
+            notes=basis_notes,
+            ok=bool(basis_meta.get("available")) and not plan_blocked,
+            meta={"plan_blocked": plan_blocked},
         )
         basis_why = _append_verification_notes(basis_why, basis_v)
 
