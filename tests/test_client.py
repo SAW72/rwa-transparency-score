@@ -14,6 +14,7 @@ from rwa_score.client import (
     ENDPOINT_MAP,
     FixtureClient,
     create_client,
+    directory_has_more,
     env_flag,
     parse_market_pairs_payload,
     parse_rwa_map_payload,
@@ -439,6 +440,46 @@ def test_parse_rwa_map_payload_paginates() -> None:
     assert empty["has_more"] is False
 
 
+def test_directory_has_more_uses_total_size_when_flag_omitted() -> None:
+    assert directory_has_more(
+        {"has_more": False, "total_size": 7805}, start=1, batch_len=250
+    )
+    assert directory_has_more({"has_more": True, "total_size": 2}, start=1, batch_len=1)
+    assert not directory_has_more(
+        {"has_more": False, "total_size": 2}, start=1, batch_len=2
+    )
+    assert not directory_has_more({}, start=1, batch_len=250)
+
+
+def test_live_map_paginates_when_only_total_size_says_more() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "total_size": 2,
+                    "has_more": False,
+                    "rwa_assets": [
+                        {"symbol": "GOLD", "rwa_id": 1, "asset_type": "commodity"}
+                    ],
+                }
+            ),
+            cmc_ok(
+                {
+                    "total_size": 2,
+                    "has_more": False,
+                    "rwa_assets": [
+                        {"symbol": "NVDA", "rwa_id": 2, "asset_type": "stock"}
+                    ],
+                }
+            ),
+        ]
+    )
+    client = _live(session, page_gap=0)
+    rows = client.rwa_map()
+    assert [row["symbol"] for row in rows] == ["GOLD", "NVDA"]
+    assert session.paths() == [ENDPOINT_MAP, ENDPOINT_MAP]
+
+
 def test_live_map_paginates_until_complete() -> None:
     session = FakeSession(
         [
@@ -467,7 +508,7 @@ def test_live_map_paginates_until_complete() -> None:
     assert [row["symbol"] for row in rows] == ["GOLD", "NVDA"]
     assert session.paths() == [ENDPOINT_MAP, ENDPOINT_MAP]
     assert session.calls[0][1]["start"] == 1
-    assert session.calls[1][1]["start"] == 251
+    assert session.calls[1][1]["start"] == 2
     again = client.rwa_map()
     assert [row["symbol"] for row in again] == ["GOLD", "NVDA"]
     assert session.paths() == [ENDPOINT_MAP, ENDPOINT_MAP]

@@ -34,7 +34,7 @@ Wired CMC endpoints (live when `CMC_API_KEY` is set; fixture mode stays labeled)
 - `/v5/real-world-assets/market-pairs/list`
 - `/v2/cryptocurrency/quotes/latest`
 
-BTC / ETH (and WBTC / WETH) are **Crypto / Digital Assets**, never an RWA class.
+BTC / ETH (and WBTC / WETH) are never an RWA class and have no RWA-bar pill.
 
 ## What was missing / fixed
 
@@ -47,9 +47,11 @@ BTC / ETH (and WBTC / WETH) are **Crypto / Digital Assets**, never an RWA class.
   Currencies / CMC `real_estate` were missing from Search.
 - Category controls were tall Streamlit column blocks; they are now a
   horizontal wrapping pill row.
-- Fix: paginate `map` + `assets/list`, always show the six CMC classes,
-  add labeled fixture rows per class, keep industry chips as extras,
-  never file BTC/ETH under RWA.
+- Fix: paginate `map` + `assets/list` (and fill missing `asset_type`
+  classes when the default listing is stock-scoped), always show the
+  six CMC classes as the only RWA-bar pills, add labeled fixture rows
+  per class, keep industry keywords typeable (not on that bar), never
+  file BTC/ETH under RWA, keep Backed bTokens searchable.
 
 This snapshot is **bundled demo fixtures** — not live CoinMarketCap.
 

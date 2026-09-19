@@ -5,10 +5,14 @@ The Streamlit bar is exact-assign unless the query opens a picker:
   - CMC RWA ``asset_type`` classes (``stock``, ``commodity``, ``etf``, …)
   - optional industry keywords (``AI``, ``oil``, …) even when short
 
+The RWA pill bar is **only** the six official CMC ``asset_type`` classes.
+Industry keywords stay typeable; they are not chips on that bar. Native
+crypto (BTC / ETH and wraps) is never filed under an RWA class and is not
+an RWA pill.
+
 CMC RWA classes come from the official ``asset_type`` enum on ``map`` and
-``assets/list`` (paginated — not a hard-coded ticker stub). Industry chips
-are extra Look-style filters over ``industry`` / name hints. Native crypto
-(BTC / ETH and wraps) is never filed under an RWA class.
+``assets/list`` (paginated, **per class** — a stock-scoped default listing
+must not hide Commodities / Treasuries / ETFs). No stub ticker list.
 
 Published Backed **bToken** symbols from ``BACKED_POR_FEEDS`` are merged in as
 first-class picker rows so ``bNV`` / ``bNVDA`` (and feed aliases) can land a
@@ -144,19 +148,21 @@ CATEGORY_LABELS = {cat.id: cat.label for cat in CATEGORIES}
 
 CATEGORY_DOC = (
     "Search categories (type a keyword, case-insensitive; spaces OK):\n"
-    "CMC RWA asset_type (always in the UI; directory from paginated map + assets/list):\n"
+    "CMC RWA asset_type (the RWA bar is exactly these six pills; directory "
+    "from paginated map + assets/list, filled per class when the default "
+    "listing is stock-scoped):\n"
     "- Stocks — stock, stocks, equity, equities\n"
     "- Commodities — commodity, commodities\n"
     "- Treasuries — government_security, treasury, treasuries, fixed income\n"
     "- ETFs — etf, etfs\n"
     "- Real Estate — real_estate, real estate, reit, realty, property\n"
     "- Currencies — currency, currencies, fx\n"
-    "Industry chips (optional, over CMC/fixture industry or name hints):\n"
+    "Industry keywords (typeable, not RWA-bar chips):\n"
     "- AI/Tech — ai, tech, technology, semiconductor, software, computer\n"
     "- Oil/Energy — oil, energy, petroleum, crude, refining, gas\n"
     "- Auto/EV — auto, ev, vehicle, automotive, motor\n"
     "- Finance — finance, bank, financial, insurance\n"
-    "BTC / ETH (and WBTC / WETH) are Crypto / Digital Assets, never an RWA class.\n"
+    "BTC / ETH (and WBTC / WETH) are never an RWA class and have no RWA pill.\n"
     "Directory also lists published Backed bTokens (bNVDA, bIB01, bCSPX, bC3M, "
     "bIBTA) from BACKED_POR_FEEDS so on-chain PoR cards are searchable."
 )
@@ -349,12 +355,18 @@ def classify_categories(
 
 
 def resolve_categories(query: str) -> tuple[str, ...]:
-    """Category ids whose keywords/labels match the typed query."""
+    """Category ids whose keywords/labels match the typed query.
+
+    Crypto is not an RWA browse class — BTC/ETH stay classified as crypto
+    so they never join Stocks / Commodities / …, but typing ``crypto`` does
+    not open a Crypto pill bucket.
+    """
     q = normalize_query(query).lower()
     if len(q) < CATEGORY_MIN_CHARS:
         return ()
     hits: list[str] = []
-    for cat in CATEGORIES:
+    searchable = (*RWA_CLASS_CATEGORIES, *INDUSTRY_CATEGORIES)
+    for cat in searchable:
         label = cat.label.lower()
         aliases = (
             label,
@@ -483,17 +495,36 @@ def catalog_from_por_feeds(feeds: Sequence[PorFeed] | None = None) -> list[Ticke
 def merge_search_catalog(
     base: Sequence[TickerOption],
     extra: Sequence[TickerOption],
+    *,
+    prefer_extra: bool = False,
 ) -> list[TickerOption]:
-    """Append extra rows whose symbols are not already in ``base`` (case-insensitive)."""
+    """Union ``extra`` into ``base`` by case-insensitive symbol.
+
+    Default appends new symbols only. ``prefer_extra=True`` replaces a
+    colliding ``base`` row — used so a CMC ``BNVDA`` map row cannot hide
+    the published Backed ``bNVDA`` PoR picker identity.
+    """
     merged = list(base)
-    seen = {opt.symbol.upper() for opt in merged if opt.symbol}
+    index = {opt.symbol.upper(): i for i, opt in enumerate(merged) if opt.symbol}
     for opt in extra:
         key = (opt.symbol or "").upper()
-        if not key or key in seen:
+        if not key:
             continue
-        seen.add(key)
+        if key in index:
+            if prefer_extra:
+                merged[index[key]] = opt
+            continue
+        index[key] = len(merged)
         merged.append(opt)
     return merged
+
+
+def merge_por_catalog(
+    base: Sequence[TickerOption],
+    extra: Sequence[TickerOption],
+) -> list[TickerOption]:
+    """Backed bToken rows always win their symbol."""
+    return merge_search_catalog(base, extra, prefer_extra=True)
 
 
 def enrich_catalog_from_assets_list(
@@ -532,23 +563,136 @@ def enrich_catalog_from_assets_list(
     return out
 
 
+def _row_asset_type(row: dict[str, Any] | TickerOption) -> str:
+    if isinstance(row, TickerOption):
+        return (row.asset_type or "").strip().lower()
+    return str(row.get("asset_type") or "").strip().lower()
+
+
+def present_asset_types(rows: Sequence[Any]) -> set[str]:
+    """Official CMC ``asset_type`` values observed on map / list rows."""
+    present: set[str] = set()
+    for row in rows or []:
+        kind = _row_asset_type(row)
+        if kind in ASSET_TYPES:
+            present.add(kind)
+    return present
+
+
+def missing_asset_types(rows: Sequence[Any]) -> tuple[str, ...]:
+    present = present_asset_types(rows)
+    return tuple(kind for kind in ASSET_TYPES if kind not in present)
+
+
+def _extend_map_rows(
+    rows: list[dict[str, Any]],
+    batch: Sequence[dict[str, Any]] | None,
+    seen: set[Any],
+) -> None:
+    for row in batch or []:
+        if not isinstance(row, dict):
+            continue
+        marker = row.get("rwa_id")
+        if marker is None:
+            marker = (row.get("symbol") or "").upper()
+        if not marker or marker in seen:
+            continue
+        seen.add(marker)
+        rows.append(row)
+
+
+def _safe_rwa_map(
+    client: Any,
+    symbol: str | None = None,
+    *,
+    asset_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Call ``rwa_map``; tolerate clients that reject ``asset_type``."""
+    try:
+        if symbol and asset_type:
+            return list(client.rwa_map(symbol, asset_type=asset_type) or [])
+        if symbol:
+            return list(client.rwa_map(symbol) or [])
+        if asset_type:
+            return list(client.rwa_map(asset_type=asset_type) or [])
+        return list(client.rwa_map() or [])
+    except TypeError:
+        if symbol:
+            return list(client.rwa_map(symbol) or [])
+        return list(client.rwa_map() or [])
+
+
+def _fetch_assets_list_options(
+    client: Any, asset_type: str | None = None
+) -> list[TickerOption]:
+    fetch_all = getattr(client, "assets_list_all", None)
+    fetch_list = getattr(client, "assets_list", None)
+    kind = (asset_type or "").strip() or None
+    if callable(fetch_all):
+        try:
+            payload = fetch_all(asset_type=kind) if kind else fetch_all()
+        except TypeError:
+            payload = fetch_all()
+        return catalog_from_assets_list(payload)
+    if callable(fetch_list):
+        try:
+            payload = fetch_list(asset_type=kind) if kind else fetch_list()
+        except TypeError:
+            payload = fetch_list()
+        return catalog_from_assets_list(payload)
+    return []
+
+
+def lookup_symbol_on_client(client: Any, query: str) -> list[TickerOption]:
+    """Live ``map?symbol=`` lookup (0 credits). Empty when CMC lists nothing.
+
+    Used when the assembled directory missed a ticker CMC still serves.
+    Does not invent rows. Category queries are not looked up.
+    """
+    q = normalize_query(query)
+    if not q or resolve_categories(q) or len(q) < SEARCH_MIN_CHARS:
+        return []
+    symbol = normalize_ticker(q)
+    if not symbol:
+        return []
+    try:
+        rows = _safe_rwa_map(client, symbol)
+    except Exception:  # noqa: BLE001 — typeahead must stay up
+        return []
+    return catalog_from_rwa_map(rows)
+
+
 def load_search_catalog(client: Any) -> list[TickerOption]:
     """Read the CMC/fixture map, enrich from ``assets/list``, then Backed bTokens.
 
+    Unfiltered ``map`` / ``assets/list`` can be stock-scoped on live CMC.
+    Missing official ``asset_type`` classes are filled with typed calls so
+    Commodities / Treasuries / ETFs / Currencies / Real Estate surface.
     Map failures still return the Backed PoR catalog so ``bNVDA`` remains
     searchable. Fixture info is joined for ``industry`` (local JSON). Live
     mode does **not** call ``rwa_info`` per ticker — that would burn
-    Basic-plan credits. ``map`` and ``assets/list`` are paginated and cached
-    so every CMC RWA ticker is in the directory (not a stub list).
+    Basic-plan credits. No stub ticker list — only what the client returns.
     """
-    assets: Sequence[dict[str, Any]] | None = None
+    raw_rows: list[dict[str, Any]] = []
+    seen: set[Any] = set()
     try:
-        assets = client.rwa_map()
+        _extend_map_rows(raw_rows, _safe_rwa_map(client), seen)
     except Exception:  # noqa: BLE001 — search must not take down scoring
-        assets = None
+        pass
+    typed = present_asset_types(raw_rows)
+    fill_kinds = (
+        tuple(kind for kind in ASSET_TYPES if kind not in typed)
+        if raw_rows
+        else ASSET_TYPES
+    )
+    for kind in fill_kinds:
+        try:
+            _extend_map_rows(raw_rows, _safe_rwa_map(client, asset_type=kind), seen)
+        except Exception:  # noqa: BLE001
+            continue
     info_by_id: dict[int, dict[str, Any]] = {}
-    if assets is not None and getattr(client, "source", "") == "fixture":
-        for row in assets or []:
+    if raw_rows and getattr(client, "source", "") == "fixture":
+        for row in raw_rows:
             if not isinstance(row, dict) or row.get("rwa_id") is None:
                 continue
             try:
@@ -558,21 +702,24 @@ def load_search_catalog(client: Any) -> list[TickerOption]:
                 continue
             if info:
                 info_by_id[rid] = info
-    base = catalog_from_rwa_map(assets, info_by_id=info_by_id) if assets is not None else []
+    base = catalog_from_rwa_map(raw_rows, info_by_id=info_by_id) if raw_rows else []
     listed: list[TickerOption] = []
-    fetch_all = getattr(client, "assets_list_all", None)
-    fetch_list = getattr(client, "assets_list", None)
     try:
-        if callable(fetch_all):
-            listed = catalog_from_assets_list(fetch_all())
-        elif callable(fetch_list):
-            listed = catalog_from_assets_list(fetch_list())
+        listed = _fetch_assets_list_options(client)
     except Exception:  # noqa: BLE001 — search stays up without the ranked book
         listed = []
+    listed_missing = missing_asset_types(listed)
+    kinds = listed_missing if listed else ASSET_TYPES
+    for kind in kinds:
+        try:
+            extra_listed = _fetch_assets_list_options(client, kind)
+        except Exception:  # noqa: BLE001
+            continue
+        listed = enrich_catalog_from_assets_list(listed, extra_listed)
     if listed:
         base = enrich_catalog_from_assets_list(base, listed)
     extra = catalog_from_por_feeds()
-    return merge_search_catalog(base, extra)
+    return merge_por_catalog(base, extra)
 
 
 def _adjacent_transposition(left: str, right: str) -> bool:
@@ -629,14 +776,53 @@ def _rank(option: TickerOption, query: str) -> tuple[int, int, int, int, int, in
     return (is_prefix, exact_symbol, symbol_prefix, exact_name, name_prefix, is_category, rank, symbol)
 
 
+def _ensure_backed_visible(
+    hits: Sequence[TickerOption],
+    trimmed: Sequence[TickerOption],
+    *,
+    limit: int,
+) -> list[TickerOption]:
+    """Keep Backed bToken prefix hits inside the Matches strip."""
+    cap = max(0, int(limit))
+    out = list(trimmed)[:cap]
+    if cap <= 0:
+        return out
+    backed = [opt for opt in hits if opt.source == BACKED_SEARCH_SOURCE]
+    have = {opt.symbol.upper() for opt in out if opt.symbol}
+    for opt in backed:
+        key = (opt.symbol or "").upper()
+        if not key or key in have:
+            continue
+        if len(out) < cap:
+            out.append(opt)
+        else:
+            replaced = False
+            for index in range(len(out) - 1, -1, -1):
+                if out[index].source != BACKED_SEARCH_SOURCE:
+                    out[index] = opt
+                    replaced = True
+                    break
+            if not replaced:
+                continue
+        have.add(key)
+    return out
+
+
 def search_tickers(
     query: str,
     catalog: Sequence[TickerOption],
     *,
     min_chars: int = SEARCH_MIN_CHARS,
     limit: int = PICKER_LIMIT,
+    client: Any = None,
 ) -> list[TickerOption]:
-    """Prefix-match ticker / name, or list a category bucket."""
+    """Prefix-match ticker / name, or list a category bucket.
+
+    When ``client`` is set and the assembled catalog misses a ticker-like
+    query, try live ``map?symbol=`` (0 credits) so CMC-listed GOLD / SPY /
+    USTB / OUSG still surface. Backed bToken prefix hits stay in the strip
+    even when a large live book ranks other rows ahead.
+    """
     q = normalize_query(query)
     if not q:
         return []
@@ -644,13 +830,25 @@ def search_tickers(
     allow_prefix = len(q) >= min_chars
     if not allow_prefix and not cats:
         return []
+    working = list(catalog)
     hits = [
         opt
-        for opt in catalog
+        for opt in working
         if (allow_prefix and prefix_matches(q, opt)) or (cats and category_matches(q, opt))
     ]
+    if not hits and client is not None and allow_prefix and not cats:
+        extra = lookup_symbol_on_client(client, q)
+        if extra:
+            working = merge_search_catalog(working, extra)
+            hits = [
+                opt
+                for opt in working
+                if prefix_matches(q, opt) or category_matches(q, opt)
+            ]
     hits.sort(key=lambda opt: _rank(opt, q))
-    return hits[: max(0, int(limit))]
+    cap = max(0, int(limit))
+    trimmed = hits[:cap]
+    return _ensure_backed_visible(hits, trimmed, limit=cap)
 
 
 def resolve_assign_symbol(

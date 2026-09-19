@@ -45,7 +45,6 @@ from rwa_score.scorer import (
     remaining_heuristic_paths,
 )
 from rwa_score.ticker_search import (
-    CATEGORIES,
     CATEGORY_BY_ID,
     RWA_CLASS_CATEGORIES,
     SEARCH_MIN_CHARS,
@@ -549,15 +548,15 @@ def place_search_match(
 
 
 def browse_categories(catalog: list[TickerOption]) -> tuple:
-    """CMC RWA classes always; industry / crypto chips only when the catalog has rows."""
-    present = {cid for opt in catalog for cid in opt.categories}
-    rwa = tuple(RWA_CLASS_CATEGORIES)
-    extra = tuple(
-        cat
-        for cat in CATEGORIES
-        if cat.id not in {c.id for c in rwa} and cat.id in present
-    )
-    return rwa + extra
+    """RWA bar is exactly the six CMC ``asset_type`` classes.
+
+    Legacy Look sectors (AI/Tech, Oil/Energy, Auto/EV, Finance) and
+    Crypto / Digital Assets stay off this bar. Industry keywords remain
+    typeable in Search; BTC/ETH never classify as an RWA class.
+    ``catalog`` is unused — the six official pills always show.
+    """
+    _ = catalog
+    return tuple(RWA_CLASS_CATEGORIES)
 
 
 def chip_query(category) -> str:
@@ -1046,7 +1045,11 @@ def _install_search_typeahead() -> None:
     )
 
 
-def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> None:
+def _render_search_picker(
+    catalog: list[TickerOption],
+    use_fixtures: bool,
+    client=None,
+) -> None:
     """Categories → compact Search + attached match dropdown.
 
     Chip click writes ``ticker_query`` before the Search box is created so
@@ -1098,7 +1101,9 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         on_change=_on_search_query_change,
     )
     _install_search_typeahead()
-    matches = search_tickers(query, catalog, limit=CANDIDATE_STRIP_LIMIT)
+    matches = search_tickers(
+        query, catalog, limit=CANDIDATE_STRIP_LIMIT, client=client
+    )
     if matches:
         options = [opt.symbol for opt in matches]
         labels = {opt.symbol: format_option(opt) for opt in matches}
@@ -1128,15 +1133,17 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
             + " + XOM, PLD, GOLD, USTB, SPY, EUR, HOME + Backed bTokens "
             "(bNVDA, bIB01, bCSPX, bC3M, bIBTA). "
             "Prefix (NIV → NVDA / Nvidia, bNV → bNVDA) or a CMC RWA class "
-            "(Stocks, Commodities, Treasuries, ETFs, Real Estate, Currencies), "
-            "then choose a match. Fixture mode is not live CMC."
+            "(Stocks, Commodities, Treasuries, ETFs, Real Estate, Currencies — "
+            "the six CMC asset_type pills), then choose a match. "
+            "Fixture mode is not live CMC."
         )
     else:
         st.caption(
-            "Live mode: paginated CMC RWA map + ``assets/list`` "
-            "(every official asset_type) plus published Backed bToken PoR symbols "
-            "(bNVDA, …). Prefix-match ticker/name or tap a CMC RWA class, "
-            "then choose a match. BTC/ETH are Crypto / Digital Assets, not RWA."
+            "Live mode: paginated CMC RWA map + ``assets/list`` per official "
+            "asset_type plus published Backed bToken PoR symbols (bNVDA, …). "
+            "Prefix-match ticker/name or tap a CMC RWA class, then choose a "
+            "match. BTC/ETH are not RWA. Crypto and Look sector chips are "
+            "not on this bar."
         )
 
 
@@ -1711,7 +1718,7 @@ st.caption(
 )
 
 catalog = _ticker_catalog(scorer)
-_render_search_picker(catalog, use_fixtures)
+_render_search_picker(catalog, use_fixtures, client=scorer.client)
 
 active = int(st.session_state.active_slot)
 target = next_place_index(list(st.session_state.slots), active)

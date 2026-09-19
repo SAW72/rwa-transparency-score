@@ -151,11 +151,12 @@ def test_live_directory_is_whatever_rwa_map_already_loads() -> None:
         ]
     )
     catalog = load_search_catalog(client)
-    assert client.calls["rwa_map"] == 1
+    assert client.calls["rwa_map"] >= 1
     assert [opt.symbol for opt in search_tickers("niv", catalog)] == ["NVDA"]
     assert [opt.symbol for opt in search_tickers("mic", catalog)] == ["MSFT"]
+    before = client.calls["rwa_map"]
     load_search_catalog(client)
-    assert client.calls["rwa_map"] == 2
+    assert client.calls["rwa_map"] > before
 
 
 def test_readme_documents_search_categories() -> None:
@@ -172,6 +173,9 @@ def test_readme_documents_search_categories() -> None:
     assert "bNVDA" in text
     assert "BACKED_POR_FEEDS" in text
     assert "first-class Matches" in text or "first-class" in text
+    assert "exactly** the six" in text or "exactly the six" in text.lower()
+    assert "| Crypto / Digital Assets |" not in text
+    assert "not** chips on that bar" in text or "not chips on that bar" in text.lower()
 
 
 def test_category_taxonomy_is_documented() -> None:
@@ -192,6 +196,8 @@ def test_category_taxonomy_is_documented() -> None:
     assert resolve_categories("stock") == ("stock",)
     assert resolve_categories("treasury") == ("government_security",)
     assert resolve_categories("ni") == ()
+    assert resolve_categories("crypto") == ()
+    assert resolve_categories("digital assets") == ()
 
 
 def test_fixture_industries_map_to_categories() -> None:
@@ -337,7 +343,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "z-index: 40" in source
     assert "z-index: 1000" in source
     body = source.split('st.subheader("Score / Compare")', 1)[1]
-    assert "_render_search_picker(catalog, use_fixtures)" in body
+    assert "_render_search_picker(catalog, use_fixtures, client=scorer.client)" in body
     assert "search_match_" not in body.split("_render_search_picker", 1)[0]
     assert "rat-cat-pill" in source
     assert "Ticker, name, or category" in source
@@ -375,14 +381,25 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search_typeahead_script" in source
 
     shown = demo_app.browse_categories(catalog)
-    assert [cat.id for cat in shown][:6] == list(RWA_CLASS_IDS)
-    assert {"ai_tech", "oil_energy", "auto_ev"} <= {cat.id for cat in shown}
+    assert [cat.id for cat in shown] == list(RWA_CLASS_IDS)
+    assert {cat.label for cat in shown} == {
+        "Stocks",
+        "Commodities",
+        "Treasuries",
+        "ETFs",
+        "Real Estate",
+        "Currencies",
+    }
+    assert "ai_tech" not in {cat.id for cat in shown}
+    assert "crypto_digital" not in {cat.id for cat in shown}
     finance_row = TickerOption(
         symbol="JPM", name="JPMorgan", categories=("finance",)
     )
-    expanded = demo_app.browse_categories([*catalog, finance_row])
-    assert "finance" in [cat.id for cat in expanded]
-    assert "stock" in [cat.id for cat in expanded]
+    crypto_row = TickerOption(
+        symbol="BTC", name="Bitcoin", categories=("crypto_digital",)
+    )
+    expanded = demo_app.browse_categories([*catalog, finance_row, crypto_row])
+    assert [cat.id for cat in expanded] == list(RWA_CLASS_IDS)
     empty = demo_app.browse_categories([])
     assert [cat.id for cat in empty] == list(RWA_CLASS_IDS)
 
@@ -691,8 +708,9 @@ def test_btc_eth_are_crypto_not_rwa() -> None:
     assert by_symbol["BTC"].categories == (CRYPTO_ID,)
     assert "stock" in by_symbol["NVDA"].categories
     assert CRYPTO_ID not in by_symbol["NVDA"].categories
-    hits = search_tickers("crypto", catalog)
-    assert [opt.symbol for opt in hits] == ["BTC"]
+    # Crypto is not an RWA browse class — no pill / no "crypto" bucket.
+    assert search_tickers("crypto", catalog) == []
+    assert [opt.symbol for opt in search_tickers("BTC", catalog)] == ["BTC"]
 
 
 def test_horizontal_category_pills_are_not_column_blocks() -> None:
@@ -706,3 +724,179 @@ def test_horizontal_category_pills_are_not_column_blocks() -> None:
     picker = source.split("def _render_search_picker", 1)[1]
     assert 'class="rat-cat-row"' in picker
     assert "cat_chip_" not in picker
+
+
+class _StockScopedLiveClient:
+    """Live-shaped client whose unfiltered book is stocks (+ leaked BTC).
+
+    Typed ``map`` / ``assets/list`` still return the official CMC classes.
+    This is the #39 live QA failure mode: default listing hid non-stock
+    tickers while industry / crypto extras still classified.
+    """
+
+    source = "live"
+
+    _BOOK: dict[str, list[dict]] = {
+        "stock": [
+            {"symbol": "NVDA", "name": "Nvidia Corp", "rwa_id": 2, "asset_type": "stock"},
+            {"symbol": "TSLA", "name": "Tesla Inc", "rwa_id": 15, "asset_type": "stock"},
+        ],
+        "commodity": [
+            {"symbol": "GOLD", "name": "Gold", "rwa_id": 1, "asset_type": "commodity"},
+        ],
+        "government_security": [
+            {"symbol": "USTB", "name": "US Treasury Bill", "rwa_id": 30, "asset_type": "government_security"},
+            {"symbol": "OUSG", "name": "Ondo Short-Term US Treasuries", "rwa_id": 31, "asset_type": "government_security"},
+        ],
+        "etf": [
+            {"symbol": "SPY", "name": "SPDR S&P 500 ETF", "rwa_id": 40, "asset_type": "etf"},
+        ],
+        "real_estate": [
+            {"symbol": "HOME", "name": "Tokenized Home", "rwa_id": 50, "asset_type": "real_estate"},
+        ],
+        "currency": [
+            {"symbol": "EUR", "name": "Euro", "rwa_id": 60, "asset_type": "currency"},
+        ],
+    }
+    _LEAK = {"symbol": "BTC", "name": "Bitcoin", "rwa_id": 99, "asset_type": "stock"}
+
+    def __init__(self, *, collide_bnvda: bool = False) -> None:
+        self.collide_bnvda = collide_bnvda
+        self.calls = {"rwa_map": 0, "assets_list": 0, "assets_list_all": 0}
+
+    def _typed(self, kind: str) -> list[dict]:
+        rows = [dict(row) for row in self._BOOK.get(kind, ())]
+        if kind == "stock" and self.collide_bnvda:
+            rows.append(
+                {
+                    "symbol": "BNVDA",
+                    "name": "Colliding CMC row",
+                    "rwa_id": 77,
+                    "asset_type": "stock",
+                }
+            )
+        return rows
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None):
+        self.calls["rwa_map"] += 1
+        kind = (asset_type or "").strip().lower()
+        if symbol:
+            wanted = {part.strip().upper() for part in str(symbol).split(",") if part.strip()}
+            found = []
+            for rows in self._BOOK.values():
+                for row in rows:
+                    if (row.get("symbol") or "").upper() in wanted:
+                        found.append(dict(row))
+            return found
+        if kind:
+            return self._typed(kind)
+        # Unfiltered live listing: stocks + leaked BTC only.
+        return [*self._typed("stock"), dict(self._LEAK)]
+
+    def assets_list(self, *, asset_type: str | None = None, **_kwargs):
+        self.calls["assets_list"] += 1
+        kind = (asset_type or "").strip().lower()
+        rows = self._typed(kind) if kind else [*self._typed("stock"), dict(self._LEAK)]
+        return {"rwa_assets": rows, "total_size": len(rows), "has_more": False}
+
+    def assets_list_all(self, *, asset_type: str | None = None, **kwargs):
+        self.calls["assets_list_all"] += 1
+        return self.assets_list(asset_type=asset_type, **kwargs)
+
+
+def test_rwa_bar_pills_are_exactly_six_cmc_classes() -> None:
+    import app as demo_app
+
+    catalog = _fixture_catalog()
+    shown = demo_app.browse_categories(catalog)
+    assert [cat.label for cat in shown] == [
+        "Stocks",
+        "Commodities",
+        "Treasuries",
+        "ETFs",
+        "Real Estate",
+        "Currencies",
+    ]
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "exactly the six CMC" in source
+    assert "Crypto / Digital Assets stay off this bar" in source
+
+
+def test_live_directory_fills_non_stock_cmc_classes_and_backed() -> None:
+    """Unfiltered live map/list is stocks-only; typed fills must still wire CMC."""
+    import app as demo_app
+
+    client = _StockScopedLiveClient()
+    catalog = load_search_catalog(client)
+    by_symbol = {opt.symbol: opt for opt in catalog}
+    assert {"NVDA", "GOLD", "USTB", "OUSG", "SPY", "EUR", "HOME"} <= set(by_symbol)
+    assert BACKED_BTOKEN_SYMBOLS <= set(by_symbol)
+    assert by_symbol["GOLD"].asset_type == "commodity"
+    assert by_symbol["USTB"].asset_type == "government_security"
+    assert by_symbol["SPY"].asset_type == "etf"
+    assert by_symbol["bNVDA"].source == BACKED_SEARCH_SOURCE
+
+    assert "GOLD" in {opt.symbol for opt in search_tickers("commodity", catalog)}
+    assert "USTB" in {opt.symbol for opt in search_tickers("treasury", catalog)}
+    assert "OUSG" in {opt.symbol for opt in search_tickers("treasuries", catalog)}
+    assert {opt.symbol for opt in search_tickers("GOLD", catalog)} >= {"GOLD"}
+    assert {opt.symbol for opt in search_tickers("SPY", catalog)} >= {"SPY"}
+    assert {opt.symbol for opt in search_tickers("USTB", catalog)} >= {"USTB"}
+    assert {opt.symbol for opt in search_tickers("OUSG", catalog)} >= {"OUSG"}
+    assert [opt.symbol for opt in search_tickers("bNVDA", catalog)][0] == "bNVDA"
+    assert [opt.symbol for opt in search_tickers("bNV", catalog)] == ["bNVDA"]
+
+    shown = demo_app.browse_categories(catalog)
+    assert [cat.id for cat in shown] == list(RWA_CLASS_IDS)
+    assert "crypto_digital" not in {cat.id for cat in shown}
+    assert "ai_tech" not in {cat.id for cat in shown}
+
+
+def test_live_backed_typeahead_survives_cmc_symbol_collision() -> None:
+    client = _StockScopedLiveClient(collide_bnvda=True)
+    catalog = load_search_catalog(client)
+    bnv = [opt for opt in catalog if opt.symbol.upper() == "BNVDA"]
+    assert len(bnv) == 1
+    assert bnv[0].symbol == "bNVDA"
+    assert bnv[0].source == BACKED_SEARCH_SOURCE
+    hits = search_tickers("bNVDA", catalog, limit=4)
+    assert hits[0].symbol == "bNVDA"
+    assert hits[0].source == BACKED_SEARCH_SOURCE
+
+
+def test_live_symbol_lookup_wires_cmc_ticker_not_in_assembled_book() -> None:
+    """If the directory missed GOLD, map?symbol=GOLD still surfaces CMC's row."""
+
+    class _LookupOnly:
+        source = "live"
+
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None):
+            if symbol and str(symbol).upper() == "GOLD":
+                return [
+                    {
+                        "symbol": "GOLD",
+                        "name": "Gold",
+                        "rwa_id": 1,
+                        "asset_type": "commodity",
+                    }
+                ]
+            if asset_type == "stock" or not asset_type:
+                return [
+                    {
+                        "symbol": "NVDA",
+                        "name": "Nvidia Corp",
+                        "rwa_id": 2,
+                        "asset_type": "stock",
+                    }
+                ]
+            return []
+
+    catalog = load_search_catalog(_LookupOnly())
+    assert "GOLD" not in {opt.symbol for opt in catalog}
+    assert search_tickers("GOLD", catalog) == []
+    hits = search_tickers("GOLD", catalog, client=_LookupOnly())
+    assert [opt.symbol for opt in hits] == ["GOLD"]
+    assert hits[0].asset_type == "commodity"
+    # Category miss must not invent a ticker.
+    assert search_tickers("commodity", catalog, client=_LookupOnly()) == []
+
