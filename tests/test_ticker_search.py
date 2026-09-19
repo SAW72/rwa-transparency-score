@@ -330,11 +330,14 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert 'st.session_state.ticker_query = ""' in source
     assert "_clear_search" in source
     assert "pending_ticker_query" not in source
-    assert 'st.expander("Why this score?"' in source
+    assert "Why this score?" in source
+    assert "open_expander" in source
     assert "st.form" not in source
     assert demo_app.SEARCH_TYPEAHEAD_DEBOUNCE_MS == 150
     assert "addEventListener(\"input\"" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "addEventListener(\"keyup\"" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "keypress" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "keydown" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "_install_search_typeahead" in source
     assert "search_typeahead_script" in source
 
@@ -385,7 +388,9 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
     assert str(demo_app.SEARCH_TYPEAHEAD_DEBOUNCE_MS) in script
     assert "__DEBOUNCE_MS__" not in script
     assert "addEventListener(\"input\"" in script
+    assert "addEventListener(\"keyup\"" in script
     assert "Enter" in script
+    assert "height=1" in picker or 'height=1' in source
     assert "st.form" not in source
 
     # Category chips still pre-fill Search with the documented keyword.

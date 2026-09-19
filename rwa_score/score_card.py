@@ -25,6 +25,8 @@ from .x_client import X_POST_UNAVAILABLE_MESSAGE, user_facing_x_skip_message
 SIGNING_SECRET_ENV = "SCORE_CARD_SIGNING_SECRET"
 UNSIGNED_FINGERPRINT = "UNSIGNED"
 FINGERPRINT_LEN = 16
+PNG_BUILD_FAILED_PREFIX = "Score card generation failed:"
+X_SHARE_UI_TIMEOUT = 8.0
 CARD_WIDTH = 1200
 CARD_HEIGHT = 675
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
@@ -32,6 +34,7 @@ MONOGRAM_CANDIDATES = (
     ASSETS_DIR / "rat-monogram.png",
     ASSETS_DIR / "rat-icon-192.png",
 )
+FONTS_DIR = ASSETS_DIR / "fonts"
 
 BAND_COLORS = {
     "GREEN": (61, 220, 151),
@@ -41,6 +44,10 @@ BAND_COLORS = {
 }
 
 _FONT_PAIRS = (
+    (
+        FONTS_DIR / "Inter-Regular.ttf",
+        FONTS_DIR / "Inter-Bold.ttf",
+    ),
     (
         Path("/usr/share/fonts/truetype/macos/Inter-Regular.ttf"),
         Path("/usr/share/fonts/truetype/macos/Inter-Bold.ttf"),
@@ -158,7 +165,10 @@ def _load_font(size: int, *, bold: bool = False):
                 return ImageFont.truetype(str(path), size)
             except OSError:
                 continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def _load_monogram(size: int):
@@ -349,19 +359,34 @@ def share_score_card(
             timestamp=ts,
             caption="",
             filename="rat-score-error.png",
-            x_message=f"Score card generation failed: {exc}",
+            x_message=f"{PNG_BUILD_FAILED_PREFIX} {exc}",
         )
 
     if not post_to_x:
         card.x_message = "X post skipped (disabled)."
         return card
 
+    return attach_x_share(card, x_client=x_client)
+
+
+def attach_x_share(
+    card: ScoreCardShare,
+    *,
+    x_client: Any | None = None,
+) -> ScoreCardShare:
+    """Post an already-built PNG. Never raises. Never rebuilds the image."""
+    if not card.png_bytes:
+        card.x_posted = False
+        card.x_url = None
+        if not str(card.x_message or "").startswith(PNG_BUILD_FAILED_PREFIX):
+            card.x_message = "X post skipped: score card image was empty."
+        return card
     try:
         client = x_client
         if client is None:
             from .x_client import XClient
 
-            client = XClient.from_env()
+            client = XClient.from_env(timeout=X_SHARE_UI_TIMEOUT)
         result = client.post_image(card.png_bytes, card.caption)
         card.x_posted = bool(getattr(result, "posted", False))
         card.x_url = getattr(result, "url", None)
