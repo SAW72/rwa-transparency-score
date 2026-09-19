@@ -50,17 +50,17 @@ curl -sS https://rwa-transparency-score.onrender.com/health
 Expected when Render is live (not fixtures):
 
 ```json
-{"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "…"}
+{"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "…", "git_sha": "…", "share_ux": "scorecard-preview-first"}
 ```
 
-**Free Render cold starts:** the free web service can spin down after ~15 minutes of inactivity. The first request after idle may take ~30–60 seconds. Wait and retry `/health` — do not treat a slow first hit as a failed demo. Expected body is JSON (`fixtures`, `verifiers_live`, `backed_feed`, `timestamp`), not Streamlit's "enable JavaScript" SPA. Header `X-RWA-Health: json` is set when the Tornado JSON handler ran. If `/health` is `text/html`, the Render **Start Command** is `streamlit run app.py` and must be changed to match `render.yaml` (`python -m rwa_score.health …`). The dashboard Start Command is independent of `render.yaml` unless the service is Blueprint-synced — this repo cannot change that dashboard field. `/_stcore/health` = `ok` is Streamlit's probe, not this payload.
+**Free Render cold starts:** the free web service can spin down after ~15 minutes of inactivity. The first request after idle may take ~30–60 seconds. Wait and retry `/health` — do not treat a slow first hit as a failed demo. Expected body is JSON (`fixtures`, `verifiers_live`, `backed_feed`, `timestamp`, `git_sha`, `share_ux`), not Streamlit's "enable JavaScript" SPA. Header `X-RWA-Health: json` is set when the Tornado JSON handler ran. If `/health` is `text/html`, the Render **Start Command** is `streamlit run app.py` and must be changed to match `render.yaml` (`python -m rwa_score.health …`). The dashboard Start Command is independent of `render.yaml` unless the service is Blueprint-synced — this repo cannot change that dashboard field. `/_stcore/health` = `ok` is Streamlit's probe, not this payload.
 
 **After Spencer approves a deploy** (do not merge-deploy from this PR):
 
 ```bash
 curl -sS -D- https://rwa-transparency-score.onrender.com/health
 # Expect: content-type application/json, X-RWA-Health: json
-# Body keys only: fixtures, verifiers_live, backed_feed, timestamp
+# Body keys: fixtures, verifiers_live, backed_feed, timestamp, git_sha, share_ux
 # Live host: fixtures false, verifiers_live true
 ```
 
