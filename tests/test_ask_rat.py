@@ -306,6 +306,8 @@ def test_app_wires_collapsed_chat_no_tts() -> None:
         "def _render_sidebar_controls", 1
     )[0]
     assert "Share score card" not in render
+    assert "_maybe_rerun()" not in render
+    assert "st.rerun(" not in render
     assert "st.chat_input" in render
     assert "ask_rat_chip_" in render
     assert "ask_rat_prefill" in render

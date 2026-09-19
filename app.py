@@ -1330,7 +1330,6 @@ def _render_ask_rat(
                     }
                 )
             st.session_state["ask_rat_prefill"] = ""
-            _maybe_rerun()
         for msg in messages:
             role = "assistant" if msg.get("role") == "assistant" else "user"
             with st.chat_message(role):
