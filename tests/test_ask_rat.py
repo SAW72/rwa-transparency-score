@@ -296,7 +296,8 @@ def test_app_wires_collapsed_chat_no_tts() -> None:
     assert demo_app.ASK_RAT_GREETING == ASK_RAT_GREETING
     assert demo_app.ASK_RAT_CHIPS == ASK_RAT_CHIPS
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert ASK_RAT_GREETING in source
+    assert "ASK_RAT_GREETING" in source
+    assert "st.write(ASK_RAT_GREETING)" in source
     assert "st.chat_input" in source
     assert "st.chat_message" in source
     assert 'open_expander("Ask RAT"' in source or 'st.expander("Ask RAT"' in source
@@ -310,10 +311,11 @@ def test_app_wires_collapsed_chat_no_tts() -> None:
     assert "ask_rat_prefill" in render
     assert "format_ask_cmc_lines" in render
     lowered = source.lower()
-    assert "tts" not in lowered
+    assert "no voice" in lowered
     assert "text-to-speech" not in lowered
     assert "elevenlabs" not in lowered
     assert "pyttsx" not in lowered
+    assert "st.audio(" not in source
     readme = Path("README.md").read_text(encoding="utf-8")
     assert ASK_RAT_GREETING in readme
     assert ASK_RAT_CHIPS[1] in readme

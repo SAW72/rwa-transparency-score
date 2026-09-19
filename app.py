@@ -1257,7 +1257,7 @@ def _render_ask_rat(
     """Collapsed Ask RAT text chat. Does not run the model on page load.
 
     Chips write the exact demo question into session and submit it. ``st.chat_input``
-    is the free-form path. No TTS. Failures use the templated fallback.
+    is the free-form path. Voice output is out of MVP. Failures use the templated fallback.
     """
     messages = _ask_rat_messages()
     try:
