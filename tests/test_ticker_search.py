@@ -16,6 +16,8 @@ from rwa_score.ticker_search import (
     RWA_CLASS_CATEGORIES,
     RWA_CLASS_IDS,
     SEARCH_MIN_CHARS,
+    TREASURY_CLASS,
+    TREASURY_PROBE_SYMBOLS,
     TickerOption,
     cached_class_catalog,
     catalog_from_por_feeds,
@@ -24,6 +26,7 @@ from rwa_score.ticker_search import (
     classify_categories,
     format_option,
     is_native_crypto,
+    is_treasury_like,
     load_class_catalog,
     load_search_catalog,
     merge_search_catalog,
@@ -1054,7 +1057,10 @@ def test_treasuries_does_not_invent_tickers_when_cmc_lists_none() -> None:
     class _EmptyBoth(_StockScopedLiveClient):
         def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
             kind = (asset_type or "").strip().lower()
-            if kind == "government_security" and not symbol:
+            if symbol:
+                self.calls["rwa_map"] += 1
+                return []
+            if kind == "government_security":
                 self.calls["rwa_map"] += 1
                 return []
             return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
@@ -1069,6 +1075,179 @@ def test_treasuries_does_not_invent_tickers_when_cmc_lists_none() -> None:
     client = _EmptyBoth()
     rows = load_class_catalog(client, "government_security", first_page_only=True)
     assert rows == []
+    assert client.calls["assets_list_all"] == 0
+
+
+class _EtfLabeledTreasuryClient(_StockScopedLiveClient):
+    """#43 miss: government_security pages empty; CMC lists USTB/OUSG as etf."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        self.calls["rwa_map"] += 1
+        kind = (asset_type or "").strip().lower()
+        if symbol:
+            return []
+        if kind == "etf":
+            return [
+                {
+                    "symbol": "SPY",
+                    "name": "SPDR S&P 500 ETF",
+                    "rwa_id": 40,
+                    "asset_type": "etf",
+                },
+                {
+                    "symbol": "USTB",
+                    "name": (
+                        "Superstate Short Duration U.S. Government "
+                        "Securities Fund (USTB)"
+                    ),
+                    "rwa_id": 30,
+                    "asset_type": "etf",
+                },
+                {
+                    "symbol": "OUSG",
+                    "name": "OUSG",
+                    "rwa_id": 31,
+                    "asset_type": "etf",
+                },
+            ]
+        if kind == "government_security":
+            return []
+        return self._typed("stock")
+
+    def assets_list(self, *, asset_type: str | None = None, **kwargs):
+        self.calls["assets_list"] += 1
+        kind = (asset_type or "").strip().lower()
+        if kind == "government_security":
+            return {"rwa_assets": [], "total_size": 0, "has_more": False}
+        return super().assets_list(asset_type=asset_type, **kwargs)
+
+
+class _SymbolOnlyTreasuryClient(_StockScopedLiveClient):
+    """Typed government_security filter empty; map?symbol= still lists them."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        self.calls["rwa_map"] += 1
+        if symbol:
+            wanted = {
+                part.strip().upper()
+                for part in str(symbol).split(",")
+                if part.strip()
+            }
+            rows = []
+            if "USTB" in wanted:
+                rows.append(
+                    {
+                        "symbol": "USTB",
+                        "name": "USTB",
+                        "rwa_id": 30,
+                        "asset_type": "etf",
+                    }
+                )
+            if "OUSG" in wanted:
+                rows.append({"symbol": "OUSG", "name": "OUSG", "rwa_id": 31})
+            return rows
+        return []
+
+    def assets_list(self, *, asset_type: str | None = None, **kwargs):
+        self.calls["assets_list"] += 1
+        return {"rwa_assets": [], "total_size": 0, "has_more": False}
+
+
+class _MixedLiveTypeTreasuryClient(_StockScopedLiveClient):
+    """Filter-ignored map mixes stocks with etf / untyped treasury rows."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        kind = (asset_type or "").strip().lower()
+        if kind == "government_security" and not symbol:
+            self.calls["rwa_map"] += 1
+            return [
+                {
+                    "symbol": "NVDA",
+                    "name": "Nvidia Corp",
+                    "rwa_id": 2,
+                    "asset_type": "stock",
+                },
+                {"symbol": "USTB", "name": "US Treasury Bill", "rwa_id": 30},
+                {
+                    "symbol": "OUSG",
+                    "name": "Ondo Short-Term US Treasuries",
+                    "rwa_id": 31,
+                    "asset_type": "etf",
+                },
+            ]
+        return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+
+def test_classify_treasuries_when_cmc_labels_etf_or_omits_type() -> None:
+    cats = classify_categories(
+        symbol="USTB",
+        name="Superstate Short Duration U.S. Government Securities Fund (USTB)",
+        asset_type="etf",
+    )
+    assert "etf" in cats
+    assert TREASURY_CLASS in cats
+    assert TREASURY_CLASS in classify_categories(
+        symbol="OUSG", name="OUSG", asset_type=""
+    )
+    assert TREASURY_CLASS not in classify_categories(
+        symbol="SPY", name="SPDR S&P 500 ETF", asset_type="etf"
+    )
+    assert TREASURY_CLASS not in classify_categories(
+        symbol="TWE", name="Treasury Wine Estates", asset_type="stock"
+    )
+    assert is_treasury_like(symbol="USTB", name="USTB", asset_type="etf")
+    assert TREASURY_PROBE_SYMBOLS == ("USTB", "OUSG")
+
+
+def test_treasuries_keeps_etf_labeled_cmc_rows() -> None:
+    client = _EtfLabeledTreasuryClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert "SPY" not in {opt.symbol for opt in rows}
+    assert {opt.asset_type for opt in rows} == {"etf"}
+    assert all(TREASURY_CLASS in opt.categories for opt in rows)
+    assert client.calls["assets_list_all"] == 0
+    assert {opt.symbol for opt in search_tickers("treasuries", rows)} == {
+        "USTB",
+        "OUSG",
+    }
+
+
+def test_treasuries_uses_symbol_probe_when_typed_filters_empty() -> None:
+    client = _SymbolOnlyTreasuryClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    ustb = next(opt for opt in rows if opt.symbol == "USTB")
+    ousg = next(opt for opt in rows if opt.symbol == "OUSG")
+    assert ustb.asset_type == "etf"
+    assert ousg.asset_type == ""
+    assert client.calls["assets_list_all"] == 0
+    query = "government_security"
+    assert {opt.symbol for opt in search_tickers(query, rows)} == {"USTB", "OUSG"}
+
+
+def test_treasuries_keeps_mixed_etf_and_untyped_rows() -> None:
+    client = _MixedLiveTypeTreasuryClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert "NVDA" not in {opt.symbol for opt in rows}
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+
+
+def test_app_treasuries_pill_lists_etf_labeled_cmc_rows() -> None:
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+
+    client = _EtfLabeledTreasuryClient()
+    scorer = TransparencyScorer(client)
+    query = demo_app.chip_query(CATEGORY_BY_ID["government_security"])
+    catalog = demo_app._ticker_catalog(scorer, query=query)
+    hits = demo_app.search_tickers(query, catalog)
+    assert {opt.symbol for opt in hits} >= {"USTB", "OUSG"}
+    assert "SPY" not in {opt.symbol for opt in hits}
+    assert "NVDA" not in {opt.symbol for opt in hits}
     assert client.calls["assets_list_all"] == 0
 
 

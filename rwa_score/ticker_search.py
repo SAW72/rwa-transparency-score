@@ -142,6 +142,31 @@ CATEGORIES: tuple[Category, ...] = (
 RWA_CLASS_IDS = tuple(cat.id for cat in RWA_CLASS_CATEGORIES)
 INDUSTRY_IDS = tuple(cat.id for cat in INDUSTRY_CATEGORIES)
 CRYPTO_ID = CRYPTO_CATEGORY.id
+TREASURY_CLASS = "government_security"
+# Live CMC crypto map (keyless, 2026-09-19) lists these as tokenized T-bill /
+# T-bond tokens. Used only as ``map?symbol=`` probes (0 credits). Never
+# injected when CMC RWA returns no row.
+TREASURY_PROBE_SYMBOLS = ("USTB", "OUSG")
+_TREASURY_PHRASES = (
+    "treasury bill",
+    "treasury bills",
+    "treasuries",
+    "t-bill",
+    "t-bills",
+    "tbill",
+    "tbills",
+    "government security",
+    "government securities",
+    "government bond",
+    "government bonds",
+    "us treasury",
+    "u.s. treasury",
+    "u.s. government securities",
+    "us government securities",
+    "tokenized treasury",
+    "short-term us government",
+    "short term us government",
+)
 
 CATEGORY_BY_ID = {cat.id: cat for cat in CATEGORIES}
 CATEGORY_LABELS = {cat.id: cat.label for cat in CATEGORIES}
@@ -316,6 +341,66 @@ def is_native_crypto(
     return any(token in hay.split() for token in ("bitcoin", "ethereum"))
 
 
+def _treasury_haystack(
+    *,
+    symbol: str = "",
+    name: str = "",
+    industry: str = "",
+    aliases: Sequence[str] = (),
+    slug: str = "",
+) -> str:
+    return " ".join(
+        str(part) for part in (symbol, name, industry, slug, *aliases) if part
+    ).lower()
+
+
+def is_treasury_like(
+    *,
+    symbol: str = "",
+    name: str = "",
+    industry: str = "",
+    aliases: Sequence[str] = (),
+    slug: str = "",
+    asset_type: str = "",
+) -> bool:
+    """True when a CMC-returned row is a treasury-like RWA.
+
+    Official ``government_security`` (and aliases) count. So do live rows
+    CMC labels ``etf`` / omits / uses another enum when the symbol is a
+    known treasury probe or the name says T-bill / government security.
+    Does not invent a ticker — the row must already exist.
+    """
+    if canonical_asset_type(asset_type) == TREASURY_CLASS:
+        return True
+    if (symbol or "").strip().upper() in TREASURY_PROBE_SYMBOLS:
+        return True
+    hay = _treasury_haystack(
+        symbol=symbol, name=name, industry=industry, aliases=aliases, slug=slug
+    )
+    return any(phrase in hay for phrase in _TREASURY_PHRASES)
+
+
+def _row_is_treasury_like(row: dict[str, Any] | TickerOption) -> bool:
+    if isinstance(row, TickerOption):
+        return is_treasury_like(
+            symbol=row.symbol,
+            name=row.name,
+            industry=row.industry,
+            aliases=row.aliases,
+            asset_type=row.asset_type,
+        )
+    if not isinstance(row, dict):
+        return False
+    return is_treasury_like(
+        symbol=str(row.get("symbol") or ""),
+        name=str(row.get("name") or ""),
+        industry=str(row.get("industry") or ""),
+        aliases=_iter_aliases(row),
+        slug=str(row.get("slug") or ""),
+        asset_type=str(row.get("asset_type") or ""),
+    )
+
+
 def classify_categories(
     *,
     symbol: str = "",
@@ -328,6 +413,8 @@ def classify_categories(
 
     CMC ``asset_type`` is the RWA class. Industry chips use industry / name
     hints only — they do not invent tickers. BTC/ETH never join an RWA class.
+    Treasury-like names still browse under Treasuries when CMC labeled the
+    row ``etf`` or omitted ``asset_type`` (same pattern as tokenized REITs).
     """
     if is_native_crypto(symbol=symbol, name=name, asset_type=asset_type):
         return (CRYPTO_ID,)
@@ -351,6 +438,14 @@ def classify_categories(
             hits.append("real_estate")
         elif any(_exact_hint_hits(hint, industry_hay) for hint in re_cat.name_hints):
             hits.append("real_estate")
+    if TREASURY_CLASS not in hits and is_treasury_like(
+        symbol=symbol,
+        name=name,
+        industry=industry,
+        aliases=aliases,
+        asset_type=asset_type,
+    ):
+        hits.append(TREASURY_CLASS)
     return tuple(hits)
 
 
@@ -742,7 +837,9 @@ def classes_for_query(query: str) -> tuple[str, ...]:
 def _option_in_class(opt: TickerOption, kind: str) -> bool:
     if _row_asset_type(opt) == kind:
         return True
-    return kind in opt.categories
+    if kind in opt.categories:
+        return True
+    return kind == TREASURY_CLASS and _row_is_treasury_like(opt)
 
 
 def _stamp_typed_rows(
@@ -750,18 +847,114 @@ def _stamp_typed_rows(
 ) -> list[dict[str, Any]]:
     """Inherit the requested class when a typed CMC page omitted ``asset_type``.
 
-    Do not stamp when any row already has a *different* official type — that
-    is the stock-scoped / filter-ignored listing (#42 live Treasuries miss).
+    Homogeneous typed pages stamp every untyped row. Mixed / stock-scoped
+    pages must not relabel stocks as Treasuries — only untyped treasury-like
+    rows inherit ``government_security``.
     """
     items = [dict(row) for row in rows or [] if isinstance(row, dict)]
     seen = {_row_asset_type(row) for row in items}
     seen.discard("")
-    if seen and seen != {kind}:
-        return items
+    homogeneous = (not seen) or seen == {kind}
     for item in items:
-        if not _row_asset_type(item):
+        if _row_asset_type(item):
+            continue
+        if homogeneous:
+            item["asset_type"] = kind
+        elif kind == TREASURY_CLASS and _row_is_treasury_like(item):
             item["asset_type"] = kind
     return items
+
+
+def _promote_treasury_options(options: Sequence[TickerOption]) -> list[TickerOption]:
+    """Ensure Treasuries Matches can see CMC-listed treasury-like rows."""
+    out: list[TickerOption] = []
+    for opt in options:
+        if TREASURY_CLASS in opt.categories:
+            out.append(opt)
+            continue
+        out.append(
+            replace(
+                opt,
+                categories=tuple(dict.fromkeys((TREASURY_CLASS, *opt.categories))),
+            )
+        )
+    return out
+
+
+def _treasury_options_from_rows(
+    client: Any,
+    rows: Sequence[dict[str, Any]] | None,
+    *,
+    require_like: bool,
+) -> list[TickerOption]:
+    info = _fixture_info_by_id(client, rows or [])
+    options = catalog_from_rwa_map(rows, info_by_id=info)
+    if require_like:
+        options = [opt for opt in options if _row_is_treasury_like(opt)]
+    return _promote_treasury_options(options)
+
+
+def _recover_treasury_catalog(
+    client: Any,
+    *,
+    first_page_only: bool,
+) -> list[TickerOption]:
+    """Find CMC-listed treasuries when ``government_security`` pages are empty.
+
+    Live CMC may label USTB / OUSG ``etf``, omit ``asset_type`` on map, or
+    ignore the official filter on both ``map`` and ``assets/list``. Probe
+    ``map?symbol=`` (0 credits; docs: symbol ignores other filters), then one
+    ``etf`` map page, then one unfiltered map page, then one ``assets/list``
+    page. Never ``assets_list_all``. Never invent a ticker.
+    """
+    try:
+        probed = _safe_rwa_map(client, ",".join(TREASURY_PROBE_SYMBOLS))
+    except Exception:  # noqa: BLE001
+        probed = []
+    options = _treasury_options_from_rows(client, probed, require_like=False)
+    if options:
+        return options
+
+    try:
+        if first_page_only:
+            etf_rows = _safe_rwa_map(
+                client, asset_type="etf", start=1, limit=CLASS_PAGE_LIMIT
+            )
+        else:
+            etf_rows = _safe_rwa_map(client, asset_type="etf")
+    except Exception:  # noqa: BLE001
+        etf_rows = []
+    options = _treasury_options_from_rows(client, etf_rows, require_like=True)
+    if options:
+        return options
+
+    try:
+        if first_page_only:
+            raw_rows = _safe_rwa_map(client, start=1, limit=CLASS_PAGE_LIMIT)
+        else:
+            raw_rows = _safe_rwa_map(client)
+    except Exception:  # noqa: BLE001
+        raw_rows = []
+    options = _treasury_options_from_rows(client, raw_rows, require_like=True)
+    if options:
+        return options
+
+    try:
+        listed = _fetch_assets_list_page(client, "etf")
+    except Exception:  # noqa: BLE001
+        listed = []
+    matched = _promote_treasury_options(
+        [opt for opt in listed if _row_is_treasury_like(opt)]
+    )
+    if matched:
+        return matched
+    try:
+        listed = _fetch_assets_list_page(client, None)
+    except Exception:  # noqa: BLE001
+        return []
+    return _promote_treasury_options(
+        [opt for opt in listed if _row_is_treasury_like(opt)]
+    )
 
 
 def _options_for_class(
@@ -828,8 +1021,13 @@ def load_class_catalog(
         else:
             listed = _fetch_assets_list_options(client, kind)
     except Exception:  # noqa: BLE001
-        return []
-    return _listed_for_class(listed, kind)
+        listed = []
+    matched = _listed_for_class(listed, kind)
+    if matched:
+        return matched
+    if kind == TREASURY_CLASS:
+        return _recover_treasury_catalog(client, first_page_only=first_page_only)
+    return []
 
 
 def cached_class_catalog(
