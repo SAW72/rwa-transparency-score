@@ -13,6 +13,7 @@ from rwa_score.client import (
     ENDPOINT_ASSETS_LIST,
     ENDPOINT_MAP,
     FixtureClient,
+    canonical_asset_type,
     create_client,
     directory_has_more,
     env_flag,
@@ -438,6 +439,28 @@ def test_parse_rwa_map_payload_paginates() -> None:
     empty = parse_rwa_map_payload(None)
     assert empty["rwa_assets"] == []
     assert empty["has_more"] is False
+
+
+def test_canonical_asset_type_maps_treasury_aliases() -> None:
+    assert canonical_asset_type("government_security") == "government_security"
+    assert canonical_asset_type("Government Security") == "government_security"
+    assert canonical_asset_type("treasury") == "government_security"
+    assert canonical_asset_type("treasuries") == "government_security"
+    assert canonical_asset_type("fixed income") == "government_security"
+    assert canonical_asset_type("stock") == "stock"
+    assert canonical_asset_type("not-a-class") == ""
+    parsed = parse_rwa_map_payload(
+        {
+            "rwa_assets": [
+                {"symbol": "USTB", "rwa_id": 30, "asset_type": "treasury"},
+                {"symbol": "OUSG", "rwa_id": 31, "assetType": "Government Security"},
+            ]
+        }
+    )
+    assert [row["asset_type"] for row in parsed["rwa_assets"]] == [
+        "government_security",
+        "government_security",
+    ]
 
 
 def test_directory_has_more_uses_total_size_when_flag_omitted() -> None:

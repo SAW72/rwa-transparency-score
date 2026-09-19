@@ -32,7 +32,7 @@ from .chainlink_por import (
     PorFeed,
     canonical_backed_por_feed,
 )
-from .client import ASSET_TYPE_LABELS, ASSET_TYPES
+from .client import ASSET_TYPE_LABELS, ASSET_TYPES, canonical_asset_type
 
 SEARCH_MIN_CHARS = 3
 CATEGORY_MIN_CHARS = 2
@@ -309,7 +309,7 @@ def is_native_crypto(
     sym = (symbol or "").strip().upper()
     if sym in NATIVE_CRYPTO_SYMBOLS:
         return True
-    kind = (asset_type or "").strip().lower()
+    kind = canonical_asset_type(asset_type)
     if kind in ASSET_TYPES:
         return False
     hay = f"{name} {symbol}".lower()
@@ -332,7 +332,7 @@ def classify_categories(
     if is_native_crypto(symbol=symbol, name=name, asset_type=asset_type):
         return (CRYPTO_ID,)
     hits: list[str] = []
-    kind = (asset_type or "").strip().lower()
+    kind = canonical_asset_type(asset_type)
     if kind in ASSET_TYPES:
         hits.append(kind)
     industry_hay = " ".join(
@@ -417,7 +417,8 @@ def catalog_from_rwa_map(
         except (TypeError, ValueError):
             info = None
         industry = _row_industry(row, info)
-        asset_type = str(row.get("asset_type") or (info or {}).get("asset_type") or "").strip()
+        raw_type = row.get("asset_type") or (info or {}).get("asset_type") or ""
+        asset_type = canonical_asset_type(raw_type) or str(raw_type).strip()
         raw_rank = row.get("rwa_rank")
         if raw_rank is None and info:
             raw_rank = info.get("rwa_rank")
@@ -565,8 +566,8 @@ def enrich_catalog_from_assets_list(
 
 def _row_asset_type(row: dict[str, Any] | TickerOption) -> str:
     if isinstance(row, TickerOption):
-        return (row.asset_type or "").strip().lower()
-    return str(row.get("asset_type") or "").strip().lower()
+        return canonical_asset_type(row.asset_type)
+    return canonical_asset_type(row.get("asset_type"))
 
 
 def present_asset_types(rows: Sequence[Any]) -> set[str]:
@@ -738,6 +739,60 @@ def classes_for_query(query: str) -> tuple[str, ...]:
     return ("stock",)
 
 
+def _option_in_class(opt: TickerOption, kind: str) -> bool:
+    if _row_asset_type(opt) == kind:
+        return True
+    return kind in opt.categories
+
+
+def _stamp_typed_rows(
+    rows: Sequence[dict[str, Any]] | None, kind: str
+) -> list[dict[str, Any]]:
+    """Inherit the requested class when a typed CMC page omitted ``asset_type``.
+
+    Do not stamp when any row already has a *different* official type — that
+    is the stock-scoped / filter-ignored listing (#42 live Treasuries miss).
+    """
+    items = [dict(row) for row in rows or [] if isinstance(row, dict)]
+    seen = {_row_asset_type(row) for row in items}
+    seen.discard("")
+    if seen and seen != {kind}:
+        return items
+    for item in items:
+        if not _row_asset_type(item):
+            item["asset_type"] = kind
+    return items
+
+
+def _options_for_class(
+    client: Any,
+    rows: Sequence[dict[str, Any]] | None,
+    kind: str,
+) -> list[TickerOption]:
+    stamped = _stamp_typed_rows(rows, kind)
+    if not stamped:
+        return []
+    info = _fixture_info_by_id(client, stamped)
+    options = catalog_from_rwa_map(stamped, info_by_id=info)
+    return [opt for opt in options if _option_in_class(opt, kind)]
+
+
+def _listed_for_class(options: Sequence[TickerOption], kind: str) -> list[TickerOption]:
+    matched = [opt for opt in options if _option_in_class(opt, kind)]
+    if matched:
+        return matched
+    if options and not any(_row_asset_type(opt) for opt in options):
+        return [
+            replace(
+                opt,
+                asset_type=kind,
+                categories=tuple(dict.fromkeys((kind, *opt.categories))),
+            )
+            for opt in options
+        ]
+    return []
+
+
 def load_class_catalog(
     client: Any,
     asset_type: str,
@@ -746,11 +801,12 @@ def load_class_catalog(
 ) -> list[TickerOption]:
     """Load one official CMC ``asset_type``.
 
-    Prefers typed ``map`` (0 credits). ``assets/list`` is only the fallback
-    when that class is missing from map — never a dual full-book walk.
-    Search uses ``first_page_only=True`` (one page, enough for Matches).
+    Prefers typed ``map`` (0 credits). ``assets/list`` is the fallback when
+    that class is missing from the map page — empty, untyped, or a
+    stock-scoped page that ignored ``asset_type``. Never a dual full-book
+    walk. Search uses ``first_page_only=True`` (one page, enough for Matches).
     """
-    kind = (asset_type or "").strip().lower()
+    kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
     if kind not in ASSET_TYPES:
         return []
     rows: list[dict[str, Any]] = []
@@ -763,18 +819,17 @@ def load_class_catalog(
             rows = _safe_rwa_map(client, asset_type=kind)
     except Exception:  # noqa: BLE001 — one class must not take down Search
         rows = []
-    options: list[TickerOption] = []
-    if rows:
-        info = _fixture_info_by_id(client, rows)
-        options = catalog_from_rwa_map(rows, info_by_id=info)
+    options = _options_for_class(client, rows, kind)
     if options:
         return options
     try:
         if first_page_only:
-            return _fetch_assets_list_page(client, kind)
-        return _fetch_assets_list_options(client, kind)
+            listed = _fetch_assets_list_page(client, kind)
+        else:
+            listed = _fetch_assets_list_options(client, kind)
     except Exception:  # noqa: BLE001
         return []
+    return _listed_for_class(listed, kind)
 
 
 def cached_class_catalog(
@@ -784,7 +839,7 @@ def cached_class_catalog(
     first_page_only: bool = True,
 ) -> list[TickerOption]:
     """Return a memoized class shard for this client instance."""
-    kind = (asset_type or "").strip().lower()
+    kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
     key = (id(client), kind, bool(first_page_only))
     hit = _CLASS_CATALOG_MEMO.get(key)
     if hit is not None:
@@ -901,7 +956,11 @@ def prefix_matches(query: str, option: TickerOption) -> bool:
 
 def category_matches(query: str, option: TickerOption) -> bool:
     wanted = set(resolve_categories(query))
-    return bool(wanted) and bool(wanted.intersection(option.categories))
+    have = set(option.categories)
+    kind = canonical_asset_type(option.asset_type)
+    if kind:
+        have.add(kind)
+    return bool(wanted) and bool(wanted.intersection(have))
 
 
 def _rank(option: TickerOption, query: str) -> tuple[int, int, int, int, int, int, int, str]:

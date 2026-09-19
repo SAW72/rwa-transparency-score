@@ -72,6 +72,48 @@ ASSET_TYPE_LABELS = {
     "etf": "ETFs",
     "real_estate": "Real Estate",
 }
+
+# Live CMC sometimes returns a display alias instead of the official enum
+# (``treasury``, ``Government Security``). Request params stay on ASSET_TYPES.
+_ASSET_TYPE_ALIASES = {
+    "government_security": "government_security",
+    "government_securities": "government_security",
+    "govt_security": "government_security",
+    "govt_securities": "government_security",
+    "treasury": "government_security",
+    "treasuries": "government_security",
+    "us_treasury": "government_security",
+    "us_treasuries": "government_security",
+    "fixed_income": "government_security",
+    "tbill": "government_security",
+    "t_bill": "government_security",
+    "t_bills": "government_security",
+    "stocks": "stock",
+    "equity": "stock",
+    "equities": "stock",
+    "commodities": "commodity",
+    "currencies": "currency",
+    "etfs": "etf",
+    "realestate": "real_estate",
+}
+
+
+def canonical_asset_type(raw: Any) -> str:
+    """Map a CMC / display ``asset_type`` string to the official enum.
+
+    Unknown values return ``""`` — callers must not invent a class. Request
+    params sent to CMC must stay on ``ASSET_TYPES`` (``government_security``).
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    if text in ASSET_TYPES:
+        return text
+    collapsed = "".join(ch if ch.isalnum() else "_" for ch in text)
+    collapsed = "_".join(part for part in collapsed.split("_") if part)
+    if collapsed in ASSET_TYPES:
+        return collapsed
+    return _ASSET_TYPE_ALIASES.get(collapsed, "")
 ENDPOINT_MAP = "/v5/real-world-assets/map"
 ENDPOINT_INFO = "/v5/real-world-assets/info"
 ENDPOINT_ISSUERS_LIST = "/v5/real-world-assets/issuers/list"
@@ -278,6 +320,14 @@ def parse_rwa_quotes_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _directory_asset_type(row: dict[str, Any]) -> str:
+    """Official CMC class from a map / list row. Empty when unknown."""
+    raw = row.get("asset_type")
+    if raw in (None, ""):
+        raw = row.get("assetType")
+    return canonical_asset_type(raw)
+
+
 def _normalize_directory_row(row: dict[str, Any]) -> dict[str, Any]:
     """Shared map / assets/list fields used by the search directory."""
     return {
@@ -285,7 +335,7 @@ def _normalize_directory_row(row: dict[str, Any]) -> dict[str, Any]:
         "symbol": (row.get("symbol") or "").upper(),
         "slug": row.get("slug") or "",
         "rwa_id": _optional_int(row.get("rwa_id")),
-        "asset_type": (row.get("asset_type") or "").strip(),
+        "asset_type": _directory_asset_type(row),
         "rwa_rank": _optional_int(row.get("rwa_rank")),
         "has_tokens": bool(row.get("has_tokens")),
         "industry": (row.get("industry") or "").strip(),
