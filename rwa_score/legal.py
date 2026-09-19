@@ -1,9 +1,10 @@
 """Publish-ready Privacy Policy and Terms of Service for the Streamlit demo.
 
-``PRIVACY.md`` / ``TERMS.md`` are the source of truth. Streamlit pages render
-them in-app; Tornado handlers (installed with ``/health``) serve the same
-bodies as HTML at ``GET /privacy`` and ``GET /terms`` so crawlers and
-``curl`` see the text (Streamlit's SPA shell does not).
+``PRIVACY.md`` / ``TERMS.md`` are the source of truth. Tornado handlers
+(installed with ``/health``) serve them as HTML at ``GET /privacy`` and
+``GET /terms`` so crawlers and ``curl`` see the text (Streamlit's SPA
+shell does not). There is no ``pages/`` tree — that would enable MPA v1
+and let Share/media/component URLs surface as **Page not found**.
 """
 
 from __future__ import annotations

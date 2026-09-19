@@ -908,7 +908,11 @@ def selected_slot_contrast_line(ticker: str, diff: dict | None) -> str:
 
 
 def _maybe_rerun() -> None:
-    """Rerun only inside a live Streamlit script (no-op in unit tests)."""
+    """Rerun only inside a live Streamlit script (no-op in unit tests).
+
+    Search place-into-slot only. Share click / preview / download must never
+    call this — ``st.rerun()`` after Share is an MPA Page-not-found trigger.
+    """
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
     except Exception:  # noqa: BLE001
@@ -949,7 +953,7 @@ def share_session_keys(slot_index: int, ticker: str) -> tuple[str, str]:
 
 
 def share_card_preview_html(png_bytes: bytes, filename: str) -> str:
-    """Self-contained PNG preview + download. No Streamlit media/download URLs."""
+    """Self-contained PNG preview + download. No Streamlit media/component URLs."""
     b64 = base64.b64encode(png_bytes).decode("ascii")
     safe_name = html.escape(filename or "rat-score.png", quote=True)
     return (
@@ -963,18 +967,20 @@ def share_card_preview_html(png_bytes: bytes, filename: str) -> str:
 
 
 def _show_share_png(png_bytes: bytes, filename: str = "rat-score.png") -> None:
-    """Preview + download via data URIs so MPA v1 does not treat them as pages.
+    """Preview + download as markdown data URIs — never a Streamlit media route.
 
     ``st.image`` / ``st.download_button`` register ``/media`` and
-    ``/_stcore/download`` URLs. With ``pages/`` present, Streamlit's router
-    can surface those as **Page not found** / “Running the app's main page”
-    on the Share click rerun — the live Render break.
+    ``/_stcore/download``. ``components.html`` is an iframe proto (srcdoc /
+    ``stIFrame``). Streamlit 1.39 MPA v1 (any ``pages/`` tree) treats those
+    mounts as unknown pages and shows **Page not found** on the Share click
+    rerun — the residual live fail after #36. Markdown HTML stays inline
+    (no iframe, no media endpoint, no ``st.rerun()``). ``pages/`` is also
+    gone so the MPA router is off.
     """
     try:
-        components.html(
+        st.markdown(
             share_card_preview_html(png_bytes, filename),
-            height=460,
-            scrolling=False,
+            unsafe_allow_html=True,
         )
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not preview score card: {exc}")
@@ -1014,7 +1020,12 @@ def search_typeahead_script(debounce_ms: int = SEARCH_TYPEAHEAD_DEBOUNCE_MS) -> 
 
 
 def _install_search_typeahead() -> None:
-    """Bridge Streamlit's Enter/blur-only text_input to live-as-you-type search."""
+    """Bridge Streamlit's Enter/blur-only text_input to live-as-you-type search.
+
+    This 1px iframe is the only ``components.html`` in the app. Share preview
+    must not use it — mounting a ``/component`` iframe on the Share click
+    rerun is the residual MPA **Page not found** after #36.
+    """
     components.html(
         f"<script>{search_typeahead_script()}</script>",
         height=1,
@@ -1114,8 +1125,9 @@ def chip_display_label(label: str) -> str:
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
     """User-triggered signed PNG + optional X post. Never runs on page load.
 
-    PNG is stored first. Preview/download use data URIs (not ``st.image`` /
-    ``st.download_button``) so MPA v1 does not treat media routes as pages.
+    PNG is stored first. Preview/download use ``st.markdown`` data URIs
+    (not ``st.image`` / ``st.download_button`` / ``components.html``) so no
+    ``/media``, ``/_stcore/download``, or ``/component`` URL is registered.
     Do not ``st.rerun()`` after the click — that also trips Page not found.
     """
     ticker = str(report.get("ticker") or "UNK")
@@ -1422,7 +1434,9 @@ st.markdown(
       [data-baseweb="menu"] {{
         z-index: 1000 !important;
       }}
-      /* Typeahead bridge is a 1px iframe — keep JS alive, no layout gap. */
+      /* Typeahead bridge is a 1px iframe — keep JS alive, no layout gap.
+         Search-only; Share preview is markdown (no iframe) so a Share click
+         cannot mount /component and trip MPA Page not found. */
       div[data-testid="stIFrame"]:has(iframe[height="1"]),
       iframe[height="1"] {{
         height: 1px !important;
@@ -1435,6 +1449,16 @@ st.markdown(
         width: 1px !important;
         opacity: 0 !important;
         pointer-events: none !important;
+      }}
+      /* Share PNG preview (markdown data URI — not st.image / components.html). */
+      .rat-share-card img {{
+        width: 100%;
+        height: auto;
+        border-radius: 8px;
+        display: block;
+      }}
+      .rat-share-card p {{
+        margin: 0.65rem 0 0;
       }}
       /* Score-band pill — stronger than metric-delta text. */
       .rat-band-chip {{

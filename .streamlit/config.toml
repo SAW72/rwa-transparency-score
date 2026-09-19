@@ -5,8 +5,9 @@ enableXsrfProtection = true
 # `streamlit run app.py` leaves cold-start GET /health as Streamlit SPA HTML.
 
 [client]
-# Privacy / Terms stay reachable via sidebar + footer links (and /privacy, /terms).
-# The auto multipage list was extra chrome on top of those links.
+# Privacy / Terms are Tornado HTML at /privacy and /terms (health launcher).
+# Do not add a pages/ directory — that forces Streamlit MPA v1, which treats
+# /component, /media, and /_stcore/download as unknown pages (Share FAIL).
 showSidebarNavigation = false
 
 [theme]

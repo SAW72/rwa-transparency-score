@@ -1,4 +1,4 @@
-"""Publish-ready Privacy Policy and Terms of Service (pages + HTML routes)."""
+"""Publish-ready Privacy Policy and Terms of Service (Tornado HTML routes)."""
 
 from __future__ import annotations
 
@@ -56,17 +56,22 @@ def test_legal_html_serves_policy_body() -> None:
         assert "<ul>" in html_body
 
 
-def test_streamlit_legal_pages_exist_and_render_source() -> None:
-    for slug in LEGAL_SLUGS:
-        page = ROOT / "pages" / f"{slug}.py"
-        source = page.read_text(encoding="utf-8")
-        assert page.is_file()
-        assert f'legal_markdown("{slug}")' in source
-        assert "st.markdown" in source
-        assert "/privacy" in source
-        assert "/terms" in source
-        assert CONTACT_EMAIL in source or "CONTACT_EMAIL" in source
-        assert "Disclaimer" in source
+def test_streamlit_mpa_pages_dir_absent() -> None:
+    """No pages/ tree — Streamlit 1.39 MPA v1 is what showed Page not found on Share."""
+    pages = ROOT / "pages"
+    assert not pages.exists()
+    leftover = list(ROOT.glob("pages/*.py"))
+    assert leftover == []
+
+
+def test_legal_is_tornado_not_streamlit_mpa() -> None:
+    health = (ROOT / "rwa_score" / "health.py").read_text(encoding="utf-8")
+    legal = (ROOT / "rwa_score" / "legal.py").read_text(encoding="utf-8")
+    assert "attach_legal_handlers" in health
+    assert "_legal_handler_class" in legal
+    assert 'r"/privacy/?"' in legal
+    assert 'r"/terms/?"' in legal
+    assert "pages/" not in legal or "no ``pages/``" in legal
 
 
 def test_app_sidebar_and_footer_link_legal_pages() -> None:
