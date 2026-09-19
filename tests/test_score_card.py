@@ -9,7 +9,11 @@ from typing import Any
 
 import pytest
 
-from rwa_score.x_client import X_POST_UNAVAILABLE_MESSAGE, user_facing_x_skip_message
+from rwa_score.x_client import (
+    MISSING_CREDS_MESSAGE,
+    X_POST_UNAVAILABLE_MESSAGE,
+    user_facing_x_skip_message,
+)
 from rwa_score.score_card import (
     CARD_HEIGHT,
     CARD_WIDTH,
@@ -209,7 +213,8 @@ def test_share_skips_x_without_network(monkeypatch: pytest.MonkeyPatch) -> None:
     assert card.png_bytes.startswith(b"\x89PNG")
     assert card.signed
     assert card.x_posted is False
-    assert "X post skipped" in card.x_message
+    assert card.x_message == MISSING_CREDS_MESSAGE
+    assert card.x_message != X_POST_UNAVAILABLE_MESSAGE
 
 
 def test_share_uses_injected_x_client() -> None:
@@ -340,6 +345,8 @@ def test_readme_documents_share_and_secrets() -> None:
     assert "does **not** run on page load" in text
     assert "polished skip message" in text
     assert "never raw X API" in text
+    assert "python -m rwa_score.share" in text
+    assert "missing credentials" in text.lower() or "X credentials" in text
     assert "Not financial advice" in text
     assert "MIT" in text
     assert "not a hunter or auto-poster" in text
