@@ -10,12 +10,17 @@ from rwa_score.ticker_search import (
     BACKED_SEARCH_SOURCE,
     CATEGORIES,
     CATEGORY_DOC,
+    CRYPTO_ID,
+    NATIVE_CRYPTO_SYMBOLS,
+    RWA_CLASS_CATEGORIES,
+    RWA_CLASS_IDS,
     SEARCH_MIN_CHARS,
     TickerOption,
     catalog_from_por_feeds,
     catalog_from_rwa_map,
     classify_categories,
     format_option,
+    is_native_crypto,
     load_search_catalog,
     merge_search_catalog,
     normalize_ticker,
@@ -155,11 +160,15 @@ def test_live_directory_is_whatever_rwa_map_already_loads() -> None:
 
 def test_readme_documents_search_categories() -> None:
     text = Path("README.md").read_text(encoding="utf-8")
-    assert "| AI/Tech |" in text
-    assert "| Oil/Energy |" in text
+    assert "| Stocks |" in text
+    assert "| Commodities |" in text
+    assert "| Treasuries |" in text
+    assert "| ETFs |" in text
     assert "| Real Estate |" in text
-    assert "`oil`" in text or "oil" in text
-    assert "real estate" in text.lower()
+    assert "| Currencies |" in text
+    assert "`stock`" in text
+    assert "government_security" in text
+    assert "docs/CMC_RWA_COVERAGE.md" in text
     assert "bNVDA" in text
     assert "BACKED_POR_FEEDS" in text
     assert "first-class Matches" in text or "first-class" in text
@@ -167,15 +176,21 @@ def test_readme_documents_search_categories() -> None:
 
 def test_category_taxonomy_is_documented() -> None:
     labels = {cat.label for cat in CATEGORIES}
-    assert {"AI/Tech", "Oil/Energy", "Real Estate", "Auto/EV", "Finance"} <= labels
+    assert {"Stocks", "Commodities", "Treasuries", "ETFs", "Real Estate", "Currencies"} <= labels
+    assert {"AI/Tech", "Oil/Energy", "Auto/EV", "Finance"} <= labels
+    assert "Crypto / Digital Assets" in labels
+    assert tuple(cat.id for cat in RWA_CLASS_CATEGORIES) == RWA_CLASS_IDS
     assert "oil" in CATEGORY_DOC.lower()
     assert "real estate" in CATEGORY_DOC.lower()
     assert "ai/tech" in CATEGORY_DOC.lower()
+    assert "government_security" in CATEGORY_DOC.lower()
     assert resolve_categories("AI") == ("ai_tech",)
     assert resolve_categories("oil") == ("oil_energy",)
     assert resolve_categories("real estate") == ("real_estate",)
     assert resolve_categories("ENERGY") == ("oil_energy",)
     assert resolve_categories("reit") == ("real_estate",)
+    assert resolve_categories("stock") == ("stock",)
+    assert resolve_categories("treasury") == ("government_security",)
     assert resolve_categories("ni") == ()
 
 
@@ -188,6 +203,12 @@ def test_fixture_industries_map_to_categories() -> None:
     assert "auto_ev" in by_symbol["TSLA"].categories
     assert "oil_energy" in by_symbol["XOM"].categories
     assert "real_estate" in by_symbol["PLD"].categories
+    assert "stock" in by_symbol["NVDA"].categories
+    assert "commodity" in by_symbol["GOLD"].categories
+    assert "government_security" in by_symbol["USTB"].categories
+    assert "etf" in by_symbol["SPY"].categories
+    assert "currency" in by_symbol["EUR"].categories
+    assert "real_estate" in by_symbol["HOME"].categories
     assert by_symbol["XOM"].industry.lower().startswith("petroleum")
     assert "real estate" in by_symbol["PLD"].industry.lower()
 
@@ -195,22 +216,33 @@ def test_fixture_industries_map_to_categories() -> None:
 def test_category_search_lists_matching_tickers() -> None:
     catalog = _fixture_catalog()
     assert {opt.symbol for opt in search_tickers("AI", catalog)} == {"NVDA", "AAPL", "META"}
+    assert "GOLD" not in {opt.symbol for opt in search_tickers("AI", catalog)}
     assert [opt.symbol for opt in search_tickers("oil", catalog)] == ["XOM"]
-    assert [opt.symbol for opt in search_tickers("real estate", catalog)] == ["PLD"]
+    assert {opt.symbol for opt in search_tickers("real estate", catalog)} == {"HOME", "PLD"}
     assert [opt.symbol for opt in search_tickers("auto", catalog)] == ["TSLA"]
     assert search_tickers("finance", catalog) == []
+    assert "GOLD" in {opt.symbol for opt in search_tickers("commodity", catalog)}
+    assert "USTB" in {opt.symbol for opt in search_tickers("treasury", catalog)}
     oil = search_tickers("oil", catalog)[0]
     assert "Oil/Energy" in format_option(oil)
     assert "XOM — " in format_option(oil)
     assert resolve_assign_symbol("oil", matches=[oil]) == "XOM"
-    assert resolve_assign_symbol("real estate", matches=search_tickers("real estate", catalog)) == "PLD"
+    estate = search_tickers("real estate", catalog)
+    assert {opt.symbol for opt in estate} == {"HOME", "PLD"}
+    assert resolve_assign_symbol("real estate", matches=estate) in {"HOME", "PLD"}
 
 
 def test_category_hits_can_be_scored_from_fixtures(fixture_scorer) -> None:
     import app as demo_app
 
     catalog = demo_app._ticker_catalog(fixture_scorer)
-    for query, symbol in (("oil", "XOM"), ("real estate", "PLD"), ("AI", "AAPL")):
+    for query, symbol in (
+        ("oil", "XOM"),
+        ("real estate", "PLD"),
+        ("AI", "AAPL"),
+        ("commodity", "GOLD"),
+        ("treasury", "USTB"),
+    ):
         hits = demo_app.search_tickers(query, catalog)
         assert symbol in {opt.symbol for opt in hits}
         report = demo_app._score_one(fixture_scorer, symbol)
@@ -283,15 +315,16 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert slots[1] == "XOM"
 
     picker = source.split("def _render_search_picker", 1)[1]
-    assert picker.index("_clear_search") < picker.index("cat_chip_")
-    assert picker.index("cat_chip_") < picker.index(
+    assert picker.index("_clear_search") < picker.index("rat-cat-row")
+    assert picker.index("rat-cat-pill") < picker.index(
         'placeholder="Ticker, name, or category"'
     )
     assert picker.index("st.selectbox") < picker.index("Choose a ticker")
     assert "search_match_pick" in source
     chip_block = picker.split("st.text_input", 1)[0]
-    assert "use_container_width=True" not in chip_block
-    assert "use_container_width=False" in chip_block
+    assert "rat-cat-row" in chip_block
+    assert "flex-direction: row" in source or "rat-cat-row" in source
+    assert "st.columns" not in chip_block
     assert "st.selectbox" in picker
     assert "index=None" in picker
     assert "_auto_place(picked)" in picker
@@ -306,7 +339,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     body = source.split('st.subheader("Score / Compare")', 1)[1]
     assert "_render_search_picker(catalog, use_fixtures)" in body
     assert "search_match_" not in body.split("_render_search_picker", 1)[0]
-    assert "cat_chip_" in source
+    assert "rat-cat-pill" in source
     assert "Ticker, name, or category" in source
     assert 'placeholder="Ticker, name, or category"' in source
     assert 'st.text_input(' in source
@@ -324,8 +357,8 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.chip_display_label("Oil/Energy") == "Oil / Energy"
     assert demo_app.chip_display_label("Auto/EV") == "Auto / EV"
     assert demo_app.chip_display_label("Real Estate") == "Real Estate"
-    assert demo_app.chip_query(CATEGORIES[0]) == "ai"
-    assert demo_app.chip_query(CATEGORIES[1]) == "oil"
+    assert demo_app.chip_query(RWA_CLASS_CATEGORIES[0]) == "stock"
+    assert demo_app.chip_query(RWA_CLASS_CATEGORIES[1]) == "commodity"
     assert "st.session_state.ticker_query = chip_query(cat)" in source
     assert 'st.session_state.ticker_query = ""' in source
     assert "_clear_search" in source
@@ -342,19 +375,16 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search_typeahead_script" in source
 
     shown = demo_app.browse_categories(catalog)
-    assert [cat.id for cat in shown] == [
-        "ai_tech",
-        "oil_energy",
-        "real_estate",
-        "auto_ev",
-        "type_stock",
-    ]
+    assert [cat.id for cat in shown][:6] == list(RWA_CLASS_IDS)
+    assert {"ai_tech", "oil_energy", "auto_ev"} <= {cat.id for cat in shown}
     finance_row = TickerOption(
         symbol="JPM", name="JPMorgan", categories=("finance",)
     )
     expanded = demo_app.browse_categories([*catalog, finance_row])
     assert "finance" in [cat.id for cat in expanded]
-    assert "type_stock" in [cat.id for cat in expanded]
+    assert "stock" in [cat.id for cat in expanded]
+    empty = demo_app.browse_categories([])
+    assert [cat.id for cat in empty] == list(RWA_CLASS_IDS)
 
     assert demo_app.next_place_index(["", "TSLA", "AAPL", "META"], 2) == 0
     assert demo_app.next_place_index(["NVDA", "", "AAPL", "META"], 0) == 1
@@ -382,7 +412,7 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
     assert "No directory matches — type a ticker or tap a category." in picker
     assert "len((query or \"\").strip()) >= SEARCH_MIN_CHARS" in picker
     assert "if matches:" in picker
-    assert "cat_chip_" not in picker.split("st.text_input", 1)[1].split("if matches", 1)[0]
+    assert "rat-cat-pill" not in picker.split("st.text_input", 1)[1].split("if matches", 1)[0]
 
     script = demo_app.search_typeahead_script()
     assert str(demo_app.SEARCH_TYPEAHEAD_DEBOUNCE_MS) in script
@@ -393,8 +423,8 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
     assert "height=1" in picker or 'height=1' in source
     assert "st.form" not in source
 
-    # Category chips still pre-fill Search with the documented keyword.
-    assert demo_app.chip_query(CATEGORIES[0]) == "ai"
+    # Category pills still pre-fill Search with the documented keyword.
+    assert demo_app.chip_query(RWA_CLASS_CATEGORIES[0]) == "stock"
     assert "st.session_state.ticker_query = chip_query(cat)" in source
 
 
@@ -642,3 +672,37 @@ def test_fixture_backed_symbol_scores_with_published_por_label(fixture_scorer) -
     tsla = fixture_scorer.score("TSLA")
     assert tsla["verification"]["reserves"]["source"] == "heuristic_fallback"
     assert not (tsla["verification"]["reserves"].get("meta") or {}).get("published_por_feed")
+
+
+def test_btc_eth_are_crypto_not_rwa() -> None:
+    assert NATIVE_CRYPTO_SYMBOLS == frozenset({"BTC", "ETH", "WBTC", "WETH"})
+    assert is_native_crypto(symbol="BTC")
+    assert is_native_crypto(symbol="eth")
+    assert classify_categories(symbol="BTC", name="Bitcoin") == (CRYPTO_ID,)
+    assert classify_categories(symbol="ETH", name="Ethereum") == (CRYPTO_ID,)
+    assert "stock" not in classify_categories(symbol="BTC", name="Bitcoin", asset_type="stock")
+    catalog = catalog_from_rwa_map(
+        [
+            {"symbol": "BTC", "name": "Bitcoin", "asset_type": "stock"},
+            {"symbol": "NVDA", "name": "Nvidia Corp", "asset_type": "stock"},
+        ]
+    )
+    by_symbol = {opt.symbol: opt for opt in catalog}
+    assert by_symbol["BTC"].categories == (CRYPTO_ID,)
+    assert "stock" in by_symbol["NVDA"].categories
+    assert CRYPTO_ID not in by_symbol["NVDA"].categories
+    hits = search_tickers("crypto", catalog)
+    assert [opt.symbol for opt in hits] == ["BTC"]
+
+
+def test_horizontal_category_pills_are_not_column_blocks() -> None:
+    import app as demo_app
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert ".rat-cat-row" in source
+    assert "flex-direction: row" in source
+    assert "flex-wrap: wrap" in source
+    assert "rat-cat-pill" in source
+    picker = source.split("def _render_search_picker", 1)[1]
+    assert 'class="rat-cat-row"' in picker
+    assert "cat_chip_" not in picker

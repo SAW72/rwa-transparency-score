@@ -103,10 +103,22 @@ class RecordingClient:
             }
         )
 
-    def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
+    def rwa_map(
+        self,
+        symbol: str | None = None,
+        *,
+        asset_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         self.calls["rwa_map"] += 1
         self._record(ENDPOINT_MAP)
-        return list(self.assets)
+        rows = list(self.assets)
+        kind = (asset_type or "").strip().lower()
+        if kind:
+            rows = [row for row in rows if (row.get("asset_type") or "").lower() == kind]
+        if symbol:
+            wanted = {part.strip().upper() for part in symbol.split(",") if part.strip()}
+            rows = [row for row in rows if (row.get("symbol") or "").upper() in wanted]
+        return rows
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         self.calls["rwa_info"] += 1
@@ -172,6 +184,17 @@ class RecordingClient:
         _ = (start, limit, sort, sort_dir)
         return parse_assets_list_payload(
             {"rwa_assets": rows, "total_size": len(rows), "has_more": False}
+        )
+
+    def assets_list_all(
+        self,
+        *,
+        asset_type: str | None = None,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]:
+        return self.assets_list(
+            asset_type=asset_type, start=1, limit=250, sort=sort, sort_dir=sort_dir
         )
 
     def market_pairs(

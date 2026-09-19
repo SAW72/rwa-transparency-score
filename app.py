@@ -40,6 +40,8 @@ from rwa_score.scorer import (
 )
 from rwa_score.ticker_search import (
     CATEGORIES,
+    CATEGORY_BY_ID,
+    RWA_CLASS_CATEGORIES,
     SEARCH_MIN_CHARS,
     TickerOption,
     format_option,
@@ -541,10 +543,15 @@ def place_search_match(
 
 
 def browse_categories(catalog: list[TickerOption]) -> tuple:
-    """Chips for buckets that exist on the CMC/fixture map. Grows when the map does."""
+    """CMC RWA classes always; industry / crypto chips only when the catalog has rows."""
     present = {cid for opt in catalog for cid in opt.categories}
-    shown = tuple(cat for cat in CATEGORIES if cat.id in present)
-    return shown or CATEGORIES
+    rwa = tuple(RWA_CLASS_CATEGORIES)
+    extra = tuple(
+        cat
+        for cat in CATEGORIES
+        if cat.id not in {c.id for c in rwa} and cat.id in present
+    )
+    return rwa + extra
 
 
 def chip_query(category) -> str:
@@ -1046,19 +1053,36 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         st.session_state["_clear_search"] = False
         st.session_state.ticker_query = ""
         st.session_state.pop(SEARCH_MATCH_KEY, None)
+        try:
+            del st.query_params["rwa_cat"]
+        except (KeyError, TypeError):
+            pass
 
     chip_cats = browse_categories(catalog)
-    n_chips = max(len(chip_cats), 1)
-    # Trailing spacer keeps chips content-sized / left-packed, not full-bleed.
-    chip_cols = st.columns([1] * n_chips + [max(n_chips + 2, 6)], gap="small")
-    for index, cat in enumerate(chip_cats):
-        with chip_cols[index]:
-            if st.button(
-                chip_display_label(cat.label),
-                key=f"cat_chip_{cat.id}",
-                use_container_width=False,
-            ):
-                st.session_state.ticker_query = chip_query(cat)
+    raw_cat = st.query_params.get("rwa_cat")
+    if raw_cat:
+        cid = raw_cat if isinstance(raw_cat, str) else str(raw_cat)
+        cat = CATEGORY_BY_ID.get(cid) or next(
+            (row for row in chip_cats if row.id == cid), None
+        )
+        if cat is not None:
+            st.session_state.ticker_query = chip_query(cat)
+        try:
+            del st.query_params["rwa_cat"]
+        except (KeyError, TypeError):
+            pass
+
+    pills = []
+    for cat in chip_cats:
+        label = html.escape(chip_display_label(cat.label))
+        cid = html.escape(cat.id)
+        pills.append(
+            f'<a class="rat-cat-pill" href="?rwa_cat={cid}" target="_self">{label}</a>'
+        )
+    st.markdown(
+        f'<div class="rat-cat-row" role="list">{"".join(pills)}</div>',
+        unsafe_allow_html=True,
+    )
 
     query = st.text_input(
         "Search",
@@ -1095,16 +1119,18 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         st.caption(
             "Fixture catalog: "
             + ", ".join(FIXTURE_TICKERS)
-            + " + XOM, PLD + Backed bTokens (bNVDA, bIB01, bCSPX, bC3M, bIBTA). "
-            "Prefix (NIV → NVDA / Nvidia, bNV → bNVDA) or a category "
-            "(oil, AI, real estate, auto), then choose a match."
+            + " + XOM, PLD, GOLD, USTB, SPY, EUR, HOME + Backed bTokens "
+            "(bNVDA, bIB01, bCSPX, bC3M, bIBTA). "
+            "Prefix (NIV → NVDA / Nvidia, bNV → bNVDA) or a CMC RWA class "
+            "(Stocks, Commodities, Treasuries, ETFs, Real Estate, Currencies), "
+            "then choose a match. Fixture mode is not live CMC."
         )
     else:
         st.caption(
-            "Live mode: cached CMC RWA map + ranked ``assets/list`` "
-            "(asset_type browse) plus published Backed bToken PoR symbols "
-            "(bNVDA, …). Prefix-match ticker/name or tap a category / type, "
-            "then choose a match."
+            "Live mode: paginated CMC RWA map + ``assets/list`` "
+            "(every official asset_type) plus published Backed bToken PoR symbols "
+            "(bNVDA, …). Prefix-match ticker/name or tap a CMC RWA class, "
+            "then choose a match. BTC/ETH are Crypto / Digital Assets, not RWA."
         )
 
 
@@ -1459,6 +1485,34 @@ st.markdown(
       }}
       .rat-share-card p {{
         margin: 0.65rem 0 0;
+      }}
+      /* CMC RWA classes — horizontal wrapping pills, not tall column blocks. */
+      .rat-cat-row {{
+        display: flex;
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.4rem;
+        margin: 0 0 0.55rem 0;
+        max-width: 100%;
+      }}
+      .rat-cat-pill {{
+        display: inline-flex;
+        align-items: center;
+        padding: 0.22rem 0.8rem;
+        border-radius: 999px;
+        border: 1px solid rgba(250, 250, 250, 0.22);
+        background: rgba(250, 250, 250, 0.06);
+        color: inherit;
+        text-decoration: none;
+        font-size: 0.82rem;
+        font-weight: 650;
+        line-height: 1.25;
+        white-space: nowrap;
+      }}
+      .rat-cat-pill:hover {{
+        border-color: rgba(250, 250, 250, 0.45);
+        background: rgba(250, 250, 250, 0.12);
       }}
       /* Score-band pill — stronger than metric-delta text. */
       .rat-band-chip {{

@@ -325,7 +325,8 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     assert "_error_card_html" not in source
     assert "_empty_slot_html" not in source
     assert "score-hero" not in source
-    assert source.count("unsafe_allow_html") <= 3
+    # Band chip + category pills + Share markdown data-URI + page CSS.
+    assert source.count("unsafe_allow_html") <= 4
     assert "Pick a ticker to compare here" in source
     assert "Assign a ticker" not in source
     assert "Why this score?" in source

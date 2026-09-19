@@ -270,7 +270,7 @@ def test_search_stock_asset_type_lists_fixture_equities() -> None:
     nvidia = next(opt for opt in catalog if opt.symbol == "NVDA")
     assert nvidia.asset_type == "stock"
     assert nvidia.rwa_rank == 2
-    assert "type_stock" in nvidia.categories
+    assert "stock" in nvidia.categories
 
 
 def test_summarize_call_log_forces_fixture_when_client_is_fixture() -> None:
