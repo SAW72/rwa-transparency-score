@@ -16,11 +16,14 @@ from rwa_score.ticker_search import (
     RWA_CLASS_IDS,
     SEARCH_MIN_CHARS,
     TickerOption,
+    cached_class_catalog,
     catalog_from_por_feeds,
     catalog_from_rwa_map,
+    classes_for_query,
     classify_categories,
     format_option,
     is_native_crypto,
+    load_class_catalog,
     load_search_catalog,
     merge_search_catalog,
     normalize_ticker,
@@ -156,7 +159,7 @@ def test_live_directory_is_whatever_rwa_map_already_loads() -> None:
     assert [opt.symbol for opt in search_tickers("mic", catalog)] == ["MSFT"]
     before = client.calls["rwa_map"]
     load_search_catalog(client)
-    assert client.calls["rwa_map"] > before
+    assert client.calls["rwa_map"] == before
 
 
 def test_readme_documents_search_categories() -> None:
@@ -777,7 +780,7 @@ class _StockScopedLiveClient:
             )
         return rows
 
-    def rwa_map(self, symbol=None, *, asset_type: str | None = None):
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **_kwargs):
         self.calls["rwa_map"] += 1
         kind = (asset_type or "").strip().lower()
         if symbol:
@@ -870,7 +873,7 @@ def test_live_symbol_lookup_wires_cmc_ticker_not_in_assembled_book() -> None:
     class _LookupOnly:
         source = "live"
 
-        def rwa_map(self, symbol=None, *, asset_type: str | None = None):
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None, **_kwargs):
             if symbol and str(symbol).upper() == "GOLD":
                 return [
                     {
@@ -899,4 +902,133 @@ def test_live_symbol_lookup_wires_cmc_ticker_not_in_assembled_book() -> None:
     assert hits[0].asset_type == "commodity"
     # Category miss must not invent a ticker.
     assert search_tickers("commodity", catalog, client=_LookupOnly()) == []
+
+
+def test_classes_for_query_is_lazy_not_full_book() -> None:
+    assert classes_for_query("") == ()
+    assert classes_for_query("treasury") == ("government_security",)
+    assert classes_for_query("treasuries") == ("government_security",)
+    assert classes_for_query("government_security") == ("government_security",)
+    assert classes_for_query("stock") == ("stock",)
+    assert classes_for_query("commodity") == ("commodity",)
+    assert classes_for_query("oil") == ("stock",)
+    assert classes_for_query("bNV") == ()
+    assert classes_for_query("bNVDA") == ()
+    assert classes_for_query("NVD") == ("stock",)
+    assert classes_for_query("ni") == ()
+
+
+def test_load_class_catalog_is_one_source_not_dual_walk() -> None:
+    client = _StockScopedLiveClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert all(opt.asset_type == "government_security" for opt in rows)
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+    # Map already filled the class — no assets/list fallback.
+    load_class_catalog(client, "government_security", first_page_only=True)
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+
+
+def test_cached_class_catalog_hits_on_second_call() -> None:
+    client = _StockScopedLiveClient()
+    first = cached_class_catalog(client, "government_security")
+    assert {opt.symbol for opt in first} == {"USTB", "OUSG"}
+    assert client.calls["rwa_map"] == 1
+    second = cached_class_catalog(client, "government_security")
+    assert [opt.symbol for opt in second] == [opt.symbol for opt in first]
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list_all"] == 0
+    cached_class_catalog(client, "commodity")
+    assert client.calls["rwa_map"] == 2
+    cached_class_catalog(client, "commodity")
+    assert client.calls["rwa_map"] == 2
+
+
+def test_load_search_catalog_skips_assets_list_when_typed_map_fills() -> None:
+    client = _StockScopedLiveClient()
+    catalog = load_search_catalog(client)
+    by_symbol = {opt.symbol: opt for opt in catalog}
+    assert {"NVDA", "GOLD", "USTB", "OUSG", "SPY", "EUR", "HOME"} <= set(by_symbol)
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+    before = dict(client.calls)
+    load_search_catalog(client)
+    assert client.calls["rwa_map"] == before["rwa_map"]
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+
+
+def test_app_live_initial_catalog_is_por_only_no_directory_walk() -> None:
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+
+    client = _StockScopedLiveClient()
+    scorer = TransparencyScorer(client)
+    catalog = demo_app._ticker_catalog(scorer)
+    assert {opt.symbol for opt in catalog} == BACKED_BTOKEN_SYMBOLS
+    assert client.calls["rwa_map"] == 0
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+    # bNVDA typeahead does not need a CMC walk.
+    assert [opt.symbol for opt in demo_app.search_tickers("bNV", catalog)] == ["bNVDA"]
+    assert [opt.symbol for opt in demo_app.search_tickers("bNVDA", catalog)] == [
+        "bNVDA"
+    ]
+
+
+def test_app_lazy_loads_treasuries_and_warm_path_does_not_rewalk() -> None:
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+
+    client = _StockScopedLiveClient()
+    scorer = TransparencyScorer(client)
+    catalog = demo_app._ticker_catalog(scorer, query="treasury")
+    symbols = {opt.symbol for opt in catalog}
+    assert {"USTB", "OUSG"} <= symbols
+    assert BACKED_BTOKEN_SYMBOLS <= symbols
+    assert "NVDA" not in symbols
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+    assert "USTB" in {opt.symbol for opt in demo_app.search_tickers("treasury", catalog)}
+    assert "OUSG" in {
+        opt.symbol for opt in demo_app.search_tickers("treasuries", catalog)
+    }
+
+    before = dict(client.calls)
+    again = demo_app._ticker_catalog(scorer, query="treasury")
+    assert {opt.symbol for opt in again} >= {"USTB", "OUSG"}
+    assert client.calls["rwa_map"] == before["rwa_map"]
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+
+    # Stocks tap is a different class — still not a full dual walk.
+    stocks = demo_app._ticker_catalog(scorer, query="stock")
+    assert "NVDA" in {opt.symbol for opt in stocks}
+    assert "USTB" in {opt.symbol for opt in stocks}  # prior shard stays
+    assert client.calls["assets_list_all"] == 0
+
+    nvd = demo_app._ticker_catalog(scorer, query="NVD")
+    assert "NVDA" in {opt.symbol for opt in nvd}
+    assert [opt.symbol for opt in demo_app.search_tickers("NVD", nvd)][0] == "NVDA"
+
+
+def test_app_search_uses_cache_data_and_pending_query() -> None:
+    import app as demo_app
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "@st.cache_data" in source
+    assert "CATALOG_CACHE_TTL_SECONDS" in source
+    assert "_cached_class_catalog_data" in source
+    assert "pending_search_query" in source
+    assert "_ticker_catalog(scorer, query=" in source
+    assert "catalog_shards" in source
+    assert "first_page_only=True" in source
+    assert "load_search_catalog" not in source
+    assert demo_app.CATALOG_CACHE_TTL_SECONDS == 1800.0
+    assert demo_app.pending_search_query() == ""
+    assert demo_app.classes_for_query is classes_for_query
 

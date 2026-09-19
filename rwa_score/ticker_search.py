@@ -606,20 +606,64 @@ def _safe_rwa_map(
     symbol: str | None = None,
     *,
     asset_type: str | None = None,
+    start: int = 1,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Call ``rwa_map``; tolerate clients that reject ``asset_type``."""
+    """Call ``rwa_map``; tolerate clients that reject ``asset_type`` / ``limit``."""
+    kwargs: dict[str, Any] = {}
+    if asset_type:
+        kwargs["asset_type"] = asset_type
+    if limit is not None:
+        kwargs["start"] = start
+        kwargs["limit"] = limit
     try:
-        if symbol and asset_type:
-            return list(client.rwa_map(symbol, asset_type=asset_type) or [])
         if symbol:
-            return list(client.rwa_map(symbol) or [])
-        if asset_type:
-            return list(client.rwa_map(asset_type=asset_type) or [])
-        return list(client.rwa_map() or [])
+            return list(client.rwa_map(symbol, **kwargs) or [])
+        return list(client.rwa_map(**kwargs) or [])
     except TypeError:
-        if symbol:
-            return list(client.rwa_map(symbol) or [])
-        return list(client.rwa_map() or [])
+        try:
+            if symbol and asset_type:
+                return list(client.rwa_map(symbol, asset_type=asset_type) or [])
+            if symbol:
+                return list(client.rwa_map(symbol) or [])
+            if asset_type:
+                return list(client.rwa_map(asset_type=asset_type) or [])
+            return list(client.rwa_map() or [])
+        except TypeError:
+            if symbol:
+                return list(client.rwa_map(symbol) or [])
+            return list(client.rwa_map() or [])
+
+
+CLASS_PAGE_LIMIT = 250
+
+# Process-local class shards. Streamlit widget reruns share the scorer client
+# (``@st.cache_resource``); this memo stops a second walk of the same class.
+_CLASS_CATALOG_MEMO: dict[tuple[int, str, bool], list[TickerOption]] = {}
+
+
+def clear_catalog_cache() -> None:
+    """Drop in-process class shards (tests). Does not clear CMC HTTP TTL cache."""
+    _CLASS_CATALOG_MEMO.clear()
+
+
+def _fixture_info_by_id(
+    client: Any, rows: Sequence[dict[str, Any]]
+) -> dict[int, dict[str, Any]]:
+    info_by_id: dict[int, dict[str, Any]] = {}
+    if getattr(client, "source", "") != "fixture":
+        return info_by_id
+    for row in rows or []:
+        if not isinstance(row, dict) or row.get("rwa_id") is None:
+            continue
+        try:
+            rid = int(row["rwa_id"])
+            info = client.rwa_info(rid)
+        except Exception:  # noqa: BLE001
+            continue
+        if info:
+            info_by_id[rid] = info
+    return info_by_id
 
 
 def _fetch_assets_list_options(
@@ -643,6 +687,117 @@ def _fetch_assets_list_options(
     return []
 
 
+def _fetch_assets_list_page(
+    client: Any,
+    asset_type: str | None = None,
+    *,
+    start: int = 1,
+    limit: int = CLASS_PAGE_LIMIT,
+) -> list[TickerOption]:
+    """One ``assets/list`` page — never the full-book ``assets_list_all`` walk."""
+    fetch_list = getattr(client, "assets_list", None)
+    if not callable(fetch_list):
+        return []
+    kind = (asset_type or "").strip() or None
+    try:
+        payload = fetch_list(asset_type=kind, start=start, limit=limit)
+    except TypeError:
+        try:
+            payload = fetch_list(asset_type=kind) if kind else fetch_list()
+        except TypeError:
+            payload = fetch_list()
+    return catalog_from_assets_list(payload)
+
+
+def classes_for_query(query: str) -> tuple[str, ...]:
+    """Official CMC classes Search should fetch for this text.
+
+    Empty query → nothing (initial UI is POR-only on live). A Treasuries /
+    Stocks / … keyword loads that class. Industry keywords load ``stock``.
+    Backed prefixes (``bNV`` / ``bNVDA``) stay on ``BACKED_POR_FEEDS``.
+    Other 3+ char prefixes load one ``stock`` page so ``NVD`` typeahead works
+    without walking the whole book.
+    """
+    q = normalize_query(query)
+    if not q:
+        return ()
+    cats = resolve_categories(q)
+    rwa = tuple(cid for cid in RWA_CLASS_IDS if cid in cats)
+    if rwa:
+        return rwa
+    if any(cid in INDUSTRY_IDS for cid in cats):
+        return ("stock",)
+    if len(q) < SEARCH_MIN_CHARS:
+        return ()
+    # ``bNV`` / ``bNVDA`` are POR rows. Do not treat ``NVD`` (NVDA + NVDAx
+    # alias) as a Backed-only query — that would skip the stock page.
+    if q[0] in "bB" and any(
+        prefix_matches(q, opt) for opt in catalog_from_por_feeds()
+    ):
+        return ()
+    return ("stock",)
+
+
+def load_class_catalog(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool = True,
+) -> list[TickerOption]:
+    """Load one official CMC ``asset_type``.
+
+    Prefers typed ``map`` (0 credits). ``assets/list`` is only the fallback
+    when that class is missing from map — never a dual full-book walk.
+    Search uses ``first_page_only=True`` (one page, enough for Matches).
+    """
+    kind = (asset_type or "").strip().lower()
+    if kind not in ASSET_TYPES:
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        if first_page_only:
+            rows = _safe_rwa_map(
+                client, asset_type=kind, start=1, limit=CLASS_PAGE_LIMIT
+            )
+        else:
+            rows = _safe_rwa_map(client, asset_type=kind)
+    except Exception:  # noqa: BLE001 — one class must not take down Search
+        rows = []
+    options: list[TickerOption] = []
+    if rows:
+        info = _fixture_info_by_id(client, rows)
+        options = catalog_from_rwa_map(rows, info_by_id=info)
+    if options:
+        return options
+    try:
+        if first_page_only:
+            return _fetch_assets_list_page(client, kind)
+        return _fetch_assets_list_options(client, kind)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def cached_class_catalog(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool = True,
+) -> list[TickerOption]:
+    """Return a memoized class shard for this client instance."""
+    kind = (asset_type or "").strip().lower()
+    key = (id(client), kind, bool(first_page_only))
+    hit = _CLASS_CATALOG_MEMO.get(key)
+    if hit is not None:
+        return list(hit)
+    rows = load_class_catalog(client, kind, first_page_only=first_page_only)
+    _CLASS_CATALOG_MEMO[key] = rows
+    return list(rows)
+
+
+def _has_cmc_directory_rows(options: Sequence[TickerOption]) -> bool:
+    return any(opt.source != BACKED_SEARCH_SOURCE for opt in options)
+
+
 def lookup_symbol_on_client(client: Any, query: str) -> list[TickerOption]:
     """Live ``map?symbol=`` lookup (0 credits). Empty when CMC lists nothing.
 
@@ -662,62 +817,50 @@ def lookup_symbol_on_client(client: Any, query: str) -> list[TickerOption]:
     return catalog_from_rwa_map(rows)
 
 
-def load_search_catalog(client: Any) -> list[TickerOption]:
-    """Read the CMC/fixture map, enrich from ``assets/list``, then Backed bTokens.
+def load_search_catalog(
+    client: Any,
+    *,
+    asset_types: Sequence[str] | None = None,
+    first_page_only: bool = False,
+) -> list[TickerOption]:
+    """Assemble CMC/fixture classes, then Backed bTokens.
 
-    Unfiltered ``map`` / ``assets/list`` can be stock-scoped on live CMC.
-    Missing official ``asset_type`` classes are filled with typed calls so
-    Commodities / Treasuries / ETFs / Currencies / Real Estate surface.
-    Map failures still return the Backed PoR catalog so ``bNVDA`` remains
-    searchable. Fixture info is joined for ``industry`` (local JSON). Live
-    mode does **not** call ``rwa_info`` per ticker — that would burn
-    Basic-plan credits. No stub ticker list — only what the client returns.
+    Each official ``asset_type`` is a typed ``map`` (or ``assets/list`` only
+    when that class is missing) — never an unfiltered map walk **and** a
+    full ``assets_list_all`` of the same book. Map failures still return the
+    Backed PoR catalog so ``bNVDA`` remains searchable. Fixture info is
+    joined for ``industry`` (local JSON). Live mode does **not** call
+    ``rwa_info`` per ticker. No stub ticker list — only what the client
+    returns. Class shards are memoized on the client instance.
     """
-    raw_rows: list[dict[str, Any]] = []
-    seen: set[Any] = set()
-    try:
-        _extend_map_rows(raw_rows, _safe_rwa_map(client), seen)
-    except Exception:  # noqa: BLE001 — search must not take down scoring
-        pass
-    typed = present_asset_types(raw_rows)
-    fill_kinds = (
-        tuple(kind for kind in ASSET_TYPES if kind not in typed)
-        if raw_rows
-        else ASSET_TYPES
-    )
-    for kind in fill_kinds:
-        try:
-            _extend_map_rows(raw_rows, _safe_rwa_map(client, asset_type=kind), seen)
-        except Exception:  # noqa: BLE001
-            continue
-    info_by_id: dict[int, dict[str, Any]] = {}
-    if raw_rows and getattr(client, "source", "") == "fixture":
-        for row in raw_rows:
-            if not isinstance(row, dict) or row.get("rwa_id") is None:
-                continue
-            try:
-                rid = int(row["rwa_id"])
-                info = client.rwa_info(rid)
-            except Exception:  # noqa: BLE001
-                continue
-            if info:
-                info_by_id[rid] = info
-    base = catalog_from_rwa_map(raw_rows, info_by_id=info_by_id) if raw_rows else []
-    listed: list[TickerOption] = []
-    try:
-        listed = _fetch_assets_list_options(client)
-    except Exception:  # noqa: BLE001 — search stays up without the ranked book
-        listed = []
-    listed_missing = missing_asset_types(listed)
-    kinds = listed_missing if listed else ASSET_TYPES
+    kinds = tuple(
+        kind for kind in (asset_types or ASSET_TYPES) if kind in ASSET_TYPES
+    ) or ASSET_TYPES
+    base: list[TickerOption] = []
     for kind in kinds:
         try:
-            extra_listed = _fetch_assets_list_options(client, kind)
-        except Exception:  # noqa: BLE001
-            continue
-        listed = enrich_catalog_from_assets_list(listed, extra_listed)
-    if listed:
-        base = enrich_catalog_from_assets_list(base, listed)
+            extra = cached_class_catalog(
+                client, kind, first_page_only=first_page_only
+            )
+        except Exception:  # noqa: BLE001 — one class must not take down Search
+            extra = []
+        if extra:
+            base = enrich_catalog_from_assets_list(base, extra)
+    if not _has_cmc_directory_rows(base):
+        untyped_key = (id(client), "", bool(first_page_only))
+        cached = _CLASS_CATALOG_MEMO.get(untyped_key)
+        if cached is not None:
+            base = list(cached)
+        else:
+            raw_rows: list[dict[str, Any]] = []
+            try:
+                raw_rows = _safe_rwa_map(client)
+            except Exception:  # noqa: BLE001 — search must not take down scoring
+                raw_rows = []
+            if raw_rows:
+                info = _fixture_info_by_id(client, raw_rows)
+                base = catalog_from_rwa_map(raw_rows, info_by_id=info)
+            _CLASS_CATALOG_MEMO[untyped_key] = list(base)
     extra = catalog_from_por_feeds()
     return merge_por_catalog(base, extra)
 

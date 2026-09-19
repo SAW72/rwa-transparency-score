@@ -314,6 +314,10 @@ def test_share_score_card_is_button_gated() -> None:
     escaped = demo_app.share_card_preview_html(b"x", 'say "hi".png')
     assert "&quot;" in escaped
     assert 'download="say "hi".png"' not in escaped
+    # Share stays markdown data-URI — no MPA pages/, no st.image / download.
+    assert not Path("pages").exists()
+    assert "st.markdown(" in show_fn
+    assert "data:image/png;base64" in demo_app.share_card_preview_html(b"png", "x.png")
 
 
 def test_compare_row_is_native_streamlit_not_html() -> None:

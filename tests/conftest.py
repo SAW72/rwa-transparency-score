@@ -21,6 +21,28 @@ from rwa_score.client import (
 from rwa_score.scorer import TransparencyScorer
 
 
+@pytest.fixture(autouse=True)
+def _clear_search_catalog_memo() -> None:
+    """Isolate lazy class-shard memos across tests."""
+    from rwa_score.ticker_search import clear_catalog_cache
+
+    clear_catalog_cache()
+    try:
+        import app as demo_app
+
+        demo_app._catalog_shard_memo.clear()
+    except Exception:
+        pass
+    yield
+    clear_catalog_cache()
+    try:
+        import app as demo_app
+
+        demo_app._catalog_shard_memo.clear()
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def fixture_client() -> FixtureClient:
     return FixtureClient()
@@ -108,6 +130,8 @@ class RecordingClient:
         symbol: str | None = None,
         *,
         asset_type: str | None = None,
+        start: int = 1,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         self.calls["rwa_map"] += 1
         self._record(ENDPOINT_MAP)
@@ -118,6 +142,10 @@ class RecordingClient:
         if symbol:
             wanted = {part.strip().upper() for part in symbol.split(",") if part.strip()}
             rows = [row for row in rows if (row.get("symbol") or "").upper() in wanted]
+        if limit is not None:
+            size = max(1, int(limit))
+            offset = max(0, int(start) - 1)
+            rows = rows[offset : offset + size]
         return rows
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:

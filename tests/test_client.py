@@ -555,6 +555,54 @@ def test_live_assets_list_all_paginates() -> None:
     assert session.paths() == [ENDPOINT_ASSETS_LIST, ENDPOINT_ASSETS_LIST]
 
 
+def test_default_page_gap_is_zero_and_429_backoff_stays() -> None:
+    from rwa_score.client import DEFAULT_PAGE_GAP_SECONDS, RATE_LIMIT_HTTP
+
+    assert DEFAULT_PAGE_GAP_SECONDS == 0.0
+    assert RATE_LIMIT_HTTP == 429
+    session = FakeSession(
+        [cmc_ok({"rwa_assets": [{"symbol": "NVDA", "rwa_id": 2, "asset_type": "stock"}]})]
+    )
+    client = _live(session)
+    assert client.page_gap == 0.0
+    source = Path("rwa_score/client.py").read_text(encoding="utf-8")
+    assert "_is_rate_limited" in source
+    assert "RATE_LIMIT_CMC_CODES" in source
+    assert "def _backoff_delay" in source
+
+
+def test_live_map_limit_is_one_page_not_full_walk() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "total_size": 7805,
+                    "has_more": True,
+                    "rwa_assets": [
+                        {"symbol": "USTB", "rwa_id": 30, "asset_type": "government_security"}
+                    ],
+                }
+            ),
+            cmc_ok(
+                {
+                    "rwa_assets": [
+                        {"symbol": "SHOULD_NOT_FETCH", "rwa_id": 99, "asset_type": "stock"}
+                    ]
+                }
+            ),
+        ]
+    )
+    client = _live(session)
+    rows = client.rwa_map(asset_type="government_security", start=1, limit=250)
+    assert [row["symbol"] for row in rows] == ["USTB"]
+    assert session.paths() == [ENDPOINT_MAP]
+    assert session.calls[0][1]["asset_type"] == "government_security"
+    assert session.calls[0][1]["limit"] == 250
+    again = client.rwa_map(asset_type="government_security", start=1, limit=250)
+    assert [row["symbol"] for row in again] == ["USTB"]
+    assert session.paths() == [ENDPOINT_MAP]
+
+
 def test_fixture_map_filters_asset_type() -> None:
     client = FixtureClient()
     gold = client.rwa_map(asset_type="commodity")
