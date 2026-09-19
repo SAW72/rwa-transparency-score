@@ -10,10 +10,13 @@ from rwa_score.client import (
     BASE_URL,
     CMCClient,
     CMCError,
+    ENDPOINT_ASSETS_LIST,
+    ENDPOINT_MAP,
     FixtureClient,
     create_client,
     env_flag,
     parse_market_pairs_payload,
+    parse_rwa_map_payload,
     use_fixtures,
 )
 from rwa_score.fixtures import DEMO_FIXTURE_PATH
@@ -417,6 +420,106 @@ def test_live_market_pairs_fetches_and_caches() -> None:
     assert first["market_pairs"][0]["market_pair"] == "NVDAX/USDT"
     assert session.paths() == ["/v5/real-world-assets/market-pairs/list"]
     assert session.calls[0][1]["rwa_id"] == 2
+
+
+def test_parse_rwa_map_payload_paginates() -> None:
+    parsed = parse_rwa_map_payload(
+        {
+            "rwa_assets": [{"symbol": "gold", "rwa_id": "1", "asset_type": "commodity"}],
+            "total_size": 2,
+            "has_more": True,
+        }
+    )
+    assert parsed["rwa_assets"][0]["symbol"] == "GOLD"
+    assert parsed["rwa_assets"][0]["rwa_id"] == 1
+    assert parsed["has_more"] is True
+    assert parsed["total_size"] == 2
+    empty = parse_rwa_map_payload(None)
+    assert empty["rwa_assets"] == []
+    assert empty["has_more"] is False
+
+
+def test_live_map_paginates_until_complete() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "total_size": 2,
+                    "has_more": True,
+                    "rwa_assets": [
+                        {"symbol": "GOLD", "rwa_id": 1, "asset_type": "commodity"}
+                    ],
+                }
+            ),
+            cmc_ok(
+                {
+                    "total_size": 2,
+                    "has_more": False,
+                    "rwa_assets": [
+                        {"symbol": "NVDA", "rwa_id": 2, "asset_type": "stock"}
+                    ],
+                }
+            ),
+        ]
+    )
+    client = _live(session, page_gap=0)
+    rows = client.rwa_map()
+    assert [row["symbol"] for row in rows] == ["GOLD", "NVDA"]
+    assert session.paths() == [ENDPOINT_MAP, ENDPOINT_MAP]
+    assert session.calls[0][1]["start"] == 1
+    assert session.calls[1][1]["start"] == 251
+    again = client.rwa_map()
+    assert [row["symbol"] for row in again] == ["GOLD", "NVDA"]
+    assert session.paths() == [ENDPOINT_MAP, ENDPOINT_MAP]
+
+
+def test_live_map_symbol_lookup_is_one_request() -> None:
+    session = FakeSession(
+        [cmc_ok({"rwa_assets": [{"symbol": "NVDA", "rwa_id": 2, "asset_type": "stock"}]})]
+    )
+    client = _live(session)
+    rows = client.rwa_map("NVDA")
+    assert rows[0]["symbol"] == "NVDA"
+    assert session.paths() == [ENDPOINT_MAP]
+    assert "start" not in (session.calls[0][1] or {})
+
+
+def test_live_assets_list_all_paginates() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "total_size": 2,
+                    "has_more": True,
+                    "rwa_assets": [
+                        {"symbol": "GOLD", "rwa_id": 1, "asset_type": "commodity"}
+                    ],
+                }
+            ),
+            cmc_ok(
+                {
+                    "total_size": 2,
+                    "has_more": False,
+                    "rwa_assets": [
+                        {"symbol": "NVDA", "rwa_id": 2, "asset_type": "stock"}
+                    ],
+                }
+            ),
+        ]
+    )
+    client = _live(session, page_gap=0)
+    book = client.assets_list_all()
+    assert [row["symbol"] for row in book["rwa_assets"]] == ["GOLD", "NVDA"]
+    assert book["has_more"] is False
+    assert session.paths() == [ENDPOINT_ASSETS_LIST, ENDPOINT_ASSETS_LIST]
+
+
+def test_fixture_map_filters_asset_type() -> None:
+    client = FixtureClient()
+    gold = client.rwa_map(asset_type="commodity")
+    assert {row["symbol"] for row in gold} == {"GOLD"}
+    stocks = client.rwa_map(asset_type="stock")
+    assert {"NVDA", "TSLA", "AAPL"} <= {row["symbol"] for row in stocks}
 
 
 def test_fixture_market_pairs_by_symbol() -> None:

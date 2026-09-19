@@ -46,7 +46,13 @@ DEFAULT_QUOTES_TTL_SECONDS = 120.0
 DEFAULT_ASSETS_TTL_SECONDS = 120.0
 DEFAULT_CRYPTO_QUOTE_TTL_SECONDS = 120.0
 DEFAULT_MARKET_PAIRS_LIMIT = 100
-DEFAULT_ASSETS_LIST_LIMIT = 100
+DEFAULT_ASSETS_LIST_LIMIT = 250
+DEFAULT_PAGE_LIMIT = 250
+DEFAULT_MAX_PAGES = 80
+# Full map / assets/list directory (7.9K+ rows, many pages). Longer than the
+# per-widget TTL so Streamlit reruns do not re-paginate or re-burn credits.
+DEFAULT_DIRECTORY_TTL_SECONDS = 1800.0
+DEFAULT_PAGE_GAP_SECONDS = 0.2
 ASSET_TYPES = (
     "stock",
     "commodity",
@@ -55,6 +61,14 @@ ASSET_TYPES = (
     "etf",
     "real_estate",
 )
+ASSET_TYPE_LABELS = {
+    "stock": "Stocks",
+    "commodity": "Commodities",
+    "currency": "Currencies",
+    "government_security": "Treasuries",
+    "etf": "ETFs",
+    "real_estate": "Real Estate",
+}
 ENDPOINT_MAP = "/v5/real-world-assets/map"
 ENDPOINT_INFO = "/v5/real-world-assets/info"
 ENDPOINT_ISSUERS_LIST = "/v5/real-world-assets/issuers/list"
@@ -74,7 +88,12 @@ class RWAClient(Protocol):
 
     source: str
 
-    def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
+    def rwa_map(
+        self,
+        symbol: str | None = None,
+        *,
+        asset_type: str | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]: ...
 
@@ -97,6 +116,14 @@ class RWAClient(Protocol):
         asset_type: str | None = None,
         start: int = 1,
         limit: int = DEFAULT_ASSETS_LIST_LIMIT,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]: ...
+
+    def assets_list_all(
+        self,
+        *,
+        asset_type: str | None = None,
         sort: str = "rwa_rank",
         sort_dir: str = "asc",
     ) -> dict[str, Any]: ...
@@ -248,31 +275,49 @@ def parse_rwa_quotes_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _normalize_directory_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Shared map / assets/list fields used by the search directory."""
+    return {
+        "name": row.get("name") or "",
+        "symbol": (row.get("symbol") or "").upper(),
+        "slug": row.get("slug") or "",
+        "rwa_id": _optional_int(row.get("rwa_id")),
+        "asset_type": (row.get("asset_type") or "").strip(),
+        "rwa_rank": _optional_int(row.get("rwa_rank")),
+        "has_tokens": bool(row.get("has_tokens")),
+        "industry": (row.get("industry") or "").strip(),
+        "average_tokenized_price": _optional_float(row.get("average_tokenized_price")),
+        "tokenized_market_cap": _optional_float(row.get("tokenized_market_cap")),
+        "tokenized_volume_24h": _optional_float(row.get("tokenized_volume_24h")),
+    }
+
+
+def parse_rwa_map_payload(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize a CMC (or fixture) ``map`` ``data`` object, including pagination."""
+    payload = data if isinstance(data, dict) else {}
+    rows = payload.get("rwa_assets")
+    if not isinstance(rows, list):
+        rows = []
+    assets = [_normalize_directory_row(row) for row in rows if isinstance(row, dict)]
+    raw_total = payload.get("total_size")
+    try:
+        total_size = int(raw_total) if raw_total is not None else len(assets)
+    except (TypeError, ValueError):
+        total_size = len(assets)
+    return {
+        "rwa_assets": assets,
+        "total_size": total_size,
+        "has_more": bool(payload.get("has_more")),
+    }
+
+
 def parse_assets_list_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize a CMC (or fixture) ``assets/list`` ``data`` object."""
     payload = data if isinstance(data, dict) else {}
     rows = payload.get("rwa_assets")
     if not isinstance(rows, list):
         rows = []
-    assets: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        assets.append(
-            {
-                "name": row.get("name") or "",
-                "symbol": (row.get("symbol") or "").upper(),
-                "slug": row.get("slug") or "",
-                "rwa_id": _optional_int(row.get("rwa_id")),
-                "asset_type": (row.get("asset_type") or "").strip(),
-                "rwa_rank": _optional_int(row.get("rwa_rank")),
-                "has_tokens": bool(row.get("has_tokens")),
-                "industry": (row.get("industry") or "").strip(),
-                "average_tokenized_price": _optional_float(row.get("average_tokenized_price")),
-                "tokenized_market_cap": _optional_float(row.get("tokenized_market_cap")),
-                "tokenized_volume_24h": _optional_float(row.get("tokenized_volume_24h")),
-            }
-        )
+    assets = [_normalize_directory_row(row) for row in rows if isinstance(row, dict)]
     raw_total = payload.get("total_size")
     try:
         total_size = int(raw_total) if raw_total is not None else len(assets)
@@ -447,7 +492,10 @@ class CMCClient:
         pairs_ttl: float | None = DEFAULT_PAIRS_TTL_SECONDS,
         quotes_ttl: float | None = DEFAULT_QUOTES_TTL_SECONDS,
         assets_ttl: float | None = DEFAULT_ASSETS_TTL_SECONDS,
+        directory_ttl: float | None = DEFAULT_DIRECTORY_TTL_SECONDS,
         crypto_quote_ttl: float | None = DEFAULT_CRYPTO_QUOTE_TTL_SECONDS,
+        page_gap: float = DEFAULT_PAGE_GAP_SECONDS,
+        max_pages: int = DEFAULT_MAX_PAGES,
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("CMC_API_KEY", "")
@@ -467,6 +515,9 @@ class CMCClient:
         self.pairs_ttl = pairs_ttl
         self.quotes_ttl = quotes_ttl
         self.assets_ttl = assets_ttl
+        self.directory_ttl = directory_ttl
+        self.page_gap = max(0.0, float(page_gap))
+        self.max_pages = max(1, int(max_pages))
         self.crypto_quote_ttl = crypto_quote_ttl
         self._sleep = sleeper or time.sleep
         self._cache = _TTLCache()
@@ -531,21 +582,103 @@ class CMCClient:
 
         raise CMCError(_rate_limit_message(path, last_status, last_payload))
 
-    def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        """Resolve a ticker to its rwa_id. Costs 0 credits on Basic."""
-        key = f"map:{(symbol or '').upper()}"
-        cached = self._cache.get(key, self.map_ttl)
+    def _normalize_asset_type(self, asset_type: str | None) -> str:
+        kind = (asset_type or "").strip().lower()
+        if kind and kind not in ASSET_TYPES:
+            raise CMCError(
+                f"asset_type must be one of {', '.join(ASSET_TYPES)}"
+            )
+        return kind
+
+    def _collect_directory_pages(
+        self,
+        *,
+        endpoint: str,
+        cache_key: str,
+        fetch_page: Callable[[int, int], dict[str, Any]],
+        ttl: float | None,
+        page_limit: int = DEFAULT_PAGE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """Page a map / assets/list listing until ``has_more`` is false.
+
+        Caches the assembled directory. Each network page is journaled; a
+        later hit is a single cache record. Honors 429 backoff via ``_get``.
+        """
+        cached = self._cache.get(cache_key, ttl)
         if cached is not None:
-            self._record(ENDPOINT_MAP, via="cache", cached=True)
+            self._record(endpoint, via="cache", cached=True)
             return cached
-        params: dict[str, Any] = {}
+        rows: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        start = 1
+        size = max(1, min(int(page_limit), DEFAULT_PAGE_LIMIT))
+        for page_i in range(self.max_pages):
+            parsed = fetch_page(start, size)
+            batch = parsed.get("rwa_assets") or []
+            for row in batch:
+                if not isinstance(row, dict):
+                    continue
+                marker = row.get("rwa_id")
+                if marker is None:
+                    marker = (row.get("symbol") or "").upper()
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                rows.append(row)
+            self._record(endpoint, via="network")
+            if not parsed.get("has_more") or not batch:
+                break
+            start += size
+            if page_i + 1 < self.max_pages and self.page_gap:
+                self._sleep(self.page_gap)
+        self._cache.set(cache_key, rows)
+        return copy.deepcopy(rows)
+
+    def rwa_map(
+        self,
+        symbol: str | None = None,
+        *,
+        asset_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve tickers to ``rwa_id``. Costs 0 credits on Basic.
+
+        With no ``symbol``, paginates the full (optionally typed) map so the
+        search directory is complete. A symbol lookup is a single request.
+        """
+        kind = self._normalize_asset_type(asset_type)
         if symbol:
-            params["symbol"] = symbol
-        data = self._get(ENDPOINT_MAP, params)
-        assets = data.get("data", {}).get("rwa_assets", [])
-        self._cache.set(key, assets)
-        self._record(ENDPOINT_MAP, via="network")
-        return copy.deepcopy(assets)
+            key = f"map:sym:{symbol.upper()}:{kind}"
+            cached = self._cache.get(key, self.map_ttl)
+            if cached is not None:
+                self._record(ENDPOINT_MAP, via="cache", cached=True)
+                return cached
+            params: dict[str, Any] = {"symbol": symbol}
+            if kind:
+                params["asset_type"] = kind
+            data = self._get(ENDPOINT_MAP, params)
+            parsed = parse_rwa_map_payload(data.get("data") or {})
+            assets = parsed["rwa_assets"]
+            self._cache.set(key, assets)
+            self._record(ENDPOINT_MAP, via="network")
+            return copy.deepcopy(assets)
+
+        def _page(start: int, limit: int) -> dict[str, Any]:
+            params: dict[str, Any] = {
+                "start": start,
+                "limit": limit,
+                "sort": "rwa_rank",
+            }
+            if kind:
+                params["asset_type"] = kind
+            data = self._get(ENDPOINT_MAP, params)
+            return parse_rwa_map_payload(data.get("data") or {})
+
+        return self._collect_directory_pages(
+            endpoint=ENDPOINT_MAP,
+            cache_key=f"map:ALL:{kind}",
+            fetch_page=_page,
+            ttl=self.directory_ttl,
+        )
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         key = f"info:{int(rwa_id)}"
@@ -639,12 +772,8 @@ class CMCClient:
         sort: str = "rwa_rank",
         sort_dir: str = "asc",
     ) -> dict[str, Any]:
-        """Ranked RWA directory. One Basic credit per 250 rows; default page is 100."""
-        kind = (asset_type or "").strip().lower()
-        if kind and kind not in ASSET_TYPES:
-            raise CMCError(
-                f"assets_list asset_type must be one of {', '.join(ASSET_TYPES)}"
-            )
+        """Ranked RWA directory. One Basic credit per 250 rows; default page is 250."""
+        kind = self._normalize_asset_type(asset_type)
         page = max(1, int(start))
         size = max(1, min(int(limit), 250))
         key = f"assets:{kind}:{page}:{size}:{sort}:{sort_dir}"
@@ -665,6 +794,60 @@ class CMCClient:
         self._cache.set(key, parsed)
         self._record(ENDPOINT_ASSETS_LIST, via="network")
         return copy.deepcopy(parsed)
+
+    def assets_list_all(
+        self,
+        *,
+        asset_type: str | None = None,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]:
+        """Every ``assets/list`` page for one type (or the full ranked book).
+
+        Cached as one directory blob. Prefer this for search; use ``assets_list``
+        when a single page is enough. Credits: 1 per 250 rows.
+        """
+        kind = self._normalize_asset_type(asset_type)
+        # ``assets_list`` journals each page (cache or network). This method
+        # only journals a cache hit for the assembled directory.
+        cache_key = f"assets:ALL:{kind}:{sort}:{sort_dir}"
+        cached = self._cache.get(cache_key, self.directory_ttl)
+        if cached is not None:
+            self._record(ENDPOINT_ASSETS_LIST, via="cache", cached=True)
+            return cached
+        rows: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        start = 1
+        size = DEFAULT_PAGE_LIMIT
+        for page_i in range(self.max_pages):
+            parsed = self.assets_list(
+                asset_type=kind or None,
+                start=start,
+                limit=size,
+                sort=sort,
+                sort_dir=sort_dir,
+            )
+            batch = parsed.get("rwa_assets") or []
+            for row in batch:
+                marker = row.get("rwa_id")
+                if marker is None:
+                    marker = (row.get("symbol") or "").upper()
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                rows.append(row)
+            if not parsed.get("has_more") or not batch:
+                break
+            start += size
+            if page_i + 1 < self.max_pages and self.page_gap:
+                self._sleep(self.page_gap)
+        assembled = {
+            "rwa_assets": rows,
+            "total_size": len(rows),
+            "has_more": False,
+        }
+        self._cache.set(cache_key, assembled)
+        return copy.deepcopy(assembled)
 
     def market_pairs(
         self,
@@ -736,9 +919,17 @@ class FixtureClient:
             "label", "DEMO FIXTURE DATA — not live CoinMarketCap API responses"
         )
 
-    def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
+    def rwa_map(
+        self,
+        symbol: str | None = None,
+        *,
+        asset_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         self._record(ENDPOINT_MAP)
         assets = list(self._data.get("map") or [])
+        kind = (asset_type or "").strip().lower()
+        if kind:
+            assets = [a for a in assets if (a.get("asset_type") or "").lower() == kind]
         if not symbol:
             return assets
         wanted = {part.strip().upper() for part in symbol.split(",") if part.strip()}
@@ -828,6 +1019,34 @@ class FixtureClient:
                 "has_more": offset + size < len(rows),
             }
         )
+
+    def assets_list_all(
+        self,
+        *,
+        asset_type: str | None = None,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        start = 1
+        while True:
+            page = self.assets_list(
+                asset_type=asset_type,
+                start=start,
+                limit=DEFAULT_PAGE_LIMIT,
+                sort=sort,
+                sort_dir=sort_dir,
+            )
+            batch = page.get("rwa_assets") or []
+            rows.extend(batch)
+            if not page.get("has_more") or not batch:
+                break
+            start += DEFAULT_PAGE_LIMIT
+        return {
+            "rwa_assets": rows,
+            "total_size": len(rows),
+            "has_more": False,
+        }
 
     def market_pairs(
         self,

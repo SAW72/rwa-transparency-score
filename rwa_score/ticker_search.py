@@ -2,13 +2,13 @@
 
 The Streamlit bar is exact-assign unless the query opens a picker:
   - ticker / name / alias prefix after ``SEARCH_MIN_CHARS``
-  - category keywords (``AI``, ``oil``, ``real estate``, …) even when short
-  - CMC ``asset_type`` browse (``stock``, ``commodity``, ``etf``, …) from
-    ``assets/list`` when the client exposes it
+  - CMC RWA ``asset_type`` classes (``stock``, ``commodity``, ``etf``, …)
+  - optional industry keywords (``AI``, ``oil``, …) even when short
 
-Categories are a documented taxonomy. A directory row is bucketed from
-``industry`` / ``sector`` fields already on the map or fixture ``rwa_info``,
-plus CMC ``asset_type`` and a small name/symbol hint list — not invented tickers.
+CMC RWA classes come from the official ``asset_type`` enum on ``map`` and
+``assets/list`` (paginated — not a hard-coded ticker stub). Industry chips
+are extra Look-style filters over ``industry`` / name hints. Native crypto
+(BTC / ETH and wraps) is never filed under an RWA class.
 
 Published Backed **bToken** symbols from ``BACKED_POR_FEEDS`` are merged in as
 first-class picker rows so ``bNV`` / ``bNVDA`` (and feed aliases) can land a
@@ -28,6 +28,7 @@ from .chainlink_por import (
     PorFeed,
     canonical_backed_por_feed,
 )
+from .client import ASSET_TYPE_LABELS, ASSET_TYPES
 
 SEARCH_MIN_CHARS = 3
 CATEGORY_MIN_CHARS = 2
@@ -50,9 +51,51 @@ class Category:
     name_hints: tuple[str, ...] = ()
 
 
-# Documented taxonomy. Keywords are case-insensitive; spaces are OK.
-# name_hints only classify rows already in the directory (not extra tickers).
-CATEGORIES: tuple[Category, ...] = (
+# Official CMC RWA ``asset_type`` enum — always shown in the UI.
+# Keywords are case-insensitive; spaces are OK.
+RWA_CLASS_CATEGORIES: tuple[Category, ...] = (
+    Category(
+        id="stock",
+        label="Stocks",
+        keywords=("stock", "stocks", "equity", "equities"),
+    ),
+    Category(
+        id="commodity",
+        label="Commodities",
+        keywords=("commodity", "commodities"),
+    ),
+    Category(
+        id="government_security",
+        label="Treasuries",
+        keywords=(
+            "government_security",
+            "treasury",
+            "treasuries",
+            "fixed income",
+            "t-bill",
+            "tbill",
+        ),
+    ),
+    Category(
+        id="etf",
+        label="ETFs",
+        keywords=("etf", "etfs"),
+    ),
+    Category(
+        id="real_estate",
+        label="Real Estate",
+        keywords=("real_estate", "real estate", "reit", "realty", "property", "estate"),
+        name_hints=("prologis", "pld", "simon", "american tower"),
+    ),
+    Category(
+        id="currency",
+        label="Currencies",
+        keywords=("currency", "currencies", "fx"),
+    ),
+)
+
+# Optional industry browse over rows already in the CMC/fixture directory.
+INDUSTRY_CATEGORIES: tuple[Category, ...] = (
     Category(
         id="ai_tech",
         label="AI/Tech",
@@ -66,12 +109,6 @@ CATEGORIES: tuple[Category, ...] = (
         name_hints=("exxon", "chevron", "conocophillips", "xom", "cvx"),
     ),
     Category(
-        id="real_estate",
-        label="Real Estate",
-        keywords=("real estate", "reit", "realty", "property", "estate"),
-        name_hints=("prologis", "pld", "simon", "american tower"),
-    ),
-    Category(
         id="auto_ev",
         label="Auto/EV",
         keywords=("auto", "ev", "vehicle", "automotive", "motor"),
@@ -83,46 +120,43 @@ CATEGORIES: tuple[Category, ...] = (
         keywords=("finance", "bank", "financial", "insurance"),
         name_hints=("jpmorgan", "goldman", "visa", "berkshire"),
     ),
-    Category(
-        id="type_stock",
-        label="Stocks",
-        keywords=("stock", "stocks", "equity", "equities"),
-    ),
-    Category(
-        id="type_commodity",
-        label="Commodities",
-        keywords=("commodity", "commodities"),
-    ),
-    Category(
-        id="type_etf",
-        label="ETFs",
-        keywords=("etf", "etfs"),
-    ),
-    Category(
-        id="type_currency",
-        label="Currencies",
-        keywords=("currency", "currencies", "fx"),
-    ),
-    Category(
-        id="type_gov",
-        label="Gov securities",
-        keywords=("government_security", "treasury", "treasuries"),
-    ),
 )
+
+# Native crypto — never an RWA class. Shown only if a row leaks into the catalog.
+CRYPTO_CATEGORY = Category(
+    id="crypto_digital",
+    label="Crypto / Digital Assets",
+    keywords=("crypto", "cryptocurrency", "digital asset", "digital assets"),
+)
+NATIVE_CRYPTO_SYMBOLS = frozenset({"BTC", "ETH", "WBTC", "WETH"})
+
+CATEGORIES: tuple[Category, ...] = (
+    *RWA_CLASS_CATEGORIES,
+    *INDUSTRY_CATEGORIES,
+    CRYPTO_CATEGORY,
+)
+RWA_CLASS_IDS = tuple(cat.id for cat in RWA_CLASS_CATEGORIES)
+INDUSTRY_IDS = tuple(cat.id for cat in INDUSTRY_CATEGORIES)
+CRYPTO_ID = CRYPTO_CATEGORY.id
 
 CATEGORY_BY_ID = {cat.id: cat for cat in CATEGORIES}
 CATEGORY_LABELS = {cat.id: cat.label for cat in CATEGORIES}
 
 CATEGORY_DOC = (
     "Search categories (type a keyword, case-insensitive; spaces OK):\n"
+    "CMC RWA asset_type (always in the UI; directory from paginated map + assets/list):\n"
+    "- Stocks — stock, stocks, equity, equities\n"
+    "- Commodities — commodity, commodities\n"
+    "- Treasuries — government_security, treasury, treasuries, fixed income\n"
+    "- ETFs — etf, etfs\n"
+    "- Real Estate — real_estate, real estate, reit, realty, property\n"
+    "- Currencies — currency, currencies, fx\n"
+    "Industry chips (optional, over CMC/fixture industry or name hints):\n"
     "- AI/Tech — ai, tech, technology, semiconductor, software, computer\n"
     "- Oil/Energy — oil, energy, petroleum, crude, refining, gas\n"
-    "- Real Estate — real estate, reit, realty, property, estate\n"
     "- Auto/EV — auto, ev, vehicle, automotive, motor\n"
     "- Finance — finance, bank, financial, insurance\n"
-    "Rows are bucketed from CMC/fixture industry or sector fields, then name hints.\n"
-    "CMC asset_type browse (from assets/list when available): stock, commodity, "
-    "etf, currency, government_security.\n"
+    "BTC / ETH (and WBTC / WETH) are Crypto / Digital Assets, never an RWA class.\n"
     "Directory also lists published Backed bTokens (bNVDA, bIB01, bCSPX, bC3M, "
     "bIBTA) from BACKED_POR_FEEDS so on-chain PoR cards are searchable."
 )
@@ -174,12 +208,14 @@ def format_option(option: TickerOption) -> str:
     sector = [
         CATEGORY_LABELS[cid]
         for cid in option.categories
-        if cid in CATEGORY_LABELS and not cid.startswith("type_")
+        if cid in INDUSTRY_IDS
     ]
     if sector:
         label = f"{label} · {sector[0]}"
     elif option.asset_type:
-        label = f"{label} · {option.asset_type}"
+        label = f"{label} · {ASSET_TYPE_LABELS.get(option.asset_type, option.asset_type)}"
+    elif CRYPTO_ID in option.categories:
+        label = f"{label} · {CATEGORY_LABELS[CRYPTO_ID]}"
     return label
 
 
@@ -235,6 +271,16 @@ def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", (text or "").lower())
 
 
+def _exact_hint_hits(hint: str, haystack: str) -> bool:
+    """Name hints are exact tokens (or a phrase). ``meta`` must not match metals."""
+    text = hint.lower().strip()
+    if not text or not haystack:
+        return False
+    if " " in text:
+        return text in haystack
+    return text in _tokens(haystack)
+
+
 def _keyword_hits_haystack(keyword: str, haystack: str) -> bool:
     kw = keyword.lower().strip()
     if not kw or not haystack:
@@ -247,6 +293,23 @@ def _keyword_hits_haystack(keyword: str, haystack: str) -> bool:
     return False
 
 
+def is_native_crypto(
+    *,
+    symbol: str = "",
+    name: str = "",
+    asset_type: str = "",
+) -> bool:
+    """True for BTC/ETH (and wraps). CMC RWA ``asset_type`` rows stay RWA."""
+    sym = (symbol or "").strip().upper()
+    if sym in NATIVE_CRYPTO_SYMBOLS:
+        return True
+    kind = (asset_type or "").strip().lower()
+    if kind in ASSET_TYPES:
+        return False
+    hay = f"{name} {symbol}".lower()
+    return any(token in hay.split() for token in ("bitcoin", "ethereum"))
+
+
 def classify_categories(
     *,
     symbol: str = "",
@@ -255,17 +318,33 @@ def classify_categories(
     aliases: Sequence[str] = (),
     asset_type: str = "",
 ) -> tuple[str, ...]:
-    """Return category ids for one directory row."""
-    haystack = " ".join(
-        part for part in (industry, name, symbol, asset_type, *aliases) if part
-    ).lower()
+    """Return category ids for one directory row.
+
+    CMC ``asset_type`` is the RWA class. Industry chips use industry / name
+    hints only — they do not invent tickers. BTC/ETH never join an RWA class.
+    """
+    if is_native_crypto(symbol=symbol, name=name, asset_type=asset_type):
+        return (CRYPTO_ID,)
     hits: list[str] = []
-    for cat in CATEGORIES:
-        if any(_keyword_hits_haystack(kw, haystack) for kw in cat.keywords):
+    kind = (asset_type or "").strip().lower()
+    if kind in ASSET_TYPES:
+        hits.append(kind)
+    industry_hay = " ".join(
+        part for part in (industry, name, symbol, *aliases) if part
+    ).lower()
+    for cat in INDUSTRY_CATEGORIES:
+        if any(_keyword_hits_haystack(kw, industry_hay) for kw in cat.keywords):
             hits.append(cat.id)
             continue
-        if any(_keyword_hits_haystack(hint, haystack) for hint in cat.name_hints):
+        if any(_exact_hint_hits(hint, industry_hay) for hint in cat.name_hints):
             hits.append(cat.id)
+    # Tokenized REITs are stocks on CMC; still browse under Real Estate.
+    if "real_estate" not in hits:
+        re_cat = CATEGORY_BY_ID["real_estate"]
+        if any(_keyword_hits_haystack(kw, industry_hay) for kw in re_cat.keywords):
+            hits.append("real_estate")
+        elif any(_exact_hint_hits(hint, industry_hay) for hint in re_cat.name_hints):
+            hits.append("real_estate")
     return tuple(hits)
 
 
@@ -459,7 +538,8 @@ def load_search_catalog(client: Any) -> list[TickerOption]:
     Map failures still return the Backed PoR catalog so ``bNVDA`` remains
     searchable. Fixture info is joined for ``industry`` (local JSON). Live
     mode does **not** call ``rwa_info`` per ticker — that would burn
-    Basic-plan credits. ``assets/list`` is one cached page (rank + asset_type).
+    Basic-plan credits. ``map`` and ``assets/list`` are paginated and cached
+    so every CMC RWA ticker is in the directory (not a stub list).
     """
     assets: Sequence[dict[str, Any]] | None = None
     try:
@@ -480,12 +560,15 @@ def load_search_catalog(client: Any) -> list[TickerOption]:
                 info_by_id[rid] = info
     base = catalog_from_rwa_map(assets, info_by_id=info_by_id) if assets is not None else []
     listed: list[TickerOption] = []
+    fetch_all = getattr(client, "assets_list_all", None)
     fetch_list = getattr(client, "assets_list", None)
-    if callable(fetch_list):
-        try:
+    try:
+        if callable(fetch_all):
+            listed = catalog_from_assets_list(fetch_all())
+        elif callable(fetch_list):
             listed = catalog_from_assets_list(fetch_list())
-        except Exception:  # noqa: BLE001 — search stays up without the ranked page
-            listed = []
+    except Exception:  # noqa: BLE001 — search stays up without the ranked book
+        listed = []
     if listed:
         base = enrich_catalog_from_assets_list(base, listed)
     extra = catalog_from_por_feeds()

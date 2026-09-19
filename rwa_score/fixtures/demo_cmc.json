@@ -1,11 +1,21 @@
 {
   "meta": {
     "kind": "demo_fixture",
-    "label": "DEMO FIXTURE DATA — not live CoinMarketCap API responses",
+    "label": "DEMO FIXTURE DATA \u2014 not live CoinMarketCap API responses",
     "generated_for": "CMC Build-a-thon offline judging",
-    "note": "Payload shapes follow public CMC Pro RWA docs. Values are synthetic so the demo runs without an API key and without burning credits. rwa_quotes / assets_list match /v5/real-world-assets/quotes/latest and /assets/list — still demo_fixture, never live CMC."
+    "note": "Payload shapes follow public CMC Pro RWA docs. Values are synthetic so the demo runs without an API key and without burning credits. rwa_quotes / assets_list match /v5/real-world-assets/quotes/latest and /assets/list \u2014 still demo_fixture, never live CMC. Map + assets_list include one labeled fixture row per official CMC asset_type (stock, commodity, government_security, etf, currency, real_estate)."
   },
   "map": [
+    {
+      "name": "Gold [FIXTURE]",
+      "symbol": "GOLD",
+      "slug": "gold",
+      "rwa_id": 1,
+      "asset_type": "commodity",
+      "industry": "Precious Metals",
+      "rwa_rank": 1,
+      "has_tokens": true
+    },
     {
       "name": "Nvidia Corp",
       "symbol": "NVDA",
@@ -65,6 +75,46 @@
       "industry": "Real Estate Investment Trusts",
       "rwa_rank": 18,
       "has_tokens": true
+    },
+    {
+      "name": "Short-Term U.S. Treasuries [FIXTURE]",
+      "symbol": "USTB",
+      "slug": "ustb",
+      "rwa_id": 101,
+      "asset_type": "government_security",
+      "industry": "U.S. Treasury Bills",
+      "rwa_rank": 20,
+      "has_tokens": true
+    },
+    {
+      "name": "S&P 500 ETF [FIXTURE]",
+      "symbol": "SPY",
+      "slug": "spy",
+      "rwa_id": 102,
+      "asset_type": "etf",
+      "industry": "Equity ETF",
+      "rwa_rank": 21,
+      "has_tokens": true
+    },
+    {
+      "name": "Euro [FIXTURE]",
+      "symbol": "EUR",
+      "slug": "euro",
+      "rwa_id": 103,
+      "asset_type": "currency",
+      "industry": "Fiat Currency",
+      "rwa_rank": 22,
+      "has_tokens": true
+    },
+    {
+      "name": "Tokenized Residential [FIXTURE]",
+      "symbol": "HOME",
+      "slug": "home",
+      "rwa_id": 104,
+      "asset_type": "real_estate",
+      "industry": "Residential Real Estate",
+      "rwa_rank": 23,
+      "has_tokens": true
     }
   ],
   "info": {
@@ -80,7 +130,9 @@
       "rwa_id": 2,
       "asset_type": "stock",
       "primary_exchange": "Nasdaq",
-      "issuer": { "name": "Backed Finance" }
+      "issuer": {
+        "name": "Backed Finance"
+      }
     },
     "15": {
       "name": "Tesla Inc",
@@ -94,7 +146,9 @@
       "rwa_id": 15,
       "asset_type": "stock",
       "primary_exchange": "Nasdaq",
-      "issuer": { "name": "NoteVault Demo Issuer" }
+      "issuer": {
+        "name": "NoteVault Demo Issuer"
+      }
     },
     "16": {
       "name": "Apple Inc",
@@ -108,7 +162,9 @@
       "rwa_id": 16,
       "asset_type": "stock",
       "primary_exchange": "Nasdaq",
-      "issuer": { "name": "xStocks" }
+      "issuer": {
+        "name": "xStocks"
+      }
     },
     "18": {
       "name": "Meta Platforms Inc",
@@ -122,7 +178,9 @@
       "rwa_id": 18,
       "asset_type": "stock",
       "primary_exchange": "Nasdaq",
-      "issuer": { "name": "Ondo" }
+      "issuer": {
+        "name": "Ondo"
+      }
     },
     "21": {
       "name": "Exxon Mobil Corp",
@@ -136,7 +194,9 @@
       "rwa_id": 21,
       "asset_type": "stock",
       "primary_exchange": "NYSE",
-      "issuer": { "name": "Backed Finance" }
+      "issuer": {
+        "name": "Backed Finance"
+      }
     },
     "22": {
       "name": "Prologis Inc",
@@ -150,7 +210,89 @@
       "rwa_id": 22,
       "asset_type": "stock",
       "primary_exchange": "NYSE",
-      "issuer": { "name": "Ondo" }
+      "issuer": {
+        "name": "Ondo"
+      }
+    },
+    "1": {
+      "name": "Gold [FIXTURE]",
+      "symbol": "GOLD",
+      "slug": "gold",
+      "website": null,
+      "employees": null,
+      "founded": null,
+      "industry": "Precious Metals",
+      "cik": null,
+      "rwa_id": 1,
+      "asset_type": "commodity",
+      "primary_exchange": null,
+      "issuer": {
+        "name": "NoteVault Demo Issuer"
+      }
+    },
+    "101": {
+      "name": "Short-Term U.S. Treasuries [FIXTURE]",
+      "symbol": "USTB",
+      "slug": "ustb",
+      "website": null,
+      "employees": null,
+      "founded": null,
+      "industry": "U.S. Treasury Bills",
+      "cik": null,
+      "rwa_id": 101,
+      "asset_type": "government_security",
+      "primary_exchange": null,
+      "issuer": {
+        "name": "Ondo"
+      }
+    },
+    "102": {
+      "name": "S&P 500 ETF [FIXTURE]",
+      "symbol": "SPY",
+      "slug": "spy",
+      "website": "https://www.ssga.com",
+      "employees": null,
+      "founded": null,
+      "industry": "Equity ETF",
+      "cik": null,
+      "rwa_id": 102,
+      "asset_type": "etf",
+      "primary_exchange": "NYSE Arca",
+      "issuer": {
+        "name": "Backed Finance"
+      }
+    },
+    "103": {
+      "name": "Euro [FIXTURE]",
+      "symbol": "EUR",
+      "slug": "euro",
+      "website": null,
+      "employees": null,
+      "founded": null,
+      "industry": "Fiat Currency",
+      "cik": null,
+      "rwa_id": 103,
+      "asset_type": "currency",
+      "primary_exchange": null,
+      "issuer": {
+        "name": "NoteVault Demo Issuer"
+      }
+    },
+    "104": {
+      "name": "Tokenized Residential [FIXTURE]",
+      "symbol": "HOME",
+      "slug": "home",
+      "website": null,
+      "employees": null,
+      "founded": null,
+      "industry": "Residential Real Estate",
+      "cik": null,
+      "rwa_id": 104,
+      "asset_type": "real_estate",
+      "primary_exchange": null,
+      "issuer": {
+        "name": "Ondo"
+      }
     }
   },
   "issuers_list": [
@@ -184,7 +326,7 @@
       "name": "Backed Finance",
       "website": "https://assets.backed.fi/",
       "issuer_id": "6878977dcbbf471de3366e85",
-      "num_tokens": 2,
+      "num_tokens": 3,
       "tokens": [
         {
           "name": "NVIDIA tokenized stock (Backed) [FIXTURE]",
@@ -197,6 +339,12 @@
           "symbol": "XOMx",
           "crypto_id": 36995,
           "rwa_id": 21
+        },
+        {
+          "name": "SPY tokenized ETF (Backed) [FIXTURE]",
+          "symbol": "SPYx",
+          "crypto_id": 90103,
+          "rwa_id": 102
         }
       ]
     },
@@ -218,13 +366,25 @@
       "name": "NoteVault Demo Issuer",
       "website": null,
       "issuer_id": "64656d6f00000000000000d1",
-      "num_tokens": 1,
+      "num_tokens": 3,
       "tokens": [
         {
           "name": "Tesla wrapped note (NoteVault) [FIXTURE]",
           "symbol": "TSLAn",
           "crypto_id": 90015,
           "rwa_id": 15
+        },
+        {
+          "name": "Gold tokenized commodity (NoteVault) [FIXTURE]",
+          "symbol": "GOLDx",
+          "crypto_id": 90101,
+          "rwa_id": 1
+        },
+        {
+          "name": "Euro tokenized currency (NoteVault) [FIXTURE]",
+          "symbol": "EURx",
+          "crypto_id": 90104,
+          "rwa_id": 103
         }
       ]
     },
@@ -232,7 +392,7 @@
       "name": "Ondo",
       "website": "https://ondo.finance",
       "issuer_id": "6f6e646f00000000000000d2",
-      "num_tokens": 2,
+      "num_tokens": 4,
       "tokens": [
         {
           "name": "Meta tokenized stock (Ondo) [FIXTURE]",
@@ -245,11 +405,36 @@
           "symbol": "PLDx",
           "crypto_id": 36996,
           "rwa_id": 22
+        },
+        {
+          "name": "USTB tokenized T-bills (Ondo) [FIXTURE]",
+          "symbol": "USTBx",
+          "crypto_id": 90102,
+          "rwa_id": 101
+        },
+        {
+          "name": "HOME tokenized real estate (Ondo) [FIXTURE]",
+          "symbol": "HOMEx",
+          "crypto_id": 90105,
+          "rwa_id": 104
         }
       ]
     }
   },
   "assets_list": [
+    {
+      "name": "Gold [FIXTURE]",
+      "symbol": "GOLD",
+      "slug": "gold",
+      "rwa_id": 1,
+      "asset_type": "commodity",
+      "industry": "Precious Metals",
+      "rwa_rank": 1,
+      "has_tokens": true,
+      "average_tokenized_price": 2000.0,
+      "tokenized_market_cap": 5000000.0,
+      "tokenized_volume_24h": 800000.0
+    },
     {
       "name": "Nvidia Corp",
       "symbol": "NVDA",
@@ -327,6 +512,58 @@
       "average_tokenized_price": 112.8,
       "tokenized_market_cap": 1800000.0,
       "tokenized_volume_24h": 640000.0
+    },
+    {
+      "name": "Short-Term U.S. Treasuries [FIXTURE]",
+      "symbol": "USTB",
+      "slug": "ustb",
+      "rwa_id": 101,
+      "asset_type": "government_security",
+      "industry": "U.S. Treasury Bills",
+      "rwa_rank": 20,
+      "has_tokens": true,
+      "average_tokenized_price": 1.0,
+      "tokenized_market_cap": 4200000.0,
+      "tokenized_volume_24h": 250000.0
+    },
+    {
+      "name": "S&P 500 ETF [FIXTURE]",
+      "symbol": "SPY",
+      "slug": "spy",
+      "rwa_id": 102,
+      "asset_type": "etf",
+      "industry": "Equity ETF",
+      "rwa_rank": 21,
+      "has_tokens": true,
+      "average_tokenized_price": 500.0,
+      "tokenized_market_cap": 3100000.0,
+      "tokenized_volume_24h": 410000.0
+    },
+    {
+      "name": "Euro [FIXTURE]",
+      "symbol": "EUR",
+      "slug": "euro",
+      "rwa_id": 103,
+      "asset_type": "currency",
+      "industry": "Fiat Currency",
+      "rwa_rank": 22,
+      "has_tokens": true,
+      "average_tokenized_price": 1.1,
+      "tokenized_market_cap": 900000.0,
+      "tokenized_volume_24h": 120000.0
+    },
+    {
+      "name": "Tokenized Residential [FIXTURE]",
+      "symbol": "HOME",
+      "slug": "home",
+      "rwa_id": 104,
+      "asset_type": "real_estate",
+      "industry": "Residential Real Estate",
+      "rwa_rank": 23,
+      "has_tokens": true,
+      "average_tokenized_price": 100.0,
+      "tokenized_market_cap": 750000.0,
+      "tokenized_volume_24h": 40000.0
     }
   ],
   "rwa_quotes": {
@@ -365,7 +602,7 @@
         {
           "symbol": "NVDAxst",
           "name": "NVIDIA tokenized stock (xStocks) [FIXTURE]",
-          "price": 118.70,
+          "price": 118.7,
           "crypto_id": 37002,
           "issuer_id": "69af7c7fef8bc60199c88622",
           "issuer_name": "xStocks",
@@ -375,7 +612,11 @@
       ],
       "tradfi_markets": [
         {
-          "exchange": {"slug": "nasdaq", "name": "Nasdaq", "exchange_id": null},
+          "exchange": {
+            "slug": "nasdaq",
+            "name": "Nasdaq",
+            "exchange_id": null
+          },
           "ticker": "NVDA",
           "market_url": "https://www.nasdaq.com/market-activity/stocks/nvda"
         }
@@ -416,7 +657,11 @@
       ],
       "tradfi_markets": [
         {
-          "exchange": {"slug": "nasdaq", "name": "Nasdaq", "exchange_id": null},
+          "exchange": {
+            "slug": "nasdaq",
+            "name": "Nasdaq",
+            "exchange_id": null
+          },
           "ticker": "TSLA",
           "market_url": "https://www.nasdaq.com/market-activity/stocks/tsla"
         }
@@ -467,7 +712,11 @@
       ],
       "tradfi_markets": [
         {
-          "exchange": {"slug": "nasdaq", "name": "Nasdaq", "exchange_id": null},
+          "exchange": {
+            "slug": "nasdaq",
+            "name": "Nasdaq",
+            "exchange_id": null
+          },
           "ticker": "AAPL",
           "market_url": "https://www.nasdaq.com/market-activity/stocks/aapl"
         }
@@ -557,6 +806,131 @@
         }
       ],
       "tradfi_markets": []
+    },
+    "1": {
+      "name": "Gold [FIXTURE]",
+      "symbol": "GOLD",
+      "slug": "gold",
+      "rwa_id": 1,
+      "asset_type": "commodity",
+      "rwa_rank": 1,
+      "has_tokens": true,
+      "average_tokenized_price": 2000.0,
+      "tokenized_market_cap": 5000000.0,
+      "tokenized_volume_24h": 800000.0,
+      "tokens": [
+        {
+          "symbol": "GOLDx",
+          "name": "Gold tokenized commodity (NoteVault) [FIXTURE]",
+          "price": 2000.0,
+          "crypto_id": 90101,
+          "issuer_id": "64656d6f00000000000000d1",
+          "issuer_name": "NoteVault Demo Issuer",
+          "market_cap": 5000000.0,
+          "volume_24h": 800000.0
+        }
+      ],
+      "tradfi_markets": []
+    },
+    "101": {
+      "name": "Short-Term U.S. Treasuries [FIXTURE]",
+      "symbol": "USTB",
+      "slug": "ustb",
+      "rwa_id": 101,
+      "asset_type": "government_security",
+      "rwa_rank": 20,
+      "has_tokens": true,
+      "average_tokenized_price": 1.0,
+      "tokenized_market_cap": 4200000.0,
+      "tokenized_volume_24h": 250000.0,
+      "tokens": [
+        {
+          "symbol": "USTBx",
+          "name": "USTB tokenized T-bills (Ondo) [FIXTURE]",
+          "price": 1.0,
+          "crypto_id": 90102,
+          "issuer_id": "6f6e646f00000000000000d2",
+          "issuer_name": "Ondo",
+          "market_cap": 4200000.0,
+          "volume_24h": 250000.0
+        }
+      ],
+      "tradfi_markets": []
+    },
+    "102": {
+      "name": "S&P 500 ETF [FIXTURE]",
+      "symbol": "SPY",
+      "slug": "spy",
+      "rwa_id": 102,
+      "asset_type": "etf",
+      "rwa_rank": 21,
+      "has_tokens": true,
+      "average_tokenized_price": 500.0,
+      "tokenized_market_cap": 3100000.0,
+      "tokenized_volume_24h": 410000.0,
+      "tokens": [
+        {
+          "symbol": "SPYx",
+          "name": "SPY tokenized ETF (Backed) [FIXTURE]",
+          "price": 500.0,
+          "crypto_id": 90103,
+          "issuer_id": "6878977dcbbf471de3366e85",
+          "issuer_name": "Backed Finance",
+          "market_cap": 3100000.0,
+          "volume_24h": 410000.0
+        }
+      ],
+      "tradfi_markets": []
+    },
+    "103": {
+      "name": "Euro [FIXTURE]",
+      "symbol": "EUR",
+      "slug": "euro",
+      "rwa_id": 103,
+      "asset_type": "currency",
+      "rwa_rank": 22,
+      "has_tokens": true,
+      "average_tokenized_price": 1.1,
+      "tokenized_market_cap": 900000.0,
+      "tokenized_volume_24h": 120000.0,
+      "tokens": [
+        {
+          "symbol": "EURx",
+          "name": "Euro tokenized currency (NoteVault) [FIXTURE]",
+          "price": 1.1,
+          "crypto_id": 90104,
+          "issuer_id": "64656d6f00000000000000d1",
+          "issuer_name": "NoteVault Demo Issuer",
+          "market_cap": 900000.0,
+          "volume_24h": 120000.0
+        }
+      ],
+      "tradfi_markets": []
+    },
+    "104": {
+      "name": "Tokenized Residential [FIXTURE]",
+      "symbol": "HOME",
+      "slug": "home",
+      "rwa_id": 104,
+      "asset_type": "real_estate",
+      "rwa_rank": 23,
+      "has_tokens": true,
+      "average_tokenized_price": 100.0,
+      "tokenized_market_cap": 750000.0,
+      "tokenized_volume_24h": 40000.0,
+      "tokens": [
+        {
+          "symbol": "HOMEx",
+          "name": "HOME tokenized real estate (Ondo) [FIXTURE]",
+          "price": 100.0,
+          "crypto_id": 90105,
+          "issuer_id": "6f6e646f00000000000000d2",
+          "issuer_name": "Ondo",
+          "market_cap": 750000.0,
+          "volume_24h": 40000.0
+        }
+      ],
+      "tradfi_markets": []
     }
   },
   "quotes": {
@@ -637,6 +1011,71 @@
           "market_cap": 1800000.0
         }
       }
+    },
+    "90101": {
+      "id": 90101,
+      "name": "GOLDx [FIXTURE]",
+      "symbol": "GOLDx",
+      "quote": {
+        "USD": {
+          "price": 2000.0,
+          "volume_24h": 800000.0,
+          "percent_change_24h": 0.2,
+          "market_cap": 5000000.0
+        }
+      }
+    },
+    "90102": {
+      "id": 90102,
+      "name": "USTBx [FIXTURE]",
+      "symbol": "USTBx",
+      "quote": {
+        "USD": {
+          "price": 1.0,
+          "volume_24h": 250000.0,
+          "percent_change_24h": 0.05,
+          "market_cap": 4200000.0
+        }
+      }
+    },
+    "90103": {
+      "id": 90103,
+      "name": "SPYx [FIXTURE]",
+      "symbol": "SPYx",
+      "quote": {
+        "USD": {
+          "price": 500.0,
+          "volume_24h": 410000.0,
+          "percent_change_24h": 0.3,
+          "market_cap": 3100000.0
+        }
+      }
+    },
+    "90104": {
+      "id": 90104,
+      "name": "EURx [FIXTURE]",
+      "symbol": "EURx",
+      "quote": {
+        "USD": {
+          "price": 1.1,
+          "volume_24h": 120000.0,
+          "percent_change_24h": 0.1,
+          "market_cap": 900000.0
+        }
+      }
+    },
+    "90105": {
+      "id": 90105,
+      "name": "HOMEx [FIXTURE]",
+      "symbol": "HOMEx",
+      "quote": {
+        "USD": {
+          "price": 100.0,
+          "volume_24h": 40000.0,
+          "percent_change_24h": 0.15,
+          "market_cap": 750000.0
+        }
+      }
     }
   },
   "market_pairs": {
@@ -649,7 +1088,11 @@
       "has_more": false,
       "market_pairs": [
         {
-          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "exchange": {
+            "exchange_id": 270,
+            "name": "Binance",
+            "slug": "binance"
+          },
           "market_id": 99001,
           "market_pair": "NVDAX/USDT",
           "category": "spot",
@@ -677,7 +1120,11 @@
           ]
         },
         {
-          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
           "market_id": 99002,
           "market_pair": "NVDAon/USD",
           "category": "spot",
@@ -705,7 +1152,11 @@
           ]
         },
         {
-          "exchange": {"exchange_id": 311, "name": "Gate.io", "slug": "gate-io"},
+          "exchange": {
+            "exchange_id": 311,
+            "name": "Gate.io",
+            "slug": "gate-io"
+          },
           "market_id": 99003,
           "market_pair": "NVDAxst/USDT",
           "category": "spot",
@@ -726,7 +1177,7 @@
             {
               "crypto_id": 2781,
               "symbol": "USD",
-              "price": 118.70,
+              "price": 118.7,
               "volume_24h": 1500000.0,
               "last_updated": "2026-09-10T12:00:00.000Z"
             }
@@ -743,7 +1194,11 @@
       "has_more": false,
       "market_pairs": [
         {
-          "exchange": {"exchange_id": 890, "name": "ThinDEX Demo", "slug": "thindex-demo"},
+          "exchange": {
+            "exchange_id": 890,
+            "name": "ThinDEX Demo",
+            "slug": "thindex-demo"
+          },
           "market_id": 99101,
           "market_pair": "TSLAn/USDT",
           "category": "spot",
@@ -771,7 +1226,11 @@
           ]
         },
         {
-          "exchange": {"exchange_id": 891, "name": "ShadowVault Demo", "slug": "shadowvault-demo"},
+          "exchange": {
+            "exchange_id": 891,
+            "name": "ShadowVault Demo",
+            "slug": "shadowvault-demo"
+          },
           "market_id": 99102,
           "market_pair": "TSLAx/USDT",
           "category": "spot",
@@ -809,7 +1268,11 @@
       "has_more": false,
       "market_pairs": [
         {
-          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "exchange": {
+            "exchange_id": 270,
+            "name": "Binance",
+            "slug": "binance"
+          },
           "market_id": 99201,
           "market_pair": "AAPLx/USDT",
           "category": "spot",
@@ -837,7 +1300,11 @@
           ]
         },
         {
-          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
           "market_id": 99202,
           "market_pair": "AAPLb/USD",
           "category": "spot",
@@ -865,7 +1332,11 @@
           ]
         },
         {
-          "exchange": {"exchange_id": 544, "name": "Dinari", "slug": "dinari"},
+          "exchange": {
+            "exchange_id": 544,
+            "name": "Dinari",
+            "slug": "dinari"
+          },
           "market_id": 99203,
           "market_pair": "AAPLd/USDC",
           "category": "spot",
@@ -903,7 +1374,11 @@
       "has_more": false,
       "market_pairs": [
         {
-          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
           "market_id": 99301,
           "market_pair": "METAx/USD",
           "category": "spot",
@@ -931,7 +1406,11 @@
           ]
         },
         {
-          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "exchange": {
+            "exchange_id": 270,
+            "name": "Binance",
+            "slug": "binance"
+          },
           "market_id": 99302,
           "market_pair": "METAxst/USDT",
           "category": "spot",
@@ -969,7 +1448,11 @@
       "has_more": false,
       "market_pairs": [
         {
-          "exchange": {"exchange_id": 102, "name": "Kraken", "slug": "kraken"},
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
           "market_id": 99401,
           "market_pair": "XOMx/USD",
           "category": "spot",
@@ -1007,7 +1490,11 @@
       "has_more": false,
       "market_pairs": [
         {
-          "exchange": {"exchange_id": 270, "name": "Binance", "slug": "binance"},
+          "exchange": {
+            "exchange_id": 270,
+            "name": "Binance",
+            "slug": "binance"
+          },
           "market_id": 99501,
           "market_pair": "PLDx/USDT",
           "category": "spot",
@@ -1030,6 +1517,216 @@
               "symbol": "USD",
               "price": 112.8,
               "volume_24h": 640000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "1": {
+      "rwa_id": 1,
+      "name": "Gold [FIXTURE]",
+      "symbol": "GOLD",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
+          "market_id": 99601,
+          "market_pair": "GOLDx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90101,
+            "symbol": "GOLDx",
+            "exchange_symbol": "GOLDX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 2000.0,
+              "volume_24h": 800000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "101": {
+      "rwa_id": 101,
+      "name": "Short-Term U.S. Treasuries [FIXTURE]",
+      "symbol": "USTB",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
+          "market_id": 99602,
+          "market_pair": "USTBx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90102,
+            "symbol": "USTBx",
+            "exchange_symbol": "USTBX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 1.0,
+              "volume_24h": 250000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "102": {
+      "rwa_id": 102,
+      "name": "S&P 500 ETF [FIXTURE]",
+      "symbol": "SPY",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
+          "market_id": 99603,
+          "market_pair": "SPYx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90103,
+            "symbol": "SPYx",
+            "exchange_symbol": "SPYX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 500.0,
+              "volume_24h": 410000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "103": {
+      "rwa_id": 103,
+      "name": "Euro [FIXTURE]",
+      "symbol": "EUR",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
+          "market_id": 99604,
+          "market_pair": "EURx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90104,
+            "symbol": "EURx",
+            "exchange_symbol": "EURX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 1.1,
+              "volume_24h": 120000.0,
+              "last_updated": "2026-09-10T12:00:00.000Z"
+            }
+          ]
+        }
+      ]
+    },
+    "104": {
+      "rwa_id": 104,
+      "name": "Tokenized Residential [FIXTURE]",
+      "symbol": "HOME",
+      "num_market_pairs": 1,
+      "total_size": 1,
+      "has_more": false,
+      "market_pairs": [
+        {
+          "exchange": {
+            "exchange_id": 102,
+            "name": "Kraken",
+            "slug": "kraken"
+          },
+          "market_id": 99605,
+          "market_pair": "HOMEx/USD",
+          "category": "spot",
+          "fee_type": "percentage",
+          "market_pair_base": {
+            "crypto_id": 90105,
+            "symbol": "HOMEx",
+            "exchange_symbol": "HOMEX",
+            "currency_type": "cryptocurrency"
+          },
+          "market_pair_quote": {
+            "crypto_id": 2781,
+            "symbol": "USD",
+            "exchange_symbol": "USD",
+            "currency_type": "fiat"
+          },
+          "quotes": [
+            {
+              "crypto_id": 2781,
+              "symbol": "USD",
+              "price": 100.0,
+              "volume_24h": 40000.0,
               "last_updated": "2026-09-10T12:00:00.000Z"
             }
           ]

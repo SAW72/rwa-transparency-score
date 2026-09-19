@@ -13,20 +13,22 @@ RWA_USE_FIXTURES=1 streamlit run app.py
 
 **Paid API evidence:** [`docs/API_EVIDENCE.md`](docs/API_EVIDENCE.md) — redacted `GET /v1/score/NVDA` with `X-API-Key: <REDACTED>` plus a real JSON body captured from the paid API locally under `RWA_USE_FIXTURES=1` (**fixture-backed, not live CMC**).
 
-Then open the local URL Streamlit prints. Type a prefix like `NIV` or `NVD` (3+ characters — Matches appear as you type, no Enter) to pick **NVDA / Nvidia**, or a category like `oil`, `AI`, or `real estate`. Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work.
+Then open the local URL Streamlit prints. Type a prefix like `NIV` or `NVD` (3+ characters — Matches appear as you type, no Enter) to pick **NVDA / Nvidia**, or tap a **CMC RWA class** (Stocks, Commodities, Treasuries, ETFs, Real Estate, Currencies). Assign into one of the four compare slots. Exact tickers (`NVDA`, `TSLA`, `AAPL`) still work. Industry keywords (`oil`, `AI`) still filter stocks already in the directory.
 
 Search also lists published Backed **bToken** symbols from `BACKED_POR_FEEDS` (`bNVDA`, `bIB01`, `bCSPX`, `bC3M`, `bIBTA`) as first-class Matches — type `bNV` / `bNVDA` (or a feed alias such as `NVDAx`). The CMC/fixture underlying row (`NVDA`) still ranks first when you type `NVDA`; the bToken is an extra match so you can land a card that is eligible for the **on-chain PoR** badge. Tickers with no published proxy (most xStocks) stay on the labeled **heuristic fallback**.
 
-**Search categories** (case-insensitive keywords; rows come from the CMC/fixture directory plus published Backed bTokens, bucketed by `industry` / `sector` plus name hints):
+**Search categories** — UI chips are the official CMC RWA `asset_type` classes (always shown, horizontal pills). Rows come from the **paginated** CMC/fixture `map` + `assets/list` plus published Backed bTokens. Industry chips (`AI`, `oil`, …) are optional filters over `industry` / name hints. **BTC / ETH are not RWA.** Coverage matrix: [`docs/CMC_RWA_COVERAGE.md`](docs/CMC_RWA_COVERAGE.md).
 
-| Category | Type | Fixture examples |
+| Category | CMC `asset_type` / keywords | Fixture examples (labeled, not live) |
 |---|---|---|
-| AI/Tech | `ai`, `tech`, `semiconductor`, `software`, `computer` | NVDA, AAPL, META |
-| Oil/Energy | `oil`, `energy`, `petroleum`, `crude` | XOM |
-| Real Estate | `real estate`, `reit`, `realty`, `property` | PLD |
-| Auto/EV | `auto`, `ev`, `vehicle`, `motor` | TSLA |
-| Finance | `finance`, `bank`, `financial` | live directory only |
-| Stocks / Commodities / ETFs / … | CMC `asset_type` (`stock`, `commodity`, `etf`, `currency`, `government_security`) from ranked `assets/list` | fixture stocks; live directory grows |
+| Stocks | `stock` | NVDA, TSLA, AAPL, META, XOM, PLD |
+| Commodities | `commodity` | GOLD |
+| Treasuries | `government_security` | USTB |
+| ETFs | `etf` | SPY |
+| Real Estate | `real_estate` (+ REIT industry) | HOME, PLD |
+| Currencies | `currency` | EUR |
+| AI/Tech · Oil/Energy · Auto/EV · Finance | industry hints (`ai`, `oil`, `auto`, `finance`) | NVDA / XOM / TSLA; Finance live-only |
+| Crypto / Digital Assets | BTC, ETH, WBTC, WETH — **not** an RWA class | shown only if a row leaks in |
 
 CLI equivalent:
 
@@ -159,7 +161,9 @@ app.py                 Streamlit demo (search, pillars, verification badges, com
 PRIVACY.md             Privacy Policy source (Steward of the King LLC / Ohio)
 TERMS.md               Terms of Service source
 rwa_score/legal.py     Privacy/Terms markdown loader + Tornado HTML /privacy and /terms (no pages/ MPA)
-rwa_score/ticker_search.py  Prefix + category picker over the RWA map plus Backed bTokens (no extra API)
+rwa_score/ticker_search.py  Prefix + CMC RWA class picker over the paginated map / assets/list plus Backed bTokens
+rwa_score/coverage.py      Category → ticker → endpoint coverage matrix
+docs/CMC_RWA_COVERAGE.md   Fixture (and optional live) coverage matrix
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
 rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
 rwa_score/chainlink_por.py  Chainlink AggregatorV3 PoR reader (JSON-RPC eth_call, requests only)
@@ -177,7 +181,7 @@ scripts/verify_attestation.py   Re-hash a live score and optionally read the cha
 Live data flow (CMC Basic):
 
 1. `GET /v5/real-world-assets/map` — ticker → `rwa_id` (0 credits)
-2. `GET /v5/real-world-assets/assets/list` — ranked directory + `asset_type` browse (1 credit / 250; short TTL; default page 100)
+2. `GET /v5/real-world-assets/assets/list` — ranked directory + `asset_type` browse (1 credit / 250; directory TTL; paginated, default page 250)
 3. `GET /v5/real-world-assets/info` — issuer metadata + **SEC CIK**
 4. `GET /v5/real-world-assets/issuers/list` then `/issuers` — who mints the token, on-chain `crypto_id` (cached for the process lifetime)
 5. `GET /v5/real-world-assets/quotes/latest` — `average_tokenized_price`, tokenized mcap/vol, `tokens[]` (issuer_name/prices), `tradfi_markets[]` for **price integrity** and to strengthen **basis**

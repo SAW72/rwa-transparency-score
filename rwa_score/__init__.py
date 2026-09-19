@@ -7,6 +7,7 @@ from .client import (
     create_client,
     parse_assets_list_payload,
     parse_market_pairs_payload,
+    parse_rwa_map_payload,
     parse_rwa_quotes_payload,
     use_fixtures,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "basis_score_from_spread",
     "create_client",
     "parse_market_pairs_payload",
+    "parse_rwa_map_payload",
     "percent_spread",
     "use_fixtures",
 ]
