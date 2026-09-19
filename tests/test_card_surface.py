@@ -70,7 +70,7 @@ def test_pillar_evidence_rows_reuse_existing_verification(fixture_scorer) -> Non
     assert "published Chainlink PoR" not in reserves["badge"]
     basis = next(row for row in rows if row["key"] == "basis")
     assert "self-reported" in basis["badge"]
-    assert "CMC market-pairs" in basis["evidence"]
+    assert "quotes" in basis["evidence"].lower() or "market-pairs" in basis["evidence"]
 
 
 def test_pillar_evidence_rows_bnvda_fixture_por_skip(fixture_scorer) -> None:

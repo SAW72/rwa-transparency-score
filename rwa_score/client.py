@@ -5,8 +5,10 @@ Live endpoints used (Basic plan):
   - GET /v5/real-world-assets/info               -> metadata incl. CIK (1 credit / 250)
   - GET /v5/real-world-assets/issuers/list       -> issuer directory (1 credit)
   - GET /v5/real-world-assets/issuers            -> single issuer + tokens (1 credit)
+  - GET /v5/real-world-assets/quotes/latest      -> tokenized avg/mcap/vol, tokens[], tradfi
+  - GET /v5/real-world-assets/assets/list        -> ranked directory / asset_type browse
   - GET /v5/real-world-assets/market-pairs/list  -> wrapper markets for one RWA
-  - GET /v2/cryptocurrency/quotes/latest         -> token price/volume
+  - GET /v2/cryptocurrency/quotes/latest         -> token 24hΔ fallback when RWA quotes lack it
 """
 
 from __future__ import annotations
@@ -35,11 +37,32 @@ RATE_LIMIT_HTTP = 429
 RATE_LIMIT_CMC_CODES = {1008, "1008"}
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_MAX_WAIT_SECONDS = 60.0
-# Map / info / market-pairs can refresh; issuer directory is process-lifetime (no TTL).
+# Map / info / market-pairs / RWA quotes / assets list can refresh; issuer directory
+# is process-lifetime (no TTL). Short TTLs absorb Streamlit widget reruns.
 DEFAULT_MAP_TTL_SECONDS = 120.0
 DEFAULT_INFO_TTL_SECONDS = 120.0
 DEFAULT_PAIRS_TTL_SECONDS = 120.0
+DEFAULT_QUOTES_TTL_SECONDS = 120.0
+DEFAULT_ASSETS_TTL_SECONDS = 120.0
+DEFAULT_CRYPTO_QUOTE_TTL_SECONDS = 120.0
 DEFAULT_MARKET_PAIRS_LIMIT = 100
+DEFAULT_ASSETS_LIST_LIMIT = 100
+ASSET_TYPES = (
+    "stock",
+    "commodity",
+    "currency",
+    "government_security",
+    "etf",
+    "real_estate",
+)
+ENDPOINT_MAP = "/v5/real-world-assets/map"
+ENDPOINT_INFO = "/v5/real-world-assets/info"
+ENDPOINT_ISSUERS_LIST = "/v5/real-world-assets/issuers/list"
+ENDPOINT_ISSUERS = "/v5/real-world-assets/issuers"
+ENDPOINT_QUOTES = "/v5/real-world-assets/quotes/latest"
+ENDPOINT_ASSETS_LIST = "/v5/real-world-assets/assets/list"
+ENDPOINT_MARKET_PAIRS = "/v5/real-world-assets/market-pairs/list"
+ENDPOINT_CRYPTO_QUOTE = "/v2/cryptocurrency/quotes/latest"
 
 
 class CMCError(RuntimeError):
@@ -61,12 +84,33 @@ class RWAClient(Protocol):
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]: ...
 
+    def rwa_quotes(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    def assets_list(
+        self,
+        *,
+        asset_type: str | None = None,
+        start: int = 1,
+        limit: int = DEFAULT_ASSETS_LIST_LIMIT,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]: ...
+
     def market_pairs(
         self,
         *,
         rwa_id: int | None = None,
         symbol: str | None = None,
     ) -> dict[str, Any]: ...
+
+    def begin_run(self) -> None: ...
+
+    def call_log(self) -> list[dict[str, Any]]: ...
 
 
 def env_flag(name: str) -> bool:
@@ -114,6 +158,131 @@ def _cmc_error_code(payload: dict[str, Any] | None) -> Any:
     if not payload:
         return None
     return (payload.get("status") or {}).get("error_code")
+
+
+def _optional_float(raw: Any) -> float | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_rwa_token(row: Any) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    return {
+        "symbol": (row.get("symbol") or "").strip(),
+        "name": (row.get("name") or "").strip(),
+        "price": _optional_float(row.get("price")),
+        "crypto_id": _optional_int(row.get("crypto_id")),
+        "issuer_id": row.get("issuer_id"),
+        "issuer_name": (row.get("issuer_name") or "").strip(),
+        "market_cap": _optional_float(row.get("market_cap")),
+        "volume_24h": _optional_float(row.get("volume_24h")),
+    }
+
+
+def _normalize_tradfi_market(row: Any) -> dict[str, Any] | None:
+    """Keep venue identity only — CMC tradfi rows do not include a last price."""
+    if not isinstance(row, dict):
+        return None
+    exchange = row.get("exchange") if isinstance(row.get("exchange"), dict) else {}
+    return {
+        "exchange": {
+            "slug": (exchange.get("slug") or "").strip(),
+            "name": (exchange.get("name") or "").strip(),
+            "exchange_id": _optional_int(exchange.get("exchange_id")),
+        },
+        "ticker": (row.get("ticker") or "").strip(),
+        "market_url": (row.get("market_url") or "").strip(),
+    }
+
+
+def parse_rwa_quotes_payload(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize a CMC (or fixture) ``quotes/latest`` asset object.
+
+    Accepts the inner asset, ``{rwa_assets: [asset]}``, or empty input.
+    Missing numeric fields stay ``None`` — callers must not invent them.
+    """
+    payload = data if isinstance(data, dict) else {}
+    if isinstance(payload.get("rwa_assets"), list) and payload["rwa_assets"]:
+        first = payload["rwa_assets"][0]
+        payload = first if isinstance(first, dict) else {}
+    tokens = [
+        tok
+        for tok in (_normalize_rwa_token(row) for row in (payload.get("tokens") or []))
+        if tok is not None
+    ]
+    tradfi = [
+        row
+        for row in (_normalize_tradfi_market(item) for item in (payload.get("tradfi_markets") or []))
+        if row is not None
+    ]
+    quotes = payload.get("quotes") if isinstance(payload.get("quotes"), list) else []
+    return {
+        "rwa_id": _optional_int(payload.get("rwa_id")),
+        "name": payload.get("name") or "",
+        "symbol": (payload.get("symbol") or "").upper(),
+        "slug": payload.get("slug") or "",
+        "asset_type": (payload.get("asset_type") or "").strip(),
+        "rwa_rank": _optional_int(payload.get("rwa_rank")),
+        "has_tokens": bool(payload.get("has_tokens")),
+        "average_tokenized_price": _optional_float(payload.get("average_tokenized_price")),
+        "tokenized_market_cap": _optional_float(payload.get("tokenized_market_cap")),
+        "tokenized_volume_24h": _optional_float(payload.get("tokenized_volume_24h")),
+        "quotes": list(quotes),
+        "tokens": tokens,
+        "tradfi_markets": tradfi,
+        "last_updated": payload.get("last_updated"),
+    }
+
+
+def parse_assets_list_payload(data: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize a CMC (or fixture) ``assets/list`` ``data`` object."""
+    payload = data if isinstance(data, dict) else {}
+    rows = payload.get("rwa_assets")
+    if not isinstance(rows, list):
+        rows = []
+    assets: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        assets.append(
+            {
+                "name": row.get("name") or "",
+                "symbol": (row.get("symbol") or "").upper(),
+                "slug": row.get("slug") or "",
+                "rwa_id": _optional_int(row.get("rwa_id")),
+                "asset_type": (row.get("asset_type") or "").strip(),
+                "rwa_rank": _optional_int(row.get("rwa_rank")),
+                "has_tokens": bool(row.get("has_tokens")),
+                "industry": (row.get("industry") or "").strip(),
+                "average_tokenized_price": _optional_float(row.get("average_tokenized_price")),
+                "tokenized_market_cap": _optional_float(row.get("tokenized_market_cap")),
+                "tokenized_volume_24h": _optional_float(row.get("tokenized_volume_24h")),
+            }
+        )
+    raw_total = payload.get("total_size")
+    try:
+        total_size = int(raw_total) if raw_total is not None else len(assets)
+    except (TypeError, ValueError):
+        total_size = len(assets)
+    return {
+        "rwa_assets": assets,
+        "total_size": total_size,
+        "has_more": bool(payload.get("has_more")),
+    }
 
 
 def parse_market_pairs_payload(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -171,6 +340,70 @@ def _rate_limit_message(path: str, status_code: int, payload: dict[str, Any] | N
     )
 
 
+class _CallJournal:
+    """Per-client CMC/fixture call evidence. Fixture clients never label ``live``."""
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self._calls: list[dict[str, Any]] = []
+
+    def begin_run(self) -> None:
+        self._calls = []
+
+    def record(self, endpoint: str, *, via: str, cached: bool = False) -> None:
+        source = "fixture" if self.source == "fixture" else "live"
+        self._calls.append(
+            {
+                "endpoint": endpoint,
+                "source": source,
+                "via": "fixture" if source == "fixture" else via,
+                "cached": bool(cached) and source != "fixture",
+            }
+        )
+
+    def call_log(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._calls]
+
+
+def summarize_call_log(
+    calls: list[dict[str, Any]] | None,
+    *,
+    client_source: str,
+) -> dict[str, Any]:
+    """UI/API evidence block. Never claims live when the client is a fixture."""
+    source = "fixture" if client_source == "fixture" else "live"
+    rows = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in calls or []:
+        endpoint = str(raw.get("endpoint") or "")
+        if not endpoint:
+            continue
+        row_source = "fixture" if source == "fixture" or raw.get("source") == "fixture" else "live"
+        via = "fixture" if row_source == "fixture" else str(raw.get("via") or "network")
+        key = (endpoint, row_source, via)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "endpoint": endpoint,
+                "source": row_source,
+                "via": via,
+                "cached": bool(raw.get("cached")) and row_source == "live",
+            }
+        )
+    return {
+        "source": source,
+        "live": source == "live",
+        "label": (
+            "bundled DEMO FIXTURES — not live CoinMarketCap"
+            if source == "fixture"
+            else "live CoinMarketCap API"
+        ),
+        "endpoints": rows,
+    }
+
+
 class _TTLCache:
     """In-process cache. ``ttl=None`` means keep until process exit."""
 
@@ -212,6 +445,9 @@ class CMCClient:
         map_ttl: float | None = DEFAULT_MAP_TTL_SECONDS,
         info_ttl: float | None = DEFAULT_INFO_TTL_SECONDS,
         pairs_ttl: float | None = DEFAULT_PAIRS_TTL_SECONDS,
+        quotes_ttl: float | None = DEFAULT_QUOTES_TTL_SECONDS,
+        assets_ttl: float | None = DEFAULT_ASSETS_TTL_SECONDS,
+        crypto_quote_ttl: float | None = DEFAULT_CRYPTO_QUOTE_TTL_SECONDS,
         sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("CMC_API_KEY", "")
@@ -229,8 +465,21 @@ class CMCClient:
         self.map_ttl = map_ttl
         self.info_ttl = info_ttl
         self.pairs_ttl = pairs_ttl
+        self.quotes_ttl = quotes_ttl
+        self.assets_ttl = assets_ttl
+        self.crypto_quote_ttl = crypto_quote_ttl
         self._sleep = sleeper or time.sleep
         self._cache = _TTLCache()
+        self._journal = _CallJournal(self.source)
+
+    def begin_run(self) -> None:
+        self._journal.begin_run()
+
+    def call_log(self) -> list[dict[str, Any]]:
+        return self._journal.call_log()
+
+    def _record(self, endpoint: str, *, via: str, cached: bool = False) -> None:
+        self._journal.record(endpoint, via=via, cached=cached)
 
     def _backoff_delay(self, attempt: int, retry_after: float | None, remaining: float) -> float:
         """Seconds to wait before the next try. ``attempt`` is 0 on the first retry."""
@@ -287,51 +536,135 @@ class CMCClient:
         key = f"map:{(symbol or '').upper()}"
         cached = self._cache.get(key, self.map_ttl)
         if cached is not None:
+            self._record(ENDPOINT_MAP, via="cache", cached=True)
             return cached
         params: dict[str, Any] = {}
         if symbol:
             params["symbol"] = symbol
-        data = self._get("/v5/real-world-assets/map", params)
+        data = self._get(ENDPOINT_MAP, params)
         assets = data.get("data", {}).get("rwa_assets", [])
         self._cache.set(key, assets)
+        self._record(ENDPOINT_MAP, via="network")
         return copy.deepcopy(assets)
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         key = f"info:{int(rwa_id)}"
         cached = self._cache.get(key, self.info_ttl)
         if cached is not None:
+            self._record(ENDPOINT_INFO, via="cache", cached=True)
             return cached
-        data = self._get("/v5/real-world-assets/info", {"rwa_id": rwa_id})
+        data = self._get(ENDPOINT_INFO, {"rwa_id": rwa_id})
         assets = data.get("data", {}).get("rwa_assets", [])
         info = assets[0] if assets else {}
         self._cache.set(key, info)
+        self._record(ENDPOINT_INFO, via="network")
         return copy.deepcopy(info)
 
     def issuers_list(self) -> list[dict[str, Any]]:
         cached = self._cache.get("issuers_list", ttl=None)
         if cached is not None:
+            self._record(ENDPOINT_ISSUERS_LIST, via="cache", cached=True)
             return cached
-        data = self._get("/v5/real-world-assets/issuers/list")
+        data = self._get(ENDPOINT_ISSUERS_LIST)
         issuers = data.get("data", {}).get("issuers", [])
         self._cache.set("issuers_list", issuers)
+        self._record(ENDPOINT_ISSUERS_LIST, via="network")
         return copy.deepcopy(issuers)
 
     def issuer(self, issuer_id: str) -> dict[str, Any]:
         key = f"issuer:{issuer_id}"
         cached = self._cache.get(key, ttl=None)
         if cached is not None:
+            self._record(ENDPOINT_ISSUERS, via="cache", cached=True)
             return cached
-        data = self._get("/v5/real-world-assets/issuers", {"issuer_id": issuer_id})
+        data = self._get(ENDPOINT_ISSUERS, {"issuer_id": issuer_id})
         detail = data.get("data", {})
         self._cache.set(key, detail)
+        self._record(ENDPOINT_ISSUERS, via="network")
         return copy.deepcopy(detail)
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
+        key = f"crypto_quote:{int(crypto_id)}"
+        cached = self._cache.get(key, self.crypto_quote_ttl)
+        if cached is not None:
+            self._record(ENDPOINT_CRYPTO_QUOTE, via="cache", cached=True)
+            return cached
         data = self._get(
-            "/v2/cryptocurrency/quotes/latest",
+            ENDPOINT_CRYPTO_QUOTE,
             {"id": crypto_id, "convert": "USD"},
         )
-        return data.get("data", {}).get(str(crypto_id), {})
+        quote = data.get("data", {}).get(str(crypto_id), {})
+        self._cache.set(key, quote)
+        self._record(ENDPOINT_CRYPTO_QUOTE, via="network")
+        return copy.deepcopy(quote)
+
+    def rwa_quotes(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        """Latest tokenized aggregates, issuer tokens, and TradFi venues.
+
+        Requires exactly one of ``rwa_id`` or ``symbol``. Cached on a short TTL.
+        Does not pass ``convert`` — extra convert credits are not needed for the
+        USD aggregates already on the asset object.
+        """
+        if rwa_id is None and not symbol:
+            raise CMCError("rwa_quotes requires rwa_id or symbol")
+        if rwa_id is not None and symbol:
+            raise CMCError("rwa_quotes accepts only one of rwa_id or symbol")
+        if rwa_id is not None:
+            key = f"quotes:id:{int(rwa_id)}"
+            params: dict[str, Any] = {"rwa_id": int(rwa_id)}
+        else:
+            key = f"quotes:sym:{(symbol or '').upper()}"
+            params = {"symbol": (symbol or "").upper()}
+        cached = self._cache.get(key, self.quotes_ttl)
+        if cached is not None:
+            self._record(ENDPOINT_QUOTES, via="cache", cached=True)
+            return cached
+        data = self._get(ENDPOINT_QUOTES, params)
+        parsed = parse_rwa_quotes_payload(data.get("data") or {})
+        self._cache.set(key, parsed)
+        self._record(ENDPOINT_QUOTES, via="network")
+        return copy.deepcopy(parsed)
+
+    def assets_list(
+        self,
+        *,
+        asset_type: str | None = None,
+        start: int = 1,
+        limit: int = DEFAULT_ASSETS_LIST_LIMIT,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]:
+        """Ranked RWA directory. One Basic credit per 250 rows; default page is 100."""
+        kind = (asset_type or "").strip().lower()
+        if kind and kind not in ASSET_TYPES:
+            raise CMCError(
+                f"assets_list asset_type must be one of {', '.join(ASSET_TYPES)}"
+            )
+        page = max(1, int(start))
+        size = max(1, min(int(limit), 250))
+        key = f"assets:{kind}:{page}:{size}:{sort}:{sort_dir}"
+        cached = self._cache.get(key, self.assets_ttl)
+        if cached is not None:
+            self._record(ENDPOINT_ASSETS_LIST, via="cache", cached=True)
+            return cached
+        params: dict[str, Any] = {
+            "start": page,
+            "limit": size,
+            "sort": sort,
+            "sort_dir": sort_dir,
+        }
+        if kind:
+            params["asset_type"] = kind
+        data = self._get(ENDPOINT_ASSETS_LIST, params)
+        parsed = parse_assets_list_payload(data.get("data") or {})
+        self._cache.set(key, parsed)
+        self._record(ENDPOINT_ASSETS_LIST, via="network")
+        return copy.deepcopy(parsed)
 
     def market_pairs(
         self,
@@ -362,10 +695,12 @@ class CMCClient:
             }
         cached = self._cache.get(key, self.pairs_ttl)
         if cached is not None:
+            self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
             return cached
-        data = self._get("/v5/real-world-assets/market-pairs/list", params)
+        data = self._get(ENDPOINT_MARKET_PAIRS, params)
         parsed = parse_market_pairs_payload(data.get("data") or {})
         self._cache.set(key, parsed)
+        self._record(ENDPOINT_MARKET_PAIRS, via="network")
         return copy.deepcopy(parsed)
 
 
@@ -384,6 +719,16 @@ class FixtureClient:
                 f"Fixture file {self.path} is missing meta.kind=demo_fixture. "
                 "Refusing to treat unlabeled data as live CMC output."
             )
+        self._journal = _CallJournal(self.source)
+
+    def begin_run(self) -> None:
+        self._journal.begin_run()
+
+    def call_log(self) -> list[dict[str, Any]]:
+        return self._journal.call_log()
+
+    def _record(self, endpoint: str) -> None:
+        self._journal.record(endpoint, via="fixture")
 
     @property
     def label(self) -> str:
@@ -392,6 +737,7 @@ class FixtureClient:
         )
 
     def rwa_map(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        self._record(ENDPOINT_MAP)
         assets = list(self._data.get("map") or [])
         if not symbol:
             return assets
@@ -399,19 +745,89 @@ class FixtureClient:
         return [a for a in assets if (a.get("symbol") or "").upper() in wanted]
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
+        self._record(ENDPOINT_INFO)
         info = self._data.get("info") or {}
         return dict(info.get(str(rwa_id)) or {})
 
     def issuers_list(self) -> list[dict[str, Any]]:
+        self._record(ENDPOINT_ISSUERS_LIST)
         return list(self._data.get("issuers_list") or [])
 
     def issuer(self, issuer_id: str) -> dict[str, Any]:
+        self._record(ENDPOINT_ISSUERS)
         issuers = self._data.get("issuers") or {}
         return dict(issuers.get(str(issuer_id)) or {})
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
+        self._record(ENDPOINT_CRYPTO_QUOTE)
         quotes = self._data.get("quotes") or {}
         return dict(quotes.get(str(crypto_id)) or {})
+
+    def rwa_quotes(
+        self,
+        *,
+        rwa_id: int | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        self._record(ENDPOINT_QUOTES)
+        catalog = self._data.get("rwa_quotes") or {}
+        if rwa_id is not None:
+            return parse_rwa_quotes_payload(catalog.get(str(int(rwa_id))) or {})
+        if not symbol:
+            return parse_rwa_quotes_payload({})
+        wanted = symbol.strip().upper()
+        for payload in catalog.values():
+            if isinstance(payload, dict) and (payload.get("symbol") or "").upper() == wanted:
+                return parse_rwa_quotes_payload(payload)
+        return parse_rwa_quotes_payload({})
+
+    def assets_list(
+        self,
+        *,
+        asset_type: str | None = None,
+        start: int = 1,
+        limit: int = DEFAULT_ASSETS_LIST_LIMIT,
+        sort: str = "rwa_rank",
+        sort_dir: str = "asc",
+    ) -> dict[str, Any]:
+        self._record(ENDPOINT_ASSETS_LIST)
+        kind = (asset_type or "").strip().lower()
+        raw = self._data.get("assets_list")
+        if isinstance(raw, dict):
+            rows = list(raw.get("rwa_assets") or [])
+        elif isinstance(raw, list):
+            rows = list(raw)
+        else:
+            # Older fixtures: ranked map rows stand in for assets/list.
+            rows = list(self._data.get("map") or [])
+        if kind:
+            rows = [row for row in rows if (row.get("asset_type") or "").lower() == kind]
+        reverse = sort_dir.lower() == "desc"
+
+        def _sort_key(row: dict[str, Any]) -> tuple:
+            if sort == "symbol":
+                return ((row.get("symbol") or "").upper(),)
+            if sort == "tokenized_market_cap":
+                return (_optional_float(row.get("tokenized_market_cap")) or 0.0,)
+            if sort == "tokenized_volume_24h":
+                return (_optional_float(row.get("tokenized_volume_24h")) or 0.0,)
+            if sort == "average_tokenized_price":
+                return (_optional_float(row.get("average_tokenized_price")) or 0.0,)
+            rank = _optional_int(row.get("rwa_rank"))
+            return (rank if rank is not None else 10**9,)
+
+        rows = sorted(rows, key=_sort_key, reverse=reverse)
+        page = max(1, int(start))
+        size = max(1, min(int(limit), 250))
+        offset = page - 1
+        sliced = rows[offset : offset + size]
+        return parse_assets_list_payload(
+            {
+                "rwa_assets": sliced,
+                "total_size": len(rows),
+                "has_more": offset + size < len(rows),
+            }
+        )
 
     def market_pairs(
         self,
@@ -419,6 +835,7 @@ class FixtureClient:
         rwa_id: int | None = None,
         symbol: str | None = None,
     ) -> dict[str, Any]:
+        self._record(ENDPOINT_MARKET_PAIRS)
         catalog = self._data.get("market_pairs") or {}
         if rwa_id is not None:
             return parse_market_pairs_payload(catalog.get(str(int(rwa_id))) or {})

@@ -23,7 +23,12 @@ from .chainlink_por import (
     canonical_backed_por_feed,
     fixture_por_skip_note,
 )
-from .client import RWAClient, parse_market_pairs_payload
+from .client import (
+    RWAClient,
+    parse_market_pairs_payload,
+    parse_rwa_quotes_payload,
+    summarize_call_log,
+)
 from .issuer_registry import HEURISTIC_NOTE, classify, issuer_note
 from .verifiers import (
     VerificationLevel,
@@ -59,7 +64,7 @@ PILLARS: dict[str, dict[str, str]] = {
     },
     "price": {
         "label": "Price integrity",
-        "what": "On-chain token tracks the stock without wild 24h drift.",
+        "what": "Issuer tokens track CMC average_tokenized_price; crypto 24hΔ is the labeled fallback.",
     },
     "disclosure": {
         "label": "Disclosure",
@@ -67,7 +72,7 @@ PILLARS: dict[str, dict[str, str]] = {
     },
     "basis": {
         "label": "Cross-issuer basis",
-        "what": "Same underlying ticker, different wrapper prices — spread is wrapper risk.",
+        "what": "Same ticker, different issuer token prices (RWA quotes tokens[] plus market-pairs).",
     },
 }
 
@@ -80,6 +85,13 @@ SINGLE_WRAPPER_BASIS_SCORE = 55.0
 BASIS_ERROR_SCORE = 50.0
 BASIS_SCORE_FLOOR = 15.0
 BASIS_SPREAD_PENALTY = 10.0
+PRICE_SCORE_FLOOR = 20.0
+PRICE_DEV_PENALTY = 2.0
+ZERO_VOLUME_PRICE_CAP = 45.0
+SOURCE_RWA_QUOTES = "cmc_rwa_quotes"
+SOURCE_CRYPTO_QUOTE = "cmc_crypto_quote"
+SOURCE_MARKET_PAIRS = "cmc_market_pairs"
+SOURCE_RWA_AND_PAIRS = "cmc_rwa_quotes+market_pairs"
 
 
 class ScoreError(RuntimeError):
@@ -226,6 +238,92 @@ def percent_spread(prices: list[float]) -> float | None:
     if mid <= 0:
         return None
     return (high - low) / mid * 100.0
+
+
+def wrappers_from_rwa_tokens(tokens: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Priced ``tokens[]`` rows from CMC RWA quotes/latest — one wrapper each."""
+    wrappers: list[dict[str, Any]] = []
+    for row in tokens or []:
+        if not isinstance(row, dict):
+            continue
+        price = row.get("price")
+        try:
+            price_f = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price_f = None
+        if price_f is None or price_f <= 0:
+            continue
+        crypto_id = row.get("crypto_id")
+        try:
+            cid = int(crypto_id) if crypto_id is not None else None
+        except (TypeError, ValueError):
+            cid = None
+        volume = row.get("volume_24h")
+        try:
+            vol_f = max(0.0, float(volume)) if volume is not None else 0.0
+        except (TypeError, ValueError):
+            vol_f = 0.0
+        wrappers.append(
+            {
+                "crypto_id": cid,
+                "symbol": (row.get("symbol") or "").strip() or (f"id:{cid}" if cid else "token"),
+                "price": price_f,
+                "volume_24h": vol_f,
+                "venues": 1,
+                "issuer": (row.get("issuer_name") or "").strip(),
+                "source": SOURCE_RWA_QUOTES,
+            }
+        )
+    wrappers.sort(key=lambda row: (row["price"], row.get("crypto_id") or 0))
+    return wrappers
+
+
+def merge_basis_wrappers(
+    quote_wrappers: list[dict[str, Any]],
+    pair_wrappers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Union by ``crypto_id`` (else symbol). Quotes supply issuer_name; pairs add venues."""
+    merged: dict[tuple[str, Any], dict[str, Any]] = {}
+
+    def _key(row: dict[str, Any]) -> tuple[str, Any]:
+        cid = row.get("crypto_id")
+        if cid is not None:
+            return ("id", int(cid))
+        return ("sym", (row.get("symbol") or "").upper())
+
+    for row in pair_wrappers:
+        item = dict(row)
+        item.setdefault("source", SOURCE_MARKET_PAIRS)
+        item.setdefault("issuer", "")
+        merged[_key(item)] = item
+    for row in quote_wrappers:
+        item = dict(row)
+        item.setdefault("source", SOURCE_RWA_QUOTES)
+        key = _key(item)
+        if key not in merged:
+            merged[key] = item
+            continue
+        existing = merged[key]
+        out = {**existing, **item}
+        out["venues"] = max(int(existing.get("venues") or 1), int(item.get("venues") or 1))
+        if existing.get("issuer") and not item.get("issuer"):
+            out["issuer"] = existing["issuer"]
+        sources = {
+            existing.get("source") or SOURCE_MARKET_PAIRS,
+            item.get("source") or SOURCE_RWA_QUOTES,
+        }
+        out["source"] = (
+            SOURCE_RWA_AND_PAIRS if len(sources) > 1 else next(iter(sources))
+        )
+        merged[key] = out
+    wrappers = list(merged.values())
+    wrappers.sort(key=lambda row: (float(row["price"]), row.get("crypto_id") or 0))
+    return wrappers
+
+
+def price_score_from_deviation(max_deviation_pct: float) -> float:
+    """``score = max(20, 100 − |dev%| × 2)`` — same scale as the old 24hΔ formula."""
+    return max(PRICE_SCORE_FLOOR, 100.0 - abs(float(max_deviation_pct)) * PRICE_DEV_PENALTY)
 
 
 def basis_score_from_spread(pct_spread: float) -> float:
@@ -419,14 +517,39 @@ class TransparencyScorer:
         assert self._issuer_index is not None
         return self._issuer_index.get(rwa_id, {})
 
-    def _price_score(self, crypto_id: Any) -> tuple[float, dict[str, Any], list[str], str]:
-        """Return (score, quote_meta, flags, explanation). Never swallow errors silently."""
+    def _load_rwa_quotes(
+        self, rwa_id: int | None
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Fetch and normalize ``quotes/latest``. Empty dict when unused or missing."""
+        flags: list[str] = []
+        empty = parse_rwa_quotes_payload({})
+        if rwa_id is None:
+            return empty, flags
+        fetch = getattr(self.client, "rwa_quotes", None)
+        if not callable(fetch):
+            return empty, flags
+        try:
+            raw = fetch(rwa_id=rwa_id)
+        except Exception as exc:  # noqa: BLE001 — record, do not hide
+            flags.append(f"RWA quotes lookup failed: {exc}")
+            return empty, flags
+        return parse_rwa_quotes_payload(raw), flags
+
+    def _crypto_quote_price(
+        self, crypto_id: Any
+    ) -> tuple[float, dict[str, Any], list[str], str]:
+        """Labeled fallback: ``/v2/cryptocurrency/quotes/latest`` 24h change."""
         flags: list[str] = []
         if not crypto_id:
             flags.append("No on-chain crypto_id linked to this RWA — price integrity unverified.")
             return (
                 MISSING_CRYPTO_PRICE_SCORE,
-                {"available": False, "crypto_id": None, "percent_change_24h": None},
+                {
+                    "available": False,
+                    "crypto_id": None,
+                    "percent_change_24h": None,
+                    "source": SOURCE_CRYPTO_QUOTE,
+                },
                 flags,
                 "No token crypto_id in the issuer cache; assigned the missing-quote default "
                 f"({MISSING_CRYPTO_PRICE_SCORE:.0f}).",
@@ -437,7 +560,12 @@ class TransparencyScorer:
             flags.append(f"Token quote lookup failed: {exc}")
             return (
                 QUOTE_ERROR_PRICE_SCORE,
-                {"available": False, "crypto_id": int(crypto_id), "percent_change_24h": None},
+                {
+                    "available": False,
+                    "crypto_id": int(crypto_id),
+                    "percent_change_24h": None,
+                    "source": SOURCE_CRYPTO_QUOTE,
+                },
                 flags,
                 f"Quote endpoint error; assigned the error default ({QUOTE_ERROR_PRICE_SCORE:.0f}).",
             )
@@ -447,7 +575,12 @@ class TransparencyScorer:
             flags.append("Quote payload had no USD block — price integrity unverified.")
             return (
                 DEFAULT_PRICE_SCORE,
-                {"available": False, "crypto_id": int(crypto_id), "percent_change_24h": None},
+                {
+                    "available": False,
+                    "crypto_id": int(crypto_id),
+                    "percent_change_24h": None,
+                    "source": SOURCE_CRYPTO_QUOTE,
+                },
                 flags,
                 f"Empty USD quote; assigned the unverified default ({DEFAULT_PRICE_SCORE:.0f}).",
             )
@@ -457,26 +590,140 @@ class TransparencyScorer:
             flags.append("USD quote missing percent_change_24h — price integrity unverified.")
             return (
                 DEFAULT_PRICE_SCORE,
-                {"available": False, "crypto_id": int(crypto_id), "percent_change_24h": None},
+                {
+                    "available": False,
+                    "crypto_id": int(crypto_id),
+                    "percent_change_24h": None,
+                    "source": SOURCE_CRYPTO_QUOTE,
+                },
                 flags,
                 f"No 24h change in quote; assigned the unverified default ({DEFAULT_PRICE_SCORE:.0f}).",
             )
 
         pct = abs(float(raw_pct))
-        score = max(20.0, 100.0 - pct * 2)
+        score = price_score_from_deviation(pct)
         meta = {
             "available": True,
             "crypto_id": int(crypto_id),
             "percent_change_24h": float(raw_pct),
             "price": usd.get("price"),
             "volume_24h": usd.get("volume_24h"),
+            "source": SOURCE_CRYPTO_QUOTE,
+            "fallback": True,
         }
         return (
             score,
             meta,
             flags,
-            f"24h change {float(raw_pct):+.2f}%; score = max(20, 100 − |Δ| × 2) = {score:.1f}.",
+            (
+                f"CMC crypto quote 24h change {float(raw_pct):+.2f}% "
+                f"(RWA quotes/latest unused or unusable); "
+                f"score = max({PRICE_SCORE_FLOOR:.0f}, 100 − |Δ| × "
+                f"{PRICE_DEV_PENALTY:.0f}) = {score:.1f}."
+            ),
         )
+
+    def _price_score(
+        self,
+        rwa_quotes: dict[str, Any],
+        crypto_id: Any,
+        *,
+        quote_flags: list[str] | None = None,
+    ) -> tuple[float, dict[str, Any], list[str], str]:
+        """Prefer RWA ``quotes/latest``; fall back to crypto 24hΔ. Never invent fields."""
+        flags = list(quote_flags or [])
+        tokens = wrappers_from_rwa_tokens(rwa_quotes.get("tokens") or [])
+        avg = rwa_quotes.get("average_tokenized_price")
+        try:
+            avg_f = float(avg) if avg is not None else None
+        except (TypeError, ValueError):
+            avg_f = None
+        if (avg_f is None or avg_f <= 0) and tokens:
+            avg_f = sum(float(t["price"]) for t in tokens) / len(tokens)
+            avg_label = "mean of priced tokens[] (CMC average_tokenized_price missing)"
+        else:
+            avg_label = "CMC average_tokenized_price"
+
+        if avg_f is not None and avg_f > 0 and tokens:
+            deviations = [abs(float(t["price"]) - avg_f) / avg_f * 100.0 for t in tokens]
+            max_dev = max(deviations)
+            score = price_score_from_deviation(max_dev)
+            vol = rwa_quotes.get("tokenized_volume_24h")
+            try:
+                vol_f = float(vol) if vol is not None else None
+            except (TypeError, ValueError):
+                vol_f = None
+            if vol_f is not None and vol_f == 0:
+                flags.append("CMC tokenized_volume_24h is 0 — thin tape.")
+                score = min(score, ZERO_VOLUME_PRICE_CAP)
+            tradfi = rwa_quotes.get("tradfi_markets") or []
+            meta = {
+                "available": True,
+                "source": SOURCE_RWA_QUOTES,
+                "fallback": False,
+                "crypto_id": int(crypto_id) if crypto_id else None,
+                "percent_change_24h": None,
+                "price": avg_f,
+                "average_tokenized_price": avg_f,
+                "tokenized_market_cap": rwa_quotes.get("tokenized_market_cap"),
+                "tokenized_volume_24h": vol_f,
+                "max_deviation_pct": max_dev,
+                "avg_basis": avg_label,
+                "tokens": tokens,
+                "tradfi_markets": tradfi,
+                "tradfi_venue_count": len(tradfi),
+            }
+            return (
+                score,
+                meta,
+                flags,
+                (
+                    f"CMC RWA quotes/latest: {len(tokens)} priced token(s) vs "
+                    f"{avg_label} {avg_f:.4f}; max |token−avg|/avg = {max_dev:.2f}%; "
+                    f"tokenized mcap={rwa_quotes.get('tokenized_market_cap')}, "
+                    f"vol_24h={vol_f}; "
+                    f"{len(tradfi)} TradFi venue(s) listed (no TradFi last price in CMC). "
+                    f"score = max({PRICE_SCORE_FLOOR:.0f}, 100 − |dev%| × "
+                    f"{PRICE_DEV_PENALTY:.0f}) = {score:.1f}."
+                ),
+            )
+
+        if flags and any("RWA quotes lookup failed" in item for item in flags):
+            # Still try the crypto fallback so a quotes outage is not a silent 50.
+            fallback_score, fallback_meta, extra, why = self._crypto_quote_price(crypto_id)
+            flags.extend(extra)
+            fallback_meta = dict(fallback_meta)
+            fallback_meta["rwa_quotes_error"] = True
+            return fallback_score, fallback_meta, flags, why
+
+        if avg_f is not None and avg_f > 0 and not tokens:
+            flags.append(
+                "CMC RWA quotes returned average_tokenized_price but no priced tokens[] "
+                "— integrity vs wrappers unverified."
+            )
+            # Display the aggregate; score uses the labeled unverified default.
+            meta = {
+                "available": False,
+                "source": SOURCE_RWA_QUOTES,
+                "fallback": False,
+                "crypto_id": int(crypto_id) if crypto_id else None,
+                "percent_change_24h": None,
+                "price": avg_f,
+                "average_tokenized_price": avg_f,
+                "tokenized_market_cap": rwa_quotes.get("tokenized_market_cap"),
+                "tokenized_volume_24h": rwa_quotes.get("tokenized_volume_24h"),
+                "tokens": [],
+                "tradfi_markets": rwa_quotes.get("tradfi_markets") or [],
+            }
+            return (
+                DEFAULT_PRICE_SCORE,
+                meta,
+                flags,
+                f"RWA quotes have an average ({avg_f:.4f}) but no priced tokens[]; "
+                f"assigned the unverified default ({DEFAULT_PRICE_SCORE:.0f}).",
+            )
+
+        return self._crypto_quote_price(crypto_id)
 
     def _issuer_by_crypto_id(self) -> dict[int, str]:
         """crypto_id → issuer name from the already-built issuer index."""
@@ -492,9 +739,15 @@ class TransparencyScorer:
                 continue
         return names
 
-    def _basis_score(self, rwa_id: int | None) -> tuple[float, dict[str, Any], list[str], str]:
-        """Cross-issuer wrapper spread. Never swallow fetch errors silently."""
-        flags: list[str] = []
+    def _basis_score(
+        self,
+        rwa_id: int | None,
+        rwa_quotes: dict[str, Any] | None = None,
+        *,
+        quote_flags: list[str] | None = None,
+    ) -> tuple[float, dict[str, Any], list[str], str]:
+        """Cross-issuer wrapper spread from RWA quotes tokens[] plus market-pairs."""
+        flags = list(quote_flags or [])
         empty_meta: dict[str, Any] = {
             "available": False,
             "wrapper_count": 0,
@@ -502,6 +755,8 @@ class TransparencyScorer:
             "min_price": None,
             "max_price": None,
             "wrappers": [],
+            "source": None,
+            "tradfi_markets": [],
         }
         if rwa_id is None:
             flags.append(
@@ -514,40 +769,63 @@ class TransparencyScorer:
                 "Catalog-only Backed bToken (no map row); assigned the missing-pairs default "
                 f"({MISSING_BASIS_SCORE:.0f}).",
             )
+
+        quote_wrappers = wrappers_from_rwa_tokens((rwa_quotes or {}).get("tokens") or [])
+        tradfi = list((rwa_quotes or {}).get("tradfi_markets") or [])
+        pair_error: str | None = None
+        pair_wrappers: list[dict[str, Any]] = []
         try:
             raw = self.client.market_pairs(rwa_id=rwa_id)
         except Exception as exc:  # noqa: BLE001 — record, do not hide
+            pair_error = str(exc)
             flags.append(f"Market-pairs lookup failed: {exc}")
-            return (
-                BASIS_ERROR_SCORE,
-                empty_meta,
-                flags,
-                f"Market-pairs endpoint error; assigned the error default "
-                f"({BASIS_ERROR_SCORE:.0f}).",
-            )
+        else:
+            payload = parse_market_pairs_payload(raw)
+            pair_wrappers = group_wrapper_quotes(payload.get("market_pairs") or [])
+            issuer_names = self._issuer_by_crypto_id()
+            for wrapper in pair_wrappers:
+                cid = wrapper.get("crypto_id")
+                if cid is not None and not wrapper.get("issuer"):
+                    wrapper["issuer"] = issuer_names.get(int(cid)) or ""
+                wrapper.setdefault("source", SOURCE_MARKET_PAIRS)
 
-        payload = parse_market_pairs_payload(raw)
-        wrappers = group_wrapper_quotes(payload.get("market_pairs") or [])
-        issuer_names = self._issuer_by_crypto_id()
-        for wrapper in wrappers:
-            wrapper["issuer"] = issuer_names.get(int(wrapper["crypto_id"])) or ""
+        wrappers = merge_basis_wrappers(quote_wrappers, pair_wrappers)
+        used_quotes = bool(quote_wrappers)
+        used_pairs = bool(pair_wrappers)
+        if used_quotes and used_pairs:
+            source = SOURCE_RWA_AND_PAIRS
+        elif used_quotes:
+            source = SOURCE_RWA_QUOTES
+        elif used_pairs:
+            source = SOURCE_MARKET_PAIRS
+        else:
+            source = None
 
         if not wrappers:
+            if pair_error and not used_quotes:
+                return (
+                    BASIS_ERROR_SCORE,
+                    {**empty_meta, "tradfi_markets": tradfi},
+                    flags,
+                    f"Market-pairs endpoint error; assigned the error default "
+                    f"({BASIS_ERROR_SCORE:.0f}).",
+                )
             flags.append(
-                "No priced wrapper tokens on CMC market-pairs — cross-issuer basis unverified."
+                "No priced wrapper tokens on CMC RWA quotes or market-pairs — "
+                "cross-issuer basis unverified."
             )
             return (
                 MISSING_BASIS_SCORE,
-                empty_meta,
+                {**empty_meta, "tradfi_markets": tradfi, "source": source},
                 flags,
-                "No wrapper USD prices in market-pairs; assigned the missing-pairs default "
-                f"({MISSING_BASIS_SCORE:.0f}).",
+                "No wrapper USD prices in RWA quotes tokens[] or market-pairs; "
+                f"assigned the missing-pairs default ({MISSING_BASIS_SCORE:.0f}).",
             )
 
         if len(wrappers) == 1:
             only = wrappers[0]
             flags.append(
-                "Only one wrapper token on CMC market-pairs — cannot compare issuers."
+                "Only one wrapper token on CMC RWA quotes/market-pairs — cannot compare issuers."
             )
             meta = {
                 "available": False,
@@ -556,6 +834,8 @@ class TransparencyScorer:
                 "min_price": only["price"],
                 "max_price": only["price"],
                 "wrappers": wrappers,
+                "source": source,
+                "tradfi_markets": tradfi,
             }
             return (
                 SINGLE_WRAPPER_BASIS_SCORE,
@@ -568,7 +848,7 @@ class TransparencyScorer:
         prices = [float(w["price"]) for w in wrappers]
         spread = percent_spread(prices)
         if spread is None:
-            flags.append("Could not compute a wrapper percent-spread from market-pairs.")
+            flags.append("Could not compute a wrapper percent-spread from quotes/market-pairs.")
             return (
                 MISSING_BASIS_SCORE,
                 {
@@ -578,6 +858,8 @@ class TransparencyScorer:
                     "min_price": min(prices) if prices else None,
                     "max_price": max(prices) if prices else None,
                     "wrappers": wrappers,
+                    "source": source,
+                    "tradfi_markets": tradfi,
                 },
                 flags,
                 f"Invalid spread inputs; assigned the missing default ({MISSING_BASIS_SCORE:.0f}).",
@@ -594,16 +876,24 @@ class TransparencyScorer:
             "min_price": low["price"],
             "max_price": high["price"],
             "wrappers": wrappers,
+            "source": source,
+            "tradfi_markets": tradfi,
         }
         cheap = f"{low['symbol']} {low['price']:.4f}"
         dear = f"{high['symbol']} {high['price']:.4f}"
+        source_note = {
+            SOURCE_RWA_AND_PAIRS: "CMC RWA quotes tokens[] + market-pairs",
+            SOURCE_RWA_QUOTES: "CMC RWA quotes tokens[]",
+            SOURCE_MARKET_PAIRS: "CMC market-pairs",
+        }.get(source or "", "CMC wrapper prices")
         return (
             score,
             meta,
             flags,
             (
-                f"{len(wrappers)} wrappers; spread {spread:.2f}% "
+                f"{source_note}: {len(wrappers)} wrappers; spread {spread:.2f}% "
                 f"({cheap} vs {dear}); "
+                f"{len(tradfi)} TradFi venue(s) listed (no TradFi last price). "
                 f"score = max({BASIS_SCORE_FLOOR:.0f}, 100 − |spread| × "
                 f"{BASIS_SPREAD_PENALTY:.0f}) = {score:.1f}."
             ),
@@ -725,6 +1015,12 @@ class TransparencyScorer:
         )
 
     def score(self, ticker: str) -> dict[str, Any]:
+        log_start = 0
+        if hasattr(self.client, "call_log"):
+            try:
+                log_start = len(self.client.call_log())
+            except Exception:  # noqa: BLE001
+                log_start = 0
         rwa_id, backed_feed = self._resolve_score_target(ticker)
         catalog_only = rwa_id is None
         if catalog_only:
@@ -801,17 +1097,32 @@ class TransparencyScorer:
             redemption_lead = f"Live redemption check for '{issuer_name or 'unknown'}'."
         redemption_why = _append_verification_notes(redemption_lead, redemption_v)
 
-        price_score, price_meta, price_flags, price_why = self._price_score(token.get("crypto_id"))
+        rwa_quotes, quote_flags = self._load_rwa_quotes(rwa_id)
+        price_score, price_meta, price_flags, price_why = self._price_score(
+            rwa_quotes, token.get("crypto_id"), quote_flags=quote_flags
+        )
+        price_source = str(price_meta.get("source") or SOURCE_CRYPTO_QUOTE)
+        if price_meta.get("available") and price_source == SOURCE_RWA_QUOTES:
+            price_evidence = (
+                f"CMC RWA quotes/latest: avg={price_meta.get('average_tokenized_price')}; "
+                f"max token deviation {price_meta.get('max_deviation_pct'):.2f}%; "
+                f"tokenized mcap={price_meta.get('tokenized_market_cap')}, "
+                f"vol_24h={price_meta.get('tokenized_volume_24h')}; "
+                f"{price_meta.get('tradfi_venue_count') or 0} TradFi venue(s)."
+            )
+        elif price_meta.get("available"):
+            price_evidence = (
+                f"CMC crypto quote crypto_id={price_meta.get('crypto_id')}; "
+                f"24hΔ={price_meta.get('percent_change_24h')} "
+                f"(labeled fallback — RWA quotes unused or unusable)."
+            )
+        else:
+            price_evidence = "CMC RWA quotes / crypto quote unavailable — self-reported gap."
         price_v = VerificationResult(
             score=price_score,
             level=VerificationLevel.SELF_REPORTED,
-            evidence=(
-                f"CMC crypto quote crypto_id={price_meta.get('crypto_id')}; "
-                f"24hΔ={price_meta.get('percent_change_24h')}"
-                if price_meta.get("available")
-                else "CMC quote unavailable — self-reported gap."
-            ),
-            source="cmc_quote",
+            evidence=price_evidence,
+            source=price_source,
             notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
             ok=bool(price_meta.get("available")),
         )
@@ -840,29 +1151,37 @@ class TransparencyScorer:
             disclosure_v,
         )
 
-        basis_score, basis_meta, basis_flags, basis_why = self._basis_score(rwa_id)
+        basis_score, basis_meta, basis_flags, basis_why = self._basis_score(
+            rwa_id, rwa_quotes, quote_flags=quote_flags
+        )
         cheap = basis_meta.get("min_price")
         dear = basis_meta.get("max_price")
         spread_pct = basis_meta.get("percent_spread")
+        basis_source = str(basis_meta.get("source") or SOURCE_MARKET_PAIRS)
+        source_label = {
+            SOURCE_RWA_AND_PAIRS: "CMC RWA quotes tokens[] + market-pairs",
+            SOURCE_RWA_QUOTES: "CMC RWA quotes tokens[]",
+            SOURCE_MARKET_PAIRS: "CMC market-pairs",
+        }.get(basis_source, "CMC wrapper prices")
         if basis_meta.get("available"):
             basis_evidence = (
-                f"CMC market-pairs: {basis_meta.get('wrapper_count')} wrappers; "
+                f"{source_label}: {basis_meta.get('wrapper_count')} wrappers; "
                 f"spread {spread_pct:.2f}% "
                 f"(low {cheap}, high {dear})."
             )
         elif basis_meta.get("wrapper_count") == 1:
             only = (basis_meta.get("wrappers") or [{}])[0]
             basis_evidence = (
-                f"CMC market-pairs: single wrapper "
+                f"{source_label}: single wrapper "
                 f"{only.get('symbol') or 'unknown'} — no cross-issuer compare."
             )
         else:
-            basis_evidence = "CMC market-pairs unavailable — self-reported gap."
+            basis_evidence = "CMC RWA quotes / market-pairs unavailable — self-reported gap."
         basis_v = VerificationResult(
             score=basis_score,
             level=VerificationLevel.SELF_REPORTED,
             evidence=basis_evidence,
-            source="cmc_market_pairs",
+            source=basis_source,
             notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
             ok=bool(basis_meta.get("available")),
         )
@@ -888,10 +1207,18 @@ class TransparencyScorer:
                 "No redemption right — you can only sell the token, not claim the share (heuristic)."
             )
         if price_score < 50:
-            risk_flags.append("Token price drifting hard from the underlying — possible thin liquidity.")
+            if price_meta.get("source") == SOURCE_RWA_QUOTES:
+                risk_flags.append(
+                    "Issuer tokens drifting from CMC average_tokenized_price — possible thin tape."
+                )
+            else:
+                risk_flags.append(
+                    "Token price drifting hard from the underlying — possible thin liquidity."
+                )
         if basis_score < 50:
             risk_flags.append(
-                "Wide cross-issuer wrapper spread — same ticker, different prices (CMC market-pairs)."
+                "Wide cross-issuer wrapper spread — same ticker, different prices "
+                "(CMC RWA quotes / market-pairs)."
             )
         risk_flags.extend(price_flags)
         risk_flags.extend(basis_flags)
@@ -981,4 +1308,16 @@ class TransparencyScorer:
             "summary": f"{issuer_name or 'Unknown issuer'} — {len(risk_flags)} risk flag(s).",
             "verification_mode": "live" if self.use_live_verifiers else "offline_heuristic",
             "live_verifiers": bool(self.use_live_verifiers),
+            "cmc_calls": self._cmc_calls_since(log_start),
         }
+
+    def _cmc_calls_since(self, start: int) -> dict[str, Any]:
+        source = getattr(self.client, "source", "unknown")
+        rows: list[dict[str, Any]] = []
+        fetch = getattr(self.client, "call_log", None)
+        if callable(fetch):
+            try:
+                rows = list(fetch())[max(0, int(start)) :]
+            except Exception:  # noqa: BLE001
+                rows = []
+        return summarize_call_log(rows, client_source=str(source))

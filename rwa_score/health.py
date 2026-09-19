@@ -124,6 +124,7 @@ def _health_handler_class() -> type:
         def set_default_headers(self) -> None:
             self.set_header("Content-Type", "application/json")
             self.set_header("Cache-Control", "no-store")
+            self.set_header("X-RWA-Health", "json")
 
         def _write_payload(self) -> None:
             try:
@@ -136,6 +137,7 @@ def _health_handler_class() -> type:
                     "timestamp": utc_timestamp(),
                 }
             self.set_header("Content-Type", "application/json")
+            self.set_header("X-RWA-Health", "json")
             self.write(payload)
 
         def get(self) -> None:

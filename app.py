@@ -20,7 +20,7 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
-from rwa_score.client import create_client, env_flag
+from rwa_score.client import create_client, env_flag, summarize_call_log
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import share_score_card
@@ -125,7 +125,8 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
     """Educational leftover-heuristic lines. Never invents a live path."""
     base = [
         "GREEN/YELLOW/ORANGE/RED bands are automated heuristics — not audited attestations.",
-        "Price, disclosure, and cross-issuer basis are always self-reported CMC (or fixture) fields.",
+        "Price, disclosure, and cross-issuer basis are always self-reported CMC (or fixture) fields "
+        "(RWA quotes/latest plus market-pairs; crypto 24hΔ is a labeled fallback).",
         "Backing / reserves / redemption are live only when a verifier hits a published source; otherwise **heuristic fallback** (labeled, never silent).",
         "xStocks names without a published Chainlink PoR aggregator stay heuristic — that is expected coverage, not a failed probe.",
         "Fixture mode uses bundled demo data and skips live attestation / PoR / redemption HTTP.",
@@ -311,6 +312,63 @@ def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     Widget reruns must not rebuild CMCClient — that would re-hit issuers/list.
     """
     return _init_scorer(use_fixtures)
+
+
+def health_launcher_reminder(*, launcher_set: bool | None = None) -> str | None:
+    """Warn when this process was started with ``streamlit run`` instead of the health launcher.
+
+    Does not claim the Render dashboard was changed.
+    """
+    if launcher_set is None:
+        launcher_set = os.getenv("RWA_HEALTH_LAUNCHER") == "1"
+    if launcher_set:
+        return None
+    return (
+        "This process was started with `streamlit run app.py`, not "
+        "`python -m rwa_score.health`. Cold-start GET /health can be Streamlit "
+        "SPA HTML (`text/html`). Render **Start Command** must match "
+        "`render.yaml` (`python -m rwa_score.health --server.port $PORT …`). "
+        "This app cannot change the Render dashboard."
+    )
+
+
+def collect_cmc_calls(reports: list[dict], client: object) -> dict:
+    """Union of per-score journals plus leftover client log for this Streamlit run."""
+    source = getattr(client, "source", "unknown")
+    rows: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for report in reports:
+        block = report.get("cmc_calls") or {}
+        for row in block.get("endpoints") or []:
+            key = (row.get("endpoint"), row.get("source"), row.get("via"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+    fetch = getattr(client, "call_log", None)
+    extra = list(fetch()) if callable(fetch) else []
+    merged = summarize_call_log([*rows, *extra], client_source=str(source))
+    return merged
+
+
+def format_cmc_calls_lines(block: dict) -> list[str]:
+    """Human lines for the CMC-calls evidence strip. Fixture never says live."""
+    source = "fixture" if block.get("source") == "fixture" else "live"
+    if source == "fixture":
+        header = "CMC calls this run — Fixture (bundled demo, **not** live CMC)"
+    else:
+        header = "CMC calls this run — Live CMC (not fixtures)"
+    lines = [header]
+    endpoints = block.get("endpoints") or []
+    if not endpoints:
+        lines.append("No CMC/fixture directory calls recorded on this run yet.")
+        return lines
+    for row in endpoints:
+        endpoint = row.get("endpoint") or ""
+        via = row.get("via") or ("fixture" if source == "fixture" else "network")
+        tag = "fixture" if source == "fixture" else ("cache" if row.get("cached") or via == "cache" else "live")
+        lines.append(f"`GET {endpoint}` · {tag}")
+    return lines
 
 
 def assign_ticker_to_slot(slots: list[str], index: int, ticker: str) -> list[str]:
@@ -939,20 +997,20 @@ def _render_search_picker(catalog: list[TickerOption], use_fixtures: bool) -> No
         )
     else:
         st.caption(
-            "Live mode: the cached CMC RWA map plus published Backed bToken "
-            "PoR symbols (bNVDA, …). Prefix-match ticker/name or tap a "
-            "category, then choose a match."
+            "Live mode: cached CMC RWA map + ranked ``assets/list`` "
+            "(asset_type browse) plus published Backed bToken PoR symbols "
+            "(bNVDA, …). Prefix-match ticker/name or tap a category / type, "
+            "then choose a match."
         )
 
 
 def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
-    """CMC/fixture map plus published Backed bToken PoR symbols."""
-    cached = getattr(scorer, "_search_catalog", None)
-    if cached is not None:
-        return cached
-    catalog = load_search_catalog(scorer.client)
-    scorer._search_catalog = catalog
-    return catalog
+    """CMC/fixture map plus published Backed bToken PoR symbols.
+
+    Always goes through the client so ``assets/list`` / map cache hits appear
+    on the CMC-calls evidence strip. HTTP is still TTL-cached on the client.
+    """
+    return load_search_catalog(scorer.client)
 
 
 def chip_display_label(label: str) -> str:
@@ -1085,13 +1143,15 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
         if basis_meta.get("available"):
             spread = basis_meta.get("percent_spread")
             count = basis_meta.get("wrapper_count")
+            basis_src = basis_meta.get("source") or "cmc_market_pairs"
             st.caption(
                 f"Cross-issuer basis: **{spread:.2f}%** spread across {count} wrappers "
-                "(self-reported CMC market-pairs)."
+                f"(self-reported {basis_src})."
             )
         elif basis_meta.get("wrapper_count") == 1:
             st.caption(
-                "Cross-issuer basis: only one wrapper on CMC market-pairs — no issuer compare."
+                "Cross-issuer basis: only one wrapper on CMC RWA quotes/market-pairs "
+                "— no issuer compare."
             )
 
         flags = report.get("flags") or []
@@ -1311,14 +1371,20 @@ use_fixtures = _render_sidebar_controls(default_fixtures)
 
 mode_label = "Fixture" if use_fixtures else "Live"
 st.caption(f"Mode: {mode_label}")
+reminder = health_launcher_reminder()
+if reminder:
+    st.caption(reminder)
 st.caption(
     "Remaining heuristics stay labeled: name-list fallback, self-reported CMC "
-    "price/disclosure/basis, and xStocks without a published PoR proxy. "
-    "Educational demo — not financial advice."
+    "price/disclosure/basis (RWA quotes + market-pairs), and xStocks without "
+    "a published PoR proxy. Educational demo — not financial advice."
 )
 
 try:
     scorer = _cached_scorer(use_fixtures)
+    begin = getattr(scorer.client, "begin_run", None)
+    if callable(begin):
+        begin()
     st.session_state.last_error = None
 except Exception as exc:  # noqa: BLE001
     st.session_state.last_error = str(exc)
@@ -1416,6 +1482,10 @@ if ok_reports:
         rows.append(row)
     st.markdown("#### Comparison table")
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+st.markdown("#### CMC calls this run")
+for line in format_cmc_calls_lines(collect_cmc_calls(ok_reports, scorer.client)):
+    st.caption(line)
 
 st.divider()
 st.caption(DISCLAIMER)

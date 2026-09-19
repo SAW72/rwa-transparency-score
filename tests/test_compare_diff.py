@@ -206,7 +206,7 @@ def test_compare_differentiation_default_fixture_row(fixture_scorer) -> None:
     assert [row["ticker"] for row in reports] == ["NVDA", "TSLA", "AAPL", "META"]
     diff = demo_app.compare_differentiation(reports)
     assert diff["available"] is True
-    assert diff["score_spread"] >= 60
+    assert diff["score_spread"] >= 55
     assert "TSLA trails NVDA" in diff["headline"]
     assert "drives the gap" in diff["headline"]
     assert set(diff["bands"]) == {"NVDA", "TSLA", "AAPL", "META"}
