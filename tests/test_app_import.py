@@ -254,14 +254,27 @@ def test_share_score_card_is_button_gated() -> None:
     assert "share_card_preview_html" in source
     assert "Could not build the score card image" in source
     assert "Click Share score card to build a signed PNG preview." in source
-    # Data URIs only — st.image / download_button register /media and
-    # /_stcore/download, which MPA v1 surfaces as Page not found.
+    # Markdown data URIs only. st.image / download_button register /media and
+    # /_stcore/download; components.html mounts /component — MPA v1 Page not found.
     share_fn = source.split("def _render_share_controls", 1)[1].split(
         "def _render_why_this_score", 1
     )[0]
+    show_fn = source.split("def _show_share_png", 1)[1].split("def _auto_place", 1)[0]
     assert "st.download_button(" not in share_fn
     assert "st.image(" not in share_fn
+    assert "components.html(" not in share_fn
     assert "_maybe_rerun()" not in share_fn
+    assert "components.html(" not in show_fn
+    assert "st.image(" not in show_fn
+    assert "st.download_button(" not in show_fn
+    assert "st.markdown(" in show_fn
+    assert "unsafe_allow_html=True" in show_fn
+    # Only Search typeahead may mount a component iframe.
+    typeahead_fn = source.split("def _install_search_typeahead", 1)[1].split(
+        "def _render_search_picker", 1
+    )[0]
+    assert "components.html(" in typeahead_fn
+    assert source.count("components.html(") == 1
     assert "data:image/png;base64" in source
     assert "st.image(bundle.png_bytes, use_container_width=" not in source
 
@@ -307,7 +320,7 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     assert "_error_card_html" not in source
     assert "_empty_slot_html" not in source
     assert "score-hero" not in source
-    assert source.count("unsafe_allow_html") <= 2
+    assert source.count("unsafe_allow_html") <= 3
     assert "Pick a ticker to compare here" in source
     assert "Assign a ticker" not in source
     assert "Why this score?" in source

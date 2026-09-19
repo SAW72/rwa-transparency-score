@@ -100,7 +100,7 @@ Set `XAI_API_KEY` in `.env` locally or in the **Render dashboard** (`sync: false
 
 ### Shareable score card (X)
 
-Each selected compare slot has a **Share score card** expander. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding), keeps the expander open, shows a preview, and offers **Download PNG** (data URIs — not Streamlit `/media` or `/_stcore/download`, which the `pages/` multipage router can report as **Page not found**). If X credentials are configured the image is posted to X via API v2 *after* the PNG is stored. If credentials are missing, or the X post cannot be published, the PNG still downloads and the UI shows a polished skip message — never raw X API / HTTP errors. An empty/failed PNG shows an error plus retry, not a dead button. Generation or X failures never crash the demo.
+Each selected compare slot has a **Share score card** expander. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding), keeps the expander open, shows a preview, and offers **Download PNG** as **markdown data URIs** (not `st.image`, `st.download_button`, or `components.html`). Those widgets register `/media`, `/_stcore/download`, or a `/component` iframe that Streamlit 1.39 MPA v1 reports as **Page not found**. There is no `pages/` directory, so the app stays a single-page script and that router cannot fire on Share. If X credentials are configured the image is posted to X via API v2 *after* the PNG is stored. If credentials are missing, or the X post cannot be published, the PNG still downloads and the UI shows a polished skip message — never raw X API / HTTP errors. An empty/failed PNG shows an error plus retry, not a dead button. Generation or X failures never crash the demo.
 
 **Signing.** `SCORE_CARD_SIGNING_SECRET` HMAC-SHA256-signs canonical JSON of `{ticker, score, band, subscores, timestamp}`. The first 16 hex characters (the fingerprint) are printed on the image and in the caption so others can verify. No secret → card is labeled `UNSIGNED`. Never commit the secret. Store it in the **Render dashboard** (`sync: false`) or **Bitwarden**. PNG text uses bundled Inter under `assets/fonts/` so Render hosts without a system font tree still produce a readable card.
 
@@ -156,11 +156,9 @@ If you still see 429, **wait a minute** and retry. [DoraHacks Startup](https://c
 
 ```
 app.py                 Streamlit demo (search, pillars, verification badges, compare, AI explainer, share card)
-pages/privacy.py       Privacy Policy (Streamlit; URL `/privacy`)
-pages/terms.py         Terms of Service (Streamlit; URL `/terms`)
 PRIVACY.md             Privacy Policy source (Steward of the King LLC / Ohio)
 TERMS.md               Terms of Service source
-rwa_score/legal.py     Privacy/Terms markdown loader + HTML /privacy and /terms
+rwa_score/legal.py     Privacy/Terms markdown loader + Tornado HTML /privacy and /terms (no pages/ MPA)
 rwa_score/ticker_search.py  Prefix + category picker over the RWA map plus Backed bTokens (no extra API)
 rwa_score/client.py    Live CMC client + FixtureClient + create_client()
 rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent fails
@@ -333,7 +331,7 @@ curl -sS -o /dev/null -w "%{http_code}\n" https://rwa-transparency-score.onrende
 curl -sS -o /dev/null -w "%{http_code}\n" https://rwa-transparency-score.onrender.com/terms
 ```
 
-``GET /privacy`` and ``GET /terms`` return HTTP 200 with the publish-ready policy HTML (same bodies as [`PRIVACY.md`](PRIVACY.md) and [`TERMS.md`](TERMS.md)). The health launcher registers those paths on Tornado before Streamlit's SPA catch-all, the same way it registers ``/health``. Streamlit pages `pages/privacy.py` and `pages/terms.py` render the same markdown in-app.
+``GET /privacy`` and ``GET /terms`` return HTTP 200 with the publish-ready policy HTML (same bodies as [`PRIVACY.md`](PRIVACY.md) and [`TERMS.md`](TERMS.md)). The health launcher registers those paths on Tornado before Streamlit's SPA catch-all, the same way it registers ``/health``. There is no `pages/` directory — Streamlit MPA v1 is off so Share/media/component URLs cannot show **Page not found**. Sidebar and footer markdown links go to those Tornado routes.
 
 Expected when Render is live:
 
