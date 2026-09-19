@@ -26,7 +26,9 @@ SIGNING_SECRET_ENV = "SCORE_CARD_SIGNING_SECRET"
 UNSIGNED_FINGERPRINT = "UNSIGNED"
 FINGERPRINT_LEN = 16
 PNG_BUILD_FAILED_PREFIX = "Score card generation failed:"
-X_SHARE_UI_TIMEOUT = 8.0
+# Per-request X HTTP timeout. 8s was too tight once simple-upload can
+# fall back to initialize/append/finalize + tweet create.
+X_SHARE_UI_TIMEOUT = 20.0
 CARD_WIDTH = 1200
 CARD_HEIGHT = 675
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
@@ -394,7 +396,10 @@ def attach_x_share(
             f"Posted to X: {card.x_url}" if card.x_posted else "X post skipped."
         )
         card.x_message = raw if card.x_posted else user_facing_x_skip_message(raw)
-    except Exception:  # noqa: BLE001 — never crash the demo
+    except Exception as exc:  # noqa: BLE001 — never crash the demo
+        from .x_client import log_x_share_failure
+
+        log_x_share_failure("attach_x_share", exc)
         card.x_posted = False
         card.x_url = None
         card.x_message = X_POST_UNAVAILABLE_MESSAGE

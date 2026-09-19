@@ -234,7 +234,7 @@ def test_share_score_card_is_button_gated() -> None:
     import app as demo_app
     from types import SimpleNamespace
 
-    from rwa_score.x_client import X_POST_UNAVAILABLE_MESSAGE
+    from rwa_score.x_client import MISSING_CREDS_MESSAGE, X_POST_UNAVAILABLE_MESSAGE
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "Share score card" in source
@@ -288,6 +288,12 @@ def test_share_score_card_is_button_gated() -> None:
         x_message="X post skipped: X media INIT failed (400): boom",
     )
     assert demo_app._user_facing_share_status(raw) == X_POST_UNAVAILABLE_MESSAGE
+    missing = SimpleNamespace(
+        x_posted=False,
+        x_message=MISSING_CREDS_MESSAGE,
+    )
+    assert demo_app._user_facing_share_status(missing) == MISSING_CREDS_MESSAGE
+    assert MISSING_CREDS_MESSAGE != X_POST_UNAVAILABLE_MESSAGE
     posted = SimpleNamespace(
         x_posted=True,
         x_message="Posted to X: https://x.com/i/web/status/1",

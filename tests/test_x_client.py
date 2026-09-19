@@ -8,11 +8,15 @@ import pytest
 
 from rwa_score.x_client import (
     MEDIA_INITIALIZE_URL,
+    MEDIA_UPLOAD_URL,
     MISSING_CREDS_MESSAGE,
+    SKIP_REASON_API,
+    SKIP_REASON_MISSING_CREDS,
     X_POST_UNAVAILABLE_MESSAGE,
     TWEET_URL,
     XClient,
     XCredentials,
+    _safe_log_text,
     media_append_url,
     media_finalize_url,
     media_status_url,
@@ -157,6 +161,8 @@ def test_missing_credentials_skip_without_http(monkeypatch: pytest.MonkeyPatch) 
     assert result.posted is False
     assert result.skipped is True
     assert result.message == MISSING_CREDS_MESSAGE
+    assert result.skip_reason == SKIP_REASON_MISSING_CREDS
+    assert result.message != X_POST_UNAVAILABLE_MESSAGE
     assert session.calls == []
 
 
@@ -179,44 +185,59 @@ def test_post_image_mocked_happy_path() -> None:
     session = FakeSession(
         [
             FakeResponse(200, {"data": {"id": "media-1"}}),
-            FakeResponse(200, {}),
-            FakeResponse(200, {"data": {"id": "media-1"}}),
             FakeResponse(201, {"data": {"id": "tweet-9", "text": "RAT Score"}}),
         ]
     )
     client = XClient(_full_creds(), session=session)
     result = client.post_image(png, "RAT Score · NVDA · sig abcd")
     assert result.posted is True
+    assert result.skip_reason is None
     assert result.tweet_id == "tweet-9"
     assert result.media_id == "media-1"
     assert result.url == "https://x.com/i/web/status/tweet-9"
-    assert [c["url"] for c in session.calls] == [
-        MEDIA_INITIALIZE_URL,
-        media_append_url("media-1"),
-        media_finalize_url("media-1"),
-        TWEET_URL,
-    ]
-    assert [c["method"] for c in session.calls] == ["POST", "POST", "POST", "POST"]
-    assert session.calls[0]["json"] == {
-        "media_type": "image/png",
-        "total_bytes": len(png),
-        "media_category": "tweet_image",
-    }
-    assert session.calls[0]["data"] is None
-    assert session.calls[0]["headers"]["Content-Type"] == "application/json"
-    assert session.calls[1]["data"] == {"segment_index": "0"}
-    assert session.calls[1]["files"]["media"][1] == png
-    assert session.calls[2]["data"] is None
-    assert session.calls[2]["json"] is None
+    assert [c["url"] for c in session.calls] == [MEDIA_UPLOAD_URL, TWEET_URL]
+    assert [c["method"] for c in session.calls] == ["POST", "POST"]
+    assert session.calls[0]["json"] is None
+    assert session.calls[0]["data"] == {"media_category": "tweet_image"}
+    assert session.calls[0]["files"]["media"][1] == png
+    assert session.calls[0]["files"]["media"][2] == "image/png"
     for call in session.calls:
         assert "command" not in (call.get("data") or {})
         assert "command" not in (call.get("json") or {})
-    assert session.calls[3]["json"] == {
+    assert session.calls[1]["json"] == {
         "text": "RAT Score · NVDA · sig abcd",
         "media": {"media_ids": ["media-1"]},
     }
     for call in session.calls:
         assert call["headers"]["Authorization"].startswith("OAuth ")
+
+
+def test_upload_png_falls_back_to_chunked() -> None:
+    png = b"\x89PNG fake"
+    session = FakeSession(
+        [
+            FakeResponse(400, text='{"title":"Bad Request","detail":"use chunked"}'),
+            FakeResponse(200, {"data": {"id": "media-1"}}),
+            FakeResponse(200, {}),
+            FakeResponse(200, {"data": {"id": "media-1"}}),
+        ]
+    )
+    client = XClient(_full_creds(), session=session)
+    media_id = client.upload_png(png)
+    assert media_id == "media-1"
+    assert [c["url"] for c in session.calls] == [
+        MEDIA_UPLOAD_URL,
+        MEDIA_INITIALIZE_URL,
+        media_append_url("media-1"),
+        media_finalize_url("media-1"),
+    ]
+    assert session.calls[1]["json"] == {
+        "media_type": "image/png",
+        "total_bytes": len(png),
+        "media_category": "tweet_image",
+    }
+    assert "command" not in (session.calls[1].get("json") or {})
+    assert session.calls[2]["data"] == {"segment_index": "0"}
 
 
 def test_upload_png_polls_status_when_processing() -> None:
@@ -240,7 +261,7 @@ def test_upload_png_polls_status_when_processing() -> None:
         ]
     )
     client = XClient(_full_creds(), session=session)
-    media_id = client.upload_png(b"\x89PNG fake")
+    media_id = client._upload_png_chunked(b"\x89PNG fake")
     assert media_id == "media-1"
     assert [c["url"] for c in session.calls] == [
         MEDIA_INITIALIZE_URL,
@@ -253,12 +274,20 @@ def test_upload_png_polls_status_when_processing() -> None:
 
 
 def test_post_image_http_error_does_not_raise() -> None:
-    session = FakeSession([FakeResponse(403, text="forbidden")])
+    session = FakeSession(
+        [
+            FakeResponse(403, text="forbidden"),
+            FakeResponse(403, text="forbidden"),
+        ]
+    )
     client = XClient(_full_creds(), session=session)
     result = client.post_image(b"\x89PNG fake", "hi")
     assert result.posted is False
     assert result.skipped is True
+    assert result.skip_reason == SKIP_REASON_API
     assert result.message == X_POST_UNAVAILABLE_MESSAGE
+    assert result.message != MISSING_CREDS_MESSAGE
+    assert "X API" in result.message
     assert "403" not in result.message
     assert "forbidden" not in result.message
     assert "INIT" not in result.message
@@ -269,11 +298,17 @@ def test_post_image_initialize_400_is_polished() -> None:
         '{"title":"Bad Request","detail":"command=INIT and media_category '
         'rejected as invalid query params"}'
     )
-    session = FakeSession([FakeResponse(400, text=raw_body)])
+    session = FakeSession(
+        [
+            FakeResponse(400, text=raw_body),
+            FakeResponse(400, text=raw_body),
+        ]
+    )
     client = XClient(_full_creds(), session=session)
     result = client.post_image(b"\x89PNG fake", "hi")
     assert result.posted is False
     assert result.skipped is True
+    assert result.skip_reason == SKIP_REASON_API
     assert result.message == X_POST_UNAVAILABLE_MESSAGE
     assert user_facing_x_skip_message(result.message) == X_POST_UNAVAILABLE_MESSAGE
     for leak in ("400", "INIT", "Bad Request", "media_category", "{", "errors"):
@@ -310,6 +345,7 @@ def test_empty_png_skips_without_http() -> None:
 def test_post_image_append_failure_is_polished() -> None:
     session = FakeSession(
         [
+            FakeResponse(400, text='{"title":"Bad Request","detail":"use chunked"}'),
             FakeResponse(200, {"data": {"id": "media-1"}}),
             FakeResponse(400, text='{"title":"Bad Request","detail":"append rejected"}'),
         ]
@@ -317,9 +353,48 @@ def test_post_image_append_failure_is_polished() -> None:
     client = XClient(_full_creds(), session=session)
     result = client.post_image(b"\x89PNG fake", "hi")
     assert result.skipped is True
+    assert result.skip_reason == SKIP_REASON_API
     assert result.message == X_POST_UNAVAILABLE_MESSAGE
     assert "append" not in result.message
     assert "{" not in result.message
+
+
+def test_post_image_logs_failure_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    raw_body = '{"title":"Forbidden","detail":"oauth_token=abcd1234secret"}'
+    session = FakeSession(
+        [
+            FakeResponse(403, text=raw_body),
+            FakeResponse(403, text=raw_body),
+        ]
+    )
+    client = XClient(_full_creds(), session=session)
+    result = client.post_image(b"\x89PNG fake", "hi")
+    assert result.message == X_POST_UNAVAILABLE_MESSAGE
+    assert "403" not in result.message
+    assert "Forbidden" not in result.message
+    out = capsys.readouterr().out
+    assert "X_SHARE_FAIL" in out
+    assert "status=403" in out
+    assert "simple-upload" in out
+    assert "abcd1234secret" not in out
+    assert "<redacted>" in out
+
+
+def test_safe_log_text_redacts_secrets() -> None:
+    leaked = 'Authorization: Bearer super-secret oauth_token=xyz status'
+    cleaned = _safe_log_text(leaked)
+    assert "super-secret" not in cleaned
+    assert "xyz" not in cleaned
+    assert "<redacted>" in cleaned
+
+
+def test_skip_messages_distinguish_creds_vs_api() -> None:
+    assert MISSING_CREDS_MESSAGE != X_POST_UNAVAILABLE_MESSAGE
+    assert "X_API_KEY" in MISSING_CREDS_MESSAGE
+    assert "X API" in X_POST_UNAVAILABLE_MESSAGE
+    assert "X_API_KEY" not in X_POST_UNAVAILABLE_MESSAGE
+    assert user_facing_x_skip_message(MISSING_CREDS_MESSAGE) == MISSING_CREDS_MESSAGE
+    assert user_facing_x_skip_message(X_POST_UNAVAILABLE_MESSAGE) == X_POST_UNAVAILABLE_MESSAGE
 
 
 def test_json_initialize_oauth_excludes_body_fields() -> None:

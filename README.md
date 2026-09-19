@@ -114,7 +114,7 @@ Text chat uses `st.chat_input` / `st.chat_message`. **No TTS.** The agent calls 
 
 ### Shareable score card (X)
 
-Each selected compare slot has a **Share score card** expander. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding), keeps the expander open, shows a preview, and offers **Download PNG** as **markdown data URIs** (not `st.image`, `st.download_button`, or `components.html`). Those widgets register `/media`, `/_stcore/download`, or a `/component` iframe that Streamlit 1.39 MPA v1 reports as **Page not found**. There is no `pages/` directory, so the app stays a single-page script and that router cannot fire on Share. If X credentials are configured the image is posted to X via API v2 *after* the PNG is stored. If credentials are missing, or the X post cannot be published, the PNG still downloads and the UI shows a polished skip message — never raw X API / HTTP errors. An empty/failed PNG shows an error plus retry, not a dead button. Generation or X failures never crash the demo.
+Each selected compare slot has a **Share score card** expander. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding), keeps the expander open, shows a preview, and offers **Download PNG** as **markdown data URIs** (not `st.image`, `st.download_button`, or `components.html`). Those widgets register `/media`, `/_stcore/download`, or a `/component` iframe that Streamlit 1.39 MPA v1 reports as **Page not found**. There is no `pages/` directory, so the app stays a single-page script and that router cannot fire on Share. If X credentials are configured the image is posted to X via API v2 *after* the PNG is stored (simple `POST /2/media/upload` for the PNG, then `POST /2/tweets`; chunked initialize/append/finalize is only a fallback — never `command=INIT`). If credentials are missing, or the X post cannot be published, the PNG still downloads and the UI shows a polished skip message — never raw X API / HTTP errors. Missing credentials and an X API upload/tweet failure use **different** skip copy so the live banner is not ambiguous. Operator-only `X_SHARE_FAIL` lines go to stdout / Render logs (HTTP status + short redacted body); they are never shown in the UI. An empty/failed PNG shows an error plus retry, not a dead button. Generation or X failures never crash the demo.
 
 **Signing.** `SCORE_CARD_SIGNING_SECRET` HMAC-SHA256-signs canonical JSON of `{ticker, score, band, subscores, timestamp}`. The first 16 hex characters (the fingerprint) are printed on the image and in the caption so others can verify. No secret → card is labeled `UNSIGNED`. Never commit the secret. Store it in the **Render dashboard** (`sync: false`) or **Bitwarden**. PNG text uses bundled Inter under `assets/fonts/` so Render hosts without a system font tree still produce a readable card.
 
@@ -128,6 +128,15 @@ Each selected compare slot has a **Share score card** expander. It does **not** 
 | `X_ACCESS_TOKEN_SECRET` | `TWITTER_ACCESS_TOKEN_SECRET` |
 
 Set them in the Render dashboard (`sync: false`) or Bitwarden. Never commit them. Posting uses the app account — click Share only when you intend to publish. This is a user-triggered share, not a hunter or auto-poster.
+
+Film / operator CLI (fixtures, no live CMC credits):
+
+```bash
+python -m rwa_score.share --fixtures NVDA
+python -m rwa_score.share --fixtures bNVDA
+```
+
+Prints the tweet URL only when the post succeeds. If those four `X_*` vars are unset, it builds the PNG and prints the missing-credentials skip — it does **not** invent a post URL.
 
 Caption includes the fingerprint and **Not financial advice**. MIT core stays open.
 
@@ -184,6 +193,7 @@ rwa_score/explainer.py xAI Grok “Why this score?” with templated fallback
 rwa_score/ask_rat.py   Ask RAT text chat — xAI tools over existing clients; templated fallback
 rwa_score/score_card.py Signed timestamped PNG (Pillow) + HMAC-SHA256 fingerprint
 rwa_score/x_client.py  X API v2 media + tweet (OAuth 1.0a); skip if credentials missing
+rwa_score/share.py     Fixture score-card CLI; posts to X only when X_* env is set
 rwa_score/issuer_registry.py   Name-match heuristics + ISSUER_NOTES (equity vs debt)
 rwa_score/fixtures/    Demo JSON shaped like CMC RWA responses
 rwa_score/api/         Paid REST output layer (keys, quotas, history, webhooks, score hash)

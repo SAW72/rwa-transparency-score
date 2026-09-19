@@ -14,7 +14,9 @@ from __future__ import annotations
 import binascii
 import hashlib
 import hmac
+import logging
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -23,6 +25,8 @@ from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 
 import requests
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 TWEET_URL = "https://api.x.com/2/tweets"
 MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
@@ -42,8 +46,12 @@ MISSING_CREDS_MESSAGE = (
     "The PNG is still available to download."
 )
 X_POST_UNAVAILABLE_MESSAGE = (
-    "X post skipped. The score card PNG is still available to download."
+    "X post skipped: the X API upload or tweet failed. "
+    "The score card PNG is still available to download."
 )
+SKIP_REASON_MISSING_CREDS = "missing_credentials"
+SKIP_REASON_API = "x_api_failure"
+SKIP_REASON_EMPTY = "empty_image"
 _POLISHED_SKIP_MESSAGES = frozenset(
     {
         MISSING_CREDS_MESSAGE,
@@ -58,6 +66,7 @@ _RAW_API_MARKERS = (
     "APPEND failed",
     "FINALIZE failed",
     "initialize failed",
+    "simple-upload",
     "command=INIT",
     "media_category rejected",
     '"errors"',
@@ -65,6 +74,11 @@ _RAW_API_MARKERS = (
     "{",
     "}",
 )
+_REDACT_ASSIGN_RE = re.compile(
+    r"(?i)(oauth_[a-z_]+|authorization|api[_-]?key|access_token|secret)"
+    r"([\"']?\s*[:=]\s*)([^\s,;\"']+)"
+)
+_REDACT_BEARER_RE = re.compile(r"(?i)\bbearer\s+\S+")
 
 
 def media_append_url(media_id: str) -> str:
@@ -87,6 +101,35 @@ def _looks_like_raw_x_api(text: str) -> bool:
     if "failed (" in lowered and any(ch.isdigit() for ch in text):
         return True
     return False
+
+
+def _safe_log_text(text: str, limit: int = 240) -> str:
+    """Truncate operator-facing X errors. Never keep token/secret assignments."""
+    cleaned = _REDACT_BEARER_RE.sub("Bearer <redacted>", text or "")
+    cleaned = _REDACT_ASSIGN_RE.sub(r"\1\2<redacted>", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:limit]
+
+
+def log_x_share_failure(
+    stage: str,
+    exc: BaseException,
+    *,
+    status: Any = None,
+    body: str = "",
+) -> None:
+    """Temporary stdout/Render diagnostics. Never send this string to the UI."""
+    detail = _safe_log_text(str(exc), 300)
+    snippet = _safe_log_text(body, 240)
+    status_s = "-" if status is None or status == "" else str(status)
+    line = (
+        f"X_SHARE_FAIL stage={stage} type={type(exc).__name__} "
+        f"status={status_s} detail={detail}"
+    )
+    if snippet and snippet not in detail:
+        line = f"{line} body={snippet}"
+    print(line, flush=True)
+    logger.warning(line)
 
 
 def user_facing_x_skip_message(message: str | None = None) -> str:
@@ -234,6 +277,7 @@ class XPostResult:
     url: str | None = None
     tweet_id: str | None = None
     media_id: str | None = None
+    skip_reason: str | None = None
 
 
 def x_credentials_ready(creds: XCredentials | None = None) -> bool:
@@ -271,8 +315,10 @@ def _processing_info(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _media_http_error(stage: str, response: Any) -> RuntimeError:
     status = getattr(response, "status_code", "?")
-    body = (getattr(response, "text", "") or "")[:240]
-    return RuntimeError(f"X media {stage} failed ({status}): {body}")
+    body = _safe_log_text(getattr(response, "text", "") or "", 240)
+    exc = RuntimeError(f"X media {stage} failed ({status}): {body}")
+    log_x_share_failure(stage, exc, status=status, body=body)
+    return exc
 
 
 class XClient:
@@ -369,6 +415,35 @@ class XClient:
         raise RuntimeError("X media processing timed out")
 
     def upload_png(self, png_bytes: bytes) -> str:
+        """Upload a PNG score card. Prefer simple image POST; fall back to chunked.
+
+        Images belong on ``POST /2/media/upload`` (multipart ``media`` +
+        ``media_category=tweet_image``). That is not ``command=INIT``. Chunked
+        initialize/append/finalize remains the fallback for a simple-upload
+        rejection. Never send ``command=INIT|APPEND|FINALIZE`` form fields.
+        """
+        try:
+            return self._upload_png_simple(png_bytes)
+        except Exception as exc:  # noqa: BLE001 — try documented chunked next
+            log_x_share_failure("simple-upload-fallback", exc)
+        return self._upload_png_chunked(png_bytes)
+
+    def _upload_png_simple(self, png_bytes: bytes) -> str:
+        """One-shot v2 image upload. No command= query/form fields."""
+        files = {"media": ("score-card.png", png_bytes, "image/png")}
+        resp = self._post(
+            MEDIA_UPLOAD_URL,
+            data={"media_category": "tweet_image"},
+            files=files,
+        )
+        if getattr(resp, "status_code", 0) >= 400:
+            raise _media_http_error("simple-upload", resp)
+        media_id = _media_id_from(_json_payload(resp))
+        if not media_id:
+            raise RuntimeError("X media simple upload returned no media id")
+        return media_id
+
+    def _upload_png_chunked(self, png_bytes: bytes) -> str:
         """v2 chunked upload: initialize / append / finalize. Returns media id.
 
         X rejected command=INIT form fields on POST /2/media/upload. The
@@ -408,7 +483,7 @@ class XClient:
         return _media_id_from(fin_payload) or media_id
 
     def create_post(self, text: str, media_id: str) -> tuple[str, str | None]:
-        body = {"text": text, "media": {"media_ids": [media_id]}}
+        body = {"text": text, "media": {"media_ids": [str(media_id)]}}
         resp = self._post(
             TWEET_URL,
             json_body=body,
@@ -416,33 +491,38 @@ class XClient:
         )
         payload = _json_payload(resp)
         if getattr(resp, "status_code", 0) >= 400:
-            raise RuntimeError(
-                f"X tweet create failed ({resp.status_code}): "
-                f"{(getattr(resp, 'text', '') or '')[:240]}"
-            )
+            raise _media_http_error("tweet-create", resp)
         tweet_id = _tweet_id_from(payload)
         if not tweet_id:
-            raise RuntimeError(f"X tweet create returned no id: {payload!r}")
+            raise RuntimeError("X tweet create returned no id")
         return tweet_id, f"https://x.com/i/web/status/{tweet_id}"
 
     def post_image(self, png_bytes: bytes, text: str) -> XPostResult:
         """Upload PNG and create a v2 post. Skip (no network) when creds missing."""
         if not self.creds.complete:
-            return XPostResult(posted=False, skipped=True, message=MISSING_CREDS_MESSAGE)
+            return XPostResult(
+                posted=False,
+                skipped=True,
+                message=MISSING_CREDS_MESSAGE,
+                skip_reason=SKIP_REASON_MISSING_CREDS,
+            )
         if not png_bytes:
             return XPostResult(
                 posted=False,
                 skipped=True,
                 message="X post skipped: score card image was empty.",
+                skip_reason=SKIP_REASON_EMPTY,
             )
         try:
             media_id = self.upload_png(png_bytes)
             tweet_id, url = self.create_post(text, media_id)
-        except Exception:  # noqa: BLE001 — caller / UI must not crash
+        except Exception as exc:  # noqa: BLE001 — caller / UI must not crash
+            log_x_share_failure("post_image", exc)
             return XPostResult(
                 posted=False,
                 skipped=True,
                 message=X_POST_UNAVAILABLE_MESSAGE,
+                skip_reason=SKIP_REASON_API,
             )
         return XPostResult(
             posted=True,

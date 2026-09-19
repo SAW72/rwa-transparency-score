@@ -43,7 +43,10 @@ services:
       - key: SCORE_CARD_SIGNING_SECRET
         sync: false
       # X API v2 OAuth 1.0a user tokens. All four required to post.
-      # Missing any of these skips the X post; PNG download still works.
+      # Missing any of these skips the X post (missing-credentials copy).
+      # If all four are set and upload/tweet still fails, UI shows the
+      # X-API-failure skip; Render logs get X_SHARE_FAIL (not the UI).
+      # PNG download still works either way.
       - key: X_API_KEY
         sync: false
       - key: X_API_SECRET
