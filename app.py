@@ -20,6 +20,12 @@ from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 
+from rwa_score.ask_rat import (
+    ASK_RAT_CHIPS,
+    ASK_RAT_GREETING,
+    ask as ask_rat,
+    format_ask_cmc_lines,
+)
 from rwa_score.client import create_client, env_flag, summarize_call_log
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
@@ -1231,6 +1237,112 @@ def _user_facing_share_status(bundle: object) -> str:
     return user_facing_x_skip_message(message)
 
 
+def _ask_rat_messages() -> list[dict]:
+    """Session chat history. Empty list when session_state is unavailable."""
+    try:
+        rows = st.session_state.get("ask_rat_messages")
+        if not isinstance(rows, list):
+            rows = []
+            st.session_state["ask_rat_messages"] = rows
+        return rows
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return []
+
+
+def _render_ask_rat(
+    scorer: TransparencyScorer,
+    *,
+    catalog: list[TickerOption] | None = None,
+) -> None:
+    """Collapsed Ask RAT text chat. Does not run the model on page load.
+
+    Chips write the exact demo question into session and submit it. ``st.chat_input``
+    is the free-form path. No TTS. Failures use the templated fallback.
+    """
+    messages = _ask_rat_messages()
+    try:
+        engaged = bool(messages) or bool(st.session_state.get("ask_rat_engaged"))
+        pending = st.session_state.pop("ask_rat_prefill", None)
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        engaged = bool(messages)
+        pending = None
+    if isinstance(pending, str):
+        pending = pending.strip() or None
+    else:
+        pending = None
+
+    with open_expander("Ask RAT", expanded=engaged, key="ask_rat_exp"):
+        st.write(ASK_RAT_GREETING)
+        st.caption(
+            "Text chat grounded in scores, CMC, and PoR. No voice. "
+            "Chips prefill a question; type your own below."
+        )
+        chip_cols = st.columns(len(ASK_RAT_CHIPS), gap="small")
+        for index, chip in enumerate(ASK_RAT_CHIPS):
+            with chip_cols[index]:
+                if st.button(chip, key=f"ask_rat_chip_{index}", use_container_width=True):
+                    st.session_state["ask_rat_prefill"] = chip
+                    st.session_state["ask_rat_engaged"] = True
+                    st.session_state["ask_rat_draft"] = chip
+                    pending = chip
+        draft = st.session_state.get("ask_rat_draft") or pending or ""
+        if draft:
+            st.caption(f"Question: {draft}")
+        typed = st.chat_input("Ask about a tokenized stock's risk score")
+        if typed:
+            pending = typed.strip()
+            st.session_state["ask_rat_draft"] = pending
+            st.session_state["ask_rat_engaged"] = True
+        if pending:
+            messages.append({"role": "user", "content": pending})
+            try:
+                symbols = [opt.symbol for opt in (catalog or []) if getattr(opt, "symbol", "")]
+                result = ask_rat(
+                    pending,
+                    scorer,
+                    score_fn=lambda symbol: _score_one(scorer, symbol),
+                    catalog_symbols=symbols,
+                )
+                cmc_lines = format_ask_cmc_lines(result.cmc_calls)
+                body = result.answer
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": body,
+                        "cmc_lines": cmc_lines,
+                        "footnote": result.footnote,
+                        "skipped": result.skipped_reason,
+                        "polished": result.polished,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 — chat must stay up
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"Ask RAT hit an error ({exc}). "
+                            "This is an automated summary, not financial advice."
+                        ),
+                        "cmc_lines": [],
+                        "footnote": AI_FOOTNOTE,
+                        "skipped": "internal error",
+                        "polished": False,
+                    }
+                )
+            st.session_state["ask_rat_prefill"] = ""
+            _maybe_rerun()
+        for msg in messages:
+            role = "assistant" if msg.get("role") == "assistant" else "user"
+            with st.chat_message(role):
+                st.write(msg.get("content") or "")
+                if msg.get("skipped"):
+                    st.caption(str(msg["skipped"]))
+                if msg.get("footnote"):
+                    st.caption(str(msg["footnote"]))
+                for line in msg.get("cmc_lines") or []:
+                    st.caption(line)
+
+
 def _render_sidebar_controls(default_fixtures: bool) -> bool:
     """Dense sidebar: Live/fixture + labeling stay visible; help collapses.
 
@@ -1682,6 +1794,8 @@ if ok_reports:
         rows.append(row)
     st.markdown("#### Comparison table")
     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+_render_ask_rat(scorer, catalog=catalog)
 
 st.markdown("#### CMC calls this run")
 for line in format_cmc_calls_lines(collect_cmc_calls(ok_reports, scorer.client)):
