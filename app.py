@@ -27,7 +27,7 @@ from rwa_score.ask_rat import (
     format_ask_cmc_lines,
 )
 from rwa_score.client import create_client, env_flag, summarize_call_log
-from rwa_score.explainer import AI_FOOTNOTE, explain_score
+from rwa_score.explainer import AI_FOOTNOTE, explain_score, fallback_explanation
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.score_card import (
     PNG_BUILD_FAILED_PREFIX,
@@ -494,7 +494,9 @@ def _cached_explanation(report: dict) -> str:
         text = explain_score(report)
     except Exception as exc:  # noqa: BLE001 — card must still render
         text = f"Explanation unavailable ({exc}). This is an automated summary, not financial advice."
-    if symbol:
+    used_fallback = text == fallback_explanation(report)
+    # Do not cache a failed xAI turn for 24h — retry when the key is present.
+    if symbol and (not used_fallback or not os.environ.get("XAI_API_KEY")):
         _explain_cache[symbol] = (now, text)
     return text
 

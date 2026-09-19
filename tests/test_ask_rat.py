@@ -12,6 +12,7 @@ import pytest
 from rwa_score.ask_rat import (
     ASK_RAT_CHIPS,
     ASK_RAT_GREETING,
+    ASK_XAI_TIMEOUT,
     TOOL_ASSETS_LIST,
     TOOL_ISSUERS,
     TOOL_LOOKUP,
@@ -32,7 +33,7 @@ from rwa_score.ask_rat import (
     requested_pillars,
     wants_por,
 )
-from rwa_score.explainer import AI_FOOTNOTE, XAI_CHAT_URL, XAI_MODEL
+from rwa_score.explainer import AI_FOOTNOTE, XAI_CHAT_URL, XAI_MODEL, XAI_USER_AGENT
 from rwa_score.scorer import ALWAYS_SELF_REPORTED, PILLARS, TransparencyScorer
 from tests.conftest import RecordingClient
 from tests.test_explainer import FakeResponse, FakeSession
@@ -207,7 +208,23 @@ def test_ask_uses_xai_tools_when_key_present(
     assert call["url"] == XAI_CHAT_URL
     assert call["json"]["model"] == XAI_MODEL
     assert call["json"]["tools"]
-    assert call["timeout"] <= 8.0
+    timeout = call["timeout"]
+    read = timeout[1] if isinstance(timeout, tuple) else timeout
+    assert read <= ASK_XAI_TIMEOUT
+    assert call["headers"]["User-Agent"] == XAI_USER_AGENT
+
+
+def test_ask_http_error_is_not_generic_timeout(
+    fixture_scorer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "test-key-not-secret")
+    session = FakeSession(FakeResponse(400, {"error": "model grok-4.1-fast does not exist"}))
+    result = ask(ASK_RAT_CHIPS[1], fixture_scorer, session=session)
+    assert result.polished is False
+    assert result.skipped_reason
+    assert "timed out" not in (result.skipped_reason or "").lower()
+    assert "400" in (result.skipped_reason or "")
+    assert "FIXTURE" in result.answer
 
 
 def test_ask_falls_back_on_xai_timeout(fixture_scorer, monkeypatch: pytest.MonkeyPatch) -> None:

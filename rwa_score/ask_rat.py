@@ -23,7 +23,15 @@ from .client import (
     market_pairs_plan_blocked,
     summarize_call_log,
 )
-from .explainer import AI_FOOTNOTE, XAI_CHAT_URL, XAI_MODEL
+from .explainer import (
+    AI_FOOTNOTE,
+    XAI_CHAT_URL,
+    log_xai_failure,
+    redact_xai_error,
+    resolve_xai_model,
+    xai_headers,
+    xai_timeout,
+)
 from .scorer import (
     ALWAYS_SELF_REPORTED,
     PILLARS,
@@ -42,11 +50,15 @@ ASK_RAT_CHIPS = (
     "Which pillar is self-reported on NVDA?",
 )
 
-ASK_XAI_TIMEOUT = 8.0
-ASK_XAI_MAX_TOKENS = 400
+# One model call + live score_ticker (CMC + Chainlink) + a follow-up
+# completion does not fit in 8s/15s. grok-4.3 (current 4.1 Fast alias)
+# routinely exceeds that, which produced "xAI skipped or timed out".
+ASK_XAI_TIMEOUT = 25.0
+ASK_XAI_MAX_TOKENS = 800
 ASK_MAX_TOOL_ROUNDS = 3
-ASK_BUDGET_SECONDS = 15.0
-ASK_TOOL_TIMEOUT = 8.0
+ASK_BUDGET_SECONDS = 55.0
+ASK_TOOL_TIMEOUT = 12.0
+ASK_THREAD_SLACK = 2.0
 
 TOOL_LOOKUP = "lookup"
 TOOL_ASSETS_LIST = "assets_list"
@@ -242,6 +254,7 @@ class _ToolRun:
     used: list[str] = field(default_factory=list)
     results: dict[str, Any] = field(default_factory=dict)
     drifted: str | None = None
+    transport: str | None = None
 
 
 def client_source(client: object) -> str:
@@ -1003,6 +1016,19 @@ def execute_tool(
     }
 
 
+def _skip_reason_from_error(err: str | None) -> str:
+    """Map a transport/thread error to a user-facing skip caption."""
+    detail = redact_xai_error(err or "no model reply")
+    lowered = detail.lower()
+    if not err or err == "timeout" or "timeout" in lowered or "timed out" in lowered:
+        return "xAI timed out — templated fallback."
+    if "401" in detail or "unauthorized" in lowered or "incorrect api key" in lowered:
+        return f"xAI unauthorized ({detail}) — templated fallback."
+    if "400" in detail or ("invalid" in lowered and "model" in lowered):
+        return f"xAI rejected the request ({detail}) — templated fallback."
+    return f"xAI failed ({detail}) — templated fallback."
+
+
 def _call_with_timeout(fn: Callable[[], Any], timeout: float) -> tuple[Any, str | None]:
     """Run ``fn`` with a wall-clock cap. Does not block the caller past ``timeout``."""
     box: dict[str, Any] = {}
@@ -1019,7 +1045,10 @@ def _call_with_timeout(fn: Callable[[], Any], timeout: float) -> tuple[Any, str 
     if worker.is_alive():
         return None, "timeout"
     if "err" in box:
-        return None, str(box["err"])
+        exc = box["err"]
+        if isinstance(exc, (TimeoutError, requests.Timeout, requests.ConnectTimeout)):
+            return None, "timeout"
+        return None, str(exc)
     return box.get("ok"), None
 
 
@@ -1222,26 +1251,32 @@ def _xai_chat(
     session: requests.Session,
     api_key: str,
     timeout: float,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     resp = session.post(
         XAI_CHAT_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers=xai_headers(api_key),
         json={
-            "model": XAI_MODEL,
+            "model": resolve_xai_model(),
             "max_tokens": ASK_XAI_MAX_TOKENS,
             "tools": XAI_TOOLS,
             "tool_choice": "auto",
             "messages": messages,
         },
-        timeout=max(0.5, float(timeout)),
+        timeout=xai_timeout(max(0.5, float(timeout))),
     )
-    if getattr(resp, "status_code", 0) != 200:
-        return None
+    status = getattr(resp, "status_code", 0)
+    if status != 200:
+        body_text = ""
+        try:
+            body_text = resp.text or ""
+        except Exception:  # noqa: BLE001
+            body_text = ""
+        raise RuntimeError(f"HTTP {status}: {redact_xai_error(body_text)}")
     body = resp.json()
-    return ((body.get("choices") or [{}])[0].get("message")) or None
+    message = ((body.get("choices") or [{}])[0].get("message")) or None
+    if not message:
+        raise RuntimeError("empty model reply")
+    return message
 
 
 def _polished_answer(
@@ -1282,14 +1317,17 @@ def _polished_answer(
     for _round in range(ASK_MAX_TOOL_ROUNDS + 1):
         remaining = deadline - time.monotonic()
         if remaining < 1.0:
+            run.transport = "xAI budget exhausted — templated fallback."
             return None
+        read_budget = min(ASK_XAI_TIMEOUT, remaining)
         message, err = _call_with_timeout(
             lambda: _xai_chat(
-                messages, session=session, api_key=api_key, timeout=min(ASK_XAI_TIMEOUT, remaining)
+                messages, session=session, api_key=api_key, timeout=read_budget
             ),
-            timeout=min(ASK_XAI_TIMEOUT, remaining) + 0.4,
+            timeout=read_budget + ASK_THREAD_SLACK,
         )
         if err or not message:
+            run.transport = _skip_reason_from_error(err)
             return None
         tool_calls = message.get("tool_calls") or []
         content = (message.get("content") or "").strip()
@@ -1301,6 +1339,7 @@ def _polished_answer(
                 args = _parse_tool_args(fn.get("arguments"))
                 remaining = deadline - time.monotonic()
                 if remaining < 0.4:
+                    run.transport = "xAI budget exhausted — templated fallback."
                     return None
                 payload, tool_err = _call_with_timeout(
                     lambda n=name, a=args: execute_tool(
@@ -1313,6 +1352,7 @@ def _polished_answer(
                     timeout=min(ASK_TOOL_TIMEOUT, remaining),
                 )
                 if tool_err == "timeout":
+                    run.transport = "score tool timed out — templated fallback."
                     return None
                 if tool_err:
                     payload = {
@@ -1374,7 +1414,9 @@ def _polished_answer(
                     )
                     return None
             return content
+        run.transport = "xAI returned an empty reply — templated fallback."
         return None
+    run.transport = "xAI tool loop exhausted — templated fallback."
     return None
 
 
@@ -1424,10 +1466,15 @@ def ask(
                         polished = True
                     elif run.drifted:
                         skipped = run.drifted
+                    elif run.transport:
+                        skipped = run.transport
+                        log_xai_failure(run.transport)
                     else:
                         skipped = "xAI skipped or timed out — templated fallback."
-                except Exception:  # noqa: BLE001
-                    skipped = "xAI failed — templated fallback."
+                        log_xai_failure(skipped)
+                except Exception as exc:  # noqa: BLE001
+                    skipped = _skip_reason_from_error(str(exc))
+                    log_xai_failure(skipped)
             else:
                 skipped = "XAI_API_KEY missing — templated fallback."
             if not polished:
