@@ -47,10 +47,16 @@ from rwa_score.scorer import (
 from rwa_score.ticker_search import (
     CATEGORY_BY_ID,
     RWA_CLASS_CATEGORIES,
+    RWA_CLASS_IDS,
     SEARCH_MIN_CHARS,
     TickerOption,
+    cached_class_catalog,
+    catalog_from_por_feeds,
+    classes_for_query,
     format_option,
-    load_search_catalog,
+    load_class_catalog,
+    merge_por_catalog,
+    merge_search_catalog,
     normalize_ticker,
     resolve_assign_symbol,
     search_tickers,
@@ -63,8 +69,11 @@ from rwa_score.x_client import (
 )
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
+CATALOG_CACHE_TTL_SECONDS = 1800.0
 # Per-symbol wall-clock cache for the explainer — process-local dict.
 _explain_cache: dict[str, tuple[float, str]] = {}
+# Session fallback when Streamlit context is missing (unit tests).
+_catalog_shard_memo: dict[str, list[TickerOption]] = {}
 
 install_health_route()
 
@@ -350,6 +359,17 @@ def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     Widget reruns must not rebuild CMCClient — that would re-hit issuers/list.
     """
     return _init_scorer(use_fixtures)
+
+
+@st.cache_data(ttl=CATALOG_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_class_catalog_data(
+    use_fixtures: bool, asset_type: str
+) -> tuple[TickerOption, ...]:
+    """One CMC class page per process. Widget clicks must not re-walk."""
+    scorer = _cached_scorer(use_fixtures)
+    return tuple(
+        load_class_catalog(scorer.client, asset_type, first_page_only=True)
+    )
 
 
 def health_launcher_reminder(*, launcher_set: bool | None = None) -> str | None:
@@ -1139,21 +1159,93 @@ def _render_search_picker(
         )
     else:
         st.caption(
-            "Live mode: paginated CMC RWA map + ``assets/list`` per official "
-            "asset_type plus published Backed bToken PoR symbols (bNVDA, …). "
+            "Live mode: lazy per-class CMC map (one page on tap) plus "
+            "published Backed bToken PoR symbols (bNVDA, …). "
             "Prefix-match ticker/name or tap a CMC RWA class, then choose a "
             "match. BTC/ETH are not RWA. Crypto and Look sector chips are "
             "not on this bar."
         )
 
 
-def _ticker_catalog(scorer: TransparencyScorer) -> list[TickerOption]:
-    """CMC/fixture map plus published Backed bToken PoR symbols.
+def _in_streamlit_script() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # noqa: BLE001
+        return False
+    return get_script_run_ctx() is not None
 
-    Always goes through the client so ``assets/list`` / map cache hits appear
-    on the CMC-calls evidence strip. HTTP is still TTL-cached on the client.
+
+def _shard_store() -> dict:
+    """Session class shards. Falls back to the process memo in unit tests."""
+    try:
+        store = st.session_state.get("catalog_shards")
+        if not isinstance(store, dict):
+            store = {}
+            st.session_state["catalog_shards"] = store
+        return store
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return _catalog_shard_memo
+
+
+def pending_search_query() -> str:
+    """Search text the next catalog build should honor (chip or typed)."""
+    try:
+        if st.session_state.get("_clear_search"):
+            return ""
+        raw_cat = st.query_params.get("rwa_cat")
+        if raw_cat:
+            cid = raw_cat if isinstance(raw_cat, str) else str(raw_cat)
+            cat = CATEGORY_BY_ID.get(str(cid))
+            if cat is not None:
+                return chip_query(cat)
+        return str(st.session_state.get("ticker_query") or "")
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return ""
+
+
+def _class_shard(scorer: TransparencyScorer, asset_type: str) -> list[TickerOption]:
+    """One cached CMC class page. Warm hits do not walk the directory."""
+    source = str(getattr(scorer.client, "source", "") or "")
+    store = _shard_store()
+    key = f"{source}:{id(scorer.client)}:{asset_type}"
+    hit = store.get(key)
+    if hit is not None:
+        return list(hit)
+    if _in_streamlit_script():
+        rows = list(_cached_class_catalog_data(source == "fixture", asset_type))
+    else:
+        rows = cached_class_catalog(
+            scorer.client, asset_type, first_page_only=True
+        )
+    store[key] = rows
+    return list(rows)
+
+
+def _ticker_catalog(
+    scorer: TransparencyScorer, query: str = ""
+) -> list[TickerOption]:
+    """POR rows always; CMC classes only when Search needs them.
+
+    Live initial paint is Backed bTokens only — no full-book map /
+    ``assets_list_all`` walk. Tapping Treasuries (or typing a class keyword)
+    loads that class's first page. Fixture mode still hydrates every class
+    on an empty query so the tiny local JSON catalog stays complete.
+    Warm shards stay in session / ``@st.cache_data`` so widget reruns do
+    not rebuild the directory.
     """
-    return load_search_catalog(scorer.client)
+    source = str(getattr(scorer.client, "source", "") or "")
+    wanted = classes_for_query(query)
+    if source == "fixture" and not wanted:
+        wanted = tuple(RWA_CLASS_IDS)
+    store = _shard_store()
+    prefix = f"{source}:{id(scorer.client)}:"
+    for kind in wanted:
+        store[f"{prefix}{kind}"] = _class_shard(scorer, kind)
+    merged = list(catalog_from_por_feeds())
+    for key, rows in list(store.items()):
+        if key.startswith(prefix):
+            merged = merge_search_catalog(merged, rows)
+    return merge_por_catalog(merged, catalog_from_por_feeds())
 
 
 def chip_display_label(label: str) -> str:
@@ -1717,7 +1809,7 @@ st.caption(
     "Click a slot to choose which one the next pick replaces."
 )
 
-catalog = _ticker_catalog(scorer)
+catalog = _ticker_catalog(scorer, query=pending_search_query())
 _render_search_picker(catalog, use_fixtures, client=scorer.client)
 
 active = int(st.session_state.active_slot)

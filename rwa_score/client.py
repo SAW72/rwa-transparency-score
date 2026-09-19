@@ -52,7 +52,10 @@ DEFAULT_MAX_PAGES = 80
 # Full map / assets/list directory (7.9K+ rows, many pages). Longer than the
 # per-widget TTL so Streamlit reruns do not re-paginate or re-burn credits.
 DEFAULT_DIRECTORY_TTL_SECONDS = 1800.0
-DEFAULT_PAGE_GAP_SECONDS = 0.2
+# Directory pagination does not sleep between pages. CMC 429 / error 1008
+# still back off inside ``_get``. A fixed gap made full-book walks feel like
+# 30–60s whiteouts on Search reruns.
+DEFAULT_PAGE_GAP_SECONDS = 0.0
 ASSET_TYPES = (
     "stock",
     "commodity",
@@ -664,11 +667,14 @@ class CMCClient:
         symbol: str | None = None,
         *,
         asset_type: str | None = None,
+        start: int = 1,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve tickers to ``rwa_id``. Costs 0 credits on Basic.
 
         With no ``symbol``, paginates the full (optionally typed) map so the
-        search directory is complete. A symbol lookup is a single request.
+        search directory is complete. Pass ``limit`` for a single page (Search
+        lazy-load). A symbol lookup is a single request.
         """
         kind = self._normalize_asset_type(asset_type)
         if symbol:
@@ -687,10 +693,32 @@ class CMCClient:
             self._record(ENDPOINT_MAP, via="network")
             return copy.deepcopy(assets)
 
-        def _page(start: int, limit: int) -> dict[str, Any]:
+        if limit is not None:
+            page = max(1, int(start))
+            size = max(1, min(int(limit), DEFAULT_PAGE_LIMIT))
+            cache_key = f"map:PAGE:{kind}:{page}:{size}"
+            cached = self._cache.get(cache_key, self.directory_ttl)
+            if cached is not None:
+                self._record(ENDPOINT_MAP, via="cache", cached=True)
+                return cached
+            params = {
+                "start": page,
+                "limit": size,
+                "sort": "rwa_rank",
+            }
+            if kind:
+                params["asset_type"] = kind
+            data = self._get(ENDPOINT_MAP, params)
+            parsed = parse_rwa_map_payload(data.get("data") or {})
+            assets = parsed["rwa_assets"]
+            self._cache.set(cache_key, assets)
+            self._record(ENDPOINT_MAP, via="network")
+            return copy.deepcopy(assets)
+
+        def _page(page_start: int, page_limit: int) -> dict[str, Any]:
             params: dict[str, Any] = {
-                "start": start,
-                "limit": limit,
+                "start": page_start,
+                "limit": page_limit,
                 "sort": "rwa_rank",
             }
             if kind:
@@ -949,16 +977,22 @@ class FixtureClient:
         symbol: str | None = None,
         *,
         asset_type: str | None = None,
+        start: int = 1,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         self._record(ENDPOINT_MAP)
         assets = list(self._data.get("map") or [])
         kind = (asset_type or "").strip().lower()
         if kind:
             assets = [a for a in assets if (a.get("asset_type") or "").lower() == kind]
-        if not symbol:
-            return assets
-        wanted = {part.strip().upper() for part in symbol.split(",") if part.strip()}
-        return [a for a in assets if (a.get("symbol") or "").upper() in wanted]
+        if symbol:
+            wanted = {part.strip().upper() for part in symbol.split(",") if part.strip()}
+            assets = [a for a in assets if (a.get("symbol") or "").upper() in wanted]
+        if limit is not None:
+            size = max(1, min(int(limit), DEFAULT_PAGE_LIMIT))
+            offset = max(0, int(start) - 1)
+            assets = assets[offset : offset + size]
+        return assets
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         self._record(ENDPOINT_INFO)
