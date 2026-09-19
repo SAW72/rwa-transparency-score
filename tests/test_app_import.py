@@ -237,12 +237,16 @@ def test_share_score_card_is_button_gated() -> None:
     from rwa_score.x_client import MISSING_CREDS_MESSAGE, X_POST_UNAVAILABLE_MESSAGE
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert "Share score card" in source
+    assert "share scorecard" in source
     assert "share_score_card" in source
     assert "_render_share_controls" in source
     assert "_user_facing_share_status" in source
     assert "if st.button(" in source
-    button_idx = source.index('st.button("Share score card"')
+    assert demo_app.SCORECARD_BUTTON_LABEL == "scorecard"
+    assert demo_app.POST_TO_X_LABEL == "post to X"
+    assert demo_app.DOWNLOAD_PNG_LABEL == "download PNG"
+    assert demo_app.SHARE_EXPANDER_LABEL == "share scorecard"
+    button_idx = source.index("st.button(SCORECARD_BUTTON_LABEL")
     call_idx = source.index("share_score_card(report")
     assert button_idx < call_idx
     # Must not fire a share on import / page load.
@@ -253,7 +257,7 @@ def test_share_score_card_is_button_gated() -> None:
     assert "_show_share_png" in source
     assert "share_card_preview_html" in source
     assert "Could not build the score card image" in source
-    assert "Click Share score card to build a signed PNG preview." in source
+    assert "Click scorecard to preview the signed PNG." in source
     # Markdown data URIs only. st.image / download_button register /media and
     # /_stcore/download; components.html mounts /component — MPA v1 Page not found.
     share_fn = source.split("def _render_share_controls", 1)[1].split(
@@ -270,6 +274,18 @@ def test_share_score_card_is_button_gated() -> None:
     assert "_maybe_rerun()" not in show_fn
     assert "st.markdown(" in show_fn
     assert "unsafe_allow_html=True" in show_fn
+    scorecard_idx = share_fn.index("st.button(SCORECARD_BUTTON_LABEL")
+    post_idx = share_fn.index("st.button(POST_TO_X_LABEL")
+    attach_idx = share_fn.index("attach_x_share(")
+    assert scorecard_idx < post_idx < attach_idx
+    scorecard_branch = share_fn.split("st.button(SCORECARD_BUTTON_LABEL", 1)[1].split(
+        "st.button(POST_TO_X_LABEL", 1
+    )[0]
+    assert "attach_x_share(" not in scorecard_branch
+    assert "post_image(" not in scorecard_branch
+    assert "Posted to X" not in share_fn.split("st.button(POST_TO_X_LABEL", 1)[0]
+    assert "justify-content: flex-start" in source
+    assert "stExpander" in source
     # _maybe_rerun is Search _auto_place only (file-adjacent to Share; not called).
     # The only st.rerun() statement lives inside _maybe_rerun itself.
     assert source.count("_maybe_rerun()") == 2
@@ -297,8 +313,21 @@ def test_share_score_card_is_button_gated() -> None:
     posted = SimpleNamespace(
         x_posted=True,
         x_message="Posted to X: https://x.com/i/web/status/1",
+        x_url="https://x.com/i/web/status/1",
     )
-    assert demo_app._user_facing_share_status(posted).startswith("Posted to X:")
+    assert demo_app._user_facing_share_status(posted) == "Posted to X."
+    assert "https://" not in demo_app._user_facing_share_status(posted)
+    footer = demo_app.share_footer_markdown(posted)
+    assert "Open score page" in footer
+    assert "View post on X" in footer
+    assert "](https://x.com/i/web/status/1)" in footer
+    unseen = SimpleNamespace(x_posted=False, x_url=None, x_message="")
+    preview_footer = demo_app.share_footer_markdown(unseen)
+    assert "Open score page" in preview_footer
+    assert "View post on X" not in preview_footer
+    assert demo_app.is_x_status_url("https://x.com/i/web/status/99")
+    assert not demo_app.is_x_status_url("https://example.com/status/99")
+    assert not demo_app.is_x_status_url("")
 
     state_key, pending_key = demo_app.share_session_keys(2, "bNVDA")
     assert state_key == "share_card_2_bNVDA"
@@ -314,7 +343,7 @@ def test_share_score_card_is_button_gated() -> None:
 
     html = demo_app.share_card_preview_html(b"\x89PNG fake", 'rat-score-bNVDA.png')
     assert "data:image/png;base64," in html
-    assert "Download PNG" in html
+    assert "download PNG" in html
     assert 'download="rat-score-bNVDA.png"' in html
     assert "<img " in html
     escaped = demo_app.share_card_preview_html(b"x", 'say "hi".png')
@@ -407,7 +436,16 @@ def test_sidebar_density_keeps_required_copy() -> None:
     assert "st.toggle(" in sidebar
     assert 'st.expander("How scores are labeled"' in sidebar
     assert 'st.expander("Pillar weights"' in sidebar
+    assert 'st.expander("CMC calls this run"' in sidebar
     assert 'st.expander("Disclaimer"' in sidebar
+    assert source.index('st.expander("Pillar weights"') < source.index(
+        'st.expander("CMC calls this run"'
+    )
+    assert source.index('st.expander("CMC calls this run"') < source.index(
+        'st.expander("Disclaimer"'
+    )
+    assert "_render_sidebar_tail" in source
+    assert 'st.markdown("#### CMC calls this run")' not in source
     assert "st.write(DISCLAIMER)" in sidebar
     assert "[Privacy Policy](/privacy)" in sidebar
     assert "[Terms of Service](/terms)" in sidebar
@@ -557,4 +595,11 @@ def test_health_launcher_reminder_and_cmc_calls_strip(fixture_scorer) -> None:
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
     assert "CMC calls this run" in source
+    assert "_render_sidebar_tail" in source
     assert "health_launcher_reminder" in source
+    unknown = demo_app.format_cmc_calls_lines(
+        {"source": "mystery", "endpoints": [{"endpoint": "/v5/x", "source": "mystery"}]}
+    )
+    assert "not labeled live" in unknown[0].lower()
+    assert "Live CMC" not in unknown[0]
+    assert " · live" not in unknown[1]

@@ -25,6 +25,7 @@ import requests
 from dotenv import load_dotenv
 
 from .fixtures import DEMO_FIXTURE_PATH
+from .source_label import source_honesty_label, source_kind
 
 load_dotenv()
 
@@ -611,13 +612,14 @@ class _CallJournal:
         self._calls = []
 
     def record(self, endpoint: str, *, via: str, cached: bool = False) -> None:
-        source = "fixture" if self.source == "fixture" else "live"
+        kind = source_kind(self.source)
+        source = kind if kind in {"fixture", "live"} else "unknown"
         self._calls.append(
             {
                 "endpoint": endpoint,
                 "source": source,
                 "via": "fixture" if source == "fixture" else via,
-                "cached": bool(cached) and source != "fixture",
+                "cached": bool(cached) and source == "live",
             }
         )
 
@@ -631,14 +633,21 @@ def summarize_call_log(
     client_source: str,
 ) -> dict[str, Any]:
     """UI/API evidence block. Never claims live when the client is a fixture."""
-    source = "fixture" if client_source == "fixture" else "live"
+    kind = source_kind(client_source)
+    source = kind if kind in {"fixture", "live"} else "unknown"
     rows = []
     seen: set[tuple[str, str, str]] = set()
     for raw in calls or []:
         endpoint = str(raw.get("endpoint") or "")
         if not endpoint:
             continue
-        row_source = "fixture" if source == "fixture" or raw.get("source") == "fixture" else "live"
+        raw_kind = source_kind(raw.get("source"))
+        if source == "fixture" or raw_kind == "fixture":
+            row_source = "fixture"
+        elif source == "live" or raw_kind == "live":
+            row_source = "live"
+        else:
+            row_source = "unknown"
         via = "fixture" if row_source == "fixture" else str(raw.get("via") or "network")
         key = (endpoint, row_source, via)
         if key in seen:
@@ -655,11 +664,7 @@ def summarize_call_log(
     return {
         "source": source,
         "live": source == "live",
-        "label": (
-            "bundled DEMO FIXTURES — not live CoinMarketCap"
-            if source == "fixture"
-            else "live CoinMarketCap API"
-        ),
+        "label": source_honesty_label(source),
         "endpoints": rows,
     }
 

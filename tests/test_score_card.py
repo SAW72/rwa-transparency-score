@@ -334,7 +334,7 @@ def test_share_disabled_does_not_call_x() -> None:
 
 def test_readme_documents_share_and_secrets() -> None:
     text = Path("README.md").read_text(encoding="utf-8")
-    assert "Share score card" in text
+    assert "share scorecard" in text.lower() or "Share score card" in text
     assert "SCORE_CARD_SIGNING_SECRET" in text
     assert "X_API_KEY" in text
     assert "X_API_SECRET" in text
