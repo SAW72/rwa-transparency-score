@@ -446,8 +446,11 @@ def _exception_is_plan_blocked(exc: BaseException) -> bool:
 
 def _stamp_basis_meta(meta: dict[str, Any], *, plan_blocked: bool) -> dict[str, Any]:
     out = dict(meta)
-    out["plan_blocked"] = bool(plan_blocked)
-    out["unavailable_reason"] = PLAN_BLOCK_REASON if plan_blocked else None
+    out.pop("plan_blocked", None)
+    out.pop("unavailable_reason", None)
+    if plan_blocked:
+        out["plan_blocked"] = True
+        out["unavailable_reason"] = PLAN_BLOCK_REASON
     return out
 
 
@@ -818,8 +821,6 @@ class TransparencyScorer:
             "wrappers": [],
             "source": None,
             "tradfi_markets": [],
-            "plan_blocked": False,
-            "unavailable_reason": None,
         }
         if rwa_id is None:
             flags.append(
@@ -1321,8 +1322,10 @@ class TransparencyScorer:
         else:
             basis_evidence = "CMC RWA quotes / market-pairs unavailable — self-reported gap."
         basis_notes = [f"verification={VerificationLevel.SELF_REPORTED.value}"]
+        basis_verify_meta: dict[str, Any] = {}
         if plan_blocked:
             basis_notes.append(PLAN_BLOCKED_LABEL)
+            basis_verify_meta["plan_blocked"] = True
         basis_v = VerificationResult(
             score=basis_score,
             level=VerificationLevel.SELF_REPORTED,
@@ -1330,7 +1333,7 @@ class TransparencyScorer:
             source=basis_source,
             notes=basis_notes,
             ok=bool(basis_meta.get("available")) and not plan_blocked,
-            meta={"plan_blocked": plan_blocked},
+            meta=basis_verify_meta,
         )
         basis_why = _append_verification_notes(basis_why, basis_v)
 
