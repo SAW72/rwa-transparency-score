@@ -23,8 +23,13 @@ import streamlit.components.v1 as components
 from rwa_score.client import create_client, env_flag, summarize_call_log
 from rwa_score.explainer import AI_FOOTNOTE, explain_score
 from rwa_score.health import install_health_route, serve_health_if_requested
-from rwa_score.score_card import share_score_card
+from rwa_score.score_card import (
+    PNG_BUILD_FAILED_PREFIX,
+    attach_x_share,
+    share_score_card,
+)
 from rwa_score.scorer import (
+    ALWAYS_SELF_REPORTED,
     LIVE_OR_HEURISTIC,
     PILLARS,
     WEIGHTS,
@@ -44,7 +49,11 @@ from rwa_score.ticker_search import (
     search_tickers,
 )
 from rwa_score.verifiers import VerificationLevel
-from rwa_score.x_client import user_facing_x_skip_message, x_credentials_ready
+from rwa_score.x_client import (
+    MISSING_CREDS_MESSAGE,
+    user_facing_x_skip_message,
+    x_credentials_ready,
+)
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
 # Per-symbol wall-clock cache for the explainer — process-local dict.
@@ -108,6 +117,11 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
     evidence = block.get("evidence") or "No evidence citation."
     meta = block.get("meta") or {}
     published = meta.get("published_por_feed")
+    if pillar_key in ALWAYS_SELF_REPORTED:
+        # LIVE/FIXTURE is the data source, not an oracle. Do not label CMC-only
+        # pillars as the card's overall "Verification:" line.
+        badge = "CMC field (self-reported)"
+        return badge, evidence
     if source == "heuristic_fallback" or "heuristic fallback" in (evidence or "").lower():
         if published and meta.get("por_path") == "fixture_labeled_skip":
             badge = (
@@ -144,8 +158,15 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
 
 
 def selected_slot_verification_lines(report: dict) -> list[str]:
-    """Compact per-pillar verification labels for the active compare slot."""
-    lines: list[str] = []
+    """Compact per-pillar verification labels for the active compare slot.
+
+    First line distinguishes LIVE/FIXTURE data from the strongest
+    backing/reserves/redemption check so a card with on-chain PoR is not
+    summarized as ``Verification: self-reported``.
+    """
+    mode = mode_cue(report)
+    cue = verification_cue(report)
+    lines = [f"{mode} data · strongest check: {cue}"]
     for key in WEIGHTS:
         badge, _evidence = _verification_badge_label(key, report)
         lines.append(f"{PILLARS[key]['label']} — {badge}")
@@ -219,29 +240,39 @@ SEARCH_TYPEAHEAD_JS = r"""
     return doc.querySelector('[data-testid="stTextInput"] input');
   }
 
+  function fireEnter(input) {
+    var specs = [
+      { type: "keydown", key: "Enter", code: "Enter", keyCode: 13, which: 13 },
+      { type: "keypress", key: "Enter", code: "Enter", keyCode: 13, which: 13 },
+      { type: "keyup", key: "Enter", code: "Enter", keyCode: 13, which: 13 }
+    ];
+    var i;
+    for (i = 0; i < specs.length; i++) {
+      try { input.dispatchEvent(new KeyboardEvent(specs[i].type, Object.assign({
+        bubbles: true, cancelable: true
+      }, specs[i]))); } catch (err) {}
+    }
+  }
+
   function commitTypedValue(input) {
     if (!input || doc.activeElement !== input) return;
-    try {
-      input.dispatchEvent(new KeyboardEvent("keypress", {
-        key: "Enter",
-        code: "Enter",
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true
-      }));
-    } catch (err) {}
+    fireEnter(input);
     input.blur();
+  }
+
+  function scheduleCommit(input) {
+    setKeepFocus(true);
+    if (input._rwaTimer) win.clearTimeout(input._rwaTimer);
+    input._rwaTimer = win.setTimeout(function () { commitTypedValue(input); }, DELAY);
   }
 
   function bind(input) {
     if (!input || input.getAttribute(BOUND) === "1") return;
     input.setAttribute(BOUND, "1");
-    var timer = null;
-    input.addEventListener("input", function () {
-      setKeepFocus(true);
-      if (timer) win.clearTimeout(timer);
-      timer = win.setTimeout(function () { commitTypedValue(input); }, DELAY);
+    input.addEventListener("input", function () { scheduleCommit(input); });
+    input.addEventListener("keyup", function (ev) {
+      if (ev.key === "Enter" || ev.keyCode === 13) return;
+      scheduleCommit(input);
     });
   }
 
@@ -887,6 +918,68 @@ def _maybe_rerun() -> None:
     st.rerun()
 
 
+_EXPANDER_SUPPORTS_KEY: bool | None = None
+
+
+def open_expander(label: str, *, expanded: bool = False, key: str | None = None):
+    """Expander with a unique key when Streamlit accepts ``key=``.
+
+    Streamlit 1.39's expander has no ``key`` — identical labels across the
+    four compare columns can collide. Prefer a per-slot key; fall back to
+    the label-only API so the demo never crashes on the pinned version.
+    """
+    global _EXPANDER_SUPPORTS_KEY
+    if key and _EXPANDER_SUPPORTS_KEY is not False:
+        try:
+            widget = st.expander(label, expanded=expanded, key=key)
+            _EXPANDER_SUPPORTS_KEY = True
+            return widget
+        except TypeError:
+            _EXPANDER_SUPPORTS_KEY = False
+    return st.expander(label, expanded=expanded)
+
+
+def share_session_keys(slot_index: int, ticker: str) -> tuple[str, str]:
+    """Session keys for the PNG bundle and a pending X post."""
+    symbol = str(ticker or "UNK")
+    return (
+        f"share_card_{slot_index}_{symbol}",
+        f"share_x_pending_{slot_index}_{symbol}",
+    )
+
+
+def share_card_preview_html(png_bytes: bytes, filename: str) -> str:
+    """Self-contained PNG preview + download. No Streamlit media/download URLs."""
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    safe_name = html.escape(filename or "rat-score.png", quote=True)
+    return (
+        '<div class="rat-share-card">'
+        f'<img alt="RAT Score card" src="data:image/png;base64,{b64}" '
+        'style="width:100%;height:auto;border-radius:8px;display:block;" />'
+        '<p style="margin:0.65rem 0 0;">'
+        f'<a download="{safe_name}" href="data:image/png;base64,{b64}">Download PNG</a>'
+        "</p></div>"
+    )
+
+
+def _show_share_png(png_bytes: bytes, filename: str = "rat-score.png") -> None:
+    """Preview + download via data URIs so MPA v1 does not treat them as pages.
+
+    ``st.image`` / ``st.download_button`` register ``/media`` and
+    ``/_stcore/download`` URLs. With ``pages/`` present, Streamlit's router
+    can surface those as **Page not found** / “Running the app's main page”
+    on the Share click rerun — the live Render break.
+    """
+    try:
+        components.html(
+            share_card_preview_html(png_bytes, filename),
+            height=460,
+            scrolling=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not preview score card: {exc}")
+
+
 def _auto_place(ticker: str) -> None:
     """Drop a pick into the next compare slot and advance (no Assign button)."""
     symbol = normalize_ticker(ticker)
@@ -924,7 +1017,7 @@ def _install_search_typeahead() -> None:
     """Bridge Streamlit's Enter/blur-only text_input to live-as-you-type search."""
     components.html(
         f"<script>{search_typeahead_script()}</script>",
-        height=0,
+        height=1,
         scrolling=False,
     )
 
@@ -1019,36 +1112,44 @@ def chip_display_label(label: str) -> str:
 
 
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
-    """User-triggered signed PNG + optional X post. Never runs on page load."""
+    """User-triggered signed PNG + optional X post. Never runs on page load.
+
+    PNG is stored first. Preview/download use data URIs (not ``st.image`` /
+    ``st.download_button``) so MPA v1 does not treat media routes as pages.
+    Do not ``st.rerun()`` after the click — that also trips Page not found.
+    """
     ticker = str(report.get("ticker") or "UNK")
-    state_key = f"share_card_{slot_index}_{ticker}"
+    state_key, pending_key = share_session_keys(slot_index, ticker)
+    st.session_state.pop(pending_key, None)
     if st.button("Share score card", key=f"share_btn_{slot_index}_{ticker}"):
         try:
-            st.session_state[state_key] = share_score_card(report)
+            bundle = share_score_card(report, post_to_x=False)
         except Exception as exc:  # noqa: BLE001 — card UI must stay up
             st.session_state[state_key] = None
             st.error(f"Could not build score card: {exc}")
             return
+        if bundle.png_bytes and x_credentials_ready():
+            st.session_state[state_key] = bundle
+            bundle = attach_x_share(bundle)
+        elif bundle.png_bytes:
+            bundle.x_message = MISSING_CREDS_MESSAGE
+        st.session_state[state_key] = bundle
     if not x_credentials_ready():
         st.caption("X credentials not set — share still builds a downloadable PNG.")
     bundle = st.session_state.get(state_key)
     if bundle is None:
+        st.caption("Click Share score card to build a signed PNG preview.")
         return
-    if bundle.png_bytes:
-        try:
-            # Streamlit 1.39: st.image uses use_column_width, not use_container_width.
-            st.image(bundle.png_bytes, use_column_width=True)
-        except TypeError:
-            st.image(bundle.png_bytes)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Could not preview score card: {exc}")
-        st.download_button(
-            "Download PNG",
-            data=bundle.png_bytes,
-            file_name=bundle.filename,
-            mime="image/png",
-            key=f"share_dl_{slot_index}_{ticker}",
+    if not bundle.png_bytes:
+        st.error(
+            "Could not build the score card image. Download is unavailable — "
+            "try Share score card again."
         )
+        raw = str(getattr(bundle, "x_message", "") or "")
+        if raw.startswith(PNG_BUILD_FAILED_PREFIX) and "{" not in raw:
+            st.caption(raw)
+        return
+    _show_share_png(bundle.png_bytes, bundle.filename)
     st.caption(f"Signature fingerprint: `{bundle.fingerprint}`")
     status = _user_facing_share_status(bundle)
     if bundle.x_posted:
@@ -1066,7 +1167,11 @@ def _render_why_this_score(report: dict, *, slot_index: int = 0) -> None:
     """
     ticker = str(report.get("ticker") or "UNK")
     why_key = f"explain_{slot_index}_{ticker}"
-    with st.expander("Why this score?", expanded=False):
+    with open_expander(
+        "Why this score?",
+        expanded=False,
+        key=f"why_exp_{slot_index}_{ticker}",
+    ):
         if st.session_state.get(why_key):
             st.write(_cached_explanation(report))
             st.caption(AI_FOOTNOTE)
@@ -1127,8 +1232,12 @@ def _render_sidebar_controls(default_fixtures: bool) -> bool:
 
 def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
     """Collapsed pillar evidence on the compare card. xAI / share stay gated elsewhere."""
-    del slot_index  # kept for call-site compatibility with share / explainer helpers
-    with st.expander("Pillar evidence", expanded=False):
+    ticker = str(report.get("ticker") or "UNK")
+    with open_expander(
+        "Pillar evidence",
+        expanded=False,
+        key=f"pillar_ev_{slot_index}_{ticker}",
+    ):
         if report.get("data_source") == "fixture":
             st.caption("Demo fixture data — not a live CoinMarketCap API response.")
         else:
@@ -1279,7 +1388,18 @@ def _render_selected_slot_detail(
     ]
     for row in leftover:
         st.caption(f"Heuristic note · {row['label']}: {row['kind']}")
-    with st.expander("Share score card", expanded=False):
+    ticker = str(report.get("ticker") or "UNK")
+    state_key, _pending = share_session_keys(slot_index, ticker)
+    has_share = False
+    try:
+        has_share = st.session_state.get(state_key) is not None
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        has_share = False
+    with open_expander(
+        "Share score card",
+        expanded=has_share,
+        key=f"share_exp_{slot_index}_{ticker}",
+    ):
         _render_share_controls(report, slot_index=slot_index)
 
 
@@ -1302,17 +1422,19 @@ st.markdown(
       [data-baseweb="menu"] {{
         z-index: 1000 !important;
       }}
-      /* Typeahead bridge is a 0-height iframe — do not leave a gap under Search. */
-      div[data-testid="stIFrame"]:has(iframe[height="0"]),
-      iframe[height="0"] {{
-        height: 0 !important;
-        min-height: 0 !important;
+      /* Typeahead bridge is a 1px iframe — keep JS alive, no layout gap. */
+      div[data-testid="stIFrame"]:has(iframe[height="1"]),
+      iframe[height="1"] {{
+        height: 1px !important;
+        min-height: 1px !important;
         margin: 0 !important;
         padding: 0 !important;
         overflow: hidden !important;
         border: 0 !important;
         position: absolute !important;
-        width: 0 !important;
+        width: 1px !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
       }}
       /* Score-band pill — stronger than metric-delta text. */
       .rat-band-chip {{

@@ -1,0 +1,4 @@
+Inter-Regular.ttf and Inter-Bold.ttf are the Inter typeface
+(SIL Open Font License 1.1). https://github.com/rsms/inter
+Bundled so Render score-card PNGs stay readable when the host
+has no /usr/share/fonts tree.

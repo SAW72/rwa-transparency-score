@@ -50,7 +50,7 @@ Expected when Render is live (not fixtures):
 {"fixtures": false, "verifiers_live": true, "backed_feed": "ok", "timestamp": "…"}
 ```
 
-**Free Render cold starts:** the free web service can spin down after ~15 minutes of inactivity. The first request after idle may take ~30–60 seconds. Wait and retry `/health` — do not treat a slow first hit as a failed demo. Expected body is JSON (`fixtures`, `verifiers_live`, `backed_feed`, `timestamp`), not Streamlit's "enable JavaScript" SPA. Header `X-RWA-Health: json` is set when the Tornado JSON handler ran. If `/health` is `text/html`, the Render **Start Command** is `streamlit run app.py` and must be changed to match `render.yaml` (`python -m rwa_score.health …`). This repo cannot edit the Render dashboard. `/_stcore/health` = `ok` is Streamlit's probe, not this payload.
+**Free Render cold starts:** the free web service can spin down after ~15 minutes of inactivity. The first request after idle may take ~30–60 seconds. Wait and retry `/health` — do not treat a slow first hit as a failed demo. Expected body is JSON (`fixtures`, `verifiers_live`, `backed_feed`, `timestamp`), not Streamlit's "enable JavaScript" SPA. Header `X-RWA-Health: json` is set when the Tornado JSON handler ran. If `/health` is `text/html`, the Render **Start Command** is `streamlit run app.py` and must be changed to match `render.yaml` (`python -m rwa_score.health …`). The dashboard Start Command is independent of `render.yaml` unless the service is Blueprint-synced — this repo cannot change that dashboard field. `/_stcore/health` = `ok` is Streamlit's probe, not this payload.
 
 **After Spencer approves a deploy** (do not merge-deploy from this PR):
 

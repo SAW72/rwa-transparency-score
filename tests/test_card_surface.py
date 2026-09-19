@@ -105,7 +105,8 @@ def test_card_surface_wired_into_compare_row() -> None:
     details = source.split("def _render_card_details", 1)[1].split(
         "def _render_compare_card", 1
     )[0]
-    assert 'st.expander("Pillar evidence"' in details
+    assert 'open_expander(\n        "Pillar evidence"' in details or 'st.expander("Pillar evidence"' in details
+    assert "pillar_ev_" in details
     assert "pillar_evidence_rows" in details
     assert "Evidence:" in details
     assert "_cached_explanation" not in details

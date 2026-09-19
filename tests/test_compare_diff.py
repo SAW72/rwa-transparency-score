@@ -245,7 +245,8 @@ def test_compare_callout_and_card_wire_into_app() -> None:
     details = source.split("def _render_card_details", 1)[1].split(
         "def _render_compare_card", 1
     )[0]
-    assert 'st.expander("Pillar evidence"' in details
+    assert 'open_expander(\n        "Pillar evidence"' in details or 'st.expander("Pillar evidence"' in details
+    assert "pillar_ev_" in details
     assert "_cached_explanation" not in details
     assert "Share score card" not in details
     detail = source.split("def _render_selected_slot_detail", 1)[1].split(

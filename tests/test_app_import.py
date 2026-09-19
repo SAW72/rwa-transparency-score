@@ -63,6 +63,8 @@ def test_brand_assets_exist() -> None:
     assert (demo_app.ASSETS_DIR / "rat-icon-192.png").is_file()
     assert (demo_app.ASSETS_DIR / "rat-monogram-on-dark.png").is_file()
     assert (demo_app.ASSETS_DIR / "rat-monogram.svg").is_file()
+    assert (demo_app.ASSETS_DIR / "fonts" / "Inter-Regular.ttf").is_file()
+    assert (demo_app.ASSETS_DIR / "fonts" / "Inter-Bold.ttf").is_file()
     uri = demo_app._asset_data_uri(demo_app.MONOGRAM_PATH)
     assert uri is not None and uri.startswith("data:image/png;base64,")
 
@@ -163,14 +165,15 @@ def test_why_this_score_copy_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     import app as demo_app
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert 'st.expander("Why this score?"' in source
+    assert 'open_expander(\n        "Why this score?"' in source or 'st.expander("Why this score?"' in source
     assert "Show explanation" in source
     why = source.split("def _render_why_this_score", 1)[1].split(
         "def _user_facing_share_status", 1
     )[0]
     assert "_cached_explanation" in why
     assert "AI_FOOTNOTE" in why
-    assert "st.expander" in why
+    assert "open_expander" in why or "st.expander" in why
+    assert "why_exp_" in why
     assert "Share score card" not in why
     card = source.split("def _render_compare_card", 1)[1].split(
         "def _render_slot_error", 1
@@ -240,13 +243,27 @@ def test_share_score_card_is_button_gated() -> None:
     assert "_user_facing_share_status" in source
     assert "if st.button(" in source
     button_idx = source.index('st.button("Share score card"')
-    call_idx = source.index("share_score_card(report)")
+    call_idx = source.index("share_score_card(report")
     assert button_idx < call_idx
     # Must not fire a share on import / page load.
     assert "share_score_card(" not in source.split("def _render_share_controls")[0]
-    # Streamlit 1.39 image API — use_container_width crashes st.image.
+    # PNG first — X post is attached later so a hang cannot wipe the preview.
+    assert "post_to_x=False" in source.split("def _render_share_controls", 1)[1]
+    assert "attach_x_share" in source
+    assert "_show_share_png" in source
+    assert "share_card_preview_html" in source
+    assert "Could not build the score card image" in source
+    assert "Click Share score card to build a signed PNG preview." in source
+    # Data URIs only — st.image / download_button register /media and
+    # /_stcore/download, which MPA v1 surfaces as Page not found.
+    share_fn = source.split("def _render_share_controls", 1)[1].split(
+        "def _render_why_this_score", 1
+    )[0]
+    assert "st.download_button(" not in share_fn
+    assert "st.image(" not in share_fn
+    assert "_maybe_rerun()" not in share_fn
+    assert "data:image/png;base64" in source
     assert "st.image(bundle.png_bytes, use_container_width=" not in source
-    assert "st.image(bundle.png_bytes, use_column_width=True)" in source
 
     raw = SimpleNamespace(
         x_posted=False,
@@ -258,6 +275,27 @@ def test_share_score_card_is_button_gated() -> None:
         x_message="Posted to X: https://x.com/i/web/status/1",
     )
     assert demo_app._user_facing_share_status(posted).startswith("Posted to X:")
+
+    state_key, pending_key = demo_app.share_session_keys(2, "bNVDA")
+    assert state_key == "share_card_2_bNVDA"
+    assert pending_key == "share_x_pending_2_bNVDA"
+    empty = SimpleNamespace(
+        x_posted=False,
+        x_message=f"{demo_app.PNG_BUILD_FAILED_PREFIX} pillow missing",
+        png_bytes=b"",
+        fingerprint="UNSIGNED",
+    )
+    assert not empty.png_bytes
+    assert empty.x_message.startswith(demo_app.PNG_BUILD_FAILED_PREFIX)
+
+    html = demo_app.share_card_preview_html(b"\x89PNG fake", 'rat-score-bNVDA.png')
+    assert "data:image/png;base64," in html
+    assert "Download PNG" in html
+    assert 'download="rat-score-bNVDA.png"' in html
+    assert "<img " in html
+    escaped = demo_app.share_card_preview_html(b"x", 'say "hi".png')
+    assert "&quot;" in escaped
+    assert 'download="say "hi".png"' not in escaped
 
 
 def test_compare_row_is_native_streamlit_not_html() -> None:
@@ -272,8 +310,12 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     assert source.count("unsafe_allow_html") <= 2
     assert "Pick a ticker to compare here" in source
     assert "Assign a ticker" not in source
-    assert 'st.expander("Why this score?"' in source
-    assert 'st.expander("Pillar evidence"' in source
+    assert "Why this score?" in source
+    assert "Pillar evidence" in source
+    assert "open_expander" in source
+    assert "pillar_ev_" in source
+    assert "why_exp_" in source
+    assert "share_exp_" in source
     render = source.split("def _render_compare_card", 1)[1].split(
         "def _render_slot_error", 1
     )[0]
@@ -384,9 +426,51 @@ def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
 
     report = fixture_scorer.score("NVDA")
     slot = demo_app.selected_slot_verification_lines(report)
-    assert len(slot) == 6
+    assert len(slot) == 7
+    assert slot[0].startswith("FIXTURE data · strongest check:")
+    assert "heuristic fallback" in slot[0]
+    assert "self-reported" not in slot[0]
     assert any("heuristic fallback" in line for line in slot)
     assert any("Cross-issuer basis" in line for line in slot)
+    assert any("CMC field (self-reported)" in line for line in slot)
+    assert not any(line.startswith("Cross-issuer basis — Verification:") for line in slot)
+
+    live_por = {
+        "ticker": "bNVDA",
+        "data_source": "cmc",
+        "live_verifiers": True,
+        "verification": {
+            "backing": {
+                "level": "on-chain PoR",
+                "source": "chainlink_por",
+                "evidence": "published feed",
+            },
+            "reserves": {
+                "level": "on-chain PoR",
+                "source": "chainlink_por",
+                "evidence": "published feed",
+            },
+            "redemption": {
+                "level": "self-reported",
+                "source": "issuer",
+                "evidence": "issuer page",
+            },
+            "price": {"level": "self-reported", "source": "cmc", "evidence": "quote"},
+            "disclosure": {"level": "self-reported", "source": "cmc", "evidence": "cik"},
+            "basis": {"level": "self-reported", "source": "cmc", "evidence": "pairs"},
+        },
+    }
+    live_lines = demo_app.selected_slot_verification_lines(live_por)
+    assert live_lines[0] == "LIVE data · strongest check: on-chain PoR"
+    assert any("Verification: on-chain PoR" in line for line in live_lines)
+    cmc_lines = [
+        line
+        for line in live_lines
+        if line.startswith(("Price integrity", "Disclosure", "Cross-issuer basis"))
+    ]
+    assert cmc_lines
+    assert all("CMC field (self-reported)" in line for line in cmc_lines)
+    assert all("Verification: self-reported" not in line for line in cmc_lines)
     labeled = demo_app.heuristic_legend_lines(report)
     assert any("fixture" in line.lower() for line in labeled)
 
@@ -403,6 +487,7 @@ def test_ui_surfaces_sixth_pillar_badge(fixture_scorer) -> None:
 
     report = fixture_scorer.score("NVDA")
     badge, evidence = demo_app._verification_badge_label("basis", report)
+    assert badge == "CMC field (self-reported)"
     assert "self-reported" in badge
     assert "quotes" in evidence.lower() or "market-pairs" in evidence.lower()
     results = demo_app._score_slots(fixture_scorer, ["NVDA", "TSLA", "AAPL", "META"])
