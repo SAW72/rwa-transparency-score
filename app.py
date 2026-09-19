@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import base64
 import html
-import io
 import os
 import time
 from pathlib import Path
@@ -949,13 +948,34 @@ def share_session_keys(slot_index: int, ticker: str) -> tuple[str, str]:
     )
 
 
-def _show_share_png(png_bytes: bytes) -> None:
-    """Preview a score-card PNG. Streamlit 1.39: use_column_width, not container."""
-    preview = io.BytesIO(png_bytes)
+def share_card_preview_html(png_bytes: bytes, filename: str) -> str:
+    """Self-contained PNG preview + download. No Streamlit media/download URLs."""
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    safe_name = html.escape(filename or "rat-score.png", quote=True)
+    return (
+        '<div class="rat-share-card">'
+        f'<img alt="RAT Score card" src="data:image/png;base64,{b64}" '
+        'style="width:100%;height:auto;border-radius:8px;display:block;" />'
+        '<p style="margin:0.65rem 0 0;">'
+        f'<a download="{safe_name}" href="data:image/png;base64,{b64}">Download PNG</a>'
+        "</p></div>"
+    )
+
+
+def _show_share_png(png_bytes: bytes, filename: str = "rat-score.png") -> None:
+    """Preview + download via data URIs so MPA v1 does not treat them as pages.
+
+    ``st.image`` / ``st.download_button`` register ``/media`` and
+    ``/_stcore/download`` URLs. With ``pages/`` present, Streamlit's router
+    can surface those as **Page not found** / “Running the app's main page”
+    on the Share click rerun — the live Render break.
+    """
     try:
-        st.image(preview, use_column_width=True)
-    except TypeError:
-        st.image(preview)
+        components.html(
+            share_card_preview_html(png_bytes, filename),
+            height=460,
+            scrolling=False,
+        )
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not preview score card: {exc}")
 
@@ -1094,32 +1114,26 @@ def chip_display_label(label: str) -> str:
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
     """User-triggered signed PNG + optional X post. Never runs on page load.
 
-    PNG is built and stored first. X posting (if credentials exist) runs on a
-    later script run so a slow/failed X call cannot wipe the preview.
+    PNG is stored first. Preview/download use data URIs (not ``st.image`` /
+    ``st.download_button``) so MPA v1 does not treat media routes as pages.
+    Do not ``st.rerun()`` after the click — that also trips Page not found.
     """
     ticker = str(report.get("ticker") or "UNK")
     state_key, pending_key = share_session_keys(slot_index, ticker)
+    st.session_state.pop(pending_key, None)
     if st.button("Share score card", key=f"share_btn_{slot_index}_{ticker}"):
         try:
             bundle = share_score_card(report, post_to_x=False)
         except Exception as exc:  # noqa: BLE001 — card UI must stay up
             st.session_state[state_key] = None
-            st.session_state.pop(pending_key, None)
             st.error(f"Could not build score card: {exc}")
             return
-        if not bundle.png_bytes:
+        if bundle.png_bytes and x_credentials_ready():
             st.session_state[state_key] = bundle
-            st.session_state.pop(pending_key, None)
-        else:
-            if x_credentials_ready():
-                bundle.x_message = ""
-                st.session_state[pending_key] = True
-            else:
-                bundle.x_message = MISSING_CREDS_MESSAGE
-                st.session_state.pop(pending_key, None)
-            st.session_state[state_key] = bundle
-            if st.session_state.get(pending_key):
-                _maybe_rerun()
+            bundle = attach_x_share(bundle)
+        elif bundle.png_bytes:
+            bundle.x_message = MISSING_CREDS_MESSAGE
+        st.session_state[state_key] = bundle
     if not x_credentials_ready():
         st.caption("X credentials not set — share still builds a downloadable PNG.")
     bundle = st.session_state.get(state_key)
@@ -1135,18 +1149,7 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
         if raw.startswith(PNG_BUILD_FAILED_PREFIX) and "{" not in raw:
             st.caption(raw)
         return
-    _show_share_png(bundle.png_bytes)
-    st.download_button(
-        "Download PNG",
-        data=bundle.png_bytes,
-        file_name=bundle.filename,
-        mime="image/png",
-        key=f"share_dl_{slot_index}_{ticker}",
-    )
-    if st.session_state.get(pending_key):
-        st.session_state[pending_key] = False
-        bundle = attach_x_share(bundle)
-        st.session_state[state_key] = bundle
+    _show_share_png(bundle.png_bytes, bundle.filename)
     st.caption(f"Signature fingerprint: `{bundle.fingerprint}`")
     status = _user_facing_share_status(bundle)
     if bundle.x_posted:

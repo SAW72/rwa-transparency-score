@@ -251,15 +251,19 @@ def test_share_score_card_is_button_gated() -> None:
     assert "post_to_x=False" in source.split("def _render_share_controls", 1)[1]
     assert "attach_x_share" in source
     assert "_show_share_png" in source
+    assert "share_card_preview_html" in source
     assert "Could not build the score card image" in source
     assert "Click Share score card to build a signed PNG preview." in source
-    # Streamlit 1.39 image API — use_container_width crashes st.image.
+    # Data URIs only — st.image / download_button register /media and
+    # /_stcore/download, which MPA v1 surfaces as Page not found.
+    share_fn = source.split("def _render_share_controls", 1)[1].split(
+        "def _render_why_this_score", 1
+    )[0]
+    assert "st.download_button(" not in share_fn
+    assert "st.image(" not in share_fn
+    assert "_maybe_rerun()" not in share_fn
+    assert "data:image/png;base64" in source
     assert "st.image(bundle.png_bytes, use_container_width=" not in source
-    show_png = source.split("def _show_share_png", 1)[1].split("def share_session_keys", 1)[0]
-    if "def _render" in show_png:
-        show_png = source.split("def _show_share_png", 1)[1].split("\n\n\ndef ", 1)[0]
-    assert "use_container_width" not in show_png
-    assert "use_column_width=True" in show_png
 
     raw = SimpleNamespace(
         x_posted=False,
@@ -283,6 +287,15 @@ def test_share_score_card_is_button_gated() -> None:
     )
     assert not empty.png_bytes
     assert empty.x_message.startswith(demo_app.PNG_BUILD_FAILED_PREFIX)
+
+    html = demo_app.share_card_preview_html(b"\x89PNG fake", 'rat-score-bNVDA.png')
+    assert "data:image/png;base64," in html
+    assert "Download PNG" in html
+    assert 'download="rat-score-bNVDA.png"' in html
+    assert "<img " in html
+    escaped = demo_app.share_card_preview_html(b"x", 'say "hi".png')
+    assert "&quot;" in escaped
+    assert 'download="say "hi".png"' not in escaped
 
 
 def test_compare_row_is_native_streamlit_not_html() -> None:
