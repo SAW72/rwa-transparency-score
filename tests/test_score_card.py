@@ -13,8 +13,10 @@ from rwa_score.x_client import X_POST_UNAVAILABLE_MESSAGE, user_facing_x_skip_me
 from rwa_score.score_card import (
     CARD_HEIGHT,
     CARD_WIDTH,
+    PNG_BUILD_FAILED_PREFIX,
     SIGNING_SECRET_ENV,
     UNSIGNED_FINGERPRINT,
+    attach_x_share,
     build_signed_card,
     canonical_json,
     canonical_score_payload,
@@ -123,6 +125,31 @@ def test_missing_secret_is_unsigned(monkeypatch: pytest.MonkeyPatch) -> None:
     assert card.signature == ""
     assert card.fingerprint == UNSIGNED_FINGERPRINT
     assert not verify_signature(card.canonical, card.signature, "")
+
+
+def test_bundled_inter_fonts_are_used_first() -> None:
+    from rwa_score.score_card import FONTS_DIR, _FONT_PAIRS, _load_font
+
+    regular, bold = _FONT_PAIRS[0]
+    assert regular == FONTS_DIR / "Inter-Regular.ttf"
+    assert bold == FONTS_DIR / "Inter-Bold.ttf"
+    assert regular.is_file()
+    assert bold.is_file()
+    font = _load_font(34, bold=True)
+    assert getattr(font, "path", "") == str(bold)
+    assert int(getattr(font, "size", 0) or 0) == 34
+
+
+def test_png_renders_without_system_or_bundled_fonts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+
+    import rwa_score.score_card as score_card
+
+    monkeypatch.setattr(score_card, "_FONT_PAIRS", ())
+    card = build_signed_card(SAMPLE_REPORT, secret=TEST_SECRET, timestamp=FIXED_TS)
+    assert card.png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    image = Image.open(io.BytesIO(card.png_bytes))
+    assert image.size == (CARD_WIDTH, CARD_HEIGHT)
 
 
 def test_png_is_valid_and_branded() -> None:
@@ -237,6 +264,53 @@ def test_share_polishes_raw_x_api_skip_message() -> None:
     assert "400" not in card.x_message
     assert "INIT" not in card.x_message
     assert user_facing_x_skip_message(card.x_message) == X_POST_UNAVAILABLE_MESSAGE
+
+
+def test_attach_x_share_posts_existing_png_without_rebuild() -> None:
+    client = RecordingXClient(
+        FakeXResult(posted=True, message="Posted to X: https://x.com/i/web/status/2", url="https://x.com/i/web/status/2")
+    )
+    card = share_score_card(
+        SAMPLE_REPORT,
+        secret=TEST_SECRET,
+        timestamp=FIXED_TS,
+        post_to_x=False,
+    )
+    png = card.png_bytes
+    posted = attach_x_share(card, x_client=client)
+    assert posted.png_bytes == png
+    assert posted.x_posted is True
+    assert posted.x_url == "https://x.com/i/web/status/2"
+    assert len(client.calls) == 1
+    assert client.calls[0][0] == png
+
+
+def test_attach_x_share_empty_png_skips_without_client() -> None:
+    card = share_score_card(
+        SAMPLE_REPORT,
+        secret=TEST_SECRET,
+        timestamp=FIXED_TS,
+        post_to_x=False,
+    )
+    card.png_bytes = b""
+    card.x_message = f"{PNG_BUILD_FAILED_PREFIX} boom"
+    client = RecordingXClient(FakeXResult(posted=True, message="should not run"))
+    skipped = attach_x_share(card, x_client=client)
+    assert client.calls == []
+    assert skipped.x_posted is False
+    assert skipped.x_message.startswith(PNG_BUILD_FAILED_PREFIX)
+
+
+def test_generation_failure_bundle_is_empty_png(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("font missing")
+
+    monkeypatch.setattr("rwa_score.score_card.build_signed_card", boom)
+    card = share_score_card(SAMPLE_REPORT, post_to_x=False)
+    assert card.png_bytes == b""
+    assert card.x_message.startswith(PNG_BUILD_FAILED_PREFIX)
+    assert "font missing" in card.x_message
+    assert "{" not in card.x_message
 
 
 def test_share_disabled_does_not_call_x() -> None:
