@@ -580,7 +580,15 @@ def browse_categories(catalog: list[TickerOption]) -> tuple:
 
 
 def chip_query(category) -> str:
-    """Search text a chip should type — first documented keyword."""
+    """Search text a chip should type.
+
+    Official CMC RWA classes use the ``asset_type`` id so Treasuries loads
+    ``government_security`` (not a display alias). Industry chips still use
+    the first documented keyword.
+    """
+    cid = str(getattr(category, "id", "") or "")
+    if cid in RWA_CLASS_IDS:
+        return cid
     words = getattr(category, "keywords", ()) or ()
     return str(words[0] if words else getattr(category, "label", "") or "")
 
@@ -1090,9 +1098,11 @@ def _render_search_picker(
     chip_cats = browse_categories(catalog)
     raw_cat = st.query_params.get("rwa_cat")
     if raw_cat:
-        cid = raw_cat if isinstance(raw_cat, str) else str(raw_cat)
-        cat = CATEGORY_BY_ID.get(cid) or next(
-            (row for row in chip_cats if row.id == cid), None
+        cid = raw_cat if isinstance(raw_cat, str) else (
+            raw_cat[0] if isinstance(raw_cat, (list, tuple)) and raw_cat else str(raw_cat)
+        )
+        cat = CATEGORY_BY_ID.get(str(cid)) or next(
+            (row for row in chip_cats if row.id == str(cid)), None
         )
         if cat is not None:
             st.session_state.ticker_query = chip_query(cat)
@@ -1194,7 +1204,9 @@ def pending_search_query() -> str:
             return ""
         raw_cat = st.query_params.get("rwa_cat")
         if raw_cat:
-            cid = raw_cat if isinstance(raw_cat, str) else str(raw_cat)
+            cid = raw_cat if isinstance(raw_cat, str) else (
+                raw_cat[0] if isinstance(raw_cat, (list, tuple)) and raw_cat else str(raw_cat)
+            )
             cat = CATEGORY_BY_ID.get(str(cid))
             if cat is not None:
                 return chip_query(cat)

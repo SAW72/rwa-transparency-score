@@ -9,6 +9,7 @@ from rwa_score.client import FixtureClient
 from rwa_score.ticker_search import (
     BACKED_SEARCH_SOURCE,
     CATEGORIES,
+    CATEGORY_BY_ID,
     CATEGORY_DOC,
     CRYPTO_ID,
     NATIVE_CRYPTO_SYMBOLS,
@@ -368,6 +369,9 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.chip_display_label("Real Estate") == "Real Estate"
     assert demo_app.chip_query(RWA_CLASS_CATEGORIES[0]) == "stock"
     assert demo_app.chip_query(RWA_CLASS_CATEGORIES[1]) == "commodity"
+    assert demo_app.chip_query(CATEGORY_BY_ID["government_security"]) == (
+        "government_security"
+    )
     assert "st.session_state.ticker_query = chip_query(cat)" in source
     assert 'st.session_state.ticker_query = ""' in source
     assert "_clear_search" in source
@@ -445,6 +449,9 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
 
     # Category pills still pre-fill Search with the documented keyword.
     assert demo_app.chip_query(RWA_CLASS_CATEGORIES[0]) == "stock"
+    assert demo_app.chip_query(CATEGORY_BY_ID["government_security"]) == (
+        "government_security"
+    )
     assert "st.session_state.ticker_query = chip_query(cat)" in source
 
 
@@ -932,6 +939,139 @@ def test_load_class_catalog_is_one_source_not_dual_walk() -> None:
     assert client.calls["assets_list_all"] == 0
 
 
+class _MapIgnoresTreasuryTypeClient(_StockScopedLiveClient):
+    """#42 live miss: typed map returns the stock-scoped page; list has Treasuries."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        kind = (asset_type or "").strip().lower()
+        if kind == "government_security" and not symbol:
+            self.calls["rwa_map"] += 1
+            return self._typed("stock")
+        return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+
+class _EmptyTreasuryMapClient(_StockScopedLiveClient):
+    """Typed map first page is empty; assets/list still lists CMC treasuries."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        kind = (asset_type or "").strip().lower()
+        if kind == "government_security" and not symbol:
+            self.calls["rwa_map"] += 1
+            return []
+        return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+
+class _UntypedTreasuryMapClient(_StockScopedLiveClient):
+    """Typed map returns USTB/OUSG but omits asset_type (classification miss)."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        kind = (asset_type or "").strip().lower()
+        if kind == "government_security" and not symbol:
+            self.calls["rwa_map"] += 1
+            return [
+                {"symbol": "USTB", "name": "US Treasury Bill", "rwa_id": 30},
+                {
+                    "symbol": "OUSG",
+                    "name": "Ondo Short-Term US Treasuries",
+                    "rwa_id": 31,
+                },
+            ]
+        return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+
+class _AliasTreasuryMapClient(_StockScopedLiveClient):
+    """Live display alias instead of the official government_security enum."""
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+        kind = (asset_type or "").strip().lower()
+        if kind == "government_security" and not symbol:
+            self.calls["rwa_map"] += 1
+            return [
+                {
+                    "symbol": "USTB",
+                    "name": "US Treasury Bill",
+                    "rwa_id": 30,
+                    "asset_type": "treasury",
+                },
+                {
+                    "symbol": "OUSG",
+                    "name": "Ondo Short-Term US Treasuries",
+                    "rwa_id": 31,
+                    "asset_type": "Government Security",
+                },
+            ]
+        return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+
+def test_treasuries_falls_back_when_map_is_stock_scoped() -> None:
+    """Typed map ignored asset_type — do not keep stocks; list must supply USTB."""
+    client = _MapIgnoresTreasuryTypeClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert all(opt.asset_type == "government_security" for opt in rows)
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 1
+    assert client.calls["assets_list_all"] == 0
+    query = "government_security"
+    assert "USTB" in {opt.symbol for opt in search_tickers(query, rows)}
+    assert "OUSG" in {opt.symbol for opt in search_tickers("treasuries", rows)}
+    assert "NVDA" not in {opt.symbol for opt in rows}
+
+
+def test_treasuries_falls_back_when_map_first_page_empty() -> None:
+    client = _EmptyTreasuryMapClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 1
+    assert client.calls["assets_list_all"] == 0
+
+
+def test_treasuries_stamps_untyped_map_rows_without_list_walk() -> None:
+    client = _UntypedTreasuryMapClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert all(opt.asset_type == "government_security" for opt in rows)
+    assert "government_security" in rows[0].categories
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 0
+    assert client.calls["assets_list_all"] == 0
+    assert {opt.symbol for opt in search_tickers("treasury", rows)} == {"USTB", "OUSG"}
+
+
+def test_treasuries_maps_live_asset_type_aliases() -> None:
+    client = _AliasTreasuryMapClient()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert all(opt.asset_type == "government_security" for opt in rows)
+    assert client.calls["assets_list"] == 0
+    assert classify_categories(symbol="USTB", asset_type="treasury") == (
+        "government_security",
+    )
+
+
+def test_treasuries_does_not_invent_tickers_when_cmc_lists_none() -> None:
+    class _EmptyBoth(_StockScopedLiveClient):
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+            kind = (asset_type or "").strip().lower()
+            if kind == "government_security" and not symbol:
+                self.calls["rwa_map"] += 1
+                return []
+            return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+        def assets_list(self, *, asset_type: str | None = None, **kwargs):
+            kind = (asset_type or "").strip().lower()
+            if kind == "government_security":
+                self.calls["assets_list"] += 1
+                return {"rwa_assets": [], "total_size": 0, "has_more": False}
+            return super().assets_list(asset_type=asset_type, **kwargs)
+
+    client = _EmptyBoth()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert rows == []
+    assert client.calls["assets_list_all"] == 0
+
+
 def test_cached_class_catalog_hits_on_second_call() -> None:
     client = _StockScopedLiveClient()
     first = cached_class_catalog(client, "government_security")
@@ -1014,6 +1154,27 @@ def test_app_lazy_loads_treasuries_and_warm_path_does_not_rewalk() -> None:
     nvd = demo_app._ticker_catalog(scorer, query="NVD")
     assert "NVDA" in {opt.symbol for opt in nvd}
     assert [opt.symbol for opt in demo_app.search_tickers("NVD", nvd)][0] == "NVDA"
+
+
+def test_app_treasuries_pill_loads_cmc_class_when_map_is_stock_scoped() -> None:
+    """Treasuries pill → government_security even if typed map is stock-scoped."""
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+
+    client = _MapIgnoresTreasuryTypeClient()
+    scorer = TransparencyScorer(client)
+    query = demo_app.chip_query(CATEGORY_BY_ID["government_security"])
+    assert query == "government_security"
+    assert classes_for_query(query) == ("government_security",)
+    catalog = demo_app._ticker_catalog(scorer, query=query)
+    symbols = {opt.symbol for opt in catalog}
+    assert {"USTB", "OUSG"} <= symbols
+    assert "NVDA" not in symbols
+    hits = demo_app.search_tickers(query, catalog)
+    assert {opt.symbol for opt in hits} >= {"USTB", "OUSG"}
+    assert client.calls["rwa_map"] == 1
+    assert client.calls["assets_list"] == 1
+    assert client.calls["assets_list_all"] == 0
 
 
 def test_app_search_uses_cache_data_and_pending_query() -> None:
