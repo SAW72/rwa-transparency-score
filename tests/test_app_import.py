@@ -267,8 +267,13 @@ def test_share_score_card_is_button_gated() -> None:
     assert "components.html(" not in show_fn
     assert "st.image(" not in show_fn
     assert "st.download_button(" not in show_fn
+    assert "_maybe_rerun()" not in show_fn
     assert "st.markdown(" in show_fn
     assert "unsafe_allow_html=True" in show_fn
+    # _maybe_rerun is Search _auto_place only (file-adjacent to Share; not called).
+    # The only st.rerun() statement lives inside _maybe_rerun itself.
+    assert source.count("_maybe_rerun()") == 2
+    assert source.count("    st.rerun()") == 1
     # Only Search typeahead may mount a component iframe.
     typeahead_fn = source.split("def _install_search_typeahead", 1)[1].split(
         "def _render_search_picker", 1

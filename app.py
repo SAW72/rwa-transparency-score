@@ -908,7 +908,11 @@ def selected_slot_contrast_line(ticker: str, diff: dict | None) -> str:
 
 
 def _maybe_rerun() -> None:
-    """Rerun only inside a live Streamlit script (no-op in unit tests)."""
+    """Rerun only inside a live Streamlit script (no-op in unit tests).
+
+    Search place-into-slot only. Share click / preview / download must never
+    call this — ``st.rerun()`` after Share is an MPA Page-not-found trigger.
+    """
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
     except Exception:  # noqa: BLE001
@@ -966,12 +970,12 @@ def _show_share_png(png_bytes: bytes, filename: str = "rat-score.png") -> None:
     """Preview + download as markdown data URIs — never a Streamlit media route.
 
     ``st.image`` / ``st.download_button`` register ``/media`` and
-    ``/_stcore/download``. ``components.html`` mounts an iframe at
-    ``/component/...``. Streamlit 1.39 MPA v1 (any ``pages/`` tree) treats
-    those paths as unknown pages and shows **Page not found** on the Share
-    click rerun — the residual live fail after #36. Markdown HTML stays
-    inline (no iframe, no media endpoint). ``pages/`` is also gone so the
-    MPA router is off.
+    ``/_stcore/download``. ``components.html`` is an iframe proto (srcdoc /
+    ``stIFrame``). Streamlit 1.39 MPA v1 (any ``pages/`` tree) treats those
+    mounts as unknown pages and shows **Page not found** on the Share click
+    rerun — the residual live fail after #36. Markdown HTML stays inline
+    (no iframe, no media endpoint, no ``st.rerun()``). ``pages/`` is also
+    gone so the MPA router is off.
     """
     try:
         st.markdown(
