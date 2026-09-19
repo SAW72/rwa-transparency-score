@@ -74,10 +74,10 @@ from rwa_score.x_client import (
 
 EXPLAIN_CACHE_TTL_SECONDS = 24 * 3600.0
 CATALOG_CACHE_TTL_SECONDS = 1800.0
-SHARE_EXPANDER_LABEL = "share scorecard"
-SCORECARD_BUTTON_LABEL = "scorecard"
+SHARE_EXPANDER_LABEL = "Scorecard"
+SCORECARD_BUTTON_LABEL = "Scorecard"
 DOWNLOAD_PNG_LABEL = "download PNG"
-POST_TO_X_LABEL = "post to X"
+SHARE_BUTTON_LABEL = "Share"
 LIVE_SCORE_PAGE_URL = "https://rwa-transparency-score.onrender.com"
 X_POST_DISABLED_MESSAGE = "X post skipped (disabled)."
 # Per-symbol wall-clock cache for the explainer — process-local dict.
@@ -1391,13 +1391,14 @@ def chip_display_label(label: str) -> str:
 
 
 def _render_share_controls(report: dict, *, slot_index: int) -> None:
-    """User-triggered signed PNG, then independent download / post-to-X.
+    """Scorecard preview first; only the bottom Share button may post to X.
 
-    Primary ``scorecard`` click builds and shows the PNG only. It must not
-    call ``attach_x_share`` / ``post_image``. Download and post to X are
-    separate explicit actions after the card is visible. Preview/download
-    use ``st.markdown`` data URIs (not ``st.image`` / ``st.download_button``
-    / ``components.html``). Do not ``st.rerun()`` after a click.
+    The ``Scorecard`` control builds and shows the PNG only. That click must
+    not call ``attach_x_share`` / ``post_image`` / ``XClient``. After the
+    preview is visible, ``download PNG`` and the bottom ``Share`` button are
+    independent. Preview/download use ``st.markdown`` data URIs (not
+    ``st.image`` / ``st.download_button`` / ``components.html``). Do not
+    ``st.rerun()`` after a click. PNG bytes / caption are unchanged.
     """
     ticker = str(report.get("ticker") or "UNK")
     state_key, pending_key = share_session_keys(slot_index, ticker)
@@ -1410,7 +1411,7 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
             st.session_state[state_key] = None
             st.error(f"Could not build score card: {exc}")
             return
-        # Preview only — never call the X upload helpers on this click.
+        # Preview only — no X network on this click.
         if bundle.png_bytes:
             bundle.x_posted = False
             bundle.x_url = None
@@ -1419,23 +1420,27 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
 
     bundle = st.session_state.get(state_key)
     if bundle is None:
-        st.caption("Click scorecard to preview the signed PNG. Nothing is posted to X.")
+        st.caption("Click Scorecard to preview the signed PNG. Nothing is posted to X.")
         return
     if not bundle.png_bytes:
         st.error(
             "Could not build the score card image. Download is unavailable — "
-            "try scorecard again."
+            "try Scorecard again."
         )
         raw = str(getattr(bundle, "x_message", "") or "")
         if raw.startswith(PNG_BUILD_FAILED_PREFIX) and "{" not in raw:
             st.caption(raw)
         return
 
+    # Preview renders here — still no X client / network.
     _show_share_png(bundle.png_bytes, bundle.filename)
     st.caption(f"Signature fingerprint: `{bundle.fingerprint}`")
+    footer = share_footer_markdown(bundle)
+    if footer:
+        st.markdown(footer)
 
-    # Independent of download. Verb stays "post to X" even after success.
-    if st.button(POST_TO_X_LABEL, key=f"share_x_btn_{slot_index}_{ticker}"):
+    # Bottom of the scorecard view. Only this button may post to X.
+    if st.button(SHARE_BUTTON_LABEL, key=f"share_x_btn_{slot_index}_{ticker}"):
         if x_credentials_ready():
             bundle = attach_x_share(bundle)
         else:
@@ -1450,13 +1455,9 @@ def _render_share_controls(report: dict, *, slot_index: int) -> None:
     status = _user_facing_share_status(bundle)
     if bundle.x_posted:
         st.success(status)
-        st.caption("Download PNG and post to X stay independent. The button is still post to X.")
+        st.caption("Download PNG and Share stay independent. The Share button stays Share.")
     elif status:
         st.info(status)
-
-    footer = share_footer_markdown(bundle)
-    if footer:
-        st.markdown(footer)
 
 
 def _render_why_this_score(report: dict, *, slot_index: int = 0) -> None:
@@ -1858,7 +1859,7 @@ st.markdown(
         margin: 0.65rem 0 0;
       }}
       /* Expander chevron sits beside the label, not stranded at the far right
-         of a full-width row (share scorecard / why / ask / CMC calls). */
+         of a full-width row (Scorecard / why / ask / CMC calls). */
       div[data-testid="stExpander"] summary,
       div[data-testid="stExpander"] [class*="expanderHeader"] {{
         display: inline-flex !important;

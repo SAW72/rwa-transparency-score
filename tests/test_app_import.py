@@ -237,15 +237,15 @@ def test_share_score_card_is_button_gated() -> None:
     from rwa_score.x_client import MISSING_CREDS_MESSAGE, X_POST_UNAVAILABLE_MESSAGE
 
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert "share scorecard" in source
+    assert '"Scorecard"' in source
     assert "share_score_card" in source
     assert "_render_share_controls" in source
     assert "_user_facing_share_status" in source
     assert "if st.button(" in source
-    assert demo_app.SCORECARD_BUTTON_LABEL == "scorecard"
-    assert demo_app.POST_TO_X_LABEL == "post to X"
+    assert demo_app.SCORECARD_BUTTON_LABEL == "Scorecard"
+    assert demo_app.SHARE_BUTTON_LABEL == "Share"
     assert demo_app.DOWNLOAD_PNG_LABEL == "download PNG"
-    assert demo_app.SHARE_EXPANDER_LABEL == "share scorecard"
+    assert demo_app.SHARE_EXPANDER_LABEL == "Scorecard"
     button_idx = source.index("st.button(SCORECARD_BUTTON_LABEL")
     call_idx = source.index("share_score_card(report")
     assert button_idx < call_idx
@@ -257,7 +257,7 @@ def test_share_score_card_is_button_gated() -> None:
     assert "_show_share_png" in source
     assert "share_card_preview_html" in source
     assert "Could not build the score card image" in source
-    assert "Click scorecard to preview the signed PNG." in source
+    assert "Click Scorecard to preview the signed PNG." in source
     # Markdown data URIs only. st.image / download_button register /media and
     # /_stcore/download; components.html mounts /component — MPA v1 Page not found.
     share_fn = source.split("def _render_share_controls", 1)[1].split(
@@ -275,15 +275,18 @@ def test_share_score_card_is_button_gated() -> None:
     assert "st.markdown(" in show_fn
     assert "unsafe_allow_html=True" in show_fn
     scorecard_idx = share_fn.index("st.button(SCORECARD_BUTTON_LABEL")
-    post_idx = share_fn.index("st.button(POST_TO_X_LABEL")
+    preview_idx = share_fn.index("_show_share_png(")
+    post_idx = share_fn.index("st.button(SHARE_BUTTON_LABEL")
     attach_idx = share_fn.index("attach_x_share(")
-    assert scorecard_idx < post_idx < attach_idx
+    assert scorecard_idx < preview_idx < post_idx < attach_idx
     scorecard_branch = share_fn.split("st.button(SCORECARD_BUTTON_LABEL", 1)[1].split(
-        "st.button(POST_TO_X_LABEL", 1
+        "st.button(SHARE_BUTTON_LABEL", 1
     )[0]
     assert "attach_x_share(" not in scorecard_branch
     assert "post_image(" not in scorecard_branch
-    assert "Posted to X" not in share_fn.split("st.button(POST_TO_X_LABEL", 1)[0]
+    assert "XClient" not in scorecard_branch
+    assert "Posted to X" not in share_fn.split("st.button(SHARE_BUTTON_LABEL", 1)[0]
+    assert share_fn.index("_show_share_png(") < share_fn.index("attach_x_share(")
     assert "justify-content: flex-start" in source
     assert "stExpander" in source
     # _maybe_rerun is Search _auto_place only (file-adjacent to Share; not called).
