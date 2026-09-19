@@ -55,3 +55,4 @@ def test_coverage_doc_matches_fixture_matrix() -> None:
     assert "not live" in text.lower()
     assert "/v5/real-world-assets/map" in text
     assert "BTC" in text and "not" in text.lower()
+    assert "RWA-bar pill" in text or "not on that bar" in text

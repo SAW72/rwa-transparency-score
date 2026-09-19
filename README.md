@@ -17,7 +17,7 @@ Then open the local URL Streamlit prints. Type a prefix like `NIV` or `NVD` (3+ 
 
 Search also lists published Backed **bToken** symbols from `BACKED_POR_FEEDS` (`bNVDA`, `bIB01`, `bCSPX`, `bC3M`, `bIBTA`) as first-class Matches — type `bNV` / `bNVDA` (or a feed alias such as `NVDAx`). The CMC/fixture underlying row (`NVDA`) still ranks first when you type `NVDA`; the bToken is an extra match so you can land a card that is eligible for the **on-chain PoR** badge. Tickers with no published proxy (most xStocks) stay on the labeled **heuristic fallback**.
 
-**Search categories** — UI chips are the official CMC RWA `asset_type` classes (always shown, horizontal pills). Rows come from the **paginated** CMC/fixture `map` + `assets/list` plus published Backed bTokens. Industry chips (`AI`, `oil`, …) are optional filters over `industry` / name hints. **BTC / ETH are not RWA.** Coverage matrix: [`docs/CMC_RWA_COVERAGE.md`](docs/CMC_RWA_COVERAGE.md).
+**Search categories** — the RWA bar is **exactly** the six official CMC RWA `asset_type` pills (horizontal). Rows come from the **paginated** CMC/fixture `map` + `assets/list` (per class when the default listing is stock-scoped) plus published Backed bTokens. Industry keywords (`oil`, `AI`) still filter rows already in the directory but are **not** chips on that bar. **BTC / ETH are not RWA** and have no Crypto pill. Coverage matrix: [`docs/CMC_RWA_COVERAGE.md`](docs/CMC_RWA_COVERAGE.md).
 
 | Category | CMC `asset_type` / keywords | Fixture examples (labeled, not live) |
 |---|---|---|
@@ -27,8 +27,6 @@ Search also lists published Backed **bToken** symbols from `BACKED_POR_FEEDS` (`
 | ETFs | `etf` | SPY |
 | Real Estate | `real_estate` (+ REIT industry) | HOME, PLD |
 | Currencies | `currency` | EUR |
-| AI/Tech · Oil/Energy · Auto/EV · Finance | industry hints (`ai`, `oil`, `auto`, `finance`) | NVDA / XOM / TSLA; Finance live-only |
-| Crypto / Digital Assets | BTC, ETH, WBTC, WETH — **not** an RWA class | shown only if a row leaks in |
 
 CLI equivalent:
 

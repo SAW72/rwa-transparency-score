@@ -292,6 +292,31 @@ def _normalize_directory_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def directory_has_more(
+    parsed: dict[str, Any] | None,
+    *,
+    start: int,
+    batch_len: int,
+) -> bool:
+    """Continue paging when ``has_more`` or ``total_size`` says the book is incomplete.
+
+    Live CMC sometimes omits ``has_more`` and only sends ``total_size``. Trust
+    either signal. ``start`` is the 1-based item offset of this page.
+    """
+    payload = parsed if isinstance(parsed, dict) else {}
+    if payload.get("has_more"):
+        return True
+    raw_total = payload.get("total_size")
+    try:
+        total = int(raw_total) if raw_total is not None else None
+    except (TypeError, ValueError):
+        total = None
+    if total is None:
+        return False
+    page_end = max(0, int(start) - 1) + max(0, int(batch_len))
+    return page_end < total
+
+
 def parse_rwa_map_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize a CMC (or fixture) ``map`` ``data`` object, including pagination."""
     payload = data if isinstance(data, dict) else {}
@@ -626,9 +651,9 @@ class CMCClient:
                 seen.add(marker)
                 rows.append(row)
             self._record(endpoint, via="network")
-            if not parsed.get("has_more") or not batch:
+            if not directory_has_more(parsed, start=start, batch_len=len(batch)) or not batch:
                 break
-            start += size
+            start += len(batch)
             if page_i + 1 < self.max_pages and self.page_gap:
                 self._sleep(self.page_gap)
         self._cache.set(cache_key, rows)
@@ -836,9 +861,9 @@ class CMCClient:
                     continue
                 seen.add(marker)
                 rows.append(row)
-            if not parsed.get("has_more") or not batch:
+            if not directory_has_more(parsed, start=start, batch_len=len(batch)) or not batch:
                 break
-            start += size
+            start += len(batch)
             if page_i + 1 < self.max_pages and self.page_gap:
                 self._sleep(self.page_gap)
         assembled = {
