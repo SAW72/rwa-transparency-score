@@ -100,6 +100,20 @@ The Streamlit app caches explanations **24 hours per symbol** in a process-local
 
 Set `XAI_API_KEY` in `.env` locally or in the **Render dashboard** (`sync: false` in `render.yaml`, same pattern as `CMC_API_KEY`). Never commit the key.
 
+### Ask RAT (text chat)
+
+Collapsed **Ask RAT** panel under the compare table — it does not steal Search / compare / Share. Greeting is exactly:
+
+`Ask RAT — ask anything about a tokenized stock's risk score`
+
+Demo chips prefill (and submit) these questions:
+
+- `Why is bNVDA greener than NVDA?`
+- `What’s weakest on TSLA?`
+- `Which pillar is self-reported on NVDA?`
+
+Text chat uses `st.chat_input` / `st.chat_message`. **No TTS.** The agent calls tools on the existing CMC/fixture client and `TransparencyScorer` — lookup/map/info, `assets/list`, `quotes/latest`, market-pairs, issuers, `score_ticker`. It does not invent HTTP. Same xAI family as Why this score? (`grok-4.1-fast`, `XAI_API_KEY`). Missing key, HTTP failure, or a slow model/CMC turn uses a templated fallback so the page never crashes. Fixture answers are labeled **FIXTURE** and never claim live CMC. Each reply lists **CMC calls this turn**.
+
 ### Shareable score card (X)
 
 Each selected compare slot has a **Share score card** expander. It does **not** run on page load — only on an explicit click. The click builds a signed, timestamped PNG (ticker, score, band, all six pillar bars including **basis**, RAT branding), keeps the expander open, shows a preview, and offers **Download PNG** as **markdown data URIs** (not `st.image`, `st.download_button`, or `components.html`). Those widgets register `/media`, `/_stcore/download`, or a `/component` iframe that Streamlit 1.39 MPA v1 reports as **Page not found**. There is no `pages/` directory, so the app stays a single-page script and that router cannot fire on Share. If X credentials are configured the image is posted to X via API v2 *after* the PNG is stored. If credentials are missing, or the X post cannot be published, the PNG still downloads and the UI shows a polished skip message — never raw X API / HTTP errors. An empty/failed PNG shows an error plus retry, not a dead button. Generation or X failures never crash the demo.
@@ -169,6 +183,7 @@ rwa_score/scorer.py    Weighted pillars, bands, verification levels, no silent f
 rwa_score/chainlink_por.py  Chainlink AggregatorV3 PoR reader (JSON-RPC eth_call, requests only)
 rwa_score/verifiers.py Backed Chainlink PoR + Dinari scrapers + Robinhood debt-wrapper scores
 rwa_score/explainer.py xAI Grok “Why this score?” with templated fallback
+rwa_score/ask_rat.py   Ask RAT text chat — xAI tools over existing clients; templated fallback
 rwa_score/score_card.py Signed timestamped PNG (Pillow) + HMAC-SHA256 fingerprint
 rwa_score/x_client.py  X API v2 media + tweet (OAuth 1.0a); skip if credentials missing
 rwa_score/issuer_registry.py   Name-match heuristics + ISSUER_NOTES (equity vs debt)

@@ -82,4 +82,8 @@ Render hosts the **Streamlit** UI + `/health` (and `/privacy`, `/terms`). It doe
 - Every ticker to hit Chainlink PoR (Backed bTokens on Polygon only — search `bNV` / `bNVDA` for a card that can show the on-chain badge; most xStocks use **heuristic fallback**)
 - Instant first load on Free Render after idle
 
+## Ask RAT (text only)
+
+Collapsed **Ask RAT** under the compare table. Greeting: `Ask RAT — ask anything about a tokenized stock's risk score`. Chips prefill the three demo questions. No TTS. No `XAI_API_KEY` → templated tool-backed fallback (page stays up). Fixture answers say fixture — never live CMC. Each turn lists CMC calls.
+
 Product disclaimer stays on the README. This page does not replace it.
