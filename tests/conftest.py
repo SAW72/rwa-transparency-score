@@ -27,18 +27,26 @@ def _clear_search_catalog_memo() -> None:
     from rwa_score.ticker_search import clear_catalog_cache
 
     clear_catalog_cache()
+    _clear_app_catalog_shards()
+    yield
+    clear_catalog_cache()
+    _clear_app_catalog_shards()
+
+
+def _clear_app_catalog_shards() -> None:
+    """Drop process and session class shards so ``id()`` reuse cannot leak."""
     try:
         import app as demo_app
 
         demo_app._catalog_shard_memo.clear()
     except Exception:
         pass
-    yield
-    clear_catalog_cache()
     try:
-        import app as demo_app
+        import streamlit as st
 
-        demo_app._catalog_shard_memo.clear()
+        store = st.session_state.get("catalog_shards")
+        if isinstance(store, dict):
+            store.clear()
     except Exception:
         pass
 

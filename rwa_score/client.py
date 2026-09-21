@@ -894,8 +894,15 @@ class CMCClient:
             page = max(1, int(start))
             size = max(1, min(int(limit), DEFAULT_PAGE_LIMIT))
             cache_key = f"map:PAGE:{kind}:{page}:{size}"
+            pages = getattr(self, "_directory_pages", None)
+            if not isinstance(pages, dict):
+                pages = {}
+                self._directory_pages = pages
             cached = self._cache.get(cache_key, self.directory_ttl)
             if cached is not None:
+                remembered = pages.get(cache_key)
+                if isinstance(remembered, dict):
+                    self._directory_page = dict(remembered)
                 self._record(ENDPOINT_MAP, via="cache", cached=True)
                 return cached
             params = {
@@ -908,6 +915,14 @@ class CMCClient:
             data = self._get(ENDPOINT_MAP, params)
             parsed = parse_rwa_map_payload(data.get("data") or {})
             assets = parsed["rwa_assets"]
+            meta = {
+                "truncated": directory_has_more(
+                    parsed, start=page, batch_len=len(assets)
+                ),
+                "total_size": parsed.get("total_size"),
+            }
+            self._directory_page = dict(meta)
+            pages[cache_key] = meta
             self._cache.set(cache_key, assets)
             self._record(ENDPOINT_MAP, via="network")
             return copy.deepcopy(assets)
@@ -1205,7 +1220,13 @@ class FixtureClient:
         if limit is not None:
             size = max(1, min(int(limit), DEFAULT_PAGE_LIMIT))
             offset = max(0, int(start) - 1)
+            total = len(assets)
             assets = assets[offset : offset + size]
+            if not symbol:
+                self._directory_page = {
+                    "truncated": offset + len(assets) < total,
+                    "total_size": total,
+                }
         return assets
 
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:

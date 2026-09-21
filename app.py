@@ -49,20 +49,29 @@ from rwa_score.scorer import (
 )
 from rwa_score.ticker_search import (
     CATEGORY_BY_ID,
+    CLASS_PAGE_LIMIT,
     RWA_CLASS_CATEGORIES,
     RWA_CLASS_IDS,
     SEARCH_MIN_CHARS,
     TickerOption,
     cached_class_catalog,
     catalog_from_por_feeds,
+    class_browse_truncated,
+    class_shard_failure_is_fresh,
+    class_shard_status,
+    client_shard_token,
+    empty_class_page_is_cached_success,
     classes_for_query,
     format_option,
+    is_class_browse_query,
+    live_class_unavailable,
     load_class_catalog,
     merge_por_catalog,
     merge_search_catalog,
     normalize_ticker,
     resolve_assign_symbol,
     search_tickers,
+    symbol_lookup_failed,
 )
 from rwa_score.verifiers import VerificationLevel
 from rwa_score.source_label import source_kind
@@ -232,8 +241,26 @@ _VERIFICATION_RANK = {
     "heuristic fallback": 1,
     VerificationLevel.SELF_REPORTED.value: 0,
 }
+# Prefix typeahead only. Category / class browse uses CLASS_PAGE_LIMIT so
+# Matches can scroll the loaded CMC page instead of four top ranks.
 CANDIDATE_STRIP_LIMIT = 4
+LIVE_UNAVAILABLE_BANNER = "Live data unavailable"
+CLASS_REMAINDER_CAPTION = (
+    f"Showing first {CLASS_PAGE_LIMIT} live results — type a ticker for the rest."
+)
 SEARCH_MATCH_KEY = "search_match_pick"
+# Class browse list. Separate from the prefix selectbox so a pill tap does
+# not mount (or remount) a BaseWeb menu. Unselected stays None — do not
+# delete this key just because nothing is picked.
+SEARCH_LIST_KEY = "search_match_list"
+# Class browse pages this many plain buttons. A full-class st.radio inside
+# st.container(height=...) mounts every row as markdown in a nested scroll
+# surface and Aw Snaps Chrome (error 9) — Stocks overflows it, the ETF label
+# is markdown, and a radio click reruns while that surface is torn down.
+# The loaded shard is still up to CLASS_PAGE_LIMIT; only one page is mounted.
+MATCHES_PAGE_SIZE = 12
+SEARCH_PAGE_KEY = "search_match_page"
+SEARCH_PAGE_QUERY_KEY = "search_match_page_query"
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
 # Streamlit 1.39 text_input commits on Enter/blur only. Debounced input
 # events commit the same widget so Matches update as the user types.
@@ -330,15 +357,28 @@ SEARCH_TYPEAHEAD_JS = r"""
     } catch (err) {}
   }
 
+  function classBrowse() {
+    // Category Matches is a paged button list in this container. The pill
+    // rerun and the place-rerun must not focus the search box — that rebuild
+    // Aw Snaps Chrome (error 9) before the list or the compare slot paints.
+    // Do not wait for a radio node: a live 401 never mounts one.
+    return !!doc.querySelector(".st-key-rwa_class_browse");
+  }
+
   function attach() {
-    if (menuOpen()) return;
+    // Open select menu and category-pill browse both rebuild a lot of DOM.
+    // Focusing or rebinding during that rebuild Aw Snaps Chrome (error 5/9).
+    if (menuOpen() || classBrowse()) return;
     var input = findSearchInput();
     if (!input) return;
     bind(input);
-    restoreFocus(input);
+    // Observer bursts must not steal focus. Restore only while the user is
+    // actually typing a prefix (keepFocus). A pill click clears that flag.
+    if (keepFocus()) restoreFocus(input);
   }
 
   function attachSoon() {
+    if (menuOpen() || classBrowse()) return;
     if (win.__rwaAttachTimer) win.clearTimeout(win.__rwaAttachTimer);
     win.__rwaAttachTimer = win.setTimeout(attach, 80);
   }
@@ -396,15 +436,24 @@ def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     return _init_scorer(use_fixtures)
 
 
+class _LiveDirectoryUnavailable(Exception):
+    """Raised so Streamlit does not cache an empty failed class page."""
+
+
 @st.cache_data(ttl=CATALOG_CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_class_catalog_data(
     use_fixtures: bool, asset_type: str
 ) -> tuple[TickerOption, ...]:
-    """One CMC class page per process. Widget clicks must not re-walk."""
+    """One CMC class page per process. Widget clicks must not re-walk.
+
+    Live directory failures are not cached — an empty tuple would look like
+    a finished class and would hide the unavailable banner until TTL.
+    """
     scorer = _cached_scorer(use_fixtures)
-    return tuple(
-        load_class_catalog(scorer.client, asset_type, first_page_only=True)
-    )
+    rows = load_class_catalog(scorer.client, asset_type, first_page_only=True)
+    if class_shard_status(scorer.client, asset_type).unavailable:
+        raise _LiveDirectoryUnavailable()
+    return tuple(rows)
 
 
 def health_launcher_reminder(*, launcher_set: bool | None = None) -> str | None:
@@ -558,12 +607,19 @@ def _score_slots(
     return results
 
 
+def clear_compare_slots() -> None:
+    """Drop every compare ticker. Live directory failure must not keep the default shortlist."""
+    st.session_state.slots = [""] * MAX_COMPARE_SLOTS
+    st.session_state.active_slot = 0
+
+
 def _ensure_slot_state() -> None:
     """Init compare slots on a true first load only.
 
     Category chips must not remount the page. A widget/JS rerun keeps
     ``st.session_state``, so the default NVDA/TSLA/AAPL/META row is applied
-    only when slots have never been set.
+    only when slots have never been set. A live outage clears that row;
+    empty slots are not refilled with the defaults.
     """
     if "slots" not in st.session_state:
         st.session_state.slots = list(DEFAULT_SLOTS)
@@ -651,6 +707,55 @@ def is_browse_chip_query(query: str) -> bool:
     if not text:
         return False
     return any(text == chip_query(cat) for cat in RWA_CLASS_CATEGORIES)
+
+
+def matches_limit_for_query(query: str) -> int:
+    """Class browse scrolls the loaded page. Prefix typeahead stays short."""
+    if is_class_browse_query(query):
+        return CLASS_PAGE_LIMIT
+    return CANDIDATE_STRIP_LIMIT
+
+
+def live_unavailable_banner(use_fixtures: bool, client, query: str) -> bool:
+    """True when Live chrome must show the banner and no directory rows.
+
+    Fixture mode never banners. A healthy live page never banners. 401 / 429 /
+    1008 (and any other live directory failure) does — including a symbol
+    lookup that failed after the class page itself succeeded.
+    """
+    if use_fixtures or client is None:
+        return False
+    if not (query or "").strip():
+        return False
+    if live_class_unavailable(client, query):
+        return True
+    return symbol_lookup_failed(client, query)
+
+
+def search_matches(
+    query: str,
+    catalog: list[TickerOption],
+    client=None,
+    *,
+    use_fixtures: bool = False,
+) -> list[TickerOption]:
+    """Matches for the picker. Same live map family for pills and typeahead.
+
+    Category browse is not capped at ``CANDIDATE_STRIP_LIMIT``. A live
+    directory failure returns no rows — fixture stubs are not substituted
+    while the chrome still says Live.
+    """
+    if not use_fixtures and live_class_unavailable(client, query):
+        return []
+    hits = search_tickers(
+        query,
+        catalog,
+        limit=matches_limit_for_query(query),
+        client=client,
+    )
+    if not use_fixtures and symbol_lookup_failed(client, query):
+        return []
+    return hits
 
 
 def stale_match_pick(stored: object, options: list[str]) -> bool:
@@ -1217,9 +1322,41 @@ def _auto_place(ticker: str) -> None:
     _maybe_rerun()
 
 
+def _clear_match_pick_state() -> None:
+    """Drop both Matches widgets. Safe only before they are instantiated."""
+    st.session_state.pop(SEARCH_MATCH_KEY, None)
+    st.session_state.pop(SEARCH_LIST_KEY, None)
+
+
 def _on_search_query_change() -> None:
     """Drop a stale Matches pick when Search text changes (type-ahead or Enter)."""
-    st.session_state.pop(SEARCH_MATCH_KEY, None)
+    _clear_match_pick_state()
+
+
+def _on_class_pill(query: str) -> None:
+    """Select a class before the script body builds the catalog.
+
+    Streamlit runs this callback before the script. The pill ``if`` body runs
+    only after ``_ticker_catalog(pending_search_query())``, so without this
+    the click frame still has the previous query: a live 401 never marks the
+    class unavailable and Matches shows "No directory matches" instead of the
+    banner.
+    """
+    st.session_state.pop("_clear_search", None)
+    st.session_state.ticker_query = query
+    _clear_match_pick_state()
+
+
+def catalog_for_active_query(scorer, catalog: list[TickerOption], query: str):
+    """Catalog for the query the picker is about to render.
+
+    The module-level build uses ``pending_search_query()`` at the start of
+    the run. A class pill can change Search in that same run; reload so a
+    live directory failure is recorded before the banner check.
+    """
+    if scorer is None or not (query or "").strip():
+        return catalog
+    return _ticker_catalog(scorer, query=query)
 
 
 def search_typeahead_script(debounce_ms: int = SEARCH_TYPEAHEAD_DEBOUNCE_MS) -> str:
@@ -1242,10 +1379,106 @@ def _install_search_typeahead() -> None:
     )
 
 
+def class_match_window(
+    count: int, page: int, page_size: int = MATCHES_PAGE_SIZE
+) -> tuple[int, int, int]:
+    """Clamp a class-browse page to ``page_size`` rows.
+
+    Returns ``(page, start, end)`` with ``end`` exclusive. The shard can be
+    up to ``CLASS_PAGE_LIMIT``; the DOM only mounts one page.
+    """
+    size = max(1, int(page_size))
+    total = max(0, int(count))
+    pages = max(1, (total + size - 1) // size) if total else 1
+    current = int(page)
+    if current < 0 or current >= pages:
+        current = 0
+    start = current * size
+    end = min(total, start + size)
+    return current, start, end
+
+
+def _class_match_page(query: str, count: int) -> tuple[int, int, int]:
+    """Session page for this class query. A new query starts at the first page."""
+    if st.session_state.get(SEARCH_PAGE_QUERY_KEY) != query:
+        st.session_state[SEARCH_PAGE_KEY] = 0
+        st.session_state[SEARCH_PAGE_QUERY_KEY] = query
+    page = int(st.session_state.get(SEARCH_PAGE_KEY) or 0)
+    current, start, end = class_match_window(count, page)
+    st.session_state[SEARCH_PAGE_KEY] = current
+    return current, start, end
+
+
+def _render_class_browse(
+    matches: list[TickerOption],
+    query: str,
+    *,
+    directory_down: bool,
+    use_fixtures: bool,
+    client,
+) -> None:
+    """One page of plain buttons for a class. Does not score the shard.
+
+    Pill tap only lists the page. A row click places that one ticker; compare
+    scoring stays on the slot row. No radio and no fixed-height scroll
+    container — those crashed Chrome on Stocks, ETFs, and on activating GOLD.
+    """
+    with st.container(key="rwa_class_browse"):
+        if directory_down:
+            st.error(LIVE_UNAVAILABLE_BANNER)
+            _clear_match_pick_state()
+            return
+        if not matches:
+            _clear_match_pick_state()
+            if len((query or "").strip()) >= SEARCH_MIN_CHARS:
+                st.caption("No directory matches — type a ticker or tap a category.")
+            return
+        options = [opt.symbol for opt in matches]
+        labels = {opt.symbol: format_option(opt) for opt in matches}
+        _page, start, end = _class_match_page(query, len(options))
+        if len(options) > MATCHES_PAGE_SIZE:
+            prev_col, next_col = st.columns(2, gap="small")
+            with prev_col:
+                if st.button(
+                    "Previous",
+                    key="rwa_match_prev",
+                    disabled=start == 0,
+                    use_container_width=True,
+                ):
+                    st.session_state[SEARCH_PAGE_KEY] = max(0, _page - 1)
+                    _page, start, end = class_match_window(
+                        len(options), _page - 1
+                    )
+                    st.session_state[SEARCH_PAGE_KEY] = _page
+            with next_col:
+                if st.button(
+                    "Next",
+                    key="rwa_match_next",
+                    disabled=end >= len(options),
+                    use_container_width=True,
+                ):
+                    st.session_state[SEARCH_PAGE_KEY] = _page + 1
+                    _page, start, end = class_match_window(
+                        len(options), _page + 1
+                    )
+                    st.session_state[SEARCH_PAGE_KEY] = _page
+            st.caption(f"Showing {start + 1}–{end} of {len(options)}")
+        for symbol in options[start:end]:
+            if st.button(
+                labels.get(symbol, symbol),
+                key=f"rwa_match_row_{query}_{symbol}",
+                use_container_width=True,
+            ):
+                _auto_place(symbol)
+        if not use_fixtures and class_browse_truncated(client, query):
+            st.caption(CLASS_REMAINDER_CAPTION)
+
+
 def _render_search_picker(
     catalog: list[TickerOption],
     use_fixtures: bool,
     client=None,
+    scorer=None,
 ) -> None:
     """Categories → compact Search + attached match dropdown.
 
@@ -1261,7 +1494,7 @@ def _render_search_picker(
     if st.session_state.get("_clear_search"):
         st.session_state["_clear_search"] = False
         st.session_state.ticker_query = ""
-        st.session_state.pop(SEARCH_MATCH_KEY, None)
+        _clear_match_pick_state()
         try:
             del st.query_params["rwa_cat"]
         except (KeyError, TypeError):
@@ -1297,9 +1530,11 @@ def _render_search_picker(
                 chip_display_label(cat.label),
                 key=f"rwa_class_{cat.id}",
                 use_container_width=True,
+                on_click=_on_class_pill,
+                args=(chip_query(cat),),
             ):
                 st.session_state.ticker_query = chip_query(cat)
-                st.session_state.pop(SEARCH_MATCH_KEY, None)
+                _clear_match_pick_state()
 
     query = st.text_input(
         "Search",
@@ -1308,18 +1543,47 @@ def _render_search_picker(
         key="ticker_query",
         on_change=_on_search_query_change,
     )
-    # Category-button queries already committed ticker_query. Skip the 1px
-    # typeahead iframe so Matches selectbox is not fighting a MutationObserver
-    # remount on the same run (Aw Snap when opening the list).
-    if not is_browse_chip_query(query):
+    # Category-button and class-keyword queries already committed ticker_query.
+    # Skip the 1px typeahead iframe so the Matches selectbox is not fighting a
+    # MutationObserver remount on the same run (Aw Snap when opening the list).
+    # Keep SEARCH_MATCH_KEY stable — do not delete it while the menu can be open.
+    if not is_browse_chip_query(query) and not is_class_browse_query(query):
         _install_search_typeahead()
-    matches = search_tickers(
-        query, catalog, limit=CANDIDATE_STRIP_LIMIT, client=client
+    # Pill click updates Search after the outer catalog build. Reload for
+    # this query so a 401/429 sets class_shard_status before the banner.
+    catalog = catalog_for_active_query(scorer, catalog, query)
+    matches = search_matches(
+        query, catalog, client, use_fixtures=use_fixtures
     )
-    if matches:
+    directory_down = live_unavailable_banner(use_fixtures, client, query)
+    if directory_down:
+        # Before the compare chips render. Defaults NVDA/TSLA/AAPL/META are
+        # a stub shortlist under a Live outage — clear them, do not swap in
+        # FixtureClient. Slot button keys stay so the row does not remount.
+        clear_compare_slots()
+    if is_class_browse_query(query):
+        # Paged buttons, not a radio in a fixed-height container. That widget
+        # Aw Snapped Chrome on Stocks / ETFs and when a row was activated.
+        # A 250-option selectbox is also wrong here: it mounts a BaseWeb menu
+        # on this same pill rerun, before anyone opens Matches.
+        _render_class_browse(
+            matches,
+            query,
+            directory_down=directory_down,
+            use_fixtures=use_fixtures,
+            client=client,
+        )
+    elif directory_down:
+        # Empty Matches. Do not paint fixture stubs under a Live label, and
+        # do not swap the client to FixtureClient.
+        st.error(LIVE_UNAVAILABLE_BANNER)
+        _clear_match_pick_state()
+    elif matches:
         options = [opt.symbol for opt in matches]
         labels = {opt.symbol: format_option(opt) for opt in matches}
         stored = st.session_state.get(SEARCH_MATCH_KEY)
+        # None / empty is unselected. Deleting the key here remounts the
+        # selectbox mid-click (Aw Snap). Only drop a pick that left the strip.
         if stale_match_pick(stored, options) and SEARCH_MATCH_KEY in st.session_state:
             del st.session_state[SEARCH_MATCH_KEY]
         picked = st.selectbox(
@@ -1334,9 +1598,11 @@ def _render_search_picker(
         if picked:
             _auto_place(picked)
     else:
-        st.session_state.pop(SEARCH_MATCH_KEY, None)
+        _clear_match_pick_state()
         if len((query or "").strip()) >= SEARCH_MIN_CHARS:
             st.caption("No directory matches — type a ticker or tap a category.")
+    if directory_down:
+        st.caption("Choose a ticker")
 
     if use_fixtures:
         st.caption(
@@ -1351,9 +1617,10 @@ def _render_search_picker(
         )
     else:
         st.caption(
-            "Live mode: lazy per-class CMC map (one page on tap) plus "
+            "Live mode: the same CMC RWA map page for a category tap and for "
+            "typeahead (one class page, scroll Matches, up to 250 names) plus "
             "published Backed bToken PoR symbols (bNVDA, …). "
-            "Prefix-match ticker/name or tap a CMC RWA class, then choose a "
+            "Prefix-match a ticker or tap a CMC RWA class, then choose a "
             "match. BTC/ETH are not RWA. Crypto and Look sector chips are "
             "not on this bar."
         )
@@ -1398,19 +1665,48 @@ def pending_search_query() -> str:
 
 
 def _class_shard(scorer: TransparencyScorer, asset_type: str) -> list[TickerOption]:
-    """One cached CMC class page. Warm hits do not walk the directory."""
+    """One cached CMC class page. Warm hits do not walk the directory.
+
+    A non-empty success stays cached. ``[]`` is reused only for a recorded
+    successful empty page. Failed empties are not written, and a cached
+    ``[]`` is not a warm hit while the class is unavailable or the retry
+    window has elapsed.
+    """
     source = str(getattr(scorer.client, "source", "") or "")
     store = _shard_store()
-    key = f"{source}:{id(scorer.client)}:{asset_type}"
-    hit = store.get(key)
-    if hit is not None:
-        return list(hit)
-    if _in_streamlit_script():
-        rows = list(_cached_class_catalog_data(source == "fixture", asset_type))
-    else:
-        rows = cached_class_catalog(
-            scorer.client, asset_type, first_page_only=True
-        )
+    key = f"{source}:{client_shard_token(scorer.client)}:{asset_type}"
+    # A recent 401/429 stays empty without another directory call.
+    if class_shard_failure_is_fresh(scorer.client, asset_type):
+        store.pop(key, None)
+        return []
+    if key in store:
+        hit = store.get(key) or []
+        if hit:
+            return list(hit)
+        if empty_class_page_is_cached_success(scorer.client, asset_type):
+            return []
+        store.pop(key, None)
+    try:
+        if _in_streamlit_script():
+            rows = list(_cached_class_catalog_data(source == "fixture", asset_type))
+        else:
+            rows = cached_class_catalog(
+                scorer.client, asset_type, first_page_only=True
+            )
+    except _LiveDirectoryUnavailable:
+        store.pop(key, None)
+        return []
+    except Exception:
+        if class_shard_status(scorer.client, asset_type).unavailable:
+            store.pop(key, None)
+            return []
+        raise
+    if class_shard_status(scorer.client, asset_type).unavailable:
+        store.pop(key, None)
+        return []
+    if not rows and not empty_class_page_is_cached_success(scorer.client, asset_type):
+        store.pop(key, None)
+        return []
     store[key] = rows
     return list(rows)
 
@@ -1432,9 +1728,17 @@ def _ticker_catalog(
     if source == "fixture" and not wanted:
         wanted = tuple(RWA_CLASS_IDS)
     store = _shard_store()
-    prefix = f"{source}:{id(scorer.client)}:"
+    prefix = f"{source}:{client_shard_token(scorer.client)}:"
     for kind in wanted:
-        store[f"{prefix}{kind}"] = _class_shard(scorer, kind)
+        # ``_class_shard`` writes successes only. Assigning its return here
+        # would pin a failed ``[]`` and let the next browse skip ``rwa_map``.
+        _class_shard(scorer, kind)
+        key = f"{prefix}{kind}"
+        if class_shard_status(scorer.client, kind).unavailable or (
+            key in store and not store[key]
+            and not empty_class_page_is_cached_success(scorer.client, kind)
+        ):
+            store.pop(key, None)
     merged = list(catalog_from_por_feeds())
     for key, rows in list(store.items()):
         if key.startswith(prefix):
@@ -1889,6 +2193,13 @@ st.markdown(
       [data-baseweb="menu"] {{
         z-index: 1000 !important;
       }}
+      /* Open Matches list scrolls inside the menu (class pages up to 250).
+         The closed selectbox stays one line. Do not remount it while open. */
+      div[data-baseweb="popover"] [role="listbox"],
+      div[data-baseweb="menu"] [role="listbox"] {{
+        max-height: 18rem;
+        overflow-y: auto;
+      }}
       /* Typeahead bridge is a 1px iframe — keep JS alive, no layout gap.
          Search-only; Share preview is markdown (no iframe) so a Share click
          cannot mount /component and trip MPA Page not found. */
@@ -2055,7 +2366,7 @@ st.caption(
 )
 
 catalog = _ticker_catalog(scorer, query=pending_search_query())
-_render_search_picker(catalog, use_fixtures, client=scorer.client)
+_render_search_picker(catalog, use_fixtures, client=scorer.client, scorer=scorer)
 
 active = int(st.session_state.active_slot)
 target = next_place_index(list(st.session_state.slots), active)
