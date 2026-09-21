@@ -607,12 +607,19 @@ def _score_slots(
     return results
 
 
+def clear_compare_slots() -> None:
+    """Drop every compare ticker. Live directory failure must not keep the default shortlist."""
+    st.session_state.slots = [""] * MAX_COMPARE_SLOTS
+    st.session_state.active_slot = 0
+
+
 def _ensure_slot_state() -> None:
     """Init compare slots on a true first load only.
 
     Category chips must not remount the page. A widget/JS rerun keeps
     ``st.session_state``, so the default NVDA/TSLA/AAPL/META row is applied
-    only when slots have never been set.
+    only when slots have never been set. A live outage clears that row;
+    empty slots are not refilled with the defaults.
     """
     if "slots" not in st.session_state:
         st.session_state.slots = list(DEFAULT_SLOTS)
@@ -1549,6 +1556,11 @@ def _render_search_picker(
         query, catalog, client, use_fixtures=use_fixtures
     )
     directory_down = live_unavailable_banner(use_fixtures, client, query)
+    if directory_down:
+        # Before the compare chips render. Defaults NVDA/TSLA/AAPL/META are
+        # a stub shortlist under a Live outage — clear them, do not swap in
+        # FixtureClient. Slot button keys stay so the row does not remount.
+        clear_compare_slots()
     if is_class_browse_query(query):
         # Paged buttons, not a radio in a fixed-height container. That widget
         # Aw Snapped Chrome on Stocks / ETFs and when a row was activated.

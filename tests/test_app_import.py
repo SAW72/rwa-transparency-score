@@ -110,6 +110,25 @@ def test_app_reuses_scorer_via_cache_resource() -> None:
     assert first.client.source == "fixture"
 
 
+def test_live_outage_clears_default_compare_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live directory failure must not leave NVDA/TSLA/AAPL/META on screen."""
+    import app as demo_app
+
+    filled = _FakeSS(slots=list(demo_app.DEFAULT_SLOTS), active_slot=2)
+    monkeypatch.setattr(demo_app.st, "session_state", filled)
+    demo_app.clear_compare_slots()
+    assert demo_app.st.session_state.slots == ["", "", "", ""]
+    assert demo_app.st.session_state.active_slot == 0
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == ["", "", "", ""]
+    assert "NVDA" not in demo_app.st.session_state.slots
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    picker = source.split("def _render_search_picker", 1)[1]
+    assert "clear_compare_slots()" in picker
+    assert picker.index("live_unavailable_banner") < picker.index("clear_compare_slots()")
+
+
 def test_assign_ticker_replaces_one_slot() -> None:
     import app as demo_app
 
