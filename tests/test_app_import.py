@@ -175,6 +175,12 @@ def test_category_chips_do_not_remount_or_reset_slots(
     assert "menuOpen" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "stSelectbox" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "attachSoon" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "classBrowse" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert 'data-testid="stRadio"' in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "st.container(height=MATCHES_SCROLL_PX" in picker
+    assert "st.radio(" in picker
+    assert picker.index("st.radio(") < picker.index("st.selectbox")
+    assert "href=\"?rwa_cat" not in source
 
     # True first load: empty session → published defaults.
     monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())

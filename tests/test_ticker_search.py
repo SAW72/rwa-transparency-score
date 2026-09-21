@@ -351,6 +351,20 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "on_change=_on_search_query_change" in picker
     assert picker.index("st.text_input") < picker.index("_install_search_typeahead")
     assert picker.index("_install_search_typeahead") < picker.index("search_matches")
+    assert "st.container(height=MATCHES_SCROLL_PX" in picker
+    assert "st.radio(" in picker
+    # Class browse must not be the selectbox path (pill tap mounts no menu).
+    radio_at = picker.index("st.radio(")
+    select_at = picker.index("st.selectbox")
+    assert radio_at < select_at
+    assert "is_class_browse_query(query)" in picker[:radio_at]
+    assert "classBrowse" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert 'data-testid="stRadio"' in demo_app.SEARCH_TYPEAHEAD_JS
+    assert demo_app.SEARCH_TYPEAHEAD_JS.index("menuOpen") < demo_app.SEARCH_TYPEAHEAD_JS.index(
+        "classBrowse"
+    )
+    assert "attachSoon" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert demo_app.MATCHES_SCROLL_PX == 320
     assert "max-width" in source
     assert "stSelectbox" in source
     assert "z-index: 40" in source

@@ -247,6 +247,13 @@ CLASS_REMAINDER_CAPTION = (
     f"Showing first {CLASS_PAGE_LIMIT} live results — type a ticker for the rest."
 )
 SEARCH_MATCH_KEY = "search_match_pick"
+# Class browse list. Separate from the prefix selectbox so a pill tap does
+# not mount (or remount) a BaseWeb menu. Unselected stays None — do not
+# delete this key just because nothing is picked.
+SEARCH_LIST_KEY = "search_match_list"
+# Visible window for the class list. Rows scroll inside it; the page does not
+# grow with the whole shard, and Chrome is not handed a 250-option selectbox.
+MATCHES_SCROLL_PX = 320
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
 # Streamlit 1.39 text_input commits on Enter/blur only. Debounced input
 # events commit the same widget so Matches update as the user types.
@@ -343,8 +350,16 @@ SEARCH_TYPEAHEAD_JS = r"""
     } catch (err) {}
   }
 
+  function classBrowse() {
+    // Class Matches is a radio list, not a selectbox. While it is on the
+    // page the pill rerun must not focus or rebind (Aw Snap before open).
+    return !!doc.querySelector('[data-testid="stRadio"]');
+  }
+
   function attach() {
-    if (menuOpen()) return;
+    // Open select menu and category-pill browse both rebuild a lot of DOM.
+    // Focusing or rebinding during that rebuild Aw Snaps Chrome (error 5/9).
+    if (menuOpen() || classBrowse()) return;
     var input = findSearchInput();
     if (!input) return;
     bind(input);
@@ -352,6 +367,7 @@ SEARCH_TYPEAHEAD_JS = r"""
   }
 
   function attachSoon() {
+    if (menuOpen() || classBrowse()) return;
     if (win.__rwaAttachTimer) win.clearTimeout(win.__rwaAttachTimer);
     win.__rwaAttachTimer = win.setTimeout(attach, 80);
   }
@@ -1288,9 +1304,15 @@ def _auto_place(ticker: str) -> None:
     _maybe_rerun()
 
 
+def _clear_match_pick_state() -> None:
+    """Drop both Matches widgets. Safe only before they are instantiated."""
+    st.session_state.pop(SEARCH_MATCH_KEY, None)
+    st.session_state.pop(SEARCH_LIST_KEY, None)
+
+
 def _on_search_query_change() -> None:
     """Drop a stale Matches pick when Search text changes (type-ahead or Enter)."""
-    st.session_state.pop(SEARCH_MATCH_KEY, None)
+    _clear_match_pick_state()
 
 
 def search_typeahead_script(debounce_ms: int = SEARCH_TYPEAHEAD_DEBOUNCE_MS) -> str:
@@ -1332,7 +1354,7 @@ def _render_search_picker(
     if st.session_state.get("_clear_search"):
         st.session_state["_clear_search"] = False
         st.session_state.ticker_query = ""
-        st.session_state.pop(SEARCH_MATCH_KEY, None)
+        _clear_match_pick_state()
         try:
             del st.query_params["rwa_cat"]
         except (KeyError, TypeError):
@@ -1370,7 +1392,7 @@ def _render_search_picker(
                 use_container_width=True,
             ):
                 st.session_state.ticker_query = chip_query(cat)
-                st.session_state.pop(SEARCH_MATCH_KEY, None)
+                _clear_match_pick_state()
 
     query = st.text_input(
         "Search",
@@ -1393,11 +1415,35 @@ def _render_search_picker(
         # Empty Matches. Do not paint fixture stubs under a Live label, and
         # do not swap the client to FixtureClient.
         st.error(LIVE_UNAVAILABLE_BANNER)
-        st.session_state.pop(SEARCH_MATCH_KEY, None)
+        _clear_match_pick_state()
+    elif matches and is_class_browse_query(query):
+        # Scroll the class in document flow. A 250-option selectbox mounts a
+        # BaseWeb menu on this same pill rerun — before anyone opens Matches —
+        # and that is the Chrome Aw Snap (error 5/9).
+        options = [opt.symbol for opt in matches]
+        labels = {opt.symbol: format_option(opt) for opt in matches}
+        stored = st.session_state.get(SEARCH_LIST_KEY)
+        if stale_match_pick(stored, options) and SEARCH_LIST_KEY in st.session_state:
+            del st.session_state[SEARCH_LIST_KEY]
+        with st.container(height=MATCHES_SCROLL_PX, key="rwa_match_scroll"):
+            picked = st.radio(
+                "Matches",
+                options,
+                index=None,
+                format_func=lambda symbol: labels.get(symbol, symbol),
+                key=SEARCH_LIST_KEY,
+                label_visibility="visible",
+            )
+        if not use_fixtures and class_browse_truncated(client, query):
+            st.caption(CLASS_REMAINDER_CAPTION)
+        if picked:
+            _auto_place(picked)
     elif matches:
         options = [opt.symbol for opt in matches]
         labels = {opt.symbol: format_option(opt) for opt in matches}
         stored = st.session_state.get(SEARCH_MATCH_KEY)
+        # None / empty is unselected. Deleting the key here remounts the
+        # selectbox mid-click (Aw Snap). Only drop a pick that left the strip.
         if stale_match_pick(stored, options) and SEARCH_MATCH_KEY in st.session_state:
             del st.session_state[SEARCH_MATCH_KEY]
         picked = st.selectbox(
@@ -1409,12 +1455,10 @@ def _render_search_picker(
             key=SEARCH_MATCH_KEY,
             label_visibility="collapsed",
         )
-        if not use_fixtures and class_browse_truncated(client, query):
-            st.caption(CLASS_REMAINDER_CAPTION)
         if picked:
             _auto_place(picked)
     else:
-        st.session_state.pop(SEARCH_MATCH_KEY, None)
+        _clear_match_pick_state()
         if len((query or "").strip()) >= SEARCH_MIN_CHARS:
             st.caption("No directory matches — type a ticker or tap a category.")
     if directory_down:
