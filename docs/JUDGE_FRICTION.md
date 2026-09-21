@@ -2,6 +2,10 @@
 
 Short path so judging does not stall on CoinMarketCap rate limits or a Free Render cold start. **No Submit.** The hosted paid API is **not** deployed (spend hold).
 
+## External contribution credit
+
+**YuTao Peng** ([@imokokok](https://github.com/imokokok)) contributed the offline NVDA fixture consumer-mapping note (PR [#52](https://github.com/SAW72/rwa-transparency-score/pull/52)): [`NVDA_FIXTURE_CONSUMER_MAPPING.md`](NVDA_FIXTURE_CONSUMER_MAPPING.md), linked from [`API_EVIDENCE.md`](API_EVIDENCE.md). Docs-only — how a downstream policy tool preserves RAT provenance labels. Credit / label only; not a GitHub collaborator invite.
+
 ## Fastest path: offline fixtures (no CMC key)
 
 ```bash
