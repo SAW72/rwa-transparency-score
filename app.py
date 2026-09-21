@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 import os
 import time
 from pathlib import Path
@@ -253,14 +254,13 @@ SEARCH_MATCH_KEY = "search_match_pick"
 # not mount (or remount) a BaseWeb menu. Unselected stays None — do not
 # delete this key just because nothing is picked.
 SEARCH_LIST_KEY = "search_match_list"
-# Class browse pages this many plain buttons. A full-class st.radio inside
-# st.container(height=...) mounts every row as markdown in a nested scroll
-# surface and Aw Snaps Chrome (error 9) — Stocks overflows it, the ETF label
-# is markdown, and a radio click reruns while that surface is torn down.
-# The loaded shard is still up to CLASS_PAGE_LIMIT; only one page is mounted.
-MATCHES_PAGE_SIZE = 12
-SEARCH_PAGE_KEY = "search_match_page"
-SEARCH_PAGE_QUERY_KEY = "search_match_page_query"
+# Hidden commit channel for the class-browse ticker overlay. The visible
+# control is custom HTML (one scrollable list). This input is not a second
+# Search box and is not an st.radio. A full-class st.radio inside
+# st.container(height=...) Aw Snaps Chrome — do not bring that back.
+CLASS_PICK_KEY = "class_ticker_pick"
+CLASS_PICK_LABEL = "Class match"
+CLASS_CHOSEN_KEY = "class_ticker_chosen"
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
 # Streamlit 1.39 text_input commits on Enter/blur only. Debounced input
 # events commit the same widget so Matches update as the user types.
@@ -357,10 +357,15 @@ SEARCH_TYPEAHEAD_JS = r"""
     } catch (err) {}
   }
 
+  function removeTickerDropdown() {
+    var panel = doc.getElementById("rwa-ticker-dd-panel");
+    if (panel && panel.parentNode) panel.parentNode.removeChild(panel);
+  }
+
   function classBrowse() {
-    // Category Matches is a paged button list in this container. The pill
-    // rerun and the place-rerun must not focus the search box — that rebuild
-    // Aw Snaps Chrome (error 9) before the list or the compare slot paints.
+    // Category Matches is the compact ticker dropdown in this container.
+    // The pill rerun must not focus the search box — that rebuild Aw Snaps
+    // Chrome (error 9) before the list or the compare slot paints.
     // Do not wait for a radio node: a live 401 never mounts one.
     return !!doc.querySelector(".st-key-rwa_class_browse");
   }
@@ -368,6 +373,8 @@ SEARCH_TYPEAHEAD_JS = r"""
   function attach() {
     // Open select menu and category-pill browse both rebuild a lot of DOM.
     // Focusing or rebinding during that rebuild Aw Snaps Chrome (error 5/9).
+    // Prefix search also drops a leftover class-browse overlay.
+    if (!classBrowse()) removeTickerDropdown();
     if (menuOpen() || classBrowse()) return;
     var input = findSearchInput();
     if (!input) return;
@@ -395,6 +402,236 @@ SEARCH_TYPEAHEAD_JS = r"""
   } else {
     attach();
   }
+})();
+"""
+# Class-browse ticker overlay. Runs inside the same 1px components.html
+# iframe as typeahead, but never both in one run. No MutationObserver and
+# no st.radio — open, scroll, and close stay in the parent document. A
+# click commits one hidden text input so Streamlit places the ticker.
+TICKER_DROPDOWN_JS = r"""
+(function () {
+  var win = window.parent;
+  var doc = win.document;
+  var PAYLOAD = __PAYLOAD_JSON__;
+
+  function removePanel() {
+    var panel = doc.getElementById("rwa-ticker-dd-panel");
+    if (panel && panel.parentNode) panel.parentNode.removeChild(panel);
+  }
+
+  function findClassPickInput() {
+    var blocks = doc.querySelectorAll('[data-testid="stTextInput"]');
+    var i, label, text;
+    var want = String(PAYLOAD.pickLabel || "Class match");
+    for (i = 0; i < blocks.length; i++) {
+      label = blocks[i].querySelector("label");
+      text = label ? String(label.textContent || "").trim() : "";
+      if (text === want) return blocks[i].querySelector("input");
+    }
+    return doc.querySelector(".st-key-class_ticker_pick input");
+  }
+
+  function fireEnter(input) {
+    // Streamlit 1.39 text input commits on keypress Enter, and only when
+    // React state is already dirty. keydown does not commit this widget.
+    // Events must be constructed in the parent window — an iframe event
+    // dispatched onto the app input is ignored.
+    var EventCtor = win.KeyboardEvent || KeyboardEvent;
+    try {
+      input.dispatchEvent(new EventCtor("keypress", {
+        key: "Enter", code: "Enter", keyCode: 13, which: 13,
+        bubbles: true, cancelable: true
+      }));
+    } catch (err) {}
+  }
+
+  function commitPick(symbol) {
+    var input = findClassPickInput();
+    if (!input || !symbol) return;
+    var proto = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value");
+    if (proto && proto.set) proto.set.call(input, symbol);
+    else input.value = symbol;
+    var InputCtor = win.InputEvent || win.Event;
+    try {
+      input.dispatchEvent(new InputCtor("input", {
+        bubbles: true, cancelable: true, data: symbol, inputType: "insertText"
+      }));
+    } catch (err) {
+      try { input.dispatchEvent(new win.Event("input", { bubbles: true })); } catch (err2) {}
+    }
+    // React applies the input event asynchronously. One keypress on the
+    // next turn commits the new value. Do not also blur — a second commit
+    // would place the same ticker into the next slot.
+    win.setTimeout(function () {
+      var again = findClassPickInput();
+      if (!again) return;
+      fireEnter(again);
+    }, 50);
+  }
+
+  function contentBounds() {
+    var main = doc.querySelector('[data-testid="stMainBlockContainer"]')
+      || doc.querySelector(".block-container")
+      || doc.querySelector('[data-testid="stMain"]');
+    if (!main) return { left: 16, width: Math.max(320, win.innerWidth - 32) };
+    var rect = main.getBoundingClientRect();
+    return { left: rect.left, width: rect.width };
+  }
+
+  function positionPanel() {
+    var panel = doc.getElementById("rwa-ticker-dd-panel");
+    var label = doc.getElementById("rwa-ticker-dd-label");
+    if (!panel || !label || panel.hasAttribute("hidden")) return;
+    var bounds = contentBounds();
+    var labelRect = label.getBoundingClientRect();
+    var top = Math.round(labelRect.bottom + 4);
+    var maxH = Math.max(180, Math.min(win.innerHeight - top - 12, Math.round(win.innerHeight * 0.72)));
+    panel.style.left = Math.round(bounds.left) + "px";
+    panel.style.width = Math.round(Math.max(280, bounds.width)) + "px";
+    panel.style.top = top + "px";
+    panel.style.maxHeight = Math.round(maxH) + "px";
+    var note = panel.querySelector(".rwa-ticker-dd-note");
+    var scroll = panel.querySelector(".rwa-ticker-dd-scroll");
+    if (scroll) {
+      var noteH = note ? note.offsetHeight : 0;
+      scroll.style.maxHeight = Math.max(120, Math.round(maxH - noteH)) + "px";
+    }
+  }
+
+  function setOpen(open) {
+    var panel = doc.getElementById("rwa-ticker-dd-panel");
+    var label = doc.getElementById("rwa-ticker-dd-label");
+    if (!panel || !label) return;
+    if (open) panel.removeAttribute("hidden");
+    else panel.setAttribute("hidden", "");
+    label.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) positionPanel();
+  }
+
+  function mount(host) {
+    var previous = doc.getElementById("rwa-ticker-dd-anchor");
+    if (previous && previous.parentNode) previous.parentNode.removeChild(previous);
+    removePanel();
+
+    var anchor = doc.createElement("div");
+    anchor.id = "rwa-ticker-dd-anchor";
+    anchor.setAttribute("data-rwa-ticker-dropdown", "1");
+    host.insertBefore(anchor, host.firstChild);
+
+    var label = doc.createElement("button");
+    label.type = "button";
+    label.id = "rwa-ticker-dd-label";
+    label.className = "rwa-ticker-dd-label";
+    label.setAttribute("aria-haspopup", "listbox");
+    label.setAttribute("aria-expanded", "false");
+
+    var text = doc.createElement("span");
+    text.className = "rwa-ticker-dd-text";
+    text.textContent = PAYLOAD.label || "Choose a ticker";
+    var arrow = doc.createElement("span");
+    arrow.className = "rwa-ticker-dd-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "\u25BE";
+    label.appendChild(text);
+    label.appendChild(arrow);
+    anchor.appendChild(label);
+
+    var panel = doc.createElement("div");
+    panel.id = "rwa-ticker-dd-panel";
+    panel.className = "rwa-ticker-dd-panel";
+    panel.setAttribute("hidden", "");
+
+    var scroll = doc.createElement("div");
+    scroll.className = "rwa-ticker-dd-scroll";
+    scroll.setAttribute("role", "listbox");
+    scroll.setAttribute("aria-label", "Tickers");
+
+    var rows = PAYLOAD.rows || [];
+    var i, row, opt;
+    for (i = 0; i < rows.length; i++) {
+      row = rows[i];
+      opt = doc.createElement("button");
+      opt.type = "button";
+      opt.className = "rwa-ticker-dd-option";
+      opt.setAttribute("role", "option");
+      opt.setAttribute("data-symbol", String(row.symbol || ""));
+      opt.textContent = row.label || row.symbol || "";
+      (function (item) {
+        opt.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          text.textContent = item.label || item.symbol;
+          setOpen(false);
+          commitPick(item.symbol);
+        });
+      })(row);
+      scroll.appendChild(opt);
+    }
+    panel.appendChild(scroll);
+
+    if (PAYLOAD.remainder) {
+      var note = doc.createElement("div");
+      note.className = "rwa-ticker-dd-note";
+      note.textContent = PAYLOAD.remainder;
+      panel.appendChild(note);
+    }
+    doc.body.appendChild(panel);
+
+    label.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setOpen(label.getAttribute("aria-expanded") !== "true");
+    });
+
+    win.__rwaTickerDdPosition = positionPanel;
+    if (!win.__rwaTickerDdListeners) {
+      win.__rwaTickerDdListeners = true;
+      win.addEventListener("resize", function () {
+        if (win.__rwaTickerDdPosition) win.__rwaTickerDdPosition();
+      });
+      doc.addEventListener("scroll", function () {
+        if (win.__rwaTickerDdPosition) win.__rwaTickerDdPosition();
+      }, true);
+      doc.addEventListener("mousedown", function (ev) {
+        var target = ev.target;
+        var panelEl = doc.getElementById("rwa-ticker-dd-panel");
+        var labelEl = doc.getElementById("rwa-ticker-dd-label");
+        if (!panelEl || panelEl.hasAttribute("hidden")) return;
+        if (target && target.nodeType !== 1) target = target.parentElement;
+        if (target && target.closest && (
+          target.closest("#rwa-ticker-dd-panel") ||
+          target.closest("#rwa-ticker-dd-label") ||
+          target.closest("#rwa-ticker-dd-anchor")
+        )) return;
+        if (labelEl) labelEl.setAttribute("aria-expanded", "false");
+        panelEl.setAttribute("hidden", "");
+      }, true);
+      doc.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Escape") return;
+        var panelEl = doc.getElementById("rwa-ticker-dd-panel");
+        var labelEl = doc.getElementById("rwa-ticker-dd-label");
+        if (!panelEl || panelEl.hasAttribute("hidden")) return;
+        if (labelEl) labelEl.setAttribute("aria-expanded", "false");
+        panelEl.setAttribute("hidden", "");
+      }, true);
+    }
+  }
+
+  function mountWhenReady(tries) {
+    var rows = PAYLOAD.rows || [];
+    if (!rows.length) {
+      removePanel();
+      return;
+    }
+    var host = doc.querySelector(".st-key-rwa_class_browse");
+    if (!host) {
+      if (tries > 0) win.setTimeout(function () { mountWhenReady(tries - 1); }, 40);
+      return;
+    }
+    mount(host);
+  }
+
+  mountWhenReady(25);
 })();
 """
 # Process-local fallback when session_state is unavailable (unit tests).
@@ -1323,9 +1560,11 @@ def _auto_place(ticker: str) -> None:
 
 
 def _clear_match_pick_state() -> None:
-    """Drop both Matches widgets. Safe only before they are instantiated."""
+    """Drop Matches widgets. Safe only before they are instantiated."""
     st.session_state.pop(SEARCH_MATCH_KEY, None)
     st.session_state.pop(SEARCH_LIST_KEY, None)
+    st.session_state.pop(CLASS_PICK_KEY, None)
+    st.session_state.pop(CLASS_CHOSEN_KEY, None)
 
 
 def _on_search_query_change() -> None:
@@ -1365,48 +1604,86 @@ def search_typeahead_script(debounce_ms: int = SEARCH_TYPEAHEAD_DEBOUNCE_MS) -> 
     return SEARCH_TYPEAHEAD_JS.replace("__DEBOUNCE_MS__", str(delay))
 
 
-def _install_search_typeahead() -> None:
-    """Bridge Streamlit's Enter/blur-only text_input to live-as-you-type search.
+def ticker_dropdown_items(matches: list[TickerOption]) -> list[dict[str, str]]:
+    """Every loaded class row, in order. The overlay scrolls this whole shard."""
+    return [
+        {"symbol": opt.symbol, "label": format_option(opt)}
+        for opt in matches
+    ]
 
-    This 1px iframe is the only ``components.html`` in the app. Share preview
-    must not use it — mounting a ``/component`` iframe on the Share click
-    rerun is the residual MPA **Page not found** after #36.
+
+def class_dropdown_label(matches: list[TickerOption], chosen: str) -> str:
+    """Closed ticker control. Unselected stays the placeholder."""
+    symbol = normalize_ticker(str(chosen or ""))
+    if not symbol:
+        return "Choose a ticker"
+    for opt in matches:
+        if opt.symbol == symbol:
+            return format_option(opt)
+    return symbol
+
+
+def ticker_dropdown_script(
+    items: list[dict[str, str]],
+    *,
+    label: str = "Choose a ticker",
+    truncated: bool = False,
+) -> str:
+    """Parent-page overlay script. One continuous list; no page controls."""
+    payload = {
+        "rows": items,
+        "label": label or "Choose a ticker",
+        "remainder": CLASS_REMAINDER_CAPTION if truncated else "",
+        "pickLabel": CLASS_PICK_LABEL,
+    }
+    blob = json.dumps(payload, ensure_ascii=True).replace("<", "\\u003c")
+    return TICKER_DROPDOWN_JS.replace("__PAYLOAD_JSON__", blob)
+
+
+def _on_class_ticker_pick() -> None:
+    """Place the overlay selection into the next compare slot.
+
+    Runs before the script body, so the closed label and the slot row both
+    paint the chosen ticker on this run. Search stays on the class query —
+    the ticker label lives on the dropdown, not by clearing the box.
     """
+    symbol = normalize_ticker(str(st.session_state.get(CLASS_PICK_KEY) or ""))
+    st.session_state[CLASS_PICK_KEY] = ""
+    if not symbol:
+        return
+    st.session_state[CLASS_CHOSEN_KEY] = symbol
+    _ensure_slot_state()
+    updated, nxt = place_search_match(
+        list(st.session_state.slots), int(st.session_state.active_slot), symbol
+    )
+    st.session_state.slots = updated
+    st.session_state.active_slot = nxt
+
+
+def _install_search_typeahead(
+    dropdown_items: list[dict[str, str]] | None = None,
+    *,
+    label: str = "Choose a ticker",
+    truncated: bool = False,
+) -> None:
+    """One 1px iframe: prefix typeahead, or the class-browse ticker overlay.
+
+    Share preview must not use ``components.html`` — mounting a ``/component``
+    iframe on the Share click rerun is the residual MPA **Page not found**
+    after #36. Class browse passes ``dropdown_items`` (possibly empty, to
+    tear the overlay down). Prefix search leaves it ``None``.
+    """
+    if dropdown_items is not None:
+        script = ticker_dropdown_script(
+            dropdown_items, label=label, truncated=truncated
+        )
+    else:
+        script = search_typeahead_script()
     components.html(
-        f"<script>{search_typeahead_script()}</script>",
+        f"<script>{script}</script>",
         height=1,
         scrolling=False,
     )
-
-
-def class_match_window(
-    count: int, page: int, page_size: int = MATCHES_PAGE_SIZE
-) -> tuple[int, int, int]:
-    """Clamp a class-browse page to ``page_size`` rows.
-
-    Returns ``(page, start, end)`` with ``end`` exclusive. The shard can be
-    up to ``CLASS_PAGE_LIMIT``; the DOM only mounts one page.
-    """
-    size = max(1, int(page_size))
-    total = max(0, int(count))
-    pages = max(1, (total + size - 1) // size) if total else 1
-    current = int(page)
-    if current < 0 or current >= pages:
-        current = 0
-    start = current * size
-    end = min(total, start + size)
-    return current, start, end
-
-
-def _class_match_page(query: str, count: int) -> tuple[int, int, int]:
-    """Session page for this class query. A new query starts at the first page."""
-    if st.session_state.get(SEARCH_PAGE_QUERY_KEY) != query:
-        st.session_state[SEARCH_PAGE_KEY] = 0
-        st.session_state[SEARCH_PAGE_QUERY_KEY] = query
-    page = int(st.session_state.get(SEARCH_PAGE_KEY) or 0)
-    current, start, end = class_match_window(count, page)
-    st.session_state[SEARCH_PAGE_KEY] = current
-    return current, start, end
 
 
 def _render_class_browse(
@@ -1417,60 +1694,42 @@ def _render_class_browse(
     use_fixtures: bool,
     client,
 ) -> None:
-    """One page of plain buttons for a class. Does not score the shard.
+    """Compact ticker label. Click opens one full-width scrollable overlay.
 
-    Pill tap only lists the page. A row click places that one ticker; compare
-    scoring stays on the slot row. No radio and no fixed-height scroll
-    container — those crashed Chrome on Stocks, ETFs, and on activating GOLD.
+    The list is the loaded class shard (up to ``CLASS_PAGE_LIMIT``), not a
+    paged button strip. Open, scroll, and close do not rerun Streamlit.
+    Choosing a row places that ticker and closes the panel. No radio and no
+    fixed-height ``st.container`` — those crashed Chrome on Stocks, ETFs,
+    and on activating GOLD.
     """
     with st.container(key="rwa_class_browse"):
         if directory_down:
             st.error(LIVE_UNAVAILABLE_BANNER)
             _clear_match_pick_state()
+            _install_search_typeahead(dropdown_items=[])
             return
         if not matches:
             _clear_match_pick_state()
+            _install_search_typeahead(dropdown_items=[])
             if len((query or "").strip()) >= SEARCH_MIN_CHARS:
                 st.caption("No directory matches — type a ticker or tap a category.")
             return
-        options = [opt.symbol for opt in matches]
-        labels = {opt.symbol: format_option(opt) for opt in matches}
-        _page, start, end = _class_match_page(query, len(options))
-        if len(options) > MATCHES_PAGE_SIZE:
-            prev_col, next_col = st.columns(2, gap="small")
-            with prev_col:
-                if st.button(
-                    "Previous",
-                    key="rwa_match_prev",
-                    disabled=start == 0,
-                    use_container_width=True,
-                ):
-                    st.session_state[SEARCH_PAGE_KEY] = max(0, _page - 1)
-                    _page, start, end = class_match_window(
-                        len(options), _page - 1
-                    )
-                    st.session_state[SEARCH_PAGE_KEY] = _page
-            with next_col:
-                if st.button(
-                    "Next",
-                    key="rwa_match_next",
-                    disabled=end >= len(options),
-                    use_container_width=True,
-                ):
-                    st.session_state[SEARCH_PAGE_KEY] = _page + 1
-                    _page, start, end = class_match_window(
-                        len(options), _page + 1
-                    )
-                    st.session_state[SEARCH_PAGE_KEY] = _page
-            st.caption(f"Showing {start + 1}–{end} of {len(options)}")
-        for symbol in options[start:end]:
-            if st.button(
-                labels.get(symbol, symbol),
-                key=f"rwa_match_row_{query}_{symbol}",
-                use_container_width=True,
-            ):
-                _auto_place(symbol)
-        if not use_fixtures and class_browse_truncated(client, query):
+        if CLASS_PICK_KEY not in st.session_state:
+            st.session_state[CLASS_PICK_KEY] = ""
+        st.text_input(
+            CLASS_PICK_LABEL,
+            key=CLASS_PICK_KEY,
+            label_visibility="collapsed",
+            on_change=_on_class_ticker_pick,
+        )
+        truncated = bool(not use_fixtures and class_browse_truncated(client, query))
+        chosen = str(st.session_state.get(CLASS_CHOSEN_KEY) or "")
+        _install_search_typeahead(
+            ticker_dropdown_items(matches),
+            label=class_dropdown_label(matches, chosen),
+            truncated=truncated,
+        )
+        if truncated:
             st.caption(CLASS_REMAINDER_CAPTION)
 
 
@@ -1562,10 +1821,10 @@ def _render_search_picker(
         # FixtureClient. Slot button keys stay so the row does not remount.
         clear_compare_slots()
     if is_class_browse_query(query):
-        # Paged buttons, not a radio in a fixed-height container. That widget
-        # Aw Snapped Chrome on Stocks / ETFs and when a row was activated.
-        # A 250-option selectbox is also wrong here: it mounts a BaseWeb menu
-        # on this same pill rerun, before anyone opens Matches.
+        # Compact ticker overlay, not a radio in a fixed-height container and
+        # not a paged button strip. Those Aw Snapped Chrome on Stocks / ETFs
+        # and when a row was activated. A 250-option selectbox is also wrong
+        # here: it mounts a BaseWeb menu on this same pill rerun.
         _render_class_browse(
             matches,
             query,
@@ -2193,12 +2452,108 @@ st.markdown(
       [data-baseweb="menu"] {{
         z-index: 1000 !important;
       }}
-      /* Open Matches list scrolls inside the menu (class pages up to 250).
+      /* Open prefix Matches scroll inside the menu.
          The closed selectbox stays one line. Do not remount it while open. */
       div[data-baseweb="popover"] [role="listbox"],
       div[data-baseweb="menu"] [role="listbox"] {{
         max-height: 18rem;
         overflow-y: auto;
+      }}
+      /* Class-browse ticker dropdown. Label stays compact in the Matches
+         slot; the panel is fixed to the content column and scrolls as one
+         list over the compare tiles. Not a nested st.container height. */
+      #rwa-ticker-dd-anchor {{
+        position: relative;
+        z-index: 40;
+        min-height: 2.25rem;
+      }}
+      .rwa-ticker-dd-label {{
+        display: inline-flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.55rem;
+        max-width: min(22rem, 100%);
+        min-width: 11rem;
+        padding: 0.32rem 0.65rem;
+        border: 1px solid rgba(250, 250, 250, 0.2);
+        border-radius: 0.45rem;
+        background: rgba(38, 39, 48, 0.96);
+        color: inherit;
+        font: inherit;
+        font-size: 0.95rem;
+        line-height: 1.3;
+        cursor: pointer;
+        text-align: left;
+      }}
+      .rwa-ticker-dd-text {{
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }}
+      .rwa-ticker-dd-arrow {{
+        flex: 0 0 auto;
+        font-size: 0.75rem;
+        opacity: 0.85;
+      }}
+      .rwa-ticker-dd-label[aria-expanded="true"] .rwa-ticker-dd-arrow {{
+        transform: rotate(180deg);
+      }}
+      .rwa-ticker-dd-panel {{
+        position: fixed;
+        z-index: 1000;
+        display: flex;
+        flex-direction: column;
+        box-sizing: border-box;
+        background: rgb(14, 17, 23);
+        border: 1px solid rgba(250, 250, 250, 0.2);
+        border-radius: 0.5rem;
+        box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+        overflow: hidden;
+      }}
+      .rwa-ticker-dd-panel[hidden] {{
+        display: none !important;
+      }}
+      .rwa-ticker-dd-scroll {{
+        overflow-y: auto;
+        overflow-x: hidden;
+        min-height: 0;
+        flex: 1 1 auto;
+      }}
+      .rwa-ticker-dd-option {{
+        display: block;
+        width: 100%;
+        text-align: left;
+        padding: 0.38rem 0.8rem;
+        border: 0;
+        border-bottom: 1px solid rgba(250, 250, 250, 0.06);
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 0.92rem;
+        cursor: pointer;
+      }}
+      .rwa-ticker-dd-option:hover,
+      .rwa-ticker-dd-option:focus {{
+        background: rgba(250, 250, 250, 0.08);
+        outline: none;
+      }}
+      .rwa-ticker-dd-note {{
+        flex: 0 0 auto;
+        padding: 0.4rem 0.8rem 0.55rem;
+        font-size: 0.8rem;
+        opacity: 0.85;
+        border-top: 1px solid rgba(250, 250, 250, 0.12);
+      }}
+      .st-key-class_ticker_pick {{
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        clip: rect(0, 0, 0, 0) !important;
       }}
       /* Typeahead bridge is a 1px iframe — keep JS alive, no layout gap.
          Search-only; Share preview is markdown (no iframe) so a Share click
