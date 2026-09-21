@@ -13,6 +13,10 @@ The JSON schema is the authentic paid-API envelope (breakdown keys plus `confide
 
 Machine-readable copy: [`examples/v1_score_NVDA.fixture.json`](examples/v1_score_NVDA.fixture.json).
 
+Consumer mapping: [`NVDA_FIXTURE_CONSUMER_MAPPING.md`](NVDA_FIXTURE_CONSUMER_MAPPING.md)
+shows how to preserve the fixture's provenance labels when handing fields to a
+separate action-policy consumer.
+
 Secrets, API keys, emails, and tokens are not included. Send the real key only at request time.
 
 ## Request
