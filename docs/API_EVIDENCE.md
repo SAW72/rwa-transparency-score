@@ -56,7 +56,7 @@ content-type: application/json
   "issuer": "Backed Finance",
   "score": 90.4,
   "band": "GREEN",
-  "band_label": "GREEN \\u2014 heuristic: stronger transparency signals (still verify)",
+  "band_label": "GREEN \u2014 heuristic: stronger transparency signals (still verify)",
   "subscores": {
     "backing": 90.0,
     "reserves": 90.0,
@@ -88,7 +88,7 @@ content-type: application/json
     },
     "price": {
       "label": "Price integrity",
-      "what": "Issuer tokens track CMC average_tokenized_price; crypto 24h\\u0394 is the labeled fallback."
+      "what": "Issuer tokens track CMC average_tokenized_price; crypto 24h\u0394 is the labeled fallback."
     },
     "disclosure": {
       "label": "Disclosure",
@@ -100,17 +100,17 @@ content-type: application/json
     }
   },
   "explanations": {
-    "backing": "Heuristic: issuer 'Backed Finance' matched the fully-backed name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode \\u2014 live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "reserves": "Heuristic: issuer 'Backed Finance' matched the independent-PoR name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode \\u2014 live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "redemption": "Heuristic: issuer 'Backed Finance' matched the redeemable name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode \\u2014 live redemption verifier skipped). heuristic fallback Fixture/offline mode \\u2014 live redemption verifier skipped. Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
-    "price": "CMC RWA quotes/latest: 3 priced token(s) vs CMC average_tokenized_price 118.5500; max |token\\u2212avg|/avg = 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s) listed (no TradFi last price in CMC). score = max(20, 100 \\u2212 |dev%| \\u00d7 2) = 99.7. Verification: self-reported. Evidence: CMC RWA quotes/latest: avg=118.55; max token deviation 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s). verification=self-reported",
+    "backing": "Heuristic: issuer 'Backed Finance' matched the fully-backed name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode \u2014 live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "reserves": "Heuristic: issuer 'Backed Finance' matched the independent-PoR name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode \u2014 live attestation verifiers skipped. heuristic fallback Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "redemption": "Heuristic: issuer 'Backed Finance' matched the redeemable name list. Verification: self-reported. Evidence: heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode \u2014 live redemption verifier skipped). heuristic fallback Fixture/offline mode \u2014 live redemption verifier skipped. Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations.",
+    "price": "CMC RWA quotes/latest: 3 priced token(s) vs CMC average_tokenized_price 118.5500; max |token\u2212avg|/avg = 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s) listed (no TradFi last price in CMC). score = max(20, 100 \u2212 |dev%| \u00d7 2) = 99.7. Verification: self-reported. Evidence: CMC RWA quotes/latest: avg=118.55; max token deviation 0.13%; tokenized mcap=8500000.0, vol_24h=7600000.0; 1 TradFi venue(s). verification=self-reported",
     "disclosure": "SEC CIK 0001045810 present on the RWA info record. Verification: self-reported. Evidence: SEC CIK 0001045810 on CMC RWA info record. verification=self-reported",
-    "basis": "CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (NVDAx 118.4500 vs NVDAxst 118.7000); 1 TradFi venue(s) listed (no TradFi last price). score = max(15, 100 \\u2212 |spread| \\u00d7 10) = 97.9. Verification: self-reported. Evidence: CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7). verification=self-reported"
+    "basis": "CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (NVDAx 118.4500 vs NVDAxst 118.7000); 1 TradFi venue(s) listed (no TradFi last price). score = max(15, 100 \u2212 |spread| \u00d7 10) = 97.9. Verification: self-reported. Evidence: CMC RWA quotes tokens[] + market-pairs: 3 wrappers; spread 0.21% (low 118.45, high 118.7). verification=self-reported"
   },
   "verification": {
     "backing": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode \\u2014 live attestation verifiers skipped.",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the backing name list. Fixture/offline mode \u2014 live attestation verifiers skipped.",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
@@ -127,7 +127,7 @@ content-type: application/json
     },
     "reserves": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode \\u2014 live attestation verifiers skipped.",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' matched the reserves name list. Fixture/offline mode \u2014 live attestation verifiers skipped.",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
@@ -144,11 +144,11 @@ content-type: application/json
     },
     "redemption": {
       "level": "self-reported",
-      "evidence": "heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode \\u2014 live redemption verifier skipped).",
+      "evidence": "heuristic fallback: issuer 'Backed Finance' redemption rights via name list (Fixture/offline mode \u2014 live redemption verifier skipped).",
       "source": "heuristic_fallback",
       "notes": [
         "heuristic fallback",
-        "Fixture/offline mode \\u2014 live redemption verifier skipped.",
+        "Fixture/offline mode \u2014 live redemption verifier skipped.",
         "Issuer backing / proof-of-reserves / redemption flags are name-matching heuristics, not audited attestations."
       ],
       "ok": true,
@@ -203,7 +203,7 @@ content-type: application/json
     "Scores below use bundled DEMO FIXTURE data, not live CoinMarketCap API responses.",
     "Live attestation verifiers skipped (fixture/offline); backing/reserves use heuristic fallback.",
     "heuristic fallback",
-    "Fixture/offline mode \\u2014 live redemption verifier skipped."
+    "Fixture/offline mode \u2014 live redemption verifier skipped."
   ],
   "heuristics": {
     "backed": true,
@@ -317,13 +317,13 @@ content-type: application/json
   },
   "cik": "0001045810",
   "issuer_note": "Equity-backed token (Backed Finance / xStocks): claims 1:1 share custody with a public on-chain proof of reserves.",
-  "summary": "Backed Finance \\u2014 0 risk flag(s).",
+  "summary": "Backed Finance \u2014 0 risk flag(s).",
   "verification_mode": "offline_heuristic",
   "live_verifiers": false,
   "cmc_calls": {
     "source": "fixture",
     "live": false,
-    "label": "bundled DEMO FIXTURES \\u2014 not live CoinMarketCap",
+    "label": "bundled DEMO FIXTURES \u2014 not live CoinMarketCap",
     "endpoints": [
       {
         "endpoint": "/v5/real-world-assets/map",
