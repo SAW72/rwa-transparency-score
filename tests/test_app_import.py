@@ -144,94 +144,40 @@ class _FakeQP(dict):
         return dict.get(self, key, default)
 
 
-def test_category_remount_preserves_compare_slots(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Second category click remounts via ?rwa_cat= — do not reset to NVDA/TSLA/AAPL."""
+def test_category_chips_do_not_remount_or_reset_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Category chips must not full-navigate. Slots live in session_state only."""
     import app as demo_app
 
-    assert demo_app.format_slots_query(["GOLD", "TSLA", "AAPL", "META"]) == (
-        "GOLD,TSLA,AAPL,META"
-    )
-    assert demo_app.parse_slots_query("GOLD,TSLA,AAPL,META") == [
-        "GOLD",
-        "TSLA",
-        "AAPL",
-        "META",
-    ]
-    assert demo_app.parse_slots_query(None) is None
-    assert demo_app.parse_slots_query("") is None
-    assert demo_app.parse_slots_query("bNVDA") == ["bNVDA", "", "", ""]
-    assert demo_app.parse_active_query("1") == 1
-    assert demo_app.parse_active_query("9") is None
-    assert demo_app.parse_active_query("x") is None
-
-    href = demo_app.category_pill_href(
-        "commodity", ["GOLD", "TSLA", "AAPL", "META"], 1
-    )
-    assert href.startswith("?rwa_cat=commodity&")
-    assert "rwa_slots=GOLD,TSLA,AAPL,META" in href
-    assert "rwa_active=1" in href
-    # Bare ?rwa_cat= would wipe the row on remount — href must carry slots.
-    assert href != "?rwa_cat=commodity"
-
     source = Path(demo_app.__file__).read_text(encoding="utf-8")
-    assert "category_pill_href" in source
-    assert 'href="?rwa_cat={cid}"' not in source
-    assert "SLOT_QUERY_KEY" in source
+    picker = source.split("def _render_search_picker", 1)[1]
+    chip_block = picker.split("st.text_input", 1)[0]
+    assert "rwa_class_" in chip_block
+    assert "st.button(" in chip_block
+    assert "st.columns(" in chip_block
+    assert "category_pill_href" not in source
+    assert "rwa_slots" not in source
+    assert "rwa_active" not in source
+    assert 'href="?rwa_cat' not in source
+    assert "target=\"_self\"" not in chip_block
+    assert "applyChipQuery" not in demo_app.SEARCH_TYPEAHEAD_JS
 
-    # True first load: empty session, no slot params → published defaults.
+    # True first load: empty session → published defaults.
     monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
-    monkeypatch.setattr(demo_app.st, "query_params", _FakeQP())
     demo_app._ensure_slot_state()
     assert demo_app.st.session_state.slots == list(demo_app.DEFAULT_SLOTS)
     assert demo_app.st.session_state.active_slot == 0
 
-    # Category deep-link without a carried row is still a first load.
-    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    # ?rwa_cat= deep-link must not reset a filled row (no URL slot payload).
+    filled = _FakeSS(slots=["GOLD", "TSLA", "AAPL", "META"], active_slot=1)
+    monkeypatch.setattr(demo_app.st, "session_state", filled)
     monkeypatch.setattr(demo_app.st, "query_params", _FakeQP({"rwa_cat": "commodity"}))
-    demo_app._ensure_slot_state()
-    assert demo_app.st.session_state.slots == list(demo_app.DEFAULT_SLOTS)
-
-    # Repro: GOLD in a slot, return to categories, click another class.
-    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
-    monkeypatch.setattr(
-        demo_app.st,
-        "query_params",
-        _FakeQP(
-            {
-                "rwa_cat": "government_security",
-                demo_app.SLOT_QUERY_KEY: "GOLD,TSLA,AAPL,META",
-                demo_app.ACTIVE_QUERY_KEY: "1",
-            }
-        ),
-    )
     demo_app._ensure_slot_state()
     assert demo_app.st.session_state.slots == ["GOLD", "TSLA", "AAPL", "META"]
     assert demo_app.st.session_state.active_slot == 1
 
-    # Session row wins over a stale URL (no overwrite after first restore).
-    filled = _FakeSS(slots=["GOLD", "SLV", "AAPL", "META"], active_slot=2)
-    monkeypatch.setattr(demo_app.st, "session_state", filled)
-    monkeypatch.setattr(
-        demo_app.st,
-        "query_params",
-        _FakeQP({demo_app.SLOT_QUERY_KEY: "NVDA,TSLA,AAPL,META"}),
-    )
-    demo_app._ensure_slot_state()
-    assert demo_app.st.session_state.slots == ["GOLD", "SLV", "AAPL", "META"]
-    assert demo_app.st.session_state.active_slot == 2
-
-    # After remount, the next pick fills the carried row — not NVDA/TSLA/AAPL.
-    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
-    monkeypatch.setattr(
-        demo_app.st,
-        "query_params",
-        _FakeQP(
-            {
-                demo_app.SLOT_QUERY_KEY: "GOLD,TSLA,AAPL,META",
-                demo_app.ACTIVE_QUERY_KEY: "1",
-            }
-        ),
-    )
+    # Same-session second chip: next pick fills the existing row.
     demo_app._auto_place("SLV")
     assert demo_app.st.session_state.slots == ["GOLD", "SLV", "AAPL", "META"]
     assert demo_app.st.session_state.active_slot == 2

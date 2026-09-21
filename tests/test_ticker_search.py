@@ -337,7 +337,9 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     chip_block = picker.split("st.text_input", 1)[0]
     assert "rat-cat-row" in chip_block
     assert "flex-direction: row" in source or "rat-cat-row" in source
-    assert "st.columns" not in chip_block
+    assert "rwa_class_" in chip_block
+    assert "st.button(" in chip_block
+    assert "st.columns(" in chip_block
     assert "st.selectbox" in picker
     assert "index=None" in picker
     assert "_auto_place(picked)" in picker
@@ -387,6 +389,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "addEventListener(\"keyup\"" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "keypress" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "keydown" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "applyChipQuery" not in demo_app.SEARCH_TYPEAHEAD_JS
     assert "_install_search_typeahead" in source
     assert "search_typeahead_script" in source
 
@@ -447,6 +450,7 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
     assert "addEventListener(\"input\"" in script
     assert "addEventListener(\"keyup\"" in script
     assert "Enter" in script
+    assert "applyChipQuery" not in script
     assert "height=1" in picker or 'height=1' in source
     assert "st.form" not in source
 
@@ -748,7 +752,9 @@ def test_horizontal_category_pills_are_not_column_blocks() -> None:
     picker = source.split("def _render_search_picker", 1)[1]
     assert 'class="rat-cat-row"' in picker
     assert "cat_chip_" not in picker
-    assert "category_pill_href" in picker
+    assert "rwa_class_" in picker
+    assert "category_pill_href" not in picker
+    assert 'href="?rwa_cat' not in picker
 
 
 class _StockScopedLiveClient:
