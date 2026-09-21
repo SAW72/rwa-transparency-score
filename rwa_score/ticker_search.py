@@ -23,6 +23,7 @@ no proxy are not injected.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Sequence
 
@@ -32,7 +33,13 @@ from .chainlink_por import (
     PorFeed,
     canonical_backed_por_feed,
 )
-from .client import ASSET_TYPE_LABELS, ASSET_TYPES, canonical_asset_type
+from .client import (
+    ASSET_TYPE_LABELS,
+    ASSET_TYPES,
+    CMCError,
+    canonical_asset_type,
+    directory_has_more,
+)
 
 SEARCH_MIN_CHARS = 3
 CATEGORY_MIN_CHARS = 2
@@ -732,15 +739,134 @@ def _safe_rwa_map(
 
 
 CLASS_PAGE_LIMIT = 250
+# How long a failed live directory fetch stays empty before another try.
+# Successes stay on the Streamlit / process memo. Failures must not look like
+# a full class, and must not retry on every widget rerun (that amplifies 429).
+DIRECTORY_FAILURE_RETRY_SECONDS = 60.0
 
 # Process-local class shards. Streamlit widget reruns share the scorer client
 # (``@st.cache_resource``); this memo stops a second walk of the same class.
 _CLASS_CATALOG_MEMO: dict[tuple[int, str, bool], list[TickerOption]] = {}
 
 
+@dataclass(frozen=True)
+class ClassShardStatus:
+    """Outcome of the last class-page fetch for one client.
+
+    ``unavailable`` is a live directory failure (401 / 429 / 1008 / transport).
+    An empty 200 is not unavailable. ``truncated`` means CMC has another page
+    past this shard. ``failed_at`` is ``time.monotonic`` of that failure.
+    """
+
+    unavailable: bool = False
+    truncated: bool = False
+    failed_at: float = 0.0
+
+
+_CLASS_STATUS: dict[tuple[int, str, bool], ClassShardStatus] = {}
+# client id -> normalized query whose ``map?symbol=`` just failed
+_SYMBOL_LOOKUP_FAILED: dict[int, str] = {}
+
+
 def clear_catalog_cache() -> None:
     """Drop in-process class shards (tests). Does not clear CMC HTTP TTL cache."""
     _CLASS_CATALOG_MEMO.clear()
+    _CLASS_STATUS.clear()
+    _SYMBOL_LOOKUP_FAILED.clear()
+
+
+def _status_key(client: Any, asset_type: str, first_page_only: bool) -> tuple[int, str, bool]:
+    kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
+    return (id(client), kind, bool(first_page_only))
+
+
+def class_shard_status(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool = True,
+) -> ClassShardStatus:
+    """Last fetch outcome. Missing means this class has not been loaded."""
+    if client is None:
+        return ClassShardStatus()
+    return _CLASS_STATUS.get(
+        _status_key(client, asset_type, first_page_only), ClassShardStatus()
+    )
+
+
+def class_shard_failure_is_fresh(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool = True,
+) -> bool:
+    """True when a recent live failure should be reused instead of refetching."""
+    status = class_shard_status(
+        client, asset_type, first_page_only=first_page_only
+    )
+    if not status.unavailable or status.failed_at <= 0:
+        return False
+    return (time.monotonic() - status.failed_at) < DIRECTORY_FAILURE_RETRY_SECONDS
+
+
+def _remember_class_status(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool,
+    unavailable: bool,
+    truncated: bool,
+) -> None:
+    _CLASS_STATUS[_status_key(client, asset_type, first_page_only)] = ClassShardStatus(
+        unavailable=bool(unavailable),
+        truncated=bool(truncated) and not unavailable,
+        failed_at=time.monotonic() if unavailable else 0.0,
+    )
+
+
+def is_live_directory_failure(exc: BaseException) -> bool:
+    """401, 429, CMC 1008, or another CMC/transport failure. Not a TypeError."""
+    if isinstance(exc, TypeError):
+        return False
+    if isinstance(exc, CMCError):
+        return True
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in ("401", "429", "1008", "unauthorized", "rate limit")
+    )
+
+
+def _is_terminal_directory_failure(client: Any, exc: BaseException) -> bool:
+    """Live directory errors stop the fetch. Fixtures never take this path.
+
+    A live client that raises is a directory failure even when the message
+    omits the status code — silent empty results would look like a stub list.
+    """
+    if isinstance(exc, TypeError):
+        return False
+    if getattr(client, "source", "") == "fixture":
+        return False
+    if getattr(client, "source", "") == "live":
+        return True
+    return is_live_directory_failure(exc)
+
+
+def _take_page_truncated(client: Any, batch_len: int) -> bool:
+    """Whether the class page just fetched has another CMC page after it.
+
+    Real clients set ``_directory_page``. Mocks that return a full page and
+    do not report pagination are treated as truncated so the UI does not
+    pretend the page is the whole class.
+    """
+    meta = getattr(client, "_directory_page", None)
+    if isinstance(meta, dict) and "truncated" in meta:
+        try:
+            client._directory_page = None
+        except Exception:  # noqa: BLE001 — mocks may reject assignment
+            pass
+        return bool(meta.get("truncated"))
+    return batch_len >= CLASS_PAGE_LIMIT
 
 
 def _fixture_info_by_id(
@@ -789,11 +915,15 @@ def _fetch_assets_list_page(
     *,
     start: int = 1,
     limit: int = CLASS_PAGE_LIMIT,
-) -> list[TickerOption]:
-    """One ``assets/list`` page — never the full-book ``assets_list_all`` walk."""
+) -> tuple[list[TickerOption], bool, bool]:
+    """One ``assets/list`` page — never the full-book ``assets_list_all`` walk.
+
+    Returns ``(options, truncated, failed)``. ``failed`` is a live directory
+    error. An empty payload is not a failure.
+    """
     fetch_list = getattr(client, "assets_list", None)
     if not callable(fetch_list):
-        return []
+        return [], False, False
     kind = (asset_type or "").strip() or None
     try:
         payload = fetch_list(asset_type=kind, start=start, limit=limit)
@@ -801,8 +931,83 @@ def _fetch_assets_list_page(
         try:
             payload = fetch_list(asset_type=kind) if kind else fetch_list()
         except TypeError:
-            payload = fetch_list()
-    return catalog_from_assets_list(payload)
+            try:
+                payload = fetch_list()
+            except Exception as exc:  # noqa: BLE001
+                if _is_terminal_directory_failure(client, exc):
+                    return [], False, True
+                return [], False, False
+        except Exception as exc:  # noqa: BLE001
+            if _is_terminal_directory_failure(client, exc):
+                return [], False, True
+            return [], False, False
+    except Exception as exc:  # noqa: BLE001
+        if _is_terminal_directory_failure(client, exc):
+            return [], False, True
+        return [], False, False
+    options = catalog_from_assets_list(payload)
+    batch_len = len(options)
+    truncated = False
+    if isinstance(payload, dict):
+        raw_rows = payload.get("rwa_assets")
+        if isinstance(raw_rows, list):
+            batch_len = len(raw_rows)
+        truncated = directory_has_more(payload, start=start, batch_len=batch_len)
+    elif batch_len >= limit:
+        truncated = True
+    return options, truncated, False
+
+
+def _map_page(
+    client: Any,
+    symbol: str | None = None,
+    *,
+    asset_type: str | None = None,
+    start: int = 1,
+    limit: int | None = None,
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    """One ``rwa_map`` call: ``(rows, truncated, failed)``.
+
+    ``failed`` means the live directory could not be read (401 / 429 / 1008
+    or another live transport error). Empty 200 is not a failure. Callers
+    must not fall through to another endpoint after ``failed``.
+    """
+    try:
+        if symbol:
+            rows = _safe_rwa_map(
+                client,
+                symbol,
+                asset_type=asset_type,
+                start=start,
+                limit=limit,
+            )
+        elif asset_type or limit is not None:
+            rows = _safe_rwa_map(
+                client,
+                asset_type=asset_type,
+                start=start,
+                limit=limit,
+            )
+        else:
+            rows = _safe_rwa_map(client)
+    except Exception as exc:  # noqa: BLE001 — classified below
+        if _is_terminal_directory_failure(client, exc):
+            return [], False, True
+        return [], False, False
+    truncated = False
+    if limit is not None and not symbol:
+        truncated = _take_page_truncated(client, len(rows))
+    return list(rows or []), truncated, False
+
+
+def is_class_browse_query(query: str) -> bool:
+    """True when Search is listing a class, not prefix-matching a ticker.
+
+    Category pills, category keywords (``stocks``, ``treasury``), and short
+    class prefixes (``sto`` → Stocks) are browse. Typed tickers (``NVD``,
+    ``MSAI``) stay prefix matches.
+    """
+    return bool(resolve_categories(query))
 
 
 def classes_for_query(query: str) -> tuple[str, ...]:
@@ -898,7 +1103,7 @@ def _recover_treasury_catalog(
     client: Any,
     *,
     first_page_only: bool,
-) -> list[TickerOption]:
+) -> tuple[list[TickerOption], bool]:
     """Find CMC-listed treasuries when ``government_security`` pages are empty.
 
     Live CMC may label USTB / OUSG ``etf``, omit ``asset_type`` on map, or
@@ -906,54 +1111,57 @@ def _recover_treasury_catalog(
     ``map?symbol=`` (0 credits; docs: symbol ignores other filters), then one
     ``etf`` map page, then one unfiltered map page, then one ``assets/list``
     page. Never ``assets_list_all``. Never invent a ticker.
+
+    Returns ``(options, failed)``. A live directory error stops the probe
+    instead of walking every fallback (those calls would fail the same way).
     """
-    try:
-        probed = _safe_rwa_map(client, ",".join(TREASURY_PROBE_SYMBOLS))
-    except Exception:  # noqa: BLE001
-        probed = []
+    probed, _truncated, failed = _map_page(client, ",".join(TREASURY_PROBE_SYMBOLS))
+    if failed:
+        return [], True
     options = _treasury_options_from_rows(client, probed, require_like=False)
     if options:
-        return options
+        return options, False
 
-    try:
-        if first_page_only:
-            etf_rows = _safe_rwa_map(
-                client, asset_type="etf", start=1, limit=CLASS_PAGE_LIMIT
-            )
-        else:
-            etf_rows = _safe_rwa_map(client, asset_type="etf")
-    except Exception:  # noqa: BLE001
-        etf_rows = []
+    if first_page_only:
+        etf_rows, _truncated, failed = _map_page(
+            client, asset_type="etf", start=1, limit=CLASS_PAGE_LIMIT
+        )
+    else:
+        etf_rows, _truncated, failed = _map_page(client, asset_type="etf")
+    if failed:
+        return [], True
     options = _treasury_options_from_rows(client, etf_rows, require_like=True)
     if options:
-        return options
+        return options, False
 
-    try:
-        if first_page_only:
-            raw_rows = _safe_rwa_map(client, start=1, limit=CLASS_PAGE_LIMIT)
-        else:
-            raw_rows = _safe_rwa_map(client)
-    except Exception:  # noqa: BLE001
-        raw_rows = []
+    if first_page_only:
+        raw_rows, _truncated, failed = _map_page(
+            client, start=1, limit=CLASS_PAGE_LIMIT
+        )
+    else:
+        raw_rows, _truncated, failed = _map_page(client)
+    if failed:
+        return [], True
     options = _treasury_options_from_rows(client, raw_rows, require_like=True)
     if options:
-        return options
+        return options, False
 
-    try:
-        listed = _fetch_assets_list_page(client, "etf")
-    except Exception:  # noqa: BLE001
-        listed = []
+    listed, _truncated, failed = _fetch_assets_list_page(client, "etf")
+    if failed:
+        return [], True
     matched = _promote_treasury_options(
         [opt for opt in listed if _row_is_treasury_like(opt)]
     )
     if matched:
-        return matched
-    try:
-        listed = _fetch_assets_list_page(client, None)
-    except Exception:  # noqa: BLE001
-        return []
-    return _promote_treasury_options(
-        [opt for opt in listed if _row_is_treasury_like(opt)]
+        return matched, False
+    listed, _truncated, failed = _fetch_assets_list_page(client, None)
+    if failed:
+        return [], True
+    return (
+        _promote_treasury_options(
+            [opt for opt in listed if _row_is_treasury_like(opt)]
+        ),
+        False,
     )
 
 
@@ -997,37 +1205,60 @@ def load_class_catalog(
     Prefers typed ``map`` (0 credits). ``assets/list`` is the fallback when
     that class is missing from the map page — empty, untyped, or a
     stock-scoped page that ignored ``asset_type``. Never a dual full-book
-    walk. Search uses ``first_page_only=True`` (one page, enough for Matches).
+    walk. Search uses ``first_page_only=True`` (one page, up to
+    ``CLASS_PAGE_LIMIT``). A live 401 / 429 / 1008 does not fall through to
+    another endpoint and does not swap in fixture rows — the shard is empty
+    and :func:`class_shard_status` reports ``unavailable``.
     """
     kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
     if kind not in ASSET_TYPES:
         return []
-    rows: list[dict[str, Any]] = []
-    try:
-        if first_page_only:
-            rows = _safe_rwa_map(
-                client, asset_type=kind, start=1, limit=CLASS_PAGE_LIMIT
-            )
-        else:
-            rows = _safe_rwa_map(client, asset_type=kind)
-    except Exception:  # noqa: BLE001 — one class must not take down Search
-        rows = []
+
+    def _finish(options: list[TickerOption], *, unavailable: bool, truncated: bool) -> list[TickerOption]:
+        _remember_class_status(
+            client,
+            kind,
+            first_page_only=first_page_only,
+            unavailable=unavailable,
+            truncated=truncated,
+        )
+        return options
+
+    if first_page_only:
+        rows, truncated, failed = _map_page(
+            client, asset_type=kind, start=1, limit=CLASS_PAGE_LIMIT
+        )
+    else:
+        rows, truncated, failed = _map_page(client, asset_type=kind)
+    if failed:
+        return _finish([], unavailable=True, truncated=False)
     options = _options_for_class(client, rows, kind)
     if options:
-        return options
-    try:
-        if first_page_only:
-            listed = _fetch_assets_list_page(client, kind)
-        else:
+        return _finish(options, unavailable=False, truncated=truncated)
+
+    list_truncated = False
+    if first_page_only:
+        listed, list_truncated, failed = _fetch_assets_list_page(client, kind)
+    else:
+        try:
             listed = _fetch_assets_list_options(client, kind)
-    except Exception:  # noqa: BLE001
-        listed = []
+            failed = False
+        except Exception as exc:  # noqa: BLE001
+            listed = []
+            failed = _is_terminal_directory_failure(client, exc)
+    if failed:
+        return _finish([], unavailable=True, truncated=False)
     matched = _listed_for_class(listed, kind)
     if matched:
-        return matched
+        return _finish(matched, unavailable=False, truncated=list_truncated)
     if kind == TREASURY_CLASS:
-        return _recover_treasury_catalog(client, first_page_only=first_page_only)
-    return []
+        recovered, failed = _recover_treasury_catalog(
+            client, first_page_only=first_page_only
+        )
+        if failed:
+            return _finish([], unavailable=True, truncated=False)
+        return _finish(recovered, unavailable=False, truncated=False)
+    return _finish([], unavailable=False, truncated=False)
 
 
 def cached_class_catalog(
@@ -1036,12 +1267,26 @@ def cached_class_catalog(
     *,
     first_page_only: bool = True,
 ) -> list[TickerOption]:
-    """Return a memoized class shard for this client instance."""
+    """Return a memoized class shard for this client instance.
+
+    A fresh live failure is reused so widget reruns do not amplify 429s.
+    After :data:`DIRECTORY_FAILURE_RETRY_SECONDS` the shard is fetched again.
+    """
     kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
     key = (id(client), kind, bool(first_page_only))
     hit = _CLASS_CATALOG_MEMO.get(key)
     if hit is not None:
-        return list(hit)
+        status = _CLASS_STATUS.get(key)
+        stale_failure = (
+            status is not None
+            and status.unavailable
+            and not class_shard_failure_is_fresh(
+                client, kind, first_page_only=first_page_only
+            )
+        )
+        if not stale_failure:
+            return list(hit)
+        _CLASS_CATALOG_MEMO.pop(key, None)
     rows = load_class_catalog(client, kind, first_page_only=first_page_only)
     _CLASS_CATALOG_MEMO[key] = rows
     return list(rows)
@@ -1063,11 +1308,44 @@ def lookup_symbol_on_client(client: Any, query: str) -> list[TickerOption]:
     symbol = normalize_ticker(q)
     if not symbol:
         return []
-    try:
-        rows = _safe_rwa_map(client, symbol)
-    except Exception:  # noqa: BLE001 — typeahead must stay up
+    rows, _truncated, failed = _map_page(client, symbol)
+    if failed:
+        _SYMBOL_LOOKUP_FAILED[id(client)] = q.lower()
         return []
+    _SYMBOL_LOOKUP_FAILED.pop(id(client), None)
     return catalog_from_rwa_map(rows)
+
+
+def symbol_lookup_failed(client: Any, query: str) -> bool:
+    """True when ``map?symbol=`` just failed for this exact query."""
+    if client is None:
+        return False
+    failed = _SYMBOL_LOOKUP_FAILED.get(id(client))
+    if not failed:
+        return False
+    return failed == normalize_query(query).lower()
+
+
+def live_class_unavailable(client: Any, query: str) -> bool:
+    """True when this query's live class page failed and must not show rows."""
+    if client is None or getattr(client, "source", "") == "fixture":
+        return False
+    q = normalize_query(query)
+    if not q:
+        return False
+    kinds = classes_for_query(q)
+    if not kinds:
+        return False
+    return any(class_shard_status(client, kind).unavailable for kind in kinds)
+
+
+def class_browse_truncated(client: Any, query: str) -> bool:
+    """True when a class browse loaded a page CMC says is not the whole class."""
+    if client is None or not is_class_browse_query(query):
+        return False
+    return any(
+        class_shard_status(client, kind).truncated for kind in classes_for_query(query)
+    )
 
 
 def load_search_catalog(
@@ -1099,6 +1377,13 @@ def load_search_catalog(
             extra = []
         if extra:
             base = enrich_catalog_from_assets_list(base, extra)
+    if not _has_cmc_directory_rows(base) and any(
+        class_shard_status(client, kind, first_page_only=first_page_only).unavailable
+        for kind in kinds
+    ):
+        # Live directory is down. Do not walk an untyped map or swap in
+        # fixture rows — Backed PoR symbols stay searchable on their own.
+        return merge_por_catalog(base, catalog_from_por_feeds())
     if not _has_cmc_directory_rows(base):
         untyped_key = (id(client), "", bool(first_page_only))
         cached = _CLASS_CATALOG_MEMO.get(untyped_key)

@@ -296,6 +296,10 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "search-assign-anchor" not in source
     assert demo_app.SEARCH_MIN_CHARS == 3
     assert demo_app.CANDIDATE_STRIP_LIMIT == 4
+    assert demo_app.matches_limit_for_query("stock") == demo_app.CLASS_PAGE_LIMIT
+    assert demo_app.matches_limit_for_query("NVD") == 4
+    assert demo_app.matches_limit_for_query("MSAI") == 4
+    assert demo_app.LIVE_UNAVAILABLE_BANNER == "Live data unavailable"
     assert demo_app.SEARCH_MATCH_KEY == "search_match_pick"
     assert demo_app.SEARCH_FIELD_MAX == "17rem"
     assert "st.metric" in source
@@ -346,7 +350,7 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "_install_search_typeahead" in picker
     assert "on_change=_on_search_query_change" in picker
     assert picker.index("st.text_input") < picker.index("_install_search_typeahead")
-    assert picker.index("_install_search_typeahead") < picker.index("search_tickers")
+    assert picker.index("_install_search_typeahead") < picker.index("search_matches")
     assert "max-width" in source
     assert "stSelectbox" in source
     assert "z-index: 40" in source
@@ -1389,4 +1393,182 @@ def test_app_search_uses_cache_data_and_pending_query() -> None:
     assert demo_app.CATALOG_CACHE_TTL_SECONDS == 1800.0
     assert demo_app.pending_search_query() == ""
     assert demo_app.classes_for_query is classes_for_query
+    assert demo_app.LIVE_UNAVAILABLE_BANNER == "Live data unavailable"
+    assert demo_app.CLASS_REMAINDER_CAPTION == (
+        "Showing first 250 live results — type a ticker for the rest."
+    )
+    assert "[role=\"listbox\"]" in source
+    assert "overflow-y: auto" in source
+    picker = source.split("def _render_search_picker", 1)[1]
+    assert "FixtureClient(" not in picker
+    assert "create_client(" not in picker
+    assert "st.error(LIVE_UNAVAILABLE_BANNER)" in picker
+
+
+def _ranked_stock_client():
+    """Live map with six ranked stocks plus an obscure symbol only on lookup."""
+
+    class _Client:
+        source = "live"
+
+        def __init__(self) -> None:
+            self.calls = {"rwa_map": 0, "assets_list": 0, "assets_list_all": 0}
+            self.symbol_lookups: list[str] = []
+            self.class_pages: list[str] = []
+            self.stocks = [
+                {
+                    "symbol": f"S{index}",
+                    "name": f"Share {index}",
+                    "rwa_id": index,
+                    "asset_type": "stock",
+                    "rwa_rank": index,
+                }
+                for index in range(1, 7)
+            ]
+
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+            self.calls["rwa_map"] += 1
+            if symbol:
+                self.symbol_lookups.append(str(symbol).upper())
+                if str(symbol).upper() == "MSAI":
+                    return [
+                        {
+                            "symbol": "MSAI",
+                            "name": "Obscure Token",
+                            "rwa_id": 99,
+                            "asset_type": "stock",
+                            "rwa_rank": 4000,
+                        }
+                    ]
+                return []
+            kind = (asset_type or "").strip().lower()
+            self.class_pages.append(kind)
+            limit = kwargs.get("limit")
+            rows = list(self.stocks) if kind in {"", "stock"} else []
+            if limit is not None:
+                rows = rows[: int(limit)]
+            self._directory_page = {
+                "truncated": False,
+                "total_size": len(self.stocks) if kind in {"", "stock"} else 0,
+            }
+            return rows
+
+        def assets_list(self, **_kwargs):
+            self.calls["assets_list"] += 1
+            return {"rwa_assets": [], "total_size": 0, "has_more": False}
+
+        def assets_list_all(self, **kwargs):
+            self.calls["assets_list_all"] += 1
+            return self.assets_list(**kwargs)
+
+    return _Client()
+
+
+def test_category_browse_scrolls_past_four_on_the_live_map() -> None:
+    """Stocks tap and MSAI typeahead share rwa_map. Category Matches is not 4."""
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+
+    client = _ranked_stock_client()
+    scorer = TransparencyScorer(client)
+    query = demo_app.chip_query(CATEGORY_BY_ID["stock"])
+    catalog = demo_app._ticker_catalog(scorer, query=query)
+    hits = demo_app.search_matches(query, catalog, client)
+    assert [opt.symbol for opt in hits] == ["S1", "S2", "S3", "S4", "S5", "S6"]
+    assert len(hits) > demo_app.CANDIDATE_STRIP_LIMIT
+    assert all(opt.source == "rwa_map" for opt in hits)
+    assert client.class_pages == ["stock"]
+    assert client.calls["assets_list_all"] == 0
+    assert not demo_app.live_unavailable_banner(False, client, query)
+
+    # Same client family: obscure ticker is map?symbol=, not a fixture stub.
+    typed = demo_app._ticker_catalog(scorer, query="MSAI")
+    found = demo_app.search_matches("MSAI", typed, client)
+    assert [opt.symbol for opt in found] == ["MSAI"]
+    assert "MSAI" in client.symbol_lookups
+    assert client.source == "live"
+    # Prefix strip stays short when many names share a prefix.
+    prefix = demo_app.search_matches("SHA", typed, client)
+    assert len(prefix) == demo_app.CANDIDATE_STRIP_LIMIT
+    assert [opt.symbol for opt in prefix] == ["S1", "S2", "S3", "S4"]
+
+
+def test_full_class_page_sets_honest_remainder_caption() -> None:
+    import app as demo_app
+    from rwa_score.ticker_search import CLASS_PAGE_LIMIT, class_shard_status
+
+    class _FullPage:
+        source = "live"
+
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None, **_kwargs):
+            if symbol:
+                return []
+            rows = [
+                {
+                    "symbol": f"T{index}",
+                    "name": f"Token {index}",
+                    "rwa_id": index,
+                    "asset_type": "stock",
+                    "rwa_rank": index,
+                }
+                for index in range(1, CLASS_PAGE_LIMIT + 1)
+            ]
+            self._directory_page = {"truncated": True, "total_size": 7900}
+            return rows
+
+    client = _FullPage()
+    rows = load_class_catalog(client, "stock", first_page_only=True)
+    assert len(rows) == CLASS_PAGE_LIMIT
+    assert class_shard_status(client, "stock").truncated is True
+    assert class_shard_status(client, "stock").unavailable is False
+    assert demo_app.class_browse_truncated(client, "stock") is True
+    assert "250" in demo_app.CLASS_REMAINDER_CAPTION
+    assert "type a ticker for the rest" in demo_app.CLASS_REMAINDER_CAPTION
+
+
+def test_live_directory_failure_is_empty_not_fixture_swap() -> None:
+    """401 / 429 / 1008 leave Matches empty and do not build a FixtureClient."""
+    import app as demo_app
+    from rwa_score.client import CMCError
+    from rwa_score.scorer import TransparencyScorer
+    from rwa_score.ticker_search import class_shard_status
+
+    errors = (
+        CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized"),
+        CMCError("map hit CoinMarketCap rate limit (HTTP 429, error_code 1008)"),
+        CMCError("map -> CMC error 1008: rate limit"),
+    )
+    for exc in errors:
+        class _Down:
+            source = "live"
+
+            def __init__(self) -> None:
+                self.calls = {"rwa_map": 0, "assets_list": 0}
+                self.exc = exc
+
+            def rwa_map(self, *_args, **_kwargs):
+                self.calls["rwa_map"] += 1
+                raise self.exc
+
+            def assets_list(self, **_kwargs):
+                self.calls["assets_list"] += 1
+                raise self.exc
+
+        client = _Down()
+        scorer = TransparencyScorer(client)
+        catalog = demo_app._ticker_catalog(scorer, query="stock")
+        assert class_shard_status(client, "stock").unavailable is True
+        assert demo_app.search_matches("stock", catalog, client) == []
+        assert demo_app.live_unavailable_banner(False, client, "stock") is True
+        assert demo_app.live_unavailable_banner(True, client, "stock") is False
+        assert client.calls["assets_list"] == 0
+        assert client.calls["rwa_map"] == 1
+        assert client.source == "live"
+        symbols = {opt.symbol for opt in catalog}
+        assert "TSLA" not in symbols
+        assert "META" not in symbols
+        # Second browse inside the retry window does not hammer the endpoint.
+        again = demo_app._ticker_catalog(scorer, query="stock")
+        assert demo_app.search_matches("stock", again, client) == []
+        assert client.calls["rwa_map"] == 1
 
