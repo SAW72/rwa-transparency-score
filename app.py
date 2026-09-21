@@ -59,6 +59,8 @@ from rwa_score.ticker_search import (
     class_browse_truncated,
     class_shard_failure_is_fresh,
     class_shard_status,
+    client_shard_token,
+    empty_class_page_is_cached_success,
     classes_for_query,
     format_option,
     is_class_browse_query,
@@ -1525,18 +1527,27 @@ def pending_search_query() -> str:
 
 
 def _class_shard(scorer: TransparencyScorer, asset_type: str) -> list[TickerOption]:
-    """One cached CMC class page. Warm hits do not walk the directory."""
+    """One cached CMC class page. Warm hits do not walk the directory.
+
+    A non-empty success stays cached. ``[]`` is reused only for a recorded
+    successful empty page. Failed empties are not written, and a cached
+    ``[]`` is not a warm hit while the class is unavailable or the retry
+    window has elapsed.
+    """
     source = str(getattr(scorer.client, "source", "") or "")
     store = _shard_store()
-    key = f"{source}:{id(scorer.client)}:{asset_type}"
-    hit = store.get(key)
-    if hit is not None:
-        return list(hit)
-    # A recent 401/429 stays empty without another directory call. Do not
-    # pin that empty shard into the session — after the retry window the
-    # next browse fetches again. Successes stay cached.
+    key = f"{source}:{client_shard_token(scorer.client)}:{asset_type}"
+    # A recent 401/429 stays empty without another directory call.
     if class_shard_failure_is_fresh(scorer.client, asset_type):
+        store.pop(key, None)
         return []
+    if key in store:
+        hit = store.get(key) or []
+        if hit:
+            return list(hit)
+        if empty_class_page_is_cached_success(scorer.client, asset_type):
+            return []
+        store.pop(key, None)
     try:
         if _in_streamlit_script():
             rows = list(_cached_class_catalog_data(source == "fixture", asset_type))
@@ -1545,12 +1556,18 @@ def _class_shard(scorer: TransparencyScorer, asset_type: str) -> list[TickerOpti
                 scorer.client, asset_type, first_page_only=True
             )
     except _LiveDirectoryUnavailable:
+        store.pop(key, None)
         return []
     except Exception:
         if class_shard_status(scorer.client, asset_type).unavailable:
+            store.pop(key, None)
             return []
         raise
     if class_shard_status(scorer.client, asset_type).unavailable:
+        store.pop(key, None)
+        return []
+    if not rows and not empty_class_page_is_cached_success(scorer.client, asset_type):
+        store.pop(key, None)
         return []
     store[key] = rows
     return list(rows)
@@ -1573,9 +1590,17 @@ def _ticker_catalog(
     if source == "fixture" and not wanted:
         wanted = tuple(RWA_CLASS_IDS)
     store = _shard_store()
-    prefix = f"{source}:{id(scorer.client)}:"
+    prefix = f"{source}:{client_shard_token(scorer.client)}:"
     for kind in wanted:
-        store[f"{prefix}{kind}"] = _class_shard(scorer, kind)
+        # ``_class_shard`` writes successes only. Assigning its return here
+        # would pin a failed ``[]`` and let the next browse skip ``rwa_map``.
+        _class_shard(scorer, kind)
+        key = f"{prefix}{kind}"
+        if class_shard_status(scorer.client, kind).unavailable or (
+            key in store and not store[key]
+            and not empty_class_page_is_cached_success(scorer.client, kind)
+        ):
+            store.pop(key, None)
     merged = list(catalog_from_por_feeds())
     for key, rows in list(store.items()):
         if key.startswith(prefix):

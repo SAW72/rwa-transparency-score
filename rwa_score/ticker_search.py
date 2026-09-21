@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Sequence
 
@@ -746,7 +747,9 @@ DIRECTORY_FAILURE_RETRY_SECONDS = 60.0
 
 # Process-local class shards. Streamlit widget reruns share the scorer client
 # (``@st.cache_resource``); this memo stops a second walk of the same class.
-_CLASS_CATALOG_MEMO: dict[tuple[int, str, bool], list[TickerOption]] = {}
+# Keys are a per-instance token, not ``id(client)`` — CPython reuses ids and a
+# later client must not inherit the previous shard.
+_CLASS_CATALOG_MEMO: dict[tuple[str, str, bool], list[TickerOption]] = {}
 
 
 @dataclass(frozen=True)
@@ -763,9 +766,9 @@ class ClassShardStatus:
     failed_at: float = 0.0
 
 
-_CLASS_STATUS: dict[tuple[int, str, bool], ClassShardStatus] = {}
-# client id -> normalized query whose ``map?symbol=`` just failed
-_SYMBOL_LOOKUP_FAILED: dict[int, str] = {}
+_CLASS_STATUS: dict[tuple[str, str, bool], ClassShardStatus] = {}
+# client token -> normalized query whose ``map?symbol=`` just failed
+_SYMBOL_LOOKUP_FAILED: dict[str, str] = {}
 
 
 def clear_catalog_cache() -> None:
@@ -775,9 +778,59 @@ def clear_catalog_cache() -> None:
     _SYMBOL_LOOKUP_FAILED.clear()
 
 
-def _status_key(client: Any, asset_type: str, first_page_only: bool) -> tuple[int, str, bool]:
+def client_shard_token(client: Any) -> str:
+    """Identity for catalog memos. Stable on the instance, never a recycled ``id()``."""
+    if client is None:
+        return "none"
+    try:
+        existing = getattr(client, "_rwa_shard_token", None)
+    except Exception:  # noqa: BLE001 — slotted / hostile clients
+        existing = None
+    if isinstance(existing, str) and existing:
+        return existing
+    token = uuid.uuid4().hex
+    try:
+        setattr(client, "_rwa_shard_token", token)
+    except Exception:  # noqa: BLE001
+        return f"id:{id(client)}"
+    return token
+
+
+def _status_key(client: Any, asset_type: str, first_page_only: bool) -> tuple[str, str, bool]:
     kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
-    return (id(client), kind, bool(first_page_only))
+    return (client_shard_token(client), kind, bool(first_page_only))
+
+
+def class_shard_status_recorded(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool = True,
+) -> bool:
+    """True when this class has a recorded fetch outcome (success or failure)."""
+    if client is None:
+        return False
+    return _status_key(client, asset_type, first_page_only) in _CLASS_STATUS
+
+
+def empty_class_page_is_cached_success(
+    client: Any,
+    asset_type: str,
+    *,
+    first_page_only: bool = True,
+) -> bool:
+    """True when ``[]`` is an honest empty 200, not a failed or unknown pin.
+
+    Unavailable, retry-due, and missing status are not warm hits.
+    """
+    if not class_shard_status_recorded(
+        client, asset_type, first_page_only=first_page_only
+    ):
+        return False
+    status = class_shard_status(
+        client, asset_type, first_page_only=first_page_only
+    )
+    return not status.unavailable
 
 
 def class_shard_status(
@@ -1273,21 +1326,33 @@ def cached_class_catalog(
     After :data:`DIRECTORY_FAILURE_RETRY_SECONDS` the shard is fetched again.
     """
     kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
-    key = (id(client), kind, bool(first_page_only))
-    hit = _CLASS_CATALOG_MEMO.get(key)
-    if hit is not None:
-        status = _CLASS_STATUS.get(key)
-        stale_failure = (
-            status is not None
-            and status.unavailable
-            and not class_shard_failure_is_fresh(
-                client, kind, first_page_only=first_page_only
-            )
-        )
-        if not stale_failure:
-            return list(hit)
+    key = _status_key(client, kind, first_page_only)
+    # A fresh 401/429 is empty without another directory call, and that empty
+    # is not stored. A cached ``[]`` is a warm hit only for a recorded
+    # successful page. Unavailable / retry-due empties refetch.
+    if class_shard_failure_is_fresh(client, kind, first_page_only=first_page_only):
         _CLASS_CATALOG_MEMO.pop(key, None)
+        return []
+    hit = _CLASS_CATALOG_MEMO.get(key)
+    if hit:
+        return list(hit)
+    if (
+        hit is not None
+        and empty_class_page_is_cached_success(
+            client, kind, first_page_only=first_page_only
+        )
+    ):
+        return []
+    _CLASS_CATALOG_MEMO.pop(key, None)
     rows = load_class_catalog(client, kind, first_page_only=first_page_only)
+    if class_shard_status(client, kind, first_page_only=first_page_only).unavailable:
+        _CLASS_CATALOG_MEMO.pop(key, None)
+        return []
+    if not rows and not empty_class_page_is_cached_success(
+        client, kind, first_page_only=first_page_only
+    ):
+        _CLASS_CATALOG_MEMO.pop(key, None)
+        return []
     _CLASS_CATALOG_MEMO[key] = rows
     return list(rows)
 
@@ -1309,10 +1374,11 @@ def lookup_symbol_on_client(client: Any, query: str) -> list[TickerOption]:
     if not symbol:
         return []
     rows, _truncated, failed = _map_page(client, symbol)
+    token = client_shard_token(client)
     if failed:
-        _SYMBOL_LOOKUP_FAILED[id(client)] = q.lower()
+        _SYMBOL_LOOKUP_FAILED[token] = q.lower()
         return []
-    _SYMBOL_LOOKUP_FAILED.pop(id(client), None)
+    _SYMBOL_LOOKUP_FAILED.pop(token, None)
     return catalog_from_rwa_map(rows)
 
 
@@ -1320,7 +1386,7 @@ def symbol_lookup_failed(client: Any, query: str) -> bool:
     """True when ``map?symbol=`` just failed for this exact query."""
     if client is None:
         return False
-    failed = _SYMBOL_LOOKUP_FAILED.get(id(client))
+    failed = _SYMBOL_LOOKUP_FAILED.get(client_shard_token(client))
     if not failed:
         return False
     return failed == normalize_query(query).lower()
@@ -1385,20 +1451,26 @@ def load_search_catalog(
         # fixture rows — Backed PoR symbols stay searchable on their own.
         return merge_por_catalog(base, catalog_from_por_feeds())
     if not _has_cmc_directory_rows(base):
-        untyped_key = (id(client), "", bool(first_page_only))
+        untyped_key = (client_shard_token(client), "", bool(first_page_only))
         cached = _CLASS_CATALOG_MEMO.get(untyped_key)
-        if cached is not None:
+        if cached:
             base = list(cached)
+        elif cached is not None:
+            # Recorded honest empty. A failed empty is never written below.
+            base = []
         else:
             raw_rows: list[dict[str, Any]] = []
+            failed = False
             try:
                 raw_rows = _safe_rwa_map(client)
             except Exception:  # noqa: BLE001 — search must not take down scoring
                 raw_rows = []
+                failed = True
             if raw_rows:
                 info = _fixture_info_by_id(client, raw_rows)
                 base = catalog_from_rwa_map(raw_rows, info_by_id=info)
-            _CLASS_CATALOG_MEMO[untyped_key] = list(base)
+            if not failed:
+                _CLASS_CATALOG_MEMO[untyped_key] = list(base)
     extra = catalog_from_por_feeds()
     return merge_por_catalog(base, extra)
 

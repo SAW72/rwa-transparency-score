@@ -1540,19 +1540,49 @@ def test_full_class_page_sets_honest_remainder_caption() -> None:
     assert "type a ticker for the rest" in demo_app.CLASS_REMAINDER_CAPTION
 
 
+def _isolate_live_catalog_memos() -> None:
+    """Drop process, class, and session shards before a live-failure case."""
+    import app as demo_app
+    from rwa_score.ticker_search import clear_catalog_cache
+
+    clear_catalog_cache()
+    demo_app._catalog_shard_memo.clear()
+    try:
+        import streamlit as st
+
+        store = st.session_state.get("catalog_shards")
+        if isinstance(store, dict):
+            store.clear()
+    except Exception:
+        pass
+
+
 def test_live_directory_failure_is_empty_not_fixture_swap() -> None:
     """401 / 429 / 1008 leave Matches empty and do not build a FixtureClient."""
+    import time
+
     import app as demo_app
     from rwa_score.client import CMCError
     from rwa_score.scorer import TransparencyScorer
-    from rwa_score.ticker_search import class_shard_status
+    from rwa_score.ticker_search import (
+        DIRECTORY_FAILURE_RETRY_SECONDS,
+        ClassShardStatus,
+        _CLASS_CATALOG_MEMO,
+        _CLASS_STATUS,
+        _status_key,
+        class_shard_status,
+        client_shard_token,
+    )
 
+    _isolate_live_catalog_memos()
     errors = (
         CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized"),
         CMCError("map hit CoinMarketCap rate limit (HTTP 429, error_code 1008)"),
         CMCError("map -> CMC error 1008: rate limit"),
     )
     for exc in errors:
+        _isolate_live_catalog_memos()
+
         class _Down:
             source = "live"
 
@@ -1581,8 +1611,71 @@ def test_live_directory_failure_is_empty_not_fixture_swap() -> None:
         symbols = {opt.symbol for opt in catalog}
         assert "TSLA" not in symbols
         assert "META" not in symbols
+        token = client_shard_token(client)
+        assert not any(key[0] == token for key in _CLASS_CATALOG_MEMO)
+        store = demo_app._shard_store()
+        assert not any(
+            str(key).startswith(f"live:{token}:") and not rows
+            for key, rows in store.items()
+        )
         # Second browse inside the retry window does not hammer the endpoint.
         again = demo_app._ticker_catalog(scorer, query="stock")
         assert demo_app.search_matches("stock", again, client) == []
         assert client.calls["rwa_map"] == 1
+
+    # After the retry window a recovered directory must be fetched again.
+    # A pinned failed ``[]`` used to keep rwa_map at 1.
+    _isolate_live_catalog_memos()
+
+    class _Recover:
+        source = "live"
+
+        def __init__(self) -> None:
+            self.calls = {"rwa_map": 0, "assets_list": 0}
+            self.down = True
+
+        def rwa_map(self, *_args, **_kwargs):
+            self.calls["rwa_map"] += 1
+            if self.down:
+                raise CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized")
+            return [
+                {
+                    "symbol": "S1",
+                    "name": "Recovered Stock",
+                    "rwa_id": 1,
+                    "asset_type": "stock",
+                    "rwa_rank": 1,
+                }
+            ]
+
+        def assets_list(self, **_kwargs):
+            self.calls["assets_list"] += 1
+            raise CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized")
+
+    client = _Recover()
+    scorer = TransparencyScorer(client)
+    failed = demo_app._ticker_catalog(scorer, query="stock")
+    assert class_shard_status(client, "stock").unavailable is True
+    assert demo_app.search_matches("stock", failed, client) == []
+    assert client.calls["rwa_map"] == 1
+    demo_app._ticker_catalog(scorer, query="stock")
+    assert client.calls["rwa_map"] == 1
+    # A failed empty pinned in either store must not survive the retry window.
+    token = client_shard_token(client)
+    _CLASS_CATALOG_MEMO[(token, "stock", True)] = []
+    demo_app._shard_store()[f"live:{token}:stock"] = []
+    demo_app._catalog_shard_memo[f"live:{token}:stock"] = []
+    status_key = _status_key(client, "stock", True)
+    _CLASS_STATUS[status_key] = ClassShardStatus(
+        unavailable=True,
+        truncated=False,
+        failed_at=time.monotonic() - DIRECTORY_FAILURE_RETRY_SECONDS - 5,
+    )
+    client.down = False
+    recovered = demo_app._ticker_catalog(scorer, query="stock")
+    assert client.calls["rwa_map"] == 2
+    assert class_shard_status(client, "stock").unavailable is False
+    assert [opt.symbol for opt in demo_app.search_matches("stock", recovered, client)] == [
+        "S1"
+    ]
 
