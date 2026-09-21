@@ -748,6 +748,7 @@ def test_horizontal_category_pills_are_not_column_blocks() -> None:
     picker = source.split("def _render_search_picker", 1)[1]
     assert 'class="rat-cat-row"' in picker
     assert "cat_chip_" not in picker
+    assert "category_pill_href" in picker
 
 
 class _StockScopedLiveClient:

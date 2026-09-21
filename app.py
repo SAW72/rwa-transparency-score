@@ -16,7 +16,7 @@ import html
 import os
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -221,6 +221,10 @@ def sidebar_weights_markdown() -> str:
 FIXTURE_TICKERS = ["NVDA", "TSLA", "AAPL", "META"]
 DEFAULT_SLOTS = ["NVDA", "TSLA", "AAPL", "META"]
 MAX_COMPARE_SLOTS = 4
+# Category pills are <a href="?rwa_cat=…"> remounts. Carry compare state in
+# the URL so a second chip click does not re-init NVDA/TSLA/AAPL/META.
+SLOT_QUERY_KEY = "rwa_slots"
+ACTIVE_QUERY_KEY = "rwa_active"
 # Pillar / score gaps below these stay unlabeled — do not invent a "driver".
 COMPARE_MIN_SCORE_DELTA = 5.0
 COMPARE_MIN_PILLAR_DELTA = 8.0
@@ -538,15 +542,105 @@ def _score_slots(
     return results
 
 
+def _query_param_get(name: str) -> str | None:
+    """One query-param value, or None when Streamlit has no ScriptRunContext."""
+    try:
+        raw = st.query_params.get(name)
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return None
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    if raw is None:
+        return None
+    return str(raw)
+
+
+def format_slots_query(slots: list[str]) -> str:
+    """Serialize compare slots for a category-pill remount URL."""
+    padded = list(slots[:MAX_COMPARE_SLOTS])
+    while len(padded) < MAX_COMPARE_SLOTS:
+        padded.append("")
+    return ",".join(normalize_ticker(raw) or "" for raw in padded)
+
+
+def parse_slots_query(raw: str | None) -> list[str] | None:
+    """Restore slots from ``rwa_slots``. None means “not in the URL” → defaults."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    parts = [normalize_ticker(piece) for piece in text.split(",")]
+    if not parts:
+        return None
+    if len(parts) != MAX_COMPARE_SLOTS:
+        parts = (parts + [""] * MAX_COMPARE_SLOTS)[:MAX_COMPARE_SLOTS]
+    return parts
+
+
+def parse_active_query(raw: str | None) -> int | None:
+    """Restore the highlighted slot index from ``rwa_active``."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        index = int(text)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= index < MAX_COMPARE_SLOTS:
+        return None
+    return index
+
+
+def category_pill_href(cat_id: str, slots: list[str], active: int) -> str:
+    """Category chip URL: set search class without wiping the compare row."""
+    slot_q = quote(format_slots_query(slots), safe=",")
+    cid = quote(str(cat_id), safe="")
+    return f"?rwa_cat={cid}&{SLOT_QUERY_KEY}={slot_q}&{ACTIVE_QUERY_KEY}={int(active)}"
+
+
+def _nav_compare_state() -> tuple[list[str], int]:
+    """Current compare row for category hrefs. Defaults only if unset."""
+    try:
+        slots = list(st.session_state.slots)
+        active = int(st.session_state.active_slot)
+    except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
+        return list(DEFAULT_SLOTS), 0
+    if len(slots) != MAX_COMPARE_SLOTS:
+        slots = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
+    if not 0 <= active < MAX_COMPARE_SLOTS:
+        active = default_active_slot(slots)
+    return slots, active
+
+
 def _ensure_slot_state() -> None:
+    """Init compare slots on first load; restore them after a category remount.
+
+    Category pills navigate with ``?rwa_cat=`` (full page load). That can open a
+    new Streamlit session and drop ``st.session_state``. Defaults apply only
+    when this is a true first load — no session slots and no ``rwa_slots`` in
+    the URL. A second category click carries the current row in the href.
+    """
     if "slots" not in st.session_state:
-        st.session_state.slots = list(DEFAULT_SLOTS)
+        restored = parse_slots_query(_query_param_get(SLOT_QUERY_KEY))
+        st.session_state.slots = (
+            list(restored) if restored is not None else list(DEFAULT_SLOTS)
+        )
     slots = list(st.session_state.slots)
     if len(slots) != MAX_COMPARE_SLOTS:
         slots = (slots + list(DEFAULT_SLOTS))[:MAX_COMPARE_SLOTS]
         st.session_state.slots = slots
     if "active_slot" not in st.session_state:
-        st.session_state.active_slot = default_active_slot(slots)
+        restored_active = parse_active_query(_query_param_get(ACTIVE_QUERY_KEY))
+        st.session_state.active_slot = (
+            restored_active
+            if restored_active is not None
+            else default_active_slot(slots)
+        )
     if not 0 <= int(st.session_state.active_slot) < MAX_COMPARE_SLOTS:
         st.session_state.active_slot = default_active_slot(slots)
 
@@ -1157,12 +1251,7 @@ def _auto_place(ticker: str) -> None:
     symbol = normalize_ticker(ticker)
     if not symbol:
         return
-    if "slots" not in st.session_state:
-        st.session_state.slots = list(DEFAULT_SLOTS)
-    if "active_slot" not in st.session_state:
-        st.session_state.active_slot = default_active_slot(
-            list(st.session_state.slots)
-        )
+    _ensure_slot_state()
     updated, nxt = place_search_match(
         list(st.session_state.slots), int(st.session_state.active_slot), symbol
     )
@@ -1237,12 +1326,13 @@ def _render_search_picker(
         except (KeyError, TypeError):
             pass
 
+    nav_slots, nav_active = _nav_compare_state()
     pills = []
     for cat in chip_cats:
         label = html.escape(chip_display_label(cat.label))
-        cid = html.escape(cat.id)
+        href = html.escape(category_pill_href(cat.id, nav_slots, nav_active), quote=True)
         pills.append(
-            f'<a class="rat-cat-pill" href="?rwa_cat={cid}" target="_self">{label}</a>'
+            f'<a class="rat-cat-pill" href="{href}" target="_self">{label}</a>'
         )
     st.markdown(
         f'<div class="rat-cat-row" role="list">{"".join(pills)}</div>',

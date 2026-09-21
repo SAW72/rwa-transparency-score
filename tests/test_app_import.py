@@ -128,6 +128,116 @@ def test_assign_ticker_rejects_empty_and_bad_index() -> None:
         demo_app.assign_ticker_to_slot(list(demo_app.DEFAULT_SLOTS), 4, "NVDA")
 
 
+class _FakeSS(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+class _FakeQP(dict):
+    def get(self, key, default=None):
+        return dict.get(self, key, default)
+
+
+def test_category_remount_preserves_compare_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Second category click remounts via ?rwa_cat= — do not reset to NVDA/TSLA/AAPL."""
+    import app as demo_app
+
+    assert demo_app.format_slots_query(["GOLD", "TSLA", "AAPL", "META"]) == (
+        "GOLD,TSLA,AAPL,META"
+    )
+    assert demo_app.parse_slots_query("GOLD,TSLA,AAPL,META") == [
+        "GOLD",
+        "TSLA",
+        "AAPL",
+        "META",
+    ]
+    assert demo_app.parse_slots_query(None) is None
+    assert demo_app.parse_slots_query("") is None
+    assert demo_app.parse_slots_query("bNVDA") == ["bNVDA", "", "", ""]
+    assert demo_app.parse_active_query("1") == 1
+    assert demo_app.parse_active_query("9") is None
+    assert demo_app.parse_active_query("x") is None
+
+    href = demo_app.category_pill_href(
+        "commodity", ["GOLD", "TSLA", "AAPL", "META"], 1
+    )
+    assert href.startswith("?rwa_cat=commodity&")
+    assert "rwa_slots=GOLD,TSLA,AAPL,META" in href
+    assert "rwa_active=1" in href
+    # Bare ?rwa_cat= would wipe the row on remount — href must carry slots.
+    assert href != "?rwa_cat=commodity"
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "category_pill_href" in source
+    assert 'href="?rwa_cat={cid}"' not in source
+    assert "SLOT_QUERY_KEY" in source
+
+    # True first load: empty session, no slot params → published defaults.
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    monkeypatch.setattr(demo_app.st, "query_params", _FakeQP())
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == list(demo_app.DEFAULT_SLOTS)
+    assert demo_app.st.session_state.active_slot == 0
+
+    # Category deep-link without a carried row is still a first load.
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    monkeypatch.setattr(demo_app.st, "query_params", _FakeQP({"rwa_cat": "commodity"}))
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == list(demo_app.DEFAULT_SLOTS)
+
+    # Repro: GOLD in a slot, return to categories, click another class.
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    monkeypatch.setattr(
+        demo_app.st,
+        "query_params",
+        _FakeQP(
+            {
+                "rwa_cat": "government_security",
+                demo_app.SLOT_QUERY_KEY: "GOLD,TSLA,AAPL,META",
+                demo_app.ACTIVE_QUERY_KEY: "1",
+            }
+        ),
+    )
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == ["GOLD", "TSLA", "AAPL", "META"]
+    assert demo_app.st.session_state.active_slot == 1
+
+    # Session row wins over a stale URL (no overwrite after first restore).
+    filled = _FakeSS(slots=["GOLD", "SLV", "AAPL", "META"], active_slot=2)
+    monkeypatch.setattr(demo_app.st, "session_state", filled)
+    monkeypatch.setattr(
+        demo_app.st,
+        "query_params",
+        _FakeQP({demo_app.SLOT_QUERY_KEY: "NVDA,TSLA,AAPL,META"}),
+    )
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == ["GOLD", "SLV", "AAPL", "META"]
+    assert demo_app.st.session_state.active_slot == 2
+
+    # After remount, the next pick fills the carried row — not NVDA/TSLA/AAPL.
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    monkeypatch.setattr(
+        demo_app.st,
+        "query_params",
+        _FakeQP(
+            {
+                demo_app.SLOT_QUERY_KEY: "GOLD,TSLA,AAPL,META",
+                demo_app.ACTIVE_QUERY_KEY: "1",
+            }
+        ),
+    )
+    demo_app._auto_place("SLV")
+    assert demo_app.st.session_state.slots == ["GOLD", "SLV", "AAPL", "META"]
+    assert demo_app.st.session_state.active_slot == 2
+    assert demo_app.st.session_state["_clear_search"] is True
+
+
 def test_score_slots_isolates_unknown_fixture_ticker(fixture_scorer) -> None:
     import app as demo_app
 
