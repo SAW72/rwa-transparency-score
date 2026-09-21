@@ -1326,6 +1326,32 @@ def _on_search_query_change() -> None:
     _clear_match_pick_state()
 
 
+def _on_class_pill(query: str) -> None:
+    """Select a class before the script body builds the catalog.
+
+    Streamlit runs this callback before the script. The pill ``if`` body runs
+    only after ``_ticker_catalog(pending_search_query())``, so without this
+    the click frame still has the previous query: a live 401 never marks the
+    class unavailable and Matches shows "No directory matches" instead of the
+    banner.
+    """
+    st.session_state.pop("_clear_search", None)
+    st.session_state.ticker_query = query
+    _clear_match_pick_state()
+
+
+def catalog_for_active_query(scorer, catalog: list[TickerOption], query: str):
+    """Catalog for the query the picker is about to render.
+
+    The module-level build uses ``pending_search_query()`` at the start of
+    the run. A class pill can change Search in that same run; reload so a
+    live directory failure is recorded before the banner check.
+    """
+    if scorer is None or not (query or "").strip():
+        return catalog
+    return _ticker_catalog(scorer, query=query)
+
+
 def search_typeahead_script(debounce_ms: int = SEARCH_TYPEAHEAD_DEBOUNCE_MS) -> str:
     """JS that commits the Search box on input so Matches update without Enter."""
     delay = max(0, int(debounce_ms))
@@ -1445,6 +1471,7 @@ def _render_search_picker(
     catalog: list[TickerOption],
     use_fixtures: bool,
     client=None,
+    scorer=None,
 ) -> None:
     """Categories → compact Search + attached match dropdown.
 
@@ -1496,6 +1523,8 @@ def _render_search_picker(
                 chip_display_label(cat.label),
                 key=f"rwa_class_{cat.id}",
                 use_container_width=True,
+                on_click=_on_class_pill,
+                args=(chip_query(cat),),
             ):
                 st.session_state.ticker_query = chip_query(cat)
                 _clear_match_pick_state()
@@ -1513,6 +1542,9 @@ def _render_search_picker(
     # Keep SEARCH_MATCH_KEY stable — do not delete it while the menu can be open.
     if not is_browse_chip_query(query) and not is_class_browse_query(query):
         _install_search_typeahead()
+    # Pill click updates Search after the outer catalog build. Reload for
+    # this query so a 401/429 sets class_shard_status before the banner.
+    catalog = catalog_for_active_query(scorer, catalog, query)
     matches = search_matches(
         query, catalog, client, use_fixtures=use_fixtures
     )
@@ -2322,7 +2354,7 @@ st.caption(
 )
 
 catalog = _ticker_catalog(scorer, query=pending_search_query())
-_render_search_picker(catalog, use_fixtures, client=scorer.client)
+_render_search_picker(catalog, use_fixtures, client=scorer.client, scorer=scorer)
 
 active = int(st.session_state.active_slot)
 target = next_place_index(list(st.session_state.slots), active)

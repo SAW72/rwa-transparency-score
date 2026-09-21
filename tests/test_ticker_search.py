@@ -379,7 +379,10 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "z-index: 40" in source
     assert "z-index: 1000" in source
     body = source.split('st.subheader("Score / Compare")', 1)[1]
-    assert "_render_search_picker(catalog, use_fixtures, client=scorer.client)" in body
+    assert "_render_search_picker(catalog, use_fixtures, client=scorer.client, scorer=scorer)" in body
+    assert picker.index("catalog_for_active_query") < picker.index("search_matches")
+    assert picker.index("st.text_input") < picker.index("catalog_for_active_query")
+    assert "on_click=_on_class_pill" in chip_block
     assert "search_match_" not in body.split("_render_search_picker", 1)[0]
     assert "rat-cat-pill" in source
     assert "Ticker, name, or category" in source
@@ -1564,6 +1567,50 @@ def _isolate_live_catalog_memos() -> None:
             store.clear()
     except Exception:
         pass
+
+
+def test_stale_catalog_reloads_before_live_banner() -> None:
+    """A pill click must banner even when the outer catalog used the old query.
+
+    ``pending_search_query()`` runs before the pill ``if`` body. That frame
+    used to search an empty live catalog and show "No directory matches"
+    instead of "Live data unavailable".
+    """
+    import app as demo_app
+    from rwa_score.client import CMCError
+    from rwa_score.scorer import TransparencyScorer
+    from rwa_score.ticker_search import class_shard_status
+
+    _isolate_live_catalog_memos()
+
+    class _Down:
+        source = "live"
+
+        def __init__(self) -> None:
+            self.calls = {"rwa_map": 0, "assets_list": 0}
+
+        def rwa_map(self, *_args, **_kwargs):
+            self.calls["rwa_map"] += 1
+            raise CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized")
+
+        def assets_list(self, **_kwargs):
+            self.calls["assets_list"] += 1
+            raise CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized")
+
+    client = _Down()
+    scorer = TransparencyScorer(client)
+    stale = demo_app._ticker_catalog(scorer, query="")
+    assert client.calls["rwa_map"] == 0
+    assert demo_app.live_unavailable_banner(False, client, "stock") is False
+    catalog = demo_app.catalog_for_active_query(scorer, stale, "stock")
+    assert client.calls["rwa_map"] == 1
+    assert class_shard_status(client, "stock").unavailable is True
+    assert demo_app.search_matches("stock", catalog, client) == []
+    assert demo_app.live_unavailable_banner(False, client, "stock") is True
+    assert demo_app.live_unavailable_banner(True, client, "stock") is False
+    symbols = {opt.symbol for opt in catalog}
+    assert "TSLA" not in symbols
+    assert "META" not in symbols
 
 
 def test_live_directory_failure_is_empty_not_fixture_swap() -> None:
