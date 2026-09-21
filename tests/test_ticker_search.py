@@ -1583,6 +1583,8 @@ def test_class_browse_dropdown_is_one_continuous_scroll() -> None:
     assert "Showing first 250" in script
     assert demo_app.CLASS_PICK_LABEL in script
     assert "commitPick" in script
+    assert "win.KeyboardEvent" in demo_app.TICKER_DROPDOWN_JS
+    assert "win.InputEvent" in demo_app.TICKER_DROPDOWN_JS
     assert "position: fixed" in Path(demo_app.__file__).read_text(encoding="utf-8")
 
     browse = Path(demo_app.__file__).read_text(encoding="utf-8").split(

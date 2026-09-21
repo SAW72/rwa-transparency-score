@@ -434,8 +434,11 @@ TICKER_DROPDOWN_JS = r"""
   function fireEnter(input) {
     // Streamlit 1.39 text input commits on keypress Enter, and only when
     // React state is already dirty. keydown does not commit this widget.
+    // Events must be constructed in the parent window — an iframe event
+    // dispatched onto the app input is ignored.
+    var EventCtor = win.KeyboardEvent || KeyboardEvent;
     try {
-      input.dispatchEvent(new KeyboardEvent("keypress", {
+      input.dispatchEvent(new EventCtor("keypress", {
         key: "Enter", code: "Enter", keyCode: 13, which: 13,
         bubbles: true, cancelable: true
       }));
@@ -448,12 +451,13 @@ TICKER_DROPDOWN_JS = r"""
     var proto = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype, "value");
     if (proto && proto.set) proto.set.call(input, symbol);
     else input.value = symbol;
+    var InputCtor = win.InputEvent || win.Event;
     try {
-      input.dispatchEvent(new InputEvent("input", {
+      input.dispatchEvent(new InputCtor("input", {
         bubbles: true, cancelable: true, data: symbol, inputType: "insertText"
       }));
     } catch (err) {
-      try { input.dispatchEvent(new Event("input", { bubbles: true })); } catch (err2) {}
+      try { input.dispatchEvent(new win.Event("input", { bubbles: true })); } catch (err2) {}
     }
     // React applies the input event asynchronously. One keypress on the
     // next turn commits the new value. Do not also blur — a second commit
