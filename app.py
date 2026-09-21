@@ -253,9 +253,14 @@ SEARCH_MATCH_KEY = "search_match_pick"
 # not mount (or remount) a BaseWeb menu. Unselected stays None — do not
 # delete this key just because nothing is picked.
 SEARCH_LIST_KEY = "search_match_list"
-# Visible window for the class list. Rows scroll inside it; the page does not
-# grow with the whole shard, and Chrome is not handed a 250-option selectbox.
-MATCHES_SCROLL_PX = 320
+# Class browse pages this many plain buttons. A full-class st.radio inside
+# st.container(height=...) mounts every row as markdown in a nested scroll
+# surface and Aw Snaps Chrome (error 9) — Stocks overflows it, the ETF label
+# is markdown, and a radio click reruns while that surface is torn down.
+# The loaded shard is still up to CLASS_PAGE_LIMIT; only one page is mounted.
+MATCHES_PAGE_SIZE = 12
+SEARCH_PAGE_KEY = "search_match_page"
+SEARCH_PAGE_QUERY_KEY = "search_match_page_query"
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
 # Streamlit 1.39 text_input commits on Enter/blur only. Debounced input
 # events commit the same widget so Matches update as the user types.
@@ -353,9 +358,11 @@ SEARCH_TYPEAHEAD_JS = r"""
   }
 
   function classBrowse() {
-    // Class Matches is a radio list, not a selectbox. While it is on the
-    // page the pill rerun must not focus or rebind (Aw Snap before open).
-    return !!doc.querySelector('[data-testid="stRadio"]');
+    // Category Matches is a paged button list in this container. The pill
+    // rerun and the place-rerun must not focus the search box — that rebuild
+    // Aw Snaps Chrome (error 9) before the list or the compare slot paints.
+    // Do not wait for a radio node: a live 401 never mounts one.
+    return !!doc.querySelector(".st-key-rwa_class_browse");
   }
 
   function attach() {
@@ -365,7 +372,9 @@ SEARCH_TYPEAHEAD_JS = r"""
     var input = findSearchInput();
     if (!input) return;
     bind(input);
-    restoreFocus(input);
+    // Observer bursts must not steal focus. Restore only while the user is
+    // actually typing a prefix (keepFocus). A pill click clears that flag.
+    if (keepFocus()) restoreFocus(input);
   }
 
   function attachSoon() {
@@ -1337,6 +1346,101 @@ def _install_search_typeahead() -> None:
     )
 
 
+def class_match_window(
+    count: int, page: int, page_size: int = MATCHES_PAGE_SIZE
+) -> tuple[int, int, int]:
+    """Clamp a class-browse page to ``page_size`` rows.
+
+    Returns ``(page, start, end)`` with ``end`` exclusive. The shard can be
+    up to ``CLASS_PAGE_LIMIT``; the DOM only mounts one page.
+    """
+    size = max(1, int(page_size))
+    total = max(0, int(count))
+    pages = max(1, (total + size - 1) // size) if total else 1
+    current = int(page)
+    if current < 0 or current >= pages:
+        current = 0
+    start = current * size
+    end = min(total, start + size)
+    return current, start, end
+
+
+def _class_match_page(query: str, count: int) -> tuple[int, int, int]:
+    """Session page for this class query. A new query starts at the first page."""
+    if st.session_state.get(SEARCH_PAGE_QUERY_KEY) != query:
+        st.session_state[SEARCH_PAGE_KEY] = 0
+        st.session_state[SEARCH_PAGE_QUERY_KEY] = query
+    page = int(st.session_state.get(SEARCH_PAGE_KEY) or 0)
+    current, start, end = class_match_window(count, page)
+    st.session_state[SEARCH_PAGE_KEY] = current
+    return current, start, end
+
+
+def _render_class_browse(
+    matches: list[TickerOption],
+    query: str,
+    *,
+    directory_down: bool,
+    use_fixtures: bool,
+    client,
+) -> None:
+    """One page of plain buttons for a class. Does not score the shard.
+
+    Pill tap only lists the page. A row click places that one ticker; compare
+    scoring stays on the slot row. No radio and no fixed-height scroll
+    container — those crashed Chrome on Stocks, ETFs, and on activating GOLD.
+    """
+    with st.container(key="rwa_class_browse"):
+        if directory_down:
+            st.error(LIVE_UNAVAILABLE_BANNER)
+            _clear_match_pick_state()
+            return
+        if not matches:
+            _clear_match_pick_state()
+            if len((query or "").strip()) >= SEARCH_MIN_CHARS:
+                st.caption("No directory matches — type a ticker or tap a category.")
+            return
+        options = [opt.symbol for opt in matches]
+        labels = {opt.symbol: format_option(opt) for opt in matches}
+        _page, start, end = _class_match_page(query, len(options))
+        if len(options) > MATCHES_PAGE_SIZE:
+            prev_col, next_col = st.columns(2, gap="small")
+            with prev_col:
+                if st.button(
+                    "Previous",
+                    key="rwa_match_prev",
+                    disabled=start == 0,
+                    use_container_width=True,
+                ):
+                    st.session_state[SEARCH_PAGE_KEY] = max(0, _page - 1)
+                    _page, start, end = class_match_window(
+                        len(options), _page - 1
+                    )
+                    st.session_state[SEARCH_PAGE_KEY] = _page
+            with next_col:
+                if st.button(
+                    "Next",
+                    key="rwa_match_next",
+                    disabled=end >= len(options),
+                    use_container_width=True,
+                ):
+                    st.session_state[SEARCH_PAGE_KEY] = _page + 1
+                    _page, start, end = class_match_window(
+                        len(options), _page + 1
+                    )
+                    st.session_state[SEARCH_PAGE_KEY] = _page
+            st.caption(f"Showing {start + 1}–{end} of {len(options)}")
+        for symbol in options[start:end]:
+            if st.button(
+                labels.get(symbol, symbol),
+                key=f"rwa_match_row_{query}_{symbol}",
+                use_container_width=True,
+            ):
+                _auto_place(symbol)
+        if not use_fixtures and class_browse_truncated(client, query):
+            st.caption(CLASS_REMAINDER_CAPTION)
+
+
 def _render_search_picker(
     catalog: list[TickerOption],
     use_fixtures: bool,
@@ -1413,33 +1517,23 @@ def _render_search_picker(
         query, catalog, client, use_fixtures=use_fixtures
     )
     directory_down = live_unavailable_banner(use_fixtures, client, query)
-    if directory_down:
+    if is_class_browse_query(query):
+        # Paged buttons, not a radio in a fixed-height container. That widget
+        # Aw Snapped Chrome on Stocks / ETFs and when a row was activated.
+        # A 250-option selectbox is also wrong here: it mounts a BaseWeb menu
+        # on this same pill rerun, before anyone opens Matches.
+        _render_class_browse(
+            matches,
+            query,
+            directory_down=directory_down,
+            use_fixtures=use_fixtures,
+            client=client,
+        )
+    elif directory_down:
         # Empty Matches. Do not paint fixture stubs under a Live label, and
         # do not swap the client to FixtureClient.
         st.error(LIVE_UNAVAILABLE_BANNER)
         _clear_match_pick_state()
-    elif matches and is_class_browse_query(query):
-        # Scroll the class in document flow. A 250-option selectbox mounts a
-        # BaseWeb menu on this same pill rerun — before anyone opens Matches —
-        # and that is the Chrome Aw Snap (error 5/9).
-        options = [opt.symbol for opt in matches]
-        labels = {opt.symbol: format_option(opt) for opt in matches}
-        stored = st.session_state.get(SEARCH_LIST_KEY)
-        if stale_match_pick(stored, options) and SEARCH_LIST_KEY in st.session_state:
-            del st.session_state[SEARCH_LIST_KEY]
-        with st.container(height=MATCHES_SCROLL_PX, key="rwa_match_scroll"):
-            picked = st.radio(
-                "Matches",
-                options,
-                index=None,
-                format_func=lambda symbol: labels.get(symbol, symbol),
-                key=SEARCH_LIST_KEY,
-                label_visibility="visible",
-            )
-        if not use_fixtures and class_browse_truncated(client, query):
-            st.caption(CLASS_REMAINDER_CAPTION)
-        if picked:
-            _auto_place(picked)
     elif matches:
         options = [opt.symbol for opt in matches]
         labels = {opt.symbol: format_option(opt) for opt in matches}

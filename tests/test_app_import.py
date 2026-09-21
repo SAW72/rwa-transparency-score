@@ -176,10 +176,11 @@ def test_category_chips_do_not_remount_or_reset_slots(
     assert "stSelectbox" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "attachSoon" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "classBrowse" in demo_app.SEARCH_TYPEAHEAD_JS
-    assert 'data-testid="stRadio"' in demo_app.SEARCH_TYPEAHEAD_JS
-    assert "st.container(height=MATCHES_SCROLL_PX" in picker
-    assert "st.radio(" in picker
-    assert picker.index("st.radio(") < picker.index("st.selectbox")
+    assert "st-key-rwa_class_browse" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert 'data-testid="stRadio"' not in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "st.container(height=" not in picker
+    assert "st.radio(" not in picker
+    assert picker.index("_render_class_browse(") < picker.index("st.selectbox")
     assert "href=\"?rwa_cat" not in source
 
     # True first load: empty session → published defaults.

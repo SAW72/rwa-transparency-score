@@ -351,20 +351,29 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert "on_change=_on_search_query_change" in picker
     assert picker.index("st.text_input") < picker.index("_install_search_typeahead")
     assert picker.index("_install_search_typeahead") < picker.index("search_matches")
-    assert "st.container(height=MATCHES_SCROLL_PX" in picker
-    assert "st.radio(" in picker
-    # Class browse must not be the selectbox path (pill tap mounts no menu).
-    radio_at = picker.index("st.radio(")
+    assert "st.container(height=" not in picker
+    assert "st.radio(" not in picker
+    # Class browse is a paged button list, not a selectbox menu and not a
+    # full-class radio (both Aw Snap Chrome on the pill rerun).
+    browse_at = picker.index("_render_class_browse(")
     select_at = picker.index("st.selectbox")
-    assert radio_at < select_at
-    assert "is_class_browse_query(query)" in picker[:radio_at]
+    assert browse_at < select_at
+    assert "is_class_browse_query(query)" in picker[:browse_at]
+    assert 'key="rwa_class_browse"' in source
+    assert "MATCHES_PAGE_SIZE" in source
+    assert demo_app.MATCHES_PAGE_SIZE == 12
+    assert demo_app.class_match_window(6, 0) == (0, 0, 6)
+    assert demo_app.class_match_window(250, 0) == (0, 0, 12)
+    assert demo_app.class_match_window(250, 1) == (1, 12, 24)
+    assert demo_app.class_match_window(250, 99) == (0, 0, 12)
     assert "classBrowse" in demo_app.SEARCH_TYPEAHEAD_JS
-    assert 'data-testid="stRadio"' in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "st-key-rwa_class_browse" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "data-testid=\"stRadio\"" not in demo_app.SEARCH_TYPEAHEAD_JS
     assert demo_app.SEARCH_TYPEAHEAD_JS.index("menuOpen") < demo_app.SEARCH_TYPEAHEAD_JS.index(
         "classBrowse"
     )
     assert "attachSoon" in demo_app.SEARCH_TYPEAHEAD_JS
-    assert demo_app.MATCHES_SCROLL_PX == 320
+    assert "keepFocus()" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "max-width" in source
     assert "stSelectbox" in source
     assert "z-index: 40" in source
