@@ -128,6 +128,75 @@ def test_assign_ticker_rejects_empty_and_bad_index() -> None:
         demo_app.assign_ticker_to_slot(list(demo_app.DEFAULT_SLOTS), 4, "NVDA")
 
 
+class _FakeSS(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+class _FakeQP(dict):
+    def get(self, key, default=None):
+        return dict.get(self, key, default)
+
+
+def test_category_chips_do_not_remount_or_reset_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Category chips must not full-navigate. Slots live in session_state only."""
+    import app as demo_app
+
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    picker = source.split("def _render_search_picker", 1)[1]
+    chip_block = picker.split("st.text_input", 1)[0]
+    assert "rwa_class_" in chip_block
+    assert "st.button(" in chip_block
+    assert "st.columns(" in chip_block
+    assert "category_pill_href" not in source
+    assert "rwa_slots" not in source
+    assert "rwa_active" not in source
+    assert 'href="?rwa_cat' not in source
+    assert "target=\"_self\"" not in chip_block
+    assert "applyChipQuery" not in demo_app.SEARCH_TYPEAHEAD_JS
+    assert demo_app.is_browse_chip_query("commodity")
+    assert demo_app.is_browse_chip_query("government_security")
+    assert not demo_app.is_browse_chip_query("GOLD")
+    assert not demo_app.is_browse_chip_query("NVD")
+    assert demo_app.stale_match_pick(None, ["GOLD", "SLV"]) is False
+    assert demo_app.stale_match_pick("", ["GOLD"]) is False
+    assert demo_app.stale_match_pick("GOLD", ["GOLD", "SLV"]) is False
+    assert demo_app.stale_match_pick("NVDA", ["GOLD", "SLV"]) is True
+    assert "stale_match_pick" in picker
+    assert "is_browse_chip_query" in picker
+    assert "menuOpen" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "stSelectbox" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "attachSoon" in demo_app.SEARCH_TYPEAHEAD_JS
+
+    # True first load: empty session → published defaults.
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == list(demo_app.DEFAULT_SLOTS)
+    assert demo_app.st.session_state.active_slot == 0
+
+    # ?rwa_cat= deep-link must not reset a filled row (no URL slot payload).
+    filled = _FakeSS(slots=["GOLD", "TSLA", "AAPL", "META"], active_slot=1)
+    monkeypatch.setattr(demo_app.st, "session_state", filled)
+    monkeypatch.setattr(demo_app.st, "query_params", _FakeQP({"rwa_cat": "commodity"}))
+    demo_app._ensure_slot_state()
+    assert demo_app.st.session_state.slots == ["GOLD", "TSLA", "AAPL", "META"]
+    assert demo_app.st.session_state.active_slot == 1
+
+    # Same-session second chip: next pick fills the existing row.
+    demo_app._auto_place("SLV")
+    assert demo_app.st.session_state.slots == ["GOLD", "SLV", "AAPL", "META"]
+    assert demo_app.st.session_state.active_slot == 2
+    assert demo_app.st.session_state["_clear_search"] is True
+
+
 def test_score_slots_isolates_unknown_fixture_ticker(fixture_scorer) -> None:
     import app as demo_app
 

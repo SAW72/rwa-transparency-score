@@ -307,8 +307,22 @@ SEARCH_TYPEAHEAD_JS = r"""
     });
   }
 
+  function menuOpen() {
+    return !!(
+      doc.querySelector('[data-baseweb="popover"]') ||
+      doc.querySelector('[data-baseweb="menu"]') ||
+      doc.querySelector('[data-testid="stSelectbox"] [aria-expanded="true"]')
+    );
+  }
+
   function restoreFocus(input) {
-    if (!input || !keepFocus()) return;
+    if (!input || !keepFocus() || menuOpen()) return;
+    var active = doc.activeElement;
+    if (active && active !== input && active.closest &&
+        (active.closest('[data-testid="stSelectbox"]') ||
+         active.closest('[data-baseweb="popover"]'))) {
+      return;
+    }
     input.focus();
     try {
       var len = (input.value || "").length;
@@ -317,10 +331,16 @@ SEARCH_TYPEAHEAD_JS = r"""
   }
 
   function attach() {
+    if (menuOpen()) return;
     var input = findSearchInput();
     if (!input) return;
     bind(input);
     restoreFocus(input);
+  }
+
+  function attachSoon() {
+    if (win.__rwaAttachTimer) win.clearTimeout(win.__rwaAttachTimer);
+    win.__rwaAttachTimer = win.setTimeout(attach, 80);
   }
 
   if (!win.__rwaTypeaheadInstalled) {
@@ -331,7 +351,7 @@ SEARCH_TYPEAHEAD_JS = r"""
       setKeepFocus(false);
     }, true);
     attach();
-    new win.MutationObserver(attach).observe(doc.body, { childList: true, subtree: true });
+    new win.MutationObserver(attachSoon).observe(doc.body, { childList: true, subtree: true });
   } else {
     attach();
   }
@@ -539,6 +559,12 @@ def _score_slots(
 
 
 def _ensure_slot_state() -> None:
+    """Init compare slots on a true first load only.
+
+    Category chips must not remount the page. A widget/JS rerun keeps
+    ``st.session_state``, so the default NVDA/TSLA/AAPL/META row is applied
+    only when slots have never been set.
+    """
     if "slots" not in st.session_state:
         st.session_state.slots = list(DEFAULT_SLOTS)
     slots = list(st.session_state.slots)
@@ -617,6 +643,28 @@ def chip_query(category) -> str:
         return cid
     words = getattr(category, "keywords", ()) or ()
     return str(words[0] if words else getattr(category, "label", "") or "")
+
+
+def is_browse_chip_query(query: str) -> bool:
+    """True when Search is exactly a category-button keyword (not typed prefix)."""
+    text = (query or "").strip()
+    if not text:
+        return False
+    return any(text == chip_query(cat) for cat in RWA_CLASS_CATEGORIES)
+
+
+def stale_match_pick(stored: object, options: list[str]) -> bool:
+    """True when a prior Matches pick is no longer in the strip.
+
+    ``None`` / empty is an unselected compact selectbox. Treating that as
+    stale deletes the widget key and remounts Matches mid-click (Aw Snap).
+    """
+    if stored is None:
+        return False
+    symbol = normalize_ticker(str(stored))
+    if not symbol:
+        return False
+    return symbol not in set(options)
 
 
 def short_company_name(name: str) -> str:
@@ -1157,12 +1205,7 @@ def _auto_place(ticker: str) -> None:
     symbol = normalize_ticker(ticker)
     if not symbol:
         return
-    if "slots" not in st.session_state:
-        st.session_state.slots = list(DEFAULT_SLOTS)
-    if "active_slot" not in st.session_state:
-        st.session_state.active_slot = default_active_slot(
-            list(st.session_state.slots)
-        )
+    _ensure_slot_state()
     updated, nxt = place_search_match(
         list(st.session_state.slots), int(st.session_state.active_slot), symbol
     )
@@ -1206,8 +1249,11 @@ def _render_search_picker(
 ) -> None:
     """Categories → compact Search + attached match dropdown.
 
-    Chip click writes ``ticker_query`` before the Search box is created so
-    matches appear on this run — no Enter, no extra rerun.
+    Category chips are Streamlit buttons (``rwa_class_*``). A click writes
+    ``ticker_query`` before Search on this rerun — same session, so compare
+    slots stay put. Chip-keyword queries skip the typeahead iframe so the
+    compact Matches selectbox is not remount-thrashed. Do not use
+    ``<a href="?…">``. ``?rwa_cat=`` deep-links still work.
     Typed queries commit on each keystroke (debounced) so Matches appear at
     3+ characters without Enter. After a successful place, ``_clear_search``
     empties the box first so the match dropdown is not created.
@@ -1237,17 +1283,23 @@ def _render_search_picker(
         except (KeyError, TypeError):
             pass
 
-    pills = []
-    for cat in chip_cats:
-        label = html.escape(chip_display_label(cat.label))
-        cid = html.escape(cat.id)
-        pills.append(
-            f'<a class="rat-cat-pill" href="?rwa_cat={cid}" target="_self">{label}</a>'
-        )
+    # Widget buttons, not <a href="?…"> — a full navigation remounts Streamlit
+    # and Chrome Aw Snaps after a slot change (query/session fight). Same-run
+    # ticker_query write keeps compare slots in session_state.
     st.markdown(
-        f'<div class="rat-cat-row" role="list">{"".join(pills)}</div>',
+        '<div class="rat-cat-row" role="list" data-rat-cat-pill="1"></div>',
         unsafe_allow_html=True,
     )
+    chip_cols = st.columns(len(chip_cats), gap="small")
+    for col, cat in zip(chip_cols, chip_cats):
+        with col:
+            if st.button(
+                chip_display_label(cat.label),
+                key=f"rwa_class_{cat.id}",
+                use_container_width=True,
+            ):
+                st.session_state.ticker_query = chip_query(cat)
+                st.session_state.pop(SEARCH_MATCH_KEY, None)
 
     query = st.text_input(
         "Search",
@@ -1256,7 +1308,11 @@ def _render_search_picker(
         key="ticker_query",
         on_change=_on_search_query_change,
     )
-    _install_search_typeahead()
+    # Category-button queries already committed ticker_query. Skip the 1px
+    # typeahead iframe so Matches selectbox is not fighting a MutationObserver
+    # remount on the same run (Aw Snap when opening the list).
+    if not is_browse_chip_query(query):
+        _install_search_typeahead()
     matches = search_tickers(
         query, catalog, limit=CANDIDATE_STRIP_LIMIT, client=client
     )
@@ -1264,7 +1320,7 @@ def _render_search_picker(
         options = [opt.symbol for opt in matches]
         labels = {opt.symbol: format_option(opt) for opt in matches}
         stored = st.session_state.get(SEARCH_MATCH_KEY)
-        if stored not in options and SEARCH_MATCH_KEY in st.session_state:
+        if stale_match_pick(stored, options) and SEARCH_MATCH_KEY in st.session_state:
             del st.session_state[SEARCH_MATCH_KEY]
         picked = st.selectbox(
             "Matches",
@@ -1885,6 +1941,11 @@ st.markdown(
         margin: 0 0 0.55rem 0;
         max-width: 100%;
       }}
+      .rat-cat-row[data-rat-cat-pill] {{
+        height: 0;
+        margin: 0;
+        overflow: hidden;
+      }}
       .rat-cat-pill {{
         display: inline-flex;
         align-items: center;
@@ -1898,6 +1959,10 @@ st.markdown(
         font-weight: 650;
         line-height: 1.25;
         white-space: nowrap;
+        cursor: pointer;
+        font-family: inherit;
+        appearance: none;
+        -webkit-appearance: none;
       }}
       .rat-cat-pill:hover {{
         border-color: rgba(250, 250, 250, 0.45);
