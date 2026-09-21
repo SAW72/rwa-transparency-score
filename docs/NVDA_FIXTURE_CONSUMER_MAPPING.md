@@ -1,5 +1,7 @@
 # Consuming the published NVDA fixture without dropping evidence labels
 
+**Contributor:** YuTao Peng ([@imokokok](https://github.com/imokokok)) via PR [#52](https://github.com/SAW72/rwa-transparency-score/pull/52) (CMC DoraHacks / Build-a-thon docs). Credit / attribution only.
+
 This note shows how a downstream action-policy consumer can read the published
 [`v1_score_NVDA.fixture.json`](examples/v1_score_NVDA.fixture.json) response while
 preserving RAT Score's scope and provenance. The fixture in the same repository
@@ -12,8 +14,8 @@ The two decisions remain separate:
 - A downstream action policy decides whether its own separately supplied evidence
   is sufficient for a particular instrument, actor, action, and time.
 
-A different downstream outcome is therefore not a RAT scoring error. It reflects a
-different question and, potentially, a stricter consumer policy.
+A different downstream outcome is therefore not a RAT scoring error. It reflects
+a different question and, potentially, a stricter consumer policy.
 
 ## Preservation rules
 
