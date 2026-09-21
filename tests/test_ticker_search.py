@@ -353,21 +353,21 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert picker.index("_install_search_typeahead") < picker.index("search_matches")
     assert "st.container(height=" not in picker
     assert "st.radio(" not in picker
-    # Class browse is a paged button list, not a selectbox menu and not a
-    # full-class radio (both Aw Snap Chrome on the pill rerun).
+    # Class browse is one compact ticker dropdown, not a selectbox menu,
+    # not paged buttons, and not a full-class radio (Aw Snap on the pill rerun).
     browse_at = picker.index("_render_class_browse(")
     select_at = picker.index("st.selectbox")
     assert browse_at < select_at
     assert "is_class_browse_query(query)" in picker[:browse_at]
     assert 'key="rwa_class_browse"' in source
-    assert "MATCHES_PAGE_SIZE" in source
-    assert demo_app.MATCHES_PAGE_SIZE == 12
-    assert demo_app.class_match_window(6, 0) == (0, 0, 6)
-    assert demo_app.class_match_window(250, 0) == (0, 0, 12)
-    assert demo_app.class_match_window(250, 1) == (1, 12, 24)
-    assert demo_app.class_match_window(250, 99) == (0, 0, 12)
+    assert "MATCHES_PAGE_SIZE" not in source
+    assert "class_match_window" not in source
+    assert "rwa_match_prev" not in source
+    assert "rwa_match_next" not in source
     assert "classBrowse" in demo_app.SEARCH_TYPEAHEAD_JS
     assert "st-key-rwa_class_browse" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "removeTickerDropdown" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "MutationObserver" not in demo_app.TICKER_DROPDOWN_JS
     assert "data-testid=\"stRadio\"" not in demo_app.SEARCH_TYPEAHEAD_JS
     assert demo_app.SEARCH_TYPEAHEAD_JS.index("menuOpen") < demo_app.SEARCH_TYPEAHEAD_JS.index(
         "classBrowse"
@@ -1550,6 +1550,52 @@ def test_full_class_page_sets_honest_remainder_caption() -> None:
     assert demo_app.class_browse_truncated(client, "stock") is True
     assert "250" in demo_app.CLASS_REMAINDER_CAPTION
     assert "type a ticker for the rest" in demo_app.CLASS_REMAINDER_CAPTION
+
+
+def test_class_browse_dropdown_is_one_continuous_scroll() -> None:
+    """The class shard is one overlay list — no Prev/Next, no radio, no nested height."""
+    import app as demo_app
+
+    rows = [
+        TickerOption(symbol=f"T{index}", name=f"Token {index}", asset_type="stock")
+        for index in range(250)
+    ]
+    items = demo_app.ticker_dropdown_items(rows)
+    assert len(items) == 250
+    assert items[0]["symbol"] == "T0"
+    assert items[-1]["symbol"] == "T249"
+    assert "Token 249" in items[-1]["label"]
+    assert demo_app.class_dropdown_label(rows, "") == "Choose a ticker"
+    assert demo_app.class_dropdown_label(rows, "T3") == items[3]["label"]
+
+    script = demo_app.ticker_dropdown_script(items, label=items[3]["label"], truncated=True)
+    assert '"T0"' in script and '"T249"' in script
+    assert script.count('"symbol"') == 250
+    assert "T3" in script
+    assert "rwa-ticker-dd-scroll" in script
+    assert 'role": "listbox"' in script or '"listbox"' in script
+    assert "overflow-y: auto" in Path(demo_app.__file__).read_text(encoding="utf-8")
+    assert "Previous" not in script
+    assert "rwa_match_next" not in script
+    assert "MutationObserver" not in script
+    assert "st.radio" not in script
+    assert "st.container" not in script
+    assert "Showing first 250" in script
+    assert demo_app.CLASS_PICK_LABEL in script
+    assert "commitPick" in script
+    assert "position: fixed" in Path(demo_app.__file__).read_text(encoding="utf-8")
+
+    browse = Path(demo_app.__file__).read_text(encoding="utf-8").split(
+        "def _render_class_browse", 1
+    )[1].split("def _render_search_picker", 1)[0]
+    assert "st.radio(" not in browse
+    assert "st.container(height=" not in browse
+    assert "place_search_match(" in Path(demo_app.__file__).read_text(encoding="utf-8").split(
+        "def _on_class_ticker_pick", 1
+    )[1].split("def _install_search_typeahead", 1)[0]
+    assert 'key="rwa_class_browse"' in browse
+    assert "rwa-ticker-dd-anchor" in demo_app.TICKER_DROPDOWN_JS
+    assert "CLASS_REMAINDER_CAPTION" in browse
 
 
 def _isolate_live_catalog_memos() -> None:
