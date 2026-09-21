@@ -162,6 +162,19 @@ def test_category_chips_do_not_remount_or_reset_slots(
     assert 'href="?rwa_cat' not in source
     assert "target=\"_self\"" not in chip_block
     assert "applyChipQuery" not in demo_app.SEARCH_TYPEAHEAD_JS
+    assert demo_app.is_browse_chip_query("commodity")
+    assert demo_app.is_browse_chip_query("government_security")
+    assert not demo_app.is_browse_chip_query("GOLD")
+    assert not demo_app.is_browse_chip_query("NVD")
+    assert demo_app.stale_match_pick(None, ["GOLD", "SLV"]) is False
+    assert demo_app.stale_match_pick("", ["GOLD"]) is False
+    assert demo_app.stale_match_pick("GOLD", ["GOLD", "SLV"]) is False
+    assert demo_app.stale_match_pick("NVDA", ["GOLD", "SLV"]) is True
+    assert "stale_match_pick" in picker
+    assert "is_browse_chip_query" in picker
+    assert "menuOpen" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "stSelectbox" in demo_app.SEARCH_TYPEAHEAD_JS
+    assert "attachSoon" in demo_app.SEARCH_TYPEAHEAD_JS
 
     # True first load: empty session → published defaults.
     monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())

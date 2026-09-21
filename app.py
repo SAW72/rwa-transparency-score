@@ -307,8 +307,22 @@ SEARCH_TYPEAHEAD_JS = r"""
     });
   }
 
+  function menuOpen() {
+    return !!(
+      doc.querySelector('[data-baseweb="popover"]') ||
+      doc.querySelector('[data-baseweb="menu"]') ||
+      doc.querySelector('[data-testid="stSelectbox"] [aria-expanded="true"]')
+    );
+  }
+
   function restoreFocus(input) {
-    if (!input || !keepFocus()) return;
+    if (!input || !keepFocus() || menuOpen()) return;
+    var active = doc.activeElement;
+    if (active && active !== input && active.closest &&
+        (active.closest('[data-testid="stSelectbox"]') ||
+         active.closest('[data-baseweb="popover"]'))) {
+      return;
+    }
     input.focus();
     try {
       var len = (input.value || "").length;
@@ -317,10 +331,16 @@ SEARCH_TYPEAHEAD_JS = r"""
   }
 
   function attach() {
+    if (menuOpen()) return;
     var input = findSearchInput();
     if (!input) return;
     bind(input);
     restoreFocus(input);
+  }
+
+  function attachSoon() {
+    if (win.__rwaAttachTimer) win.clearTimeout(win.__rwaAttachTimer);
+    win.__rwaAttachTimer = win.setTimeout(attach, 80);
   }
 
   if (!win.__rwaTypeaheadInstalled) {
@@ -331,7 +351,7 @@ SEARCH_TYPEAHEAD_JS = r"""
       setKeepFocus(false);
     }, true);
     attach();
-    new win.MutationObserver(attach).observe(doc.body, { childList: true, subtree: true });
+    new win.MutationObserver(attachSoon).observe(doc.body, { childList: true, subtree: true });
   } else {
     attach();
   }
@@ -623,6 +643,28 @@ def chip_query(category) -> str:
         return cid
     words = getattr(category, "keywords", ()) or ()
     return str(words[0] if words else getattr(category, "label", "") or "")
+
+
+def is_browse_chip_query(query: str) -> bool:
+    """True when Search is exactly a category-button keyword (not typed prefix)."""
+    text = (query or "").strip()
+    if not text:
+        return False
+    return any(text == chip_query(cat) for cat in RWA_CLASS_CATEGORIES)
+
+
+def stale_match_pick(stored: object, options: list[str]) -> bool:
+    """True when a prior Matches pick is no longer in the strip.
+
+    ``None`` / empty is an unselected compact selectbox. Treating that as
+    stale deletes the widget key and remounts Matches mid-click (Aw Snap).
+    """
+    if stored is None:
+        return False
+    symbol = normalize_ticker(str(stored))
+    if not symbol:
+        return False
+    return symbol not in set(options)
 
 
 def short_company_name(name: str) -> str:
@@ -1209,8 +1251,9 @@ def _render_search_picker(
 
     Category chips are Streamlit buttons (``rwa_class_*``). A click writes
     ``ticker_query`` before Search on this rerun — same session, so compare
-    slots stay put. Do not use ``<a href="?…">``; that remounts the page and
-    can Aw Snap after a slot change. ``?rwa_cat=`` deep-links still work.
+    slots stay put. Chip-keyword queries skip the typeahead iframe so the
+    compact Matches selectbox is not remount-thrashed. Do not use
+    ``<a href="?…">``. ``?rwa_cat=`` deep-links still work.
     Typed queries commit on each keystroke (debounced) so Matches appear at
     3+ characters without Enter. After a successful place, ``_clear_search``
     empties the box first so the match dropdown is not created.
@@ -1265,7 +1308,11 @@ def _render_search_picker(
         key="ticker_query",
         on_change=_on_search_query_change,
     )
-    _install_search_typeahead()
+    # Category-button queries already committed ticker_query. Skip the 1px
+    # typeahead iframe so Matches selectbox is not fighting a MutationObserver
+    # remount on the same run (Aw Snap when opening the list).
+    if not is_browse_chip_query(query):
+        _install_search_typeahead()
     matches = search_tickers(
         query, catalog, limit=CANDIDATE_STRIP_LIMIT, client=client
     )
@@ -1273,7 +1320,7 @@ def _render_search_picker(
         options = [opt.symbol for opt in matches]
         labels = {opt.symbol: format_option(opt) for opt in matches}
         stored = st.session_state.get(SEARCH_MATCH_KEY)
-        if stored not in options and SEARCH_MATCH_KEY in st.session_state:
+        if stale_match_pick(stored, options) and SEARCH_MATCH_KEY in st.session_state:
             del st.session_state[SEARCH_MATCH_KEY]
         picked = st.selectbox(
             "Matches",
