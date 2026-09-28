@@ -43,11 +43,13 @@ def _exercise(store: Store) -> None:
 
     first = canonical_bytes({"ticker": "NVDA", "n": 1})
     second = canonical_bytes({"ticker": "NVDA", "n": 2})
-    digest = store.save_attested_payload(ticker="nvda", canonical=first)
+    inputs = canonical_bytes({"cmc": {"ticker": "NVDA"}})
+    digest = store.save_attested_payload(ticker="nvda", canonical=first, inputs=inputs)
     assert digest == hash_canonical(first)
     loaded = store.get_attested_payload(digest)
     assert loaded is not None
     assert loaded["canonical"] == first
+    assert loaded["inputs"] == inputs
     assert store.save_attested_payload(ticker="NVDA", canonical=first) == digest
 
     job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=10)

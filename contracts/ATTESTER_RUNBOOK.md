@@ -475,15 +475,17 @@ to                   0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 
 ### 6.5 `verify.py` against the stored payload
 
-The stored bytes are on the API service disk, not on your laptop. Open the
-Render shell for `rwa-transparency-score-api` (same instance, before spin-down)
-and run:
+The stored bytes are in the API service database (`DATABASE_URL`), not on
+your laptop. Open the Render shell for `rwa-transparency-score-api` and run:
 
 ```bash
 python -m rwa_score.api.verify NVDA --json \
   --contract 0x2F073a3628D498d92956e7eFE2b26633eDa75b00 \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL"
+  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+  --attester "$ATTESTER_ADDRESS"
 ```
+
+Expected process exit code: `0`.
 
 Expected JSON fields:
 
@@ -502,6 +504,7 @@ Expected JSON fields:
 }
 ```
 
-`match` is `true` only when the stored bytes recompute to that hash and
-on-chain `verify` returns ok. A laptop run against an empty local sqlite
-file prints `"stored": false` and `"match": null`. That is the wrong machine.
+`match` is `true` only when the stored bytes recompute to that hash, the
+chain id is 84532, and the on-chain attester is `$ATTESTER_ADDRESS`. A laptop
+run against an empty local sqlite file exits `2` with `"stored": false`. That
+is the wrong machine.
