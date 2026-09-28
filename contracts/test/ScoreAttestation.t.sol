@@ -3,7 +3,6 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ScoreAttestation} from "../src/ScoreAttestation.sol";
-import {DeploySepolia} from "../script/DeploySepolia.s.sol";
 import {DeployScoreAttestation} from "../script/DeployScoreAttestation.s.sol";
 
 contract ScoreAttestationTest is Test {
@@ -198,34 +197,6 @@ contract ScoreAttestationTest is Test {
         vm.prank(attester);
         vm.expectRevert(ScoreAttestation.NotOwner.selector);
         attestor.setFee(0);
-    }
-
-    function test_deployScriptRevertsOnBaseMainnet() public {
-        vm.chainId(8453);
-        DeploySepolia script = new DeploySepolia();
-        vm.expectRevert(bytes("mainnet held: deploy Base Sepolia only"));
-        script.run();
-    }
-
-    function test_deployScriptAllowsBaseSepolia() public {
-        vm.chainId(84532);
-        DeploySepolia script = new DeploySepolia();
-        ScoreAttestation deployed = script.run();
-        assertTrue(address(deployed).code.length > 0);
-        assertEq(deployed.attestationFee(), 0.001 ether);
-        assertTrue(deployed.owner() != address(0));
-        assertTrue(deployed.authorized(deployed.owner()));
-        assertTrue(deployed.isAttester(deployed.owner()));
-    }
-
-    function test_deployScriptAllowlistsExtraAttester() public {
-        vm.chainId(84532);
-        vm.setEnv("ATTESTER_ADDRESS", vm.toString(attester));
-        DeploySepolia script = new DeploySepolia();
-        ScoreAttestation deployed = script.run();
-        assertTrue(deployed.authorized(attester));
-        assertTrue(deployed.isAttester(attester));
-        vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
     }
 
     function test_futureClaimedTimestampIsNotTrusted() public {

@@ -66,7 +66,7 @@ def test_readme_documents_tenant_scoped_webhooks() -> None:
 
 
 def test_deploy_script_holds_mainnet() -> None:
-    script = (ROOT / "contracts/script/DeploySepolia.s.sol").read_text(encoding="utf-8")
+    script = (ROOT / "contracts/script/DeployScoreAttestation.s.sol").read_text(encoding="utf-8")
     assert "84532" in script
     assert "mainnet held" in script
     assert "8453" not in script or "BASE_SEPOLIA" in script

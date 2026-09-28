@@ -16,8 +16,8 @@ import {ScoreAttestation} from "../src/ScoreAttestation.sol";
 /// - `ATTESTATION_FEE_WEI` defaults to 0.001 ether (`ScoreAttestation.DEFAULT_FEE`,
 ///   also the commented default in contracts/README.md).
 /// - `ATTESTER_ADDRESS`, `ATTESTER_ADDRESS_2`, and `ATTESTER_ADDRESS_3` default
-///   to `0x0000000000000000000000000000000000000000` (skip), same as
-///   `DeploySepolia`'s `ATTESTER_ADDRESS`.
+///   to `0x0000000000000000000000000000000000000000` (skip). Unset means no
+///   extra allowlist entry.
 /// - `ATTESTERS` is an optional comma-separated allowlist. Unset means none.
 /// - `FINAL_OWNER` defaults to unset (`address(0)`), which leaves the deployer
 ///   as owner. If it is set and differs from the deployer, the script calls

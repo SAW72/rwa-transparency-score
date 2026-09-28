@@ -30,7 +30,7 @@ export TICKER="NVDA"
 export ATTEST_TX="TBD after attest"
 ```
 
-`ATTESTATION_FEE_WEI` matches `ScoreAttestation.DEFAULT_FEE` and the commented default in `contracts/README.md`. Attester defaults match `DeploySepolia` (`ATTESTER_ADDRESS` unset means the zero address, so no extra allowlist entry). The deployer is an attester because the constructor sets `isAttester[msg.sender]`.
+`ATTESTATION_FEE_WEI` matches `ScoreAttestation.DEFAULT_FEE` and the commented default in `contracts/README.md`. Attester defaults match `DeployScoreAttestation` (`ATTESTER_ADDRESS` unset means the zero address, so no extra allowlist entry). The deployer is an attester because the constructor sets `isAttester[msg.sender]`.
 
 Derive `DEPLOYER` from the keystore. This command does not take a raw key:
 
@@ -120,11 +120,11 @@ After an attest transaction exists (`ATTEST_TX`), compare the stored trusted tim
 ```bash
 cast call "$SCORE_ATTESTATION" "verify(bytes32,string)(bool,uint256,address)" "$SCORE_HASH" "$TICKER" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 ATTEST_BLOCK="$(cast tx "$ATTEST_TX" blockNumber --rpc-url "$BASE_SEPOLIA_RPC_URL")"
-cast block "$ATTEST_BLOCK" timestamp --rpc-url "$BASE_SEPOLIA_RPC_URL"
-cast call "$SCORE_ATTESTATION" "getAttestation(bytes32)(bytes32,string,uint256,address,uint256)" "$SCORE_HASH" --rpc-url "$BASE_SEPOLIA_RPC_URL"
+cast block "$ATTEST_BLOCK" --field timestamp --rpc-url "$BASE_SEPOLIA_RPC_URL"
+cast call "$SCORE_ATTESTATION" "getAttestation(bytes32)((bytes32,string,uint256,address,uint256))" "$SCORE_HASH" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 ```
 
-The third `getAttestation` field (`attestedAt`) must equal the `cast block` timestamp. The fifth field is `claimedAt` and is not the trusted time.
+`getAttestation` returns the `Record` struct, so the return type is one tuple. The inner types follow `ScoreAttestation.sol`: `scoreHash`, `ticker`, `attestedAt`, `attester`, `claimedAt`. The third value (`attestedAt`) must equal the `cast block` timestamp. The fifth value is `claimedAt` and is not the trusted time.
 
 Simulate a non-attester `attest`. `cast call --from` is an `eth_call`. It does not send.
 
@@ -211,18 +211,18 @@ Files that mention the contract or attester slot (none of these is a deployed ad
 | `contracts/README.md` | 54 | `# FINAL_OWNER=0x...` placeholder. |
 | `contracts/README.md` | 60 | `export RWA_ATTESTATION_CONTRACT=0x...` placeholder. |
 | `contracts/README.md` | 82 | `export ATTESTATION_CONTRACT=0x...` placeholder. |
-| `README.md` | 309 | Names `RWA_ATTESTATION_CONTRACT`. No address literal. |
+| `README.md` | 310 | Names `RWA_ATTESTATION_CONTRACT`. No address literal. |
 | `rwa_score/api/settings.py` | 26 | `attestation_contract: str = ""` |
 | `rwa_score/api/settings.py` | 54 | Reads `RWA_ATTESTATION_CONTRACT` from the environment. |
 | `rwa_score/api/verify.py` | 97 | Same env var, default `""`. The on-chain JSON field is `attested_at`, not `timestamp`. |
 | `rwa_score/api/app.py` | 330 | Returns `cfg.attestation_contract or None`. |
 | `scripts/verify_attestation.py` | 7 | Example uses `$RWA_ATTESTATION_CONTRACT`. |
 | `contracts/script/Attest.s.sol` | 19 | `vm.envAddress("ATTESTATION_CONTRACT")`. |
-| `contracts/script/DeploySepolia.s.sol` | 16 | `ATTESTER_ADDRESS` defaults to `address(0)`. |
+| `contracts/script/DeployScoreAttestation.s.sol` | 90 | `ATTESTER_ADDRESS` defaults to the zero address (`NO_ATTESTER`). |
 | `render.yaml` | — | Does not set `RWA_ATTESTATION_CONTRACT`. No line to edit. |
 | ABI JSON | — | No ABI JSON file in the repo. |
 
-Test-only addresses in `contracts/test/ScoreAttestation.t.sol` are not a production allowlist: `0xA11CE` (line 11), `0xB0B` (line 12), `0xBEEF` (lines 185 and 446), `0x0A1E` (lines 300, 321, 336), `0xCA11` (line 378). Foundry's default script sender `0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38` appears only in test logs. Read-only `eth_getCode` on Base Sepolia (`https://sepolia.base.org`, chain 84532, block 47422561) returned `0x` and codesize 0 for each of those addresses. They are not contracts and not attesters on that chain.
+Test-only addresses in `contracts/test/ScoreAttestation.t.sol` are not a production allowlist: `0xA11CE` (line 10), `0xB0B` (line 11), `0xBEEF` (lines 184 and 417), `0x0A1E` (lines 271, 292, 307), `0xCA11` (line 349). Foundry's default script sender `0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38` is not in the test source. Read-only `eth_getCode` on Base Sepolia (`https://sepolia.base.org`, chain 84532, block 47422561) returned `0x` and codesize 0 for that address and for each test address above. They are not contracts and not attesters on that chain.
 
 ## 7. Retire the previous contract
 
@@ -260,11 +260,13 @@ fi
 
 ## 8. Indexer note
 
+Runbook note: the `ScoreAttested` event signature changed to `ScoreAttested(string, bytes32, uint256 attestedAt, uint256 claimedAt, address)`. Its topic0 is `keccak256` of `ScoreAttested(string,bytes32,uint256,uint256,address)`, which is `0x4d014d26aa0eac7b6be31e154921d63abec4b12a45265145127a4498a6284f07`. The previous signature `ScoreAttested(string,bytes32,uint256,address)` hashed to `0xf4b6b46a4c639075d3bbd06f60034c9db88b0fed6be99bef95720175b43a27c3`. Any indexer or log filter on the old topic0 must be updated. `rwa_score/api/verify.py` JSON output changed the trusted-time key from `timestamp` to `attested_at`. Claimed time is separate (`claimedAt` on the record) and is not that JSON field.
+
 Compared with ScoreAttestation on `main` (`a5d0c36`, PR #58). If the deployed bytecode is the pre-#58 source (`b20f9a7`), it also lacks the ownership events below.
 
-- `ScoreAttested` signature changed. Old: `ScoreAttested(string,bytes32,uint256,address)` and that uint256 was the caller-supplied timestamp. New: `ScoreAttested(string,bytes32,uint256,uint256,address)`. The first uint256 is `attestedAt` (`block.timestamp`). The second is `claimedAt` (the old caller timestamp). Topic0 changes. The address is still not indexed.
+- `ScoreAttested` signature changed. Old: `ScoreAttested(string,bytes32,uint256,address)` and that uint256 was the caller-supplied timestamp. New: `ScoreAttested(string, bytes32, uint256 attestedAt, uint256 claimedAt, address)`. The first uint256 is `attestedAt` (`block.timestamp`). The second is `claimedAt` (the old caller timestamp). Topic0 changes, as in the runbook note above. The address is still not indexed.
 - `Record` / `getAttestation` changed. Old tuple: `(bytes32 scoreHash, string ticker, uint256 timestamp, address attester)`. New tuple: `(bytes32 scoreHash, string ticker, uint256 attestedAt, address attester, uint256 claimedAt)`. The third word is still a uint256 in the same position, but the value is chain time, not the caller timestamp. `claimedAt` is appended after `attester`. `attester` stays the fourth word.
-- `verify(bytes32,string)` is still `(bool,uint256,address)`. That uint256 is `attestedAt`, not `claimedAt`. The Python helper in `rwa_score/api/verify.py` labels it `attested_at`.
+- `verify(bytes32,string)` is still `(bool,uint256,address)`. That uint256 is `attestedAt`, not `claimedAt`. The Python helper in `rwa_score/api/verify.py` labels it `attested_at` (the JSON key was `timestamp`). Claimed time stays on the record as `claimedAt` and is not this field.
 - New events: `FeeUpdated(uint256 oldFee, uint256 newFee)` from `setFee` (not from the constructor). `Withdrawn(address indexed to, uint256 amount)` after a successful `withdraw`.
 - Unchanged events that already exist on `a5d0c36`: `AttesterUpdated(address indexed,bool)`, `OwnershipTransferStarted(address indexed,address indexed)`, `OwnershipTransferred(address indexed,address indexed)`. Those three ownership-related events are absent from `b20f9a7`.
 - `transferOwnership(address(0))` on this contract reverts `ZeroOwner()`. On `a5d0c36` that call reverts `ZeroAttester()`. `setAttester(address(0))` and `withdraw(address(0))` still revert `ZeroAttester()`. New error: `FeeTooHigh(uint256,uint256)` when the fee is above `MAX_FEE` (0.1 ether). `EmptyTimestamp()` and `FutureTimestamp()` from `a5d0c36` are gone; claimed time is stored and not checked.

@@ -17,7 +17,7 @@ Anyone who cited a RAT Score can re-hash the payload and call `verify(scoreHash,
 | Network | Chain ID | This repo |
 |---|---|---|
 | Base Sepolia | 84532 | **Allowed** — scripts + tests target this |
-| Base mainnet | 8453 | **Held** — `DeploySepolia` / `Attest` revert |
+| Base mainnet | 8453 | **Held** — `DeployScoreAttestation` / `Attest` revert |
 
 Spencer standing rule: testnets only until an explicit mainnet go. Do not add a mainnet deploy script in this PR.
 
@@ -27,7 +27,7 @@ Spencer standing rule: testnets only until an explicit mainnet go. Do not add a 
 contracts/
   src/ScoreAttestation.sol
   test/ScoreAttestation.t.sol
-  script/DeploySepolia.s.sol
+  script/DeployScoreAttestation.s.sol
   script/Attest.s.sol
 ```
 
