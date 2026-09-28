@@ -13,10 +13,16 @@ reads ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
 
 If the key, contract, or RPC is unset, the worker stays disabled and the
 API says so. It does not crash and it does not send.
+
+One API instance only. During a Render deploy the old process and the new
+one overlap. Postgres claims with ``FOR UPDATE SKIP LOCKED``, and a
+broadcast transaction is retried at the same nonce. Do not run a second
+worker on this key.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -24,7 +30,8 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+from urllib.parse import unquote, urlsplit
 
 from rwa_score.api.attest import hash_canonical
 from rwa_score.api.settings import BASE_SEPOLIA_CHAIN_ID
@@ -41,9 +48,25 @@ DISABLED_REASON = (
 DEFAULT_GAS_LIMIT = 300_000
 # Hard ceiling. Env may set a lower cap. Measured attest max is about 210495.
 HARD_GAS_CAP = 500_000
+# EIP-1559 ceiling in code. Env may set a lower cap, never a higher one.
+HARD_MAX_FEE_GWEI = 100
+DEFAULT_MAX_FEE_GWEI = 20
+# Drain protection. Env may lower these. The daily cap cannot exceed the hard max.
+DEFAULT_MIN_INTERVAL_SECONDS = 300
+HARD_DAILY_TX_CAP = 48
+DEFAULT_DAILY_TX_CAP = 8
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_SECONDS = 2.0
+_REDACTED = "[redacted]"
+FAILED_REASON = "attest_failed"
+FAILED_MESSAGE = "The attest job failed."
+THROTTLE_MESSAGES = {
+    "min_interval": (
+        "Attest for this ticker is inside the minimum interval. No transaction was sent."
+    ),
+    "daily_cap": "Daily attest transaction cap reached. No transaction was sent.",
+}
 RPC_TIMEOUT_SECONDS = 20
 RECEIPT_TIMEOUT_SECONDS = 60
 # Fixture scores use as_of 0. Anything past year 2100 is not a unix second.
@@ -101,35 +124,147 @@ _ATTEST_ABI = [
 ]
 
 
-def redact(text: str, secret: str) -> str:
-    """Strip a private key from text. Empty secret is a no-op."""
-    if not text or not secret:
+def _rpc_needles(rpc_url: str) -> list[str]:
+    """Full RPC URL plus path, query, userinfo, and any embedded key."""
+    raw = (rpc_url or "").strip()
+    if not raw:
+        return []
+    found = [raw]
+    parts = urlsplit(raw)
+    if parts.username:
+        found.append(unquote(parts.username))
+    if parts.password:
+        found.append(unquote(parts.password))
+    if "@" in parts.netloc:
+        found.append(parts.netloc.split("@", 1)[0])
+    path = parts.path or ""
+    if path and path != "/":
+        found.append(path)
+        for seg in path.split("/"):
+            if seg:
+                found.append(unquote(seg))
+    if parts.query:
+        found.append(parts.query)
+        for item in parts.query.split("&"):
+            if "=" in item:
+                _key, val = item.split("=", 1)
+                if val:
+                    found.append(unquote(val))
+            elif item:
+                found.append(unquote(item))
+    return found
+
+
+def _needles_for(secret: str, rpc_url: str) -> list[str]:
+    found: list[str] = []
+    if secret:
+        found.append(secret)
+        bare = secret[2:] if secret.lower().startswith("0x") else secret
+        if bare:
+            found.append(bare)
+    found.extend(_rpc_needles(rpc_url))
+    out: list[str] = []
+    for item in found:
+        if item and len(item) >= 8 and item not in out:
+            out.append(item)
+    return out
+
+
+class _RedactionVault:
+    def __init__(self) -> None:
+        self._needles: list[str] = []
+        self._lock = threading.Lock()
+
+    def add(self, secret: str = "", rpc_url: str = "") -> None:
+        fresh = _needles_for(secret, rpc_url)
+        if not fresh:
+            return
+        with self._lock:
+            for needle in fresh:
+                if needle not in self._needles:
+                    self._needles.append(needle)
+
+    def needles(self) -> list[str]:
+        with self._lock:
+            return list(self._needles)
+
+
+_VAULT = _RedactionVault()
+_HANDLE_WRAPPED = False
+
+
+def redact(text: str, secret: str = "", rpc_url: str = "") -> str:
+    """Strip a private key and RPC URL from text. Match is case-insensitive."""
+    if not text:
         return text
-    cleaned = text.replace(secret, "[redacted]")
-    bare = secret[2:] if secret.lower().startswith("0x") else secret
-    if bare:
-        cleaned = cleaned.replace(bare, "[redacted]")
-        cleaned = cleaned.replace(bare.lower(), "[redacted]")
+    needles = _needles_for(secret, rpc_url)
+    if not needles:
+        return text
+    cleaned = text
+    for needle in sorted(needles, key=len, reverse=True):
+        cleaned = re.sub(re.escape(needle), _REDACTED, cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def _redact_known(text: str) -> str:
+    needles = _VAULT.needles()
+    if not text or not needles:
+        return text
+    cleaned = text
+    for needle in sorted(needles, key=len, reverse=True):
+        cleaned = re.sub(re.escape(needle), _REDACTED, cleaned, flags=re.IGNORECASE)
     return cleaned
 
 
 class _RedactFilter(logging.Filter):
-    def __init__(self, secret: str) -> None:
-        super().__init__()
-        self._secret = secret
+    """Redact secrets on every record. Installed on the root and app loggers."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not self._secret:
-            return True
-        record.msg = redact(str(record.msg), self._secret)
-        if record.args:
+        record.msg = _redact_known(str(record.msg))
+        if isinstance(record.args, dict):
+            record.args = {
+                key: _redact_known(val) if isinstance(val, str) else val
+                for key, val in record.args.items()
+            }
+        elif record.args:
             record.args = tuple(
-                redact(item, self._secret) if isinstance(item, str) else item
-                for item in record.args
+                _redact_known(item) if isinstance(item, str) else item for item in record.args
             )
-        record.exc_info = None
-        record.exc_text = None
+        if record.exc_info and record.exc_info[0] is not None:
+            import traceback
+
+            text = "".join(traceback.format_exception(*record.exc_info))
+            redacted = _redact_known(text)
+            if redacted != text:
+                record.exc_text = redacted
         return True
+
+
+def _install_redact_filter() -> None:
+    """Attach one filter to the root logger and the app logger tree.
+
+    Logger filters do not run for records that propagate from a child.
+    ``Logger.handle`` is wrapped once so a record from any logger is redacted
+    before a handler (including pytest's caplog) formats it.
+    """
+    global _HANDLE_WRAPPED
+    filt = _RedactFilter()
+    for name in ("", "rwa_score", "rwa_score.api", "rwa_score.api.auto_attest"):
+        target = logging.getLogger(name)
+        if not any(isinstance(item, _RedactFilter) for item in target.filters):
+            target.addFilter(filt)
+    if _HANDLE_WRAPPED or getattr(logging.Logger.handle, "_rwa_redact", False):
+        _HANDLE_WRAPPED = True
+        return
+    original = logging.Logger.handle
+
+    def handle(self: logging.Logger, record: logging.LogRecord) -> None:
+        filt.filter(record)
+        return original(self, record)
+
+    handle._rwa_redact = True  # type: ignore[attr-defined]
+    logging.Logger.handle = handle  # type: ignore[method-assign]
+    _HANDLE_WRAPPED = True
 
 
 def _env_int(name: str, default: int) -> int:
@@ -150,7 +285,22 @@ def _env_float(name: str, default: float) -> float:
 
 
 class AttesterSettings:
-    """Env-only attester config. ``repr`` never includes the private key."""
+    """Env-only attester config. The key lives in a closure, not on ``__dict__``."""
+
+    __slots__ = (
+        "_get_key",
+        "contract",
+        "rpc_url",
+        "value_cap_wei",
+        "gas_limit",
+        "max_attempts",
+        "backoff_seconds",
+        "chain_id",
+        "enforce_contract_pin",
+        "max_fee_gwei",
+        "min_interval_seconds",
+        "daily_tx_cap",
+    )
 
     def __init__(
         self,
@@ -164,8 +314,12 @@ class AttesterSettings:
         backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
         chain_id: int = BASE_SEPOLIA_CHAIN_ID,
         enforce_contract_pin: bool = True,
+        max_fee_gwei: float = DEFAULT_MAX_FEE_GWEI,
+        min_interval_seconds: int = DEFAULT_MIN_INTERVAL_SECONDS,
+        daily_tx_cap: int = DEFAULT_DAILY_TX_CAP,
     ) -> None:
-        self._private_key = (private_key or "").strip()
+        key = (private_key or "").strip()
+        self._get_key = (lambda captured: (lambda: captured))(key)
         self.contract = (contract or "").strip()
         self.rpc_url = (rpc_url or "").strip()
         self.value_cap_wei = int(value_cap_wei)
@@ -174,16 +328,26 @@ class AttesterSettings:
         self.backoff_seconds = float(backoff_seconds)
         self.chain_id = int(chain_id)
         self.enforce_contract_pin = bool(enforce_contract_pin)
-        if self._private_key:
-            logger.addFilter(_RedactFilter(self._private_key))
+        fee = float(max_fee_gwei)
+        if fee < 0:
+            fee = float(DEFAULT_MAX_FEE_GWEI)
+        self.max_fee_gwei = min(fee, float(HARD_MAX_FEE_GWEI))
+        self.min_interval_seconds = max(0, int(min_interval_seconds))
+        cap = int(daily_tx_cap)
+        if cap < 0:
+            cap = DEFAULT_DAILY_TX_CAP
+        self.daily_tx_cap = min(cap, HARD_DAILY_TX_CAP)
+        if key or self.rpc_url:
+            _VAULT.add(key, self.rpc_url)
+            _install_redact_filter()
 
     @property
     def private_key(self) -> str:
-        return self._private_key
+        return self._get_key()
 
     @property
     def enabled(self) -> bool:
-        return bool(self._private_key and self.contract and self.rpc_url)
+        return bool(self.private_key and self.contract and self.rpc_url)
 
     @property
     def disabled_reason(self) -> str:
@@ -216,6 +380,11 @@ class AttesterSettings:
             max_attempts=_env_int("RWA_ATTEST_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),
             backoff_seconds=_env_float("RWA_ATTEST_BACKOFF_SECONDS", DEFAULT_BACKOFF_SECONDS),
             chain_id=_env_int("RWA_ATTESTATION_CHAIN_ID", BASE_SEPOLIA_CHAIN_ID),
+            max_fee_gwei=_env_float("RWA_ATTEST_MAX_FEE_GWEI", DEFAULT_MAX_FEE_GWEI),
+            min_interval_seconds=_env_int(
+                "RWA_ATTEST_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL_SECONDS
+            ),
+            daily_tx_cap=_env_int("RWA_ATTEST_DAILY_CAP", DEFAULT_DAILY_TX_CAP),
         )
 
 
@@ -309,8 +478,84 @@ def _is_already(exc: BaseException) -> bool:
     return ALREADY_ATTESTED_SELECTOR in blob or "alreadyattested" in blob
 
 
+def choose_nonce(*, stored_nonce: int | None, unresolved: bool, suggested: int) -> int:
+    """Keep the in-flight nonce. A new nonce is only legal once that one is resolved."""
+    if unresolved and stored_nonce is not None:
+        return int(stored_nonce)
+    return int(suggested)
+
+
+def clamp_eip1559_fees(
+    *,
+    max_fee_gwei: float,
+    base_fee_wei: int = 0,
+    bump: int = 0,
+) -> tuple[int, int]:
+    """``(maxFeePerGas, maxPriorityFeePerGas)``, both at or under the hard ceiling.
+
+    ``bump`` raises the priority about 12.5% per step so a same-nonce replacement
+    is accepted, and still cannot pass the ceiling.
+    """
+    cap = int(HARD_MAX_FEE_GWEI * 1_000_000_000)
+    requested = float(max_fee_gwei)
+    if requested < 0:
+        requested = 0.0
+    requested_wei = int(min(requested, float(HARD_MAX_FEE_GWEI)) * 1_000_000_000)
+    if requested_wei > cap:
+        requested_wei = cap
+    if requested_wei < 1:
+        requested_wei = 1
+    priority = min(1_000_000_000, requested_wei)
+    for _ in range(max(0, int(bump))):
+        bumped = priority * 1125 // 1000 + 1
+        if bumped > requested_wei:
+            priority = requested_wei
+            break
+        priority = bumped
+    base = max(0, int(base_fee_wei))
+    max_fee = base * 2 + priority
+    if max_fee > requested_wei:
+        max_fee = requested_wei
+    if priority > max_fee:
+        priority = max_fee
+    if max_fee < 1:
+        max_fee = 1
+        priority = 1
+    return int(max_fee), int(priority)
+
+
+def _parse_iso(text: str) -> float:
+    return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
+
+
+def admission_block(store: Any, settings: AttesterSettings, ticker: str) -> str | None:
+    """``min_interval`` or ``daily_cap`` when a new enqueue must not be sent."""
+    interval = int(settings.min_interval_seconds)
+    if interval > 0:
+        latest = store.latest_attest_job_for_ticker(ticker)
+        if latest is not None:
+            try:
+                age = time.time() - _parse_iso(str(latest["created_at"]))
+            except (TypeError, ValueError, OSError):
+                age = 0.0
+            if age < interval:
+                return "min_interval"
+    cap = int(settings.daily_tx_cap)
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+    count = int(store.count_attest_jobs_since(since))
+    if count >= cap:
+        return "daily_cap"
+    return None
+
+
 class Web3Chain:
-    """One signer, one nonce stream. Do not run a second worker on this key."""
+    """One signer, one nonce stream. Do not run a second worker on this key.
+
+    A Render deploy can overlap two processes. The database claim lock
+    (``FOR UPDATE SKIP LOCKED``) gives the job to one of them. If a hash and
+    nonce are already stored, this sender re-waits or replaces at that same
+    nonce. It does not allocate a new nonce while the old one is unresolved.
+    """
 
     def __init__(self, settings: AttesterSettings) -> None:
         if not settings.enabled:
@@ -355,6 +600,10 @@ class Web3Chain:
         *,
         value_wei: int,
         gas_limit: int,
+        pending_nonce: int | None = None,
+        pending_tx: str | None = None,
+        known_hashes: list[str] | None = None,
+        on_submitted: Callable[[str, int], None] | None = None,
     ) -> str:
         with self._lock:
             return self._send(
@@ -363,7 +612,30 @@ class Web3Chain:
                 claimed_at,
                 value_wei=value_wei,
                 gas_limit=gas_limit,
+                pending_nonce=pending_nonce,
+                pending_tx=pending_tx,
+                known_hashes=known_hashes,
+                on_submitted=on_submitted,
             )
+
+    def landed_hash(
+        self,
+        score_hash: str,
+        ticker: str,
+        known: list[str] | None = None,
+    ) -> str | None:
+        hashes = [item for item in (known or []) if item]
+        return self._landed(hashes, score_hash, ticker)
+
+    def _base_fee_wei(self) -> int:
+        try:
+            block = self._w3.eth.get_block("latest")
+        except Exception:
+            return 0
+        raw = block.get("baseFeePerGas") if hasattr(block, "get") else None
+        if raw is None:
+            raw = getattr(block, "baseFeePerGas", 0)
+        return int(raw or 0)
 
     def _send(
         self,
@@ -373,6 +645,10 @@ class Web3Chain:
         *,
         value_wei: int,
         gas_limit: int,
+        pending_nonce: int | None = None,
+        pending_tx: str | None = None,
+        known_hashes: list[str] | None = None,
+        on_submitted: Callable[[str, int], None] | None = None,
     ) -> str:
         chain_id = int(self._w3.eth.chain_id)
         if chain_id != BASE_SEPOLIA_CHAIN_ID:
@@ -382,68 +658,177 @@ class Web3Chain:
         owner = str(self._contract.functions.owner().call())
         allowed = bool(self._contract.functions.isAttester(self._account.address).call())
         _assert_dedicated_attester(signer=self._account.address, owner=owner, is_attester=allowed)
+        known: list[str] = []
+        for item in list(known_hashes or []):
+            if item and item not in known:
+                known.append(item)
+        if pending_tx and pending_tx not in known:
+            known.append(pending_tx)
+        if known:
+            landed = self._landed(known, score_hash, ticker)
+            if landed:
+                if pending_nonce is not None:
+                    self._nonce = int(pending_nonce) + 1
+                return landed
+        unresolved = pending_nonce is not None and bool(pending_tx)
+        if unresolved:
+            try:
+                receipt = self._w3.eth.wait_for_transaction_receipt(
+                    pending_tx, timeout=RECEIPT_TIMEOUT_SECONDS
+                )
+            except Exception:
+                receipt = None
+            if receipt is not None and int(receipt["status"]) == 1:
+                self._nonce = int(pending_nonce) + 1
+                return _tx_hex(receipt["transactionHash"])
+            if receipt is not None and int(receipt["status"]) == 0:
+                landed = self._landed(known, score_hash, ticker)
+                if landed:
+                    self._nonce = int(pending_nonce) + 1
+                    return landed
+                # Revert consumed the nonce. A later send may take a new one.
+                self._nonce = None
+            else:
+                # Still pending. Replace at the same nonce. Never suggested+1.
+                nonce = choose_nonce(
+                    stored_nonce=int(pending_nonce),
+                    unresolved=True,
+                    suggested=int(pending_nonce) + 1,
+                )
+                self._nonce = nonce
+                return self._broadcast(
+                    score_hash,
+                    ticker,
+                    claimed_at,
+                    value_wei=value_wei,
+                    gas_limit=gas_limit,
+                    chain_id=chain_id,
+                    nonce=nonce,
+                    known=known,
+                    on_submitted=on_submitted,
+                    bump=1,
+                )
         if self._nonce is None:
-            self._nonce = int(
-                self._w3.eth.get_transaction_count(self._account.address, "pending")
-            )
-        nonce = self._nonce
+            suggested = int(self._w3.eth.get_transaction_count(self._account.address, "pending"))
+            self._nonce = choose_nonce(stored_nonce=None, unresolved=False, suggested=suggested)
+        nonce = int(self._nonce)
+        return self._broadcast(
+            score_hash,
+            ticker,
+            claimed_at,
+            value_wei=value_wei,
+            gas_limit=gas_limit,
+            chain_id=chain_id,
+            nonce=nonce,
+            known=known,
+            on_submitted=on_submitted,
+            bump=0,
+        )
+
+    def _broadcast(
+        self,
+        score_hash: str,
+        ticker: str,
+        claimed_at: int,
+        *,
+        value_wei: int,
+        gas_limit: int,
+        chain_id: int,
+        nonce: int,
+        known: list[str],
+        on_submitted: Callable[[str, int], None] | None,
+        bump: int,
+    ) -> str:
+        max_fee, priority = clamp_eip1559_fees(
+            max_fee_gwei=self._settings.max_fee_gwei,
+            base_fee_wei=self._base_fee_wei(),
+            bump=bump,
+        )
         fn = self._contract.functions.attest(_hash_bytes(score_hash), ticker, int(claimed_at))
-        tx_hash = None
+        tx = fn.build_transaction(
+            {
+                "from": self._account.address,
+                "value": int(value_wei),
+                "gas": int(gas_limit),
+                "nonce": int(nonce),
+                "chainId": chain_id,
+                "maxFeePerGas": int(max_fee),
+                "maxPriorityFeePerGas": int(priority),
+            }
+        )
+        signed = self._account.sign_transaction(tx)
+        raw = getattr(signed, "raw_transaction", None)
+        if raw is None:
+            raw = signed.rawTransaction
+        sent = self._w3.eth.send_raw_transaction(raw)
+        hex_hash = _tx_hex(sent)
+        if hex_hash not in known:
+            known.append(hex_hash)
+        if on_submitted is not None:
+            on_submitted(hex_hash, int(nonce))
+        # Stay on this nonce until a receipt says it was consumed.
+        self._nonce = int(nonce)
         try:
-            tx = fn.build_transaction(
-                {
-                    "from": self._account.address,
-                    "value": int(value_wei),
-                    "gas": int(gas_limit),
-                    "nonce": nonce,
-                    "chainId": chain_id,
-                }
-            )
-            signed = self._account.sign_transaction(tx)
-            raw = getattr(signed, "raw_transaction", None)
-            if raw is None:
-                raw = signed.rawTransaction
-            tx_hash = self._w3.eth.send_raw_transaction(raw)
-            self._nonce = nonce + 1
             receipt = self._w3.eth.wait_for_transaction_receipt(
-                tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS
+                sent, timeout=RECEIPT_TIMEOUT_SECONDS
             )
         except Exception as exc:
-            self._nonce = None
             if _is_already(exc):
                 raise AlreadyAttestedError("AlreadyAttested") from None
-            if tx_hash is not None:
-                landed = self._landed(tx_hash, score_hash, ticker)
-                if landed:
-                    return landed
-            raise RuntimeError(redact(str(exc), self._settings.private_key)) from None
-        if int(receipt.status) != 1:
-            self._nonce = None
-            landed = self._landed(tx_hash, score_hash, ticker)
+            landed = self._landed(known, score_hash, ticker)
             if landed:
+                self._nonce = int(nonce) + 1
                 return landed
+            raise RuntimeError(
+                redact(str(exc), self._settings.private_key, self._settings.rpc_url)
+            ) from None
+        if int(receipt["status"]) != 1:
+            landed = self._landed(known, score_hash, ticker)
+            if landed:
+                self._nonce = int(nonce) + 1
+                return landed
+            self._nonce = int(nonce) + 1
             reason = _revert_blob(self._w3, tx)
             if _is_already(RuntimeError(reason)):
                 raise AlreadyAttestedError("AlreadyAttested") from None
             raise RuntimeError(
-                redact(f"attest receipt status 0: {reason}", self._settings.private_key)
+                redact(
+                    f"attest receipt status 0: {reason}",
+                    self._settings.private_key,
+                    self._settings.rpc_url,
+                )
             ) from None
-        return _tx_hex(tx_hash)
+        self._nonce = int(nonce) + 1
+        return _tx_hex(receipt["transactionHash"])
 
-    def _landed(self, tx_hash: Any, score_hash: str, ticker: str) -> str | None:
-        """Receipt or verify says the hash is on chain. Do not mark that as failed."""
-        try:
-            receipt = self._w3.eth.get_transaction_receipt(tx_hash)
-        except Exception:
-            receipt = None
-        if receipt is not None and int(getattr(receipt, "status", 0)) == 1:
-            return _tx_hex(tx_hash)
-        try:
-            ok, _ts, _who = self.verify(score_hash, ticker)
-        except Exception:
-            ok = False
-        if ok:
-            return _tx_hex(tx_hash)
+    def _landed(self, known: list[str], score_hash: str, ticker: str) -> str | None:
+        """Return the known hash whose receipt status is 1.
+
+        ``score_hash`` and ``ticker`` identify the subject the caller already
+        checked with         ``verify``. This scan does not invent a hash from that
+        check. Returning None is what the anvil timeout test treats as failure.
+        """
+        _ = (score_hash, ticker)
+        for candidate in known:
+            if not candidate:
+                continue
+            try:
+                receipt = self._w3.eth.get_transaction_receipt(candidate)
+            except Exception:
+                receipt = None
+            if receipt is None:
+                continue
+            try:
+                status = int(receipt["status"])
+            except (KeyError, TypeError, ValueError):
+                status = int(getattr(receipt, "status", 0) or 0)
+            if status != 1:
+                continue
+            try:
+                raw = receipt["transactionHash"]
+            except (KeyError, TypeError):
+                raw = getattr(receipt, "transactionHash", candidate)
+            return _tx_hex(raw)
         return None
 
 
@@ -455,7 +840,13 @@ def _revert_blob(w3: Any, tx: dict[str, Any]) -> str:
     return ""
 
 
-def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> SendOutcome:
+def send_one(
+    job: dict[str, Any],
+    chain: Chain,
+    settings: AttesterSettings,
+    *,
+    on_submitted: Callable[[str, int], None] | None = None,
+) -> SendOutcome:
     """Pre-check ``verify``, then send. ``AlreadyAttested`` is success."""
     if int(settings.chain_id) != BASE_SEPOLIA_CHAIN_ID:
         raise TerminalAttestError(
@@ -475,7 +866,11 @@ def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> S
         )
     ok, attested_at, _who = chain.verify(job["score_hash"], job["ticker"])
     if ok:
-        return SendOutcome(tx_hash=None, attested_at=int(attested_at), already=True)
+        return SendOutcome(
+            tx_hash=_receipt_hash(chain, job),
+            attested_at=int(attested_at),
+            already=True,
+        )
     fee = int(chain.fee_wei())
     if fee > settings.value_cap_wei:
         raise TerminalAttestError(
@@ -488,11 +883,15 @@ def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> S
             int(job["claimed_at"]),
             value_wei=fee,
             gas_limit=settings.gas_limit,
+            pending_nonce=job.get("nonce"),
+            pending_tx=job.get("tx_hash"),
+            known_hashes=list(job.get("known_tx_hashes") or []),
+            on_submitted=on_submitted,
         )
     except AlreadyAttestedError:
         ok2, ts2, _who2 = chain.verify(job["score_hash"], job["ticker"])
         return SendOutcome(
-            tx_hash=None,
+            tx_hash=_receipt_hash(chain, job),
             attested_at=int(ts2) if ok2 else None,
             already=True,
         )
@@ -501,7 +900,11 @@ def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> S
     except Exception:
         ok_late, ts_late, _who_late = chain.verify(job["score_hash"], job["ticker"])
         if ok_late:
-            return SendOutcome(tx_hash=None, attested_at=int(ts_late), already=True)
+            return SendOutcome(
+                tx_hash=_receipt_hash(chain, job),
+                attested_at=int(ts_late) if isinstance(ts_late, int) else None,
+                already=True,
+            )
         raise
     ok3, ts3, _who3 = chain.verify(job["score_hash"], job["ticker"])
     return SendOutcome(
@@ -511,7 +914,31 @@ def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> S
     )
 
 
-def on_chain_view(store: Any, score_hash: str, settings: AttesterSettings) -> dict[str, Any]:
+def _receipt_hash(chain: Chain, job: dict[str, Any]) -> str | None:
+    """Hash ``_landed`` found. None when that check is disabled or no receipt mined."""
+    finder = getattr(chain, "landed_hash", None)
+    if not callable(finder):
+        return None
+    try:
+        found = finder(
+            job["score_hash"],
+            job["ticker"],
+            list(job.get("known_tx_hashes") or []),
+        )
+    except Exception:
+        return None
+    if not isinstance(found, str) or not found.startswith("0x"):
+        return None
+    return found
+
+
+def on_chain_view(
+    store: Any,
+    score_hash: str,
+    settings: AttesterSettings,
+    *,
+    admission: str | None = None,
+) -> dict[str, Any]:
     if not settings.enabled:
         return {
             "attested": False,
@@ -537,8 +964,19 @@ def on_chain_view(store: Any, score_hash: str, settings: AttesterSettings) -> di
         "worker": "enabled",
         "status": status or "absent",
     }
-    if status == "failed" and job is not None:
-        body["reason"] = job.get("last_error")
+    if admission in THROTTLE_MESSAGES:
+        body["status"] = "throttled"
+        body["reason"] = admission
+        body["message"] = THROTTLE_MESSAGES[admission]
+        return body
+    if status == "failed":
+        body["reason"] = FAILED_REASON
+        body["message"] = FAILED_MESSAGE
+    elif status == "pending" and job is not None and job.get("last_error") in THROTTLE_MESSAGES:
+        code = str(job["last_error"])
+        body["status"] = "throttled"
+        body["reason"] = code
+        body["message"] = THROTTLE_MESSAGES[code]
     return body
 
 
@@ -595,11 +1033,39 @@ class AttestWorker:
             except Exception as exc:  # noqa: BLE001 — keep the thread up
                 logger.info(
                     "attest worker loop error: %s",
-                    redact(str(exc), self.settings.private_key),
+                    redact(str(exc), self.settings.private_key, self.settings.rpc_url),
                 )
             if not worked:
                 self._wake.wait(timeout=2.0)
                 self._wake.clear()
+
+    def _promote_if_landed(self, job: dict[str, Any]) -> bool:
+        """If the subject is already on chain, confirm it with the mined hash."""
+        if not job.get("tx_hash") and not (job.get("known_tx_hashes") or []):
+            return False
+        try:
+            verified = self.chain().verify(job["score_hash"], job["ticker"])
+        except Exception:
+            return False
+        if not (isinstance(verified, tuple) and verified and verified[0] is True):
+            return False
+        landed = _receipt_hash(self.chain(), job)
+        attested_at = None
+        if len(verified) >= 2 and isinstance(verified[1], int):
+            attested_at = int(verified[1])
+        logger.info(
+            "attest job %s confirmed from chain hash=%s",
+            job["id"],
+            job["score_hash"],
+        )
+        self.store.finish_attest_job(
+            job["id"],
+            status="confirmed",
+            tx_hash=landed,
+            attested_at=attested_at,
+            error=None,
+        )
+        return True
 
     def process_once(self, *, now: float | None = None) -> bool:
         """Handle one due job. False when the queue has nothing due."""
@@ -610,18 +1076,33 @@ class AttestWorker:
         if job is None:
             return False
         secret = self.settings.private_key
+        rpc_url = self.settings.rpc_url
+
+        def _on_submitted(tx_hash: str, nonce: int) -> None:
+            self.store.note_submitted_tx(job["id"], tx_hash=tx_hash, nonce=nonce)
+            job["tx_hash"] = tx_hash
+            job["nonce"] = nonce
+            known = list(job.get("known_tx_hashes") or [])
+            if tx_hash not in known:
+                known.append(tx_hash)
+            job["known_tx_hashes"] = known
+
         try:
             _require_stored(self.store, job)
-            outcome = send_one(job, self.chain(), self.settings)
+            outcome = send_one(job, self.chain(), self.settings, on_submitted=_on_submitted)
         except TerminalAttestError as exc:
-            safe = redact(str(exc), secret)
+            safe = redact(str(exc), secret, rpc_url)
+            if self._promote_if_landed(job):
+                return True
             logger.info("attest job %s failed: %s", job["id"], safe)
             self.store.finish_attest_job(job["id"], status="failed", error=safe)
             return True
         except Exception as exc:  # noqa: BLE001 — retry transient RPC / gas errors
-            safe = redact(str(exc), secret)
+            safe = redact(str(exc), secret, rpc_url)
             attempts = int(job["attempts"])
             if attempts >= self.settings.max_attempts:
+                if self._promote_if_landed(job):
+                    return True
                 logger.info("attest job %s exhausted retries: %s", job["id"], safe)
                 self.store.finish_attest_job(job["id"], status="failed", error=safe)
                 return True

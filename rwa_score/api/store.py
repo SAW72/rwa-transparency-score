@@ -9,6 +9,7 @@ work; ``sslmode`` stays in the URL.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import secrets
 import sqlite3
@@ -106,7 +107,21 @@ def _payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _job_known_hashes(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if item]
+
+
 def _job_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
+    nonce = row["nonce"] if "nonce" in keys else None
     return {
         "id": int(row["id"]),
         "score_hash": row["score_hash"],
@@ -114,6 +129,8 @@ def _job_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "claimed_at": int(row["claimed_at"]),
         "status": row["status"],
         "tx_hash": row["tx_hash"],
+        "nonce": None if nonce is None else int(nonce),
+        "known_tx_hashes": _job_known_hashes(row["known_tx_hashes"]) if "known_tx_hashes" in keys else [],
         "attested_at": row["attested_at"],
         "attempts": int(row["attempts"]),
         "next_attempt_at": float(row["next_attempt_at"] or 0),
@@ -686,6 +703,48 @@ class Store:
             ).fetchone()
         return _job_from_row(row) if row is not None else None
 
+    def latest_attest_job_for_ticker(self, ticker: str) -> dict[str, Any] | None:
+        symbol = ticker.strip().upper()
+        with self._lock:
+            row = self._execute(
+                "SELECT * FROM attest_jobs WHERE ticker = ? ORDER BY id DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        return _job_from_row(row) if row is not None else None
+
+    def count_attest_jobs_since(self, created_after: str) -> int:
+        with self._lock:
+            row = self._execute(
+                "SELECT COUNT(*) AS n FROM attest_jobs WHERE created_at >= ?",
+                (created_after,),
+            ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["n"])
+        except (KeyError, IndexError, TypeError):
+            return int(row[0])
+
+    def note_submitted_tx(self, job_id: int, *, tx_hash: str, nonce: int) -> None:
+        """Remember a broadcast hash and the nonce it used, before the receipt."""
+        stamped = _iso()
+        with self._lock:
+            row = self._execute(
+                "SELECT known_tx_hashes FROM attest_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return
+            known = _job_known_hashes(row["known_tx_hashes"])
+            if tx_hash not in known:
+                known.append(tx_hash)
+            self._execute(
+                "UPDATE attest_jobs SET tx_hash = ?, nonce = ?, known_tx_hashes = ?, "
+                "updated_at = ? WHERE id = ?",
+                (tx_hash, int(nonce), json.dumps(known), stamped, job_id),
+            )
+            self._conn.commit()
+
     def claim_next_attest_job(self, *, now: float) -> dict[str, Any] | None:
         """Take the oldest due pending job and count one attempt. Single worker.
 
@@ -719,24 +778,32 @@ class Store:
         attested_at: int | None = None,
         error: str | None = None,
         next_attempt_at: float | None = None,
+        nonce: int | None = None,
     ) -> None:
         if status not in {"pending", "confirmed", "failed"}:
             raise ValueError(f"unknown job status: {status}")
         stamped = _iso()
         with self._lock:
             row = self._execute(
-                "SELECT score_hash, tx_hash FROM attest_jobs WHERE id = ?",
+                "SELECT score_hash, tx_hash, nonce FROM attest_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if row is None:
                 return
-            kept_tx = tx_hash or row["tx_hash"]
+            # A confirmed hash is the one that mined. Do not promote a broadcast
+            # hash that the caller did not just accept. Retries keep it.
+            if status == "confirmed":
+                kept_tx = tx_hash
+            else:
+                kept_tx = row["tx_hash"] if tx_hash is None else tx_hash
+            kept_nonce = row["nonce"] if nonce is None else int(nonce)
             self._execute(
-                "UPDATE attest_jobs SET status = ?, tx_hash = ?, attested_at = ?, "
+                "UPDATE attest_jobs SET status = ?, tx_hash = ?, nonce = ?, attested_at = ?, "
                 "last_error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?",
                 (
                     status,
                     kept_tx,
+                    kept_nonce,
                     attested_at,
                     error,
                     0.0 if next_attempt_at is None else float(next_attempt_at),

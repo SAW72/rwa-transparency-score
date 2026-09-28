@@ -248,6 +248,18 @@ CREATE INDEX IF NOT EXISTS idx_attest_jobs_due
     ON attest_jobs(status, next_attempt_at);
 """
 
+# In-flight send. nonce is the signer nonce already broadcast. known_tx_hashes
+# is a JSON list so a retry can find the receipt that actually mined.
+SQLITE_006 = """
+ALTER TABLE attest_jobs ADD COLUMN nonce INTEGER;
+ALTER TABLE attest_jobs ADD COLUMN known_tx_hashes TEXT;
+"""
+
+POSTGRES_006 = """
+ALTER TABLE attest_jobs ADD COLUMN IF NOT EXISTS nonce BIGINT;
+ALTER TABLE attest_jobs ADD COLUMN IF NOT EXISTS known_tx_hashes TEXT;
+"""
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -262,6 +274,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration("003_attested_payloads", SQLITE_003, POSTGRES_003),
     Migration("004_attestation_inputs", SQLITE_004, POSTGRES_004),
     Migration("005_attest_jobs", SQLITE_005, POSTGRES_005),
+    Migration("006_attest_job_nonce", SQLITE_006, POSTGRES_006),
 )
 
 

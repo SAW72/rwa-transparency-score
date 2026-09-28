@@ -92,6 +92,12 @@ services:
         sync: false
       - key: RWA_ATTEST_BACKOFF_SECONDS
         sync: false
+      - key: RWA_ATTEST_MAX_FEE_GWEI
+        sync: false
+      - key: RWA_ATTEST_MIN_INTERVAL_SECONDS
+        sync: false
+      - key: RWA_ATTEST_DAILY_CAP
+        sync: false
       - key: RWA_API_DB_PATH
         sync: false
       - key: RWA_API_BOOTSTRAP_KEY

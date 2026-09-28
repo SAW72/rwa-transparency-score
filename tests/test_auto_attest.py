@@ -21,7 +21,9 @@ from fastapi.testclient import TestClient
 from rwa_score.api.app import create_app
 from rwa_score.api.attest import attestation_payload, canonical_bytes
 from rwa_score.api.auto_attest import (
+    HARD_DAILY_TX_CAP,
     HARD_GAS_CAP,
+    HARD_MAX_FEE_GWEI,
     PINNED_ATTESTATION_CONTRACT,
     RECEIPT_TIMEOUT_SECONDS,
     RPC_TIMEOUT_SECONDS,
@@ -31,6 +33,8 @@ from rwa_score.api.auto_attest import (
     TerminalAttestError,
     Web3Chain,
     _assert_dedicated_attester,
+    choose_nonce,
+    clamp_eip1559_fees,
     redact,
 )
 from rwa_score.api.settings import ApiSettings
@@ -53,6 +57,8 @@ def _settings(key: str = "", **overrides: object) -> AttesterSettings:
         gas_limit=300_000,
         max_attempts=5,
         backoff_seconds=0.0,
+        min_interval_seconds=0,
+        daily_tx_cap=48,
     )
     data.update(overrides)
     return AttesterSettings(**data)  # type: ignore[arg-type]
@@ -500,3 +506,341 @@ def test_sca_no_private_key_flag_in_signer_or_runbook() -> None:
 def test_web3_chain_refuses_to_build_when_disabled() -> None:
     with pytest.raises(TerminalAttestError):
         Web3Chain(AttesterSettings())
+
+
+def test_runbook_single_worker_key_import_and_rotation_order() -> None:
+    text = (ROOT / "contracts" / "ATTESTER_RUNBOOK.md").read_text(encoding="utf-8")
+    assert "One worker only" in text
+    assert "FOR UPDATE SKIP LOCKED" in text
+    assert "same nonce" in text
+    new_at = text.index('"setAttester(address,bool)" "$NEW_ATTESTER" true')
+    old_at = text.index('"setAttester(address,bool)" "$OLD_ATTESTER" false')
+    assert new_at < old_at
+    assert "cast wallet import <name> --interactive" in text
+    assert "cast wallet new <dir> <name>" in text
+    assert "dashboard secret" in text
+    assert "Do not revoke the old key first" in text
+
+
+def test_settings_mapping_does_not_expose_private_key() -> None:
+    key = "0x" + "ab" * 32
+    settings = _settings(key, rpc_url="https://rpc.example/v2/SecretKey12345678")
+    with pytest.raises(TypeError):
+        vars(settings)
+    assert "_private_key" not in getattr(settings, "__dict__", {})
+    assert not hasattr(settings, "_private_key")
+    assert settings.private_key == key
+    assert key not in repr(settings)
+    assert "SecretKey12345678" not in repr(settings)
+
+
+def test_rpc_url_never_in_last_error_status_or_any_logger(
+    tmp_path: Path,
+    fixture_scorer: TransparencyScorer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rpc = "https://base-sepolia.example/v2/AbCdEfGh12345678?token=ZzYyXxWw99887766"
+    leaked = rpc.upper()
+    key = "0x" + "44" * 32
+    settings = _settings(key, rpc_url=rpc, max_attempts=1)
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.fee_wei.return_value = 0
+    chain.attest.side_effect = RuntimeError(f"provider rejected {leaked}")
+    api = ApiSettings(db_path=tmp_path / "api.sqlite")
+    store = Store(api.db_path)
+    digest, claimed = _seed(store, fixture_scorer)
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    worker = _worker(store, settings, chain)
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("web3.providers").info("dial %s", leaked)
+        logging.getLogger("rwa_score.api.app").error("app blew up on %s", rpc)
+        logging.getLogger().warning("root saw %s", leaked)
+        assert worker.process_once(now=1_000.0) is True
+    job = store.latest_attest_job(digest)
+    assert job is not None
+    assert job["status"] == "failed"
+    blob = (job["last_error"] or "") + caplog.text
+    assert rpc.lower() not in blob.lower()
+    assert "abcdefgh12345678" not in blob.lower()
+    assert "zzyyxxww99887766" not in blob.lower()
+    assert redact(f"see {leaked}", "", rpc) == "see [redacted]"
+    app = create_app(
+        settings=api,
+        store=store,
+        scorer=fixture_scorer,
+        attester=settings,
+        chain=chain,
+        start_worker=False,
+    )
+    raw = store.create_key(name="paid", tier="paid")
+    resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
+    assert resp.status_code == 200
+    body = resp.json()["on_chain"]
+    assert body["reason"] == "attest_failed"
+    assert body["message"] == "The attest job failed."
+    assert rpc.lower() not in resp.text.lower()
+    assert "abcdefgh12345678" not in resp.text.lower()
+    assert "zzyyxxww99887766" not in resp.text.lower()
+    assert job["last_error"] not in resp.text
+
+
+def test_fee_clamp_and_env_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    max_fee, priority = clamp_eip1559_fees(max_fee_gwei=99999, base_fee_wei=50 * 10**9, bump=6)
+    assert max_fee <= HARD_MAX_FEE_GWEI * 1_000_000_000
+    assert priority <= max_fee
+    assert priority > 0
+    low_fee, low_priority = clamp_eip1559_fees(max_fee_gwei=2, base_fee_wei=0, bump=0)
+    assert low_fee <= 2 * 1_000_000_000
+    assert low_priority <= low_fee
+    monkeypatch.setenv("RWA_ATTEST_MAX_FEE_GWEI", "99999")
+    monkeypatch.setenv("RWA_ATTEST_DAILY_CAP", "10000")
+    monkeypatch.setenv("RWA_ATTESTER_PRIVATE_KEY", "0x" + "66" * 32)
+    monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
+    monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", "http://127.0.0.1:9")
+    settings = AttesterSettings.from_env()
+    assert settings.max_fee_gwei == float(HARD_MAX_FEE_GWEI)
+    assert settings.daily_tx_cap == HARD_DAILY_TX_CAP
+    assert choose_nonce(stored_nonce=4, unresolved=True, suggested=9) == 4
+    assert choose_nonce(stored_nonce=None, unresolved=False, suggested=9) == 9
+
+
+def test_min_interval_does_not_enqueue_or_send(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    settings = _settings("0x" + "55" * 32, min_interval_seconds=3600, daily_tx_cap=10)
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.fee_wei.return_value = 0
+    chain.attest.return_value = "0x" + "ab" * 32
+    api = ApiSettings(db_path=tmp_path / "gap.sqlite")
+    store = Store(api.db_path)
+    app = create_app(
+        settings=api,
+        store=store,
+        scorer=fixture_scorer,
+        attester=settings,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = {"X-API-Key": raw}
+    first = client.get("/v1/attest/NVDA", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["on_chain"].get("reason") != "min_interval"
+    second = client.get("/v1/attest/NVDA", headers=headers)
+    assert second.status_code == 200
+    throttled = second.json()["on_chain"]
+    assert throttled["status"] == "throttled"
+    assert throttled["reason"] == "min_interval"
+    assert "minimum interval" in throttled["message"]
+    assert "No transaction was sent" in throttled["message"]
+    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+    worker = _worker(store, settings, chain)
+    assert worker.process_once(now=time.time()) is True
+    chain.attest.assert_called_once()
+    assert worker.process_once(now=time.time() + 10) is False
+
+
+def test_daily_cap_does_not_enqueue(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+    settings = _settings("0x" + "56" * 32, min_interval_seconds=0, daily_tx_cap=1)
+    api = ApiSettings(db_path=tmp_path / "cap.sqlite")
+    store = Store(api.db_path)
+    app = create_app(
+        settings=api,
+        store=store,
+        scorer=fixture_scorer,
+        attester=settings,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = {"X-API-Key": raw}
+    first = client.get("/v1/attest/NVDA", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["on_chain"].get("reason") != "daily_cap"
+    second = client.get("/v1/attest/NVDA", headers=headers)
+    assert second.status_code == 200
+    throttled = second.json()["on_chain"]
+    assert throttled["status"] == "throttled"
+    assert throttled["reason"] == "daily_cap"
+    assert "Daily attest" in throttled["message"]
+    assert "No transaction was sent" in throttled["message"]
+    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+
+
+def _forge_deploy(rpc: str) -> str:
+    env = os.environ.copy()
+    env.pop("RWA_ATTESTER_PRIVATE_KEY", None)
+    deployed = subprocess.check_output(
+        [
+            "forge",
+            "create",
+            "--rpc-url",
+            rpc,
+            "--unlocked",
+            "--from",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            "--broadcast",
+            "src/ScoreAttestation.sol:ScoreAttestation",
+            "--constructor-args",
+            "0",
+        ],
+        cwd=CONTRACTS,
+        text=True,
+        env=env,
+    )
+    address = ""
+    for line in deployed.splitlines():
+        if "Deployed to:" in line:
+            address = line.split("Deployed to:", 1)[1].strip()
+    if not address.startswith("0x"):
+        raise AssertionError(deployed)
+    return address
+
+
+def _allow_worker(rpc: str, contract: str) -> None:
+    from eth_account import Account
+
+    worker_addr = Account.from_key(ANVIL_ACCOUNT_1).address
+    subprocess.check_call(
+        [
+            "cast",
+            "send",
+            contract,
+            "setAttester(address,bool)",
+            worker_addr,
+            "true",
+            "--rpc-url",
+            rpc,
+            "--unlocked",
+            "--from",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        ],
+        stdout=subprocess.DEVNULL,
+    )
+    subprocess.check_call(
+        [
+            "cast",
+            "send",
+            contract,
+            "setFee(uint256)",
+            "0",
+            "--rpc-url",
+            rpc,
+            "--unlocked",
+            "--from",
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+        ],
+        stdout=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.skipif(shutil.which("anvil") is None or shutil.which("forge") is None, reason="anvil missing")
+def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+    """Receipt wait times out, the tx later mines, and the job stores that hash.
+
+    Fails if ``_landed`` is disabled: the confirmed tx hash is the receipt hash
+    ``_landed`` returns, and a success that only noticed ``verify`` has no hash.
+    A second send while the first is pending must reuse nonce 0.
+    """
+    port = _free_port()
+    rpc = f"http://127.0.0.1:{port}"
+    proc = subprocess.Popen(
+        ["anvil", "--host", "127.0.0.1", "--port", str(port), "--chain-id", "84532", "--silent"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not _anvil_ready(rpc):
+            if proc.poll() is not None:
+                pytest.fail("anvil exited before it was ready")
+            time.sleep(0.1)
+        assert _anvil_ready(rpc)
+        address = _forge_deploy(rpc)
+        _allow_worker(rpc, address)
+        settings = AttesterSettings(
+            private_key=ANVIL_ACCOUNT_1,
+            contract=address,
+            rpc_url=rpc,
+            value_cap_wei=0,
+            gas_limit=300_000,
+            max_attempts=5,
+            backoff_seconds=0.0,
+            enforce_contract_pin=False,
+            min_interval_seconds=0,
+            max_fee_gwei=20,
+        )
+        chain = Web3Chain(settings)
+        chain._w3.provider.make_request("anvil_setAutomine", [False])
+        nonce_lookups: list[str] = []
+        real_count = chain._w3.eth.get_transaction_count
+
+        def _count(address: str, block: str = "latest") -> int:
+            nonce_lookups.append(str(block))
+            return int(real_count(address, block))
+
+        chain._w3.eth.get_transaction_count = _count  # type: ignore[method-assign]
+
+        def _timeout(*_args: object, **_kwargs: object) -> None:
+            raise TimeoutError("receipt timeout")
+
+        chain._w3.eth.wait_for_transaction_receipt = _timeout  # type: ignore[method-assign]
+        store = Store(tmp_path / "timeout-lands.sqlite")
+        digest, claimed = _seed(store, fixture_scorer)
+        store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+        worker = AttestWorker(store=store, settings=settings, chain=chain, autostart=False)
+        assert worker.process_once() is True
+        pending = store.latest_attest_job(digest)
+        assert pending is not None
+        assert pending["status"] == "pending"
+        assert pending["nonce"] == 0
+        assert pending["tx_hash"]
+        first_tx = chain._w3.eth.get_transaction(pending["tx_hash"])
+        assert int(first_tx["nonce"]) == 0
+        assert int(first_tx["maxFeePerGas"]) <= HARD_MAX_FEE_GWEI * 1_000_000_000
+        assert int(first_tx["maxPriorityFeePerGas"]) <= int(first_tx["maxFeePerGas"])
+        assert int(first_tx["maxFeePerGas"]) > 0
+        assert nonce_lookups == ["pending"]
+        assert worker.process_once() is True
+        replaced = store.latest_attest_job(digest)
+        assert replaced is not None
+        assert replaced["status"] == "pending"
+        assert replaced["nonce"] == 0
+        assert len(replaced["known_tx_hashes"]) == 2
+        assert replaced["tx_hash"] != pending["tx_hash"]
+        # Same-nonce replacement. The node may drop the first hash.
+        # A new nonce would have called get_transaction_count again.
+        assert nonce_lookups == ["pending"]
+        second_tx = chain._w3.eth.get_transaction(replaced["tx_hash"])
+        assert int(second_tx["nonce"]) == 0
+        assert int(second_tx["maxFeePerGas"]) >= int(first_tx["maxFeePerGas"])
+        assert int(second_tx["maxFeePerGas"]) <= HARD_MAX_FEE_GWEI * 1_000_000_000
+        assert int(second_tx["maxPriorityFeePerGas"]) <= int(second_tx["maxFeePerGas"])
+        chain._w3.provider.make_request("evm_mine", [])
+        assert worker.process_once() is True
+        job = store.latest_attest_job(digest)
+        assert job is not None
+        assert job["status"] == "confirmed"
+        assert job["tx_hash"]
+        receipt = chain._w3.eth.get_transaction_receipt(job["tx_hash"])
+        assert int(receipt["status"]) == 1
+        mined = receipt["transactionHash"]
+        mined_hex = mined.hex() if hasattr(mined, "hex") else str(mined)
+        if not mined_hex.startswith("0x"):
+            mined_hex = "0x" + mined_hex
+        assert job["tx_hash"].lower() == mined_hex.lower()
+        assert chain._w3.eth.get_transaction_count(chain.address) == 1
+        payload = store.get_attested_payload(digest)
+        assert payload is not None
+        assert payload["tx_hash"].lower() == mined_hex.lower()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()

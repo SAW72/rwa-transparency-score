@@ -27,7 +27,7 @@ from .attest import (
     inputs_bytes,
     resolve_scorer_version,
 )
-from .auto_attest import AttestWorker, AttesterSettings, on_chain_view
+from .auto_attest import AttestWorker, AttesterSettings, admission_block, on_chain_view
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store, open_store
@@ -429,14 +429,17 @@ def create_app(
             canonical=raw,
             inputs=inputs_bytes(report),
         )
+        admission = None
         if attester_cfg.enabled:
-            db.enqueue_attest_job(
-                score_hash=digest,
-                ticker=report["ticker"],
-                claimed_at=int(payload["as_of"]),
-            )
-            worker.kick()
-        chain_view = on_chain_view(db, digest, attester_cfg)
+            admission = admission_block(db, attester_cfg, report["ticker"])
+            if admission is None:
+                db.enqueue_attest_job(
+                    score_hash=digest,
+                    ticker=report["ticker"],
+                    claimed_at=int(payload["as_of"]),
+                )
+                worker.kick()
+        chain_view = on_chain_view(db, digest, attester_cfg, admission=admission)
         return {
             "ticker": report["ticker"],
             "score_hash": digest,
