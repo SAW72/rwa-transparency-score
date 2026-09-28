@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 import secrets
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -25,6 +26,7 @@ from .attest import (
     inputs_bytes,
     resolve_scorer_version,
 )
+from .auto_attest import AttestWorker, AttesterSettings, on_chain_view
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store
@@ -118,6 +120,9 @@ def create_app(
     store: Store | None = None,
     scorer: TransparencyScorer | None = None,
     poster=None,
+    attester: AttesterSettings | None = None,
+    chain=None,
+    start_worker: bool = True,
 ) -> FastAPI:
     # Resolve once at process startup. Later scores reuse the cache.
     resolve_scorer_version()
@@ -125,6 +130,19 @@ def create_app(
     db = store or Store(cfg.db_path)
     if store is None and cfg.bootstrap_key:
         db.ensure_key(cfg.bootstrap_key, name="bootstrap", tier=cfg.bootstrap_tier)
+    attester_cfg = attester if attester is not None else AttesterSettings.from_env()
+    worker = AttestWorker(
+        store=db,
+        settings=attester_cfg,
+        chain=chain,
+        autostart=start_worker,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        worker.kick()
+        yield
+        worker.stop()
 
     app = FastAPI(
         title="RAT Score API",
@@ -133,11 +151,14 @@ def create_app(
             "this surface is API access, history, webhooks, and attestation hashes."
         ),
         version=__version__,
+        lifespan=lifespan,
     )
     app.state.settings = cfg
     app.state.store = db
     app.state.scorer = scorer
     app.state.poster = poster
+    app.state.attester = attester_cfg
+    app.state.worker = worker
 
     def get_scorer() -> TransparencyScorer:
         if app.state.scorer is None:
@@ -354,6 +375,14 @@ def create_app(
             canonical=raw,
             inputs=inputs_bytes(report),
         )
+        if attester_cfg.enabled:
+            db.enqueue_attest_job(
+                score_hash=digest,
+                ticker=report["ticker"],
+                claimed_at=int(payload["as_of"]),
+            )
+            worker.kick()
+        chain_view = on_chain_view(db, digest, attester_cfg)
         return {
             "ticker": report["ticker"],
             "score_hash": digest,
@@ -363,6 +392,7 @@ def create_app(
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or None,
             "stored": True,
+            "on_chain": chain_view,
             "note": (
                 "Call ScoreAttestation.attest(scoreHash, ticker, timestamp) "
                 "on Base Sepolia from an authorized attester (owner or "
@@ -373,9 +403,10 @@ def create_app(
                 "the Unix second when this payload was hashed, not when the "
                 "data was observed. Fixture scores use as_of 0, which is not "
                 "a calendar time. data_as_of is the latest provider observation "
-                "time already on the report, or null. The canonical JSON for "
-                "this hash is stored locally, with the scoring inputs beside it "
-                "(Render free disk is ephemeral). "
+                "time already on the report, or null. When the attester worker "
+                "is enabled it enqueues that call off this response, using "
+                "these same canonical bytes. The canonical JSON and scoring "
+                "inputs are stored locally (Render free disk is ephemeral). "
                 "The contract stores this hash only — never "
                 "the raw score. Mainnet is held."
             ),

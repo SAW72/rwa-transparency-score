@@ -89,6 +89,25 @@ def _payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "canonical": _blob(row["canonical_json"]),
         "inputs": _blob(row["inputs_json"]) if "inputs_json" in keys else None,
         "stored_at": row["stored_at"],
+        "tx_hash": row["tx_hash"] if "tx_hash" in keys else None,
+        "attested_at": row["attested_at"] if "attested_at" in keys else None,
+    }
+
+
+def _job_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "score_hash": row["score_hash"],
+        "ticker": row["ticker"],
+        "claimed_at": int(row["claimed_at"]),
+        "status": row["status"],
+        "tx_hash": row["tx_hash"],
+        "attested_at": row["attested_at"],
+        "attempts": int(row["attempts"]),
+        "next_attempt_at": float(row["next_attempt_at"] or 0),
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
     }
 
 
@@ -544,7 +563,8 @@ class Store:
         digest = score_hash.strip()
         with self._lock:
             row = self._conn.execute(
-                "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at "
+                "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at, "
+                "tx_hash, attested_at "
                 "FROM attested_payloads WHERE score_hash = ?",
                 (digest,),
             ).fetchone()
@@ -556,7 +576,8 @@ class Store:
         symbol = ticker.strip().upper()
         with self._lock:
             row = self._conn.execute(
-                "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at "
+                "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at, "
+                "tx_hash, attested_at "
                 "FROM attested_payloads WHERE ticker = ? "
                 "ORDER BY stored_at DESC, rowid DESC LIMIT 1",
                 (symbol,),
@@ -564,6 +585,124 @@ class Store:
         if row is None:
             return None
         return _payload_from_row(row)
+
+    def enqueue_attest_job(
+        self,
+        *,
+        score_hash: str,
+        ticker: str,
+        claimed_at: int,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Queue one send. A pending or confirmed job for this hash is reused.
+
+        ``force`` inserts another pending row so a rerun can hit
+        ``AlreadyAttested`` / the verify pre-check. The API does not set it.
+        """
+        digest = score_hash.strip()
+        symbol = ticker.strip().upper()
+        now = _iso()
+        with self._lock:
+            if not force:
+                existing = self._conn.execute(
+                    "SELECT * FROM attest_jobs WHERE score_hash = ? "
+                    "AND status IN ('pending', 'confirmed') "
+                    "ORDER BY id DESC LIMIT 1",
+                    (digest,),
+                ).fetchone()
+                if existing is not None:
+                    return _job_from_row(existing)
+            self._conn.execute(
+                "INSERT INTO attest_jobs ("
+                "score_hash, ticker, claimed_at, status, attempts, next_attempt_at, "
+                "created_at, updated_at"
+                ") VALUES (?, ?, ?, 'pending', 0, 0, ?, ?)",
+                (digest, symbol, int(claimed_at), now, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM attest_jobs WHERE score_hash = ? ORDER BY id DESC LIMIT 1",
+                (digest,),
+            ).fetchone()
+        return _job_from_row(row)
+
+    def latest_attest_job(self, score_hash: str) -> dict[str, Any] | None:
+        digest = score_hash.strip()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM attest_jobs WHERE score_hash = ? ORDER BY id DESC LIMIT 1",
+                (digest,),
+            ).fetchone()
+        return _job_from_row(row) if row is not None else None
+
+    def claim_next_attest_job(self, *, now: float) -> dict[str, Any] | None:
+        """Take the oldest due pending job and count one attempt. Single worker."""
+        stamped = _iso()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM attest_jobs WHERE status = 'pending' AND next_attempt_at <= ? "
+                "ORDER BY id LIMIT 1",
+                (float(now),),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                "UPDATE attest_jobs SET attempts = attempts + 1, updated_at = ? WHERE id = ?",
+                (stamped, row["id"]),
+            )
+            self._conn.commit()
+            fresh = self._conn.execute(
+                "SELECT * FROM attest_jobs WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        return _job_from_row(fresh)
+
+    def finish_attest_job(
+        self,
+        job_id: int,
+        *,
+        status: str,
+        tx_hash: str | None = None,
+        attested_at: int | None = None,
+        error: str | None = None,
+        next_attempt_at: float | None = None,
+    ) -> None:
+        if status not in {"pending", "confirmed", "failed"}:
+            raise ValueError(f"unknown job status: {status}")
+        stamped = _iso()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT score_hash, tx_hash FROM attest_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return
+            kept_tx = tx_hash or row["tx_hash"]
+            self._conn.execute(
+                "UPDATE attest_jobs SET status = ?, tx_hash = ?, attested_at = ?, "
+                "last_error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                (
+                    status,
+                    kept_tx,
+                    attested_at,
+                    error,
+                    0.0 if next_attempt_at is None else float(next_attempt_at),
+                    stamped,
+                    job_id,
+                ),
+            )
+            if status == "confirmed":
+                if kept_tx:
+                    self._conn.execute(
+                        "UPDATE attested_payloads SET tx_hash = ? WHERE score_hash = ?",
+                        (kept_tx, row["score_hash"]),
+                    )
+                if attested_at is not None:
+                    self._conn.execute(
+                        "UPDATE attested_payloads SET attested_at = ? WHERE score_hash = ?",
+                        (int(attested_at), row["score_hash"]),
+                    )
+            self._conn.commit()
 
     def recent_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:

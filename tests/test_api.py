@@ -462,6 +462,10 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
     assert "never the raw score" in body["note"].lower()
     assert body["contract"] is None
     assert body["stored"] is True
+    assert body["on_chain"]["worker"] == "disabled"
+    assert body["on_chain"]["attested"] is False
+    assert body["on_chain"]["tx"] is None
+    assert body["on_chain"]["attestedAt"] is None
     saved = store.get_attested_payload(body["score_hash"])
     assert saved is not None
     assert saved["canonical"] == canonical_bytes(body["payload"])

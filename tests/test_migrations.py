@@ -103,8 +103,10 @@ def test_postgres_dump_is_dialect_ready_and_not_executed() -> None:
         "002_history_tenant",
         "003_attested_payloads",
         "004_attestation_inputs",
+        "005_attest_jobs",
     }
     assert "inputs_json BYTEA" in sql
+    assert "attest_jobs" in sqlite_sql
     assert "attested_payloads" in sqlite_sql
     assert "BYTEA" in sql
 
@@ -134,6 +136,7 @@ def test_apply_is_idempotent(tmp_path: Path) -> None:
         "002_history_tenant",
         "003_attested_payloads",
         "004_attestation_inputs",
+        "005_attest_jobs",
     ]
     assert second == []
     conn.close()
