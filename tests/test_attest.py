@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -78,6 +79,47 @@ _FIELD_MUTATIONS = [
     ("scorer_version", "abcdef1"),
     ("inputs_digest", "0x" + "cd" * 32),
 ]
+
+
+def test_scorer_version_fallback_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RENDER_GIT_COMMIT, then `git rev-parse HEAD`, then unknown."""
+    report = {"ticker": "NVDA", "data_source": "fixture"}
+    seen: list[list[str]] = []
+
+    def git_ok(args, **_kwargs):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout=("f" * 40) + "\n", stderr="")
+
+    monkeypatch.setattr("rwa_score.api.attest.subprocess.run", git_ok)
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "a" * 40)
+    monkeypatch.setenv("SOURCE_VERSION", "should-not-be-used")
+    monkeypatch.setenv("GIT_COMMIT", "should-not-be-used")
+    assert attestation_payload(report)["scorer_version"] == "a" * 40
+    assert seen == []
+
+    monkeypatch.delenv("RENDER_GIT_COMMIT", raising=False)
+    assert attestation_payload(report)["scorer_version"] == "f" * 40
+    assert seen == [["git", "rev-parse", "HEAD"]]
+
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "   ")
+    assert attestation_payload(report)["scorer_version"] == "f" * 40
+    assert seen == [["git", "rev-parse", "HEAD"], ["git", "rev-parse", "HEAD"]]
+    monkeypatch.delenv("RENDER_GIT_COMMIT", raising=False)
+
+    def git_missing(args, **_kwargs):
+        seen.append(list(args))
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr("rwa_score.api.attest.subprocess.run", git_missing)
+    assert attestation_payload(report)["scorer_version"] == "unknown"
+
+    def git_fails(args, **_kwargs):
+        seen.append(list(args))
+        return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: not a git repository")
+
+    monkeypatch.setattr("rwa_score.api.attest.subprocess.run", git_fails)
+    assert attestation_payload(report)["scorer_version"] == "unknown"
+    assert seen[-1] == ["git", "rev-parse", "HEAD"]
 
 
 def test_hash_stable_across_two_scores(fixture_scorer: TransparencyScorer) -> None:

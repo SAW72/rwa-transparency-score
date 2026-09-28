@@ -13,9 +13,11 @@ Canonical JSON (the bytes that are hashed and, once attested, stored):
 - ``ensure_ascii=True`` so non-ASCII is ``\\uXXXX`` (the resulting text is
   ASCII, which is valid UTF-8). Key order in the input dict does not matter.
 
-``scorer_version`` reuses :func:`rwa_score.health.deploy_git_sha`: the first
-non-empty of ``RENDER_GIT_COMMIT``, ``SOURCE_VERSION``, ``GIT_COMMIT``,
-truncated to 7 characters. If none are set, the version is ``unknown``.
+``scorer_version`` is the git SHA. ``RENDER_GIT_COMMIT`` (Render sets this
+at runtime) wins. If that is empty, the value is ``git rev-parse HEAD``.
+If that fails, the version is ``unknown``. It is not truncated, and it does
+not read ``SOURCE_VERSION`` or ``GIT_COMMIT``. ``/health`` still uses its
+own short SHA via :func:`rwa_score.health.deploy_git_sha`.
 
 ``as_of`` is unix seconds UTC. A report that already carries ``as_of`` keeps
 that value. Fixture scores (``data_source == "fixture"``) use ``0`` because
@@ -34,11 +36,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
-from rwa_score.health import deploy_git_sha
 from rwa_score.scorer import WEIGHTS
+
+# rwa_score/api/attest.py → repository root.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 ATTESTATION_ALGO = "sha256"
 ATTESTATION_FIELDS = (
@@ -87,11 +94,36 @@ def _as_of(report: dict[str, Any], now: float | None) -> int:
     return int(clock)
 
 
+def _git_rev_parse_head() -> str:
+    """Full ``git rev-parse HEAD`` output, or empty when git cannot answer."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(_REPO_ROOT),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
 def _scorer_version(report: dict[str, Any]) -> str:
+    """Git SHA: ``RENDER_GIT_COMMIT``, then ``git rev-parse HEAD``, else ``unknown``.
+
+    A report that already carries ``scorer_version`` keeps that value.
+    """
     raw = report.get("scorer_version")
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
-    return deploy_git_sha()
+    env = (os.environ.get("RENDER_GIT_COMMIT") or "").strip()
+    if env:
+        return env
+    return _git_rev_parse_head() or "unknown"
 
 
 def attestation_inputs(report: dict[str, Any]) -> dict[str, Any]:

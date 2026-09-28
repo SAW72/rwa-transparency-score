@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from rwa_score.api.app import BREAKDOWN_KEYS, create_app
@@ -130,7 +131,11 @@ def test_docs_do_not_embed_secrets() -> None:
 def test_nvda_evidence_sample_matches_fixture_api(
     tmp_path: Path,
     fixture_scorer: TransparencyScorer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The published fixture hash is locked with scorer_version "unknown".
+    # Resolution order is test_scorer_version_fallback_order.
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "unknown")
     sample = json.loads(EVIDENCE_JSON.read_text(encoding="utf-8"))
     assert sample["ticker"] == "NVDA"
     assert sample["data_source"] == "fixture"
