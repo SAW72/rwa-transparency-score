@@ -365,6 +365,8 @@ contract ScoreAttestationTest is Test {
         assertFalse(deployed.isAttester(stranger));
         assertFalse(deployed.isAttester(extra));
 
+        address listed = address(0xBEEF);
+        vm.setEnv("ATTESTER_ADDRESS", vm.toString(listed));
         vm.setEnv("ATTESTER_ADDRESS_3", vm.toString(stranger));
         vm.setEnv("ATTESTERS", vm.toString(extra));
         vm.setEnv("FINAL_OWNER", vm.toString(stranger));
@@ -372,6 +374,7 @@ contract ScoreAttestationTest is Test {
         assertEq(handed.owner(), attester);
         assertEq(handed.pendingOwner(), stranger);
         assertTrue(handed.isAttester(attester));
+        assertTrue(handed.isAttester(listed));
         assertTrue(handed.isAttester(extra));
         assertTrue(handed.isAttester(stranger));
         vm.prank(stranger);

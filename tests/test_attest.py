@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+import json
+
 from rwa_score.api.attest import attestation_payload, score_hash
+from rwa_score.api.verify import main
 from rwa_score.scorer import TransparencyScorer
+
+# cast 1.8.3 prints a uint256 as the integer plus a bracketed decimal.
+CAST_183_VERIFY = (
+    "true\n"
+    "1700000000 [1.7e9]\n"
+    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n"
+)
 
 
 def test_hash_stable_across_two_scores(fixture_scorer: TransparencyScorer) -> None:
@@ -62,3 +72,27 @@ def test_basis_is_never_silently_dropped(fixture_scorer: TransparencyScorer) -> 
     assert "basis" in payload["weights"]
     assert "basis" in payload["verification"]
     assert score_hash(stripped) != original
+
+
+def test_verify_json_parses_cast_183_attested_at(monkeypatch, capsys) -> None:
+    monkeypatch.setattr("rwa_score.api.verify.shutil.which", lambda _name: "/usr/bin/cast")
+    monkeypatch.setattr(
+        "rwa_score.api.verify.subprocess.check_output",
+        lambda *_args, **_kwargs: CAST_183_VERIFY,
+    )
+    code = main(
+        [
+            "NVDA",
+            "--fixtures",
+            "--json",
+            "--contract",
+            "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+            "--rpc-url",
+            "http://127.0.0.1:8545",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["on_chain"]["attested_at"] == 1700000000
+    assert isinstance(payload["on_chain"]["attested_at"], int)
+    assert "1700000000 [1.7e9]" in payload["on_chain"]["raw"]

@@ -66,11 +66,16 @@ def test_readme_documents_tenant_scoped_webhooks() -> None:
 
 
 def test_deploy_script_holds_mainnet() -> None:
+    # Source shape only. The real guard is forge
+    # test_deployScoreAttestationRevertsOffBaseSepolia in
+    # contracts/test/ScoreAttestation.t.sol.
     script = (ROOT / "contracts/script/DeployScoreAttestation.s.sol").read_text(encoding="utf-8")
-    assert "84532" in script
-    assert "mainnet held" in script
-    assert "8453" not in script or "BASE_SEPOLIA" in script
-    # No mainnet deploy script in this PR.
+    assert re.search(
+        r"if\s*\(\s*block\.chainid\s*!=\s*BASE_SEPOLIA\s*\)\s*\{[^}]*\brevert\s*\(",
+        script,
+    )
+    assert re.search(r"\bBASE_SEPOLIA\s*=\s*84532\b", script)
+    assert re.search(r"\brpcChainId\s*!=\s*0x14a34\b", script)
     names = {p.name for p in (ROOT / "contracts/script").glob("*.sol")}
     assert "DeployMainnet.s.sol" not in names
 
