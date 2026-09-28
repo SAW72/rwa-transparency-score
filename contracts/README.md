@@ -98,13 +98,13 @@ Default fee is **0.001 ETH** per attestation (covers gas + a small revenue line)
 3. Re-verify:
 
 ```bash
-python scripts/verify_attestation.py NVDA --fixtures \
-  --contract "$ATTESTATION_CONTRACT" \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL"
+python scripts/verify_attestation.py NVDA \
+  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+  --attester "$ATTESTER_ADDRESS"
 ```
 
-`cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key.
+`--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. `--fixtures` is obsolete and only warns. `cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key. It exits non-zero when nothing is stored, the bytes do not match, the chain id is not 84532, the attester mismatches, the RPC fails, or `cast` is missing.
 
 ## Hash algorithm
 
-`sha256` of canonical JSON (sorted keys, no whitespace) over ticker, rwa_id, issuer, score, band, **full** subscores and weights (all six live pillars, including **basis**), cik, data_source, verification `{score, level, source}` per pillar (including basis), and the basis meta block. See `rwa_score/api/attest.py`. A cited breakdown that silently drops basis will not match.
+`sha256` of canonical JSON (sorted keys, no whitespace, UTF-8, no NaN/Infinity — RFC 8785 key order, Python number formatting) over ticker, rwa_id, issuer, score, band, **full** subscores and weights (all six live pillars, including **basis**), cik, data_source, verification `{score, level, source}` per pillar (including basis), the basis meta block, `as_of` (hashing time, Unix seconds), `scorer_version`, and `inputs_digest`. `inputs_digest` hashes the CMC and Chainlink values kept on the report, not raw provider HTTP bodies. See `rwa_score/api/attest.py`. A cited breakdown that silently drops basis will not match.

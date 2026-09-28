@@ -521,9 +521,112 @@ def test_verify_client_fixtures_json(
     )
     store.close()
     assert verify_main(["NVDA", "--fixtures", "--json", "--db", str(db)]) == 0
-    payload = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    assert "obsolete" in captured.err.lower()
+    payload = json.loads(captured.out)
     assert payload["ticker"] == "NVDA"
     assert payload["score_hash"].startswith("0x")
     assert payload["payload"]["subscores"]
     assert payload["on_chain"] is None
     assert payload["stored"] is True
+
+
+def test_live_mode_hash_matches_stored_bytes_when_clock_advances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One canonical build per request. A later time.time() must not fork the hash."""
+    from rwa_score.scorer import TransparencyScorer
+    from tests.conftest import RecordingClient
+
+    monkeypatch.delenv("RWA_USE_FIXTURES", raising=False)
+    ticks = {"n": 0}
+    sealed_at: list[int] = []
+
+    def clock() -> float:
+        ticks["n"] += 1
+        return 1_700_000_000.0 + ticks["n"]
+
+    import rwa_score.api.attest as attest_mod
+
+    original_as_of = attest_mod._as_of
+
+    def counting_as_of(report: dict[str, Any], now: float | None) -> int:
+        value = original_as_of(report, now)
+        sealed_at.append(value)
+        return value
+
+    monkeypatch.setattr("rwa_score.api.attest.time.time", clock)
+    monkeypatch.setattr("rwa_score.api.attest._as_of", counting_as_of)
+    inner = TransparencyScorer(RecordingClient(), use_live_verifiers=False)
+
+    class _LiveThenCross:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def score(self, ticker: str) -> dict[str, Any]:
+            report = dict(inner.score(ticker))
+            assert report["data_source"] == "live"
+            self.n += 1
+            if self.n == 1:
+                report["score"] = 90.0
+                report["band"] = "GREEN"
+            else:
+                report["score"] = 12.0
+                report["band"] = "RED"
+            return report
+
+    posted: list[dict[str, Any]] = []
+
+    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
+        posted.append(json.loads(body))
+        return 200, True
+
+    client, store = _client(tmp_path, _LiveThenCross(), poster=poster)
+    raw = store.create_key(name="paid", tier="paid")
+    created = client.post(
+        "/v1/webhooks",
+        headers=_headers(raw),
+        json={"url": "https://example.test/hook", "secret": "s", "trigger": "band_cross"},
+    )
+    assert created.status_code == 200
+
+    first = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert first.status_code == 200
+    assert posted == []
+    second = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert second.status_code == 200
+    assert len(posted) == 1
+
+    rows = store._conn.execute(
+        "SELECT payload_json, payload_hash FROM score_history WHERE ticker = ? ORDER BY id",
+        ("NVDA",),
+    ).fetchall()
+    assert len(rows) == 2
+    for row in rows:
+        blob = row["payload_json"].encode("utf-8")
+        assert hash_canonical(blob) == row["payload_hash"]
+        assert json.loads(row["payload_json"])["as_of"] == int(json.loads(row["payload_json"])["as_of"])
+    assert rows[0]["payload_hash"] == first.json()["attestation"]["score_hash"]
+    assert rows[1]["payload_hash"] == second.json()["attestation"]["score_hash"]
+    assert posted[0]["score_hash"] == rows[1]["payload_hash"]
+    assert json.loads(rows[0]["payload_json"])["as_of"] == sealed_at[0]
+    assert json.loads(rows[1]["payload_json"])["as_of"] == sealed_at[1]
+    assert sealed_at[0] != sealed_at[1]
+    assert rows[0]["payload_hash"] != rows[1]["payload_hash"]
+
+    attest = client.get("/v1/attest/NVDA", headers=_headers(raw))
+    assert attest.status_code == 200
+    body = attest.json()
+    saved = store.get_attested_payload(body["score_hash"])
+    assert saved is not None
+    assert hash_canonical(saved["canonical"]) == body["score_hash"]
+    assert saved["canonical"] == canonical_bytes(body["payload"])
+    assert body["payload"]["as_of"] == sealed_at[2]
+    assert "canonical" not in body
+    assert len(sealed_at) == 3
+    history = store._conn.execute(
+        "SELECT payload_json, payload_hash FROM score_history WHERE ticker = ? ORDER BY id DESC LIMIT 1",
+        ("NVDA",),
+    ).fetchone()
+    assert history["payload_hash"] == body["score_hash"]
+    assert history["payload_json"].encode("utf-8") == saved["canonical"]

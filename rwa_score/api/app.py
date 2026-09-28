@@ -21,9 +21,8 @@ from rwa_score.scorer import ScoreError, TransparencyScorer
 from .attest import (
     ATTESTATION_ALGO,
     ATTESTATION_FIELDS,
-    attestation_payload,
-    canonical_bytes,
-    score_hash,
+    canonical_for,
+    resolve_scorer_version,
 )
 from .confidence import compute_confidence
 from .settings import ApiSettings
@@ -69,10 +68,29 @@ def _http_error(status: int, error: str, message: str, **extra: Any) -> HTTPExce
     return HTTPException(status_code=status, detail={"error": error, "message": message, **extra})
 
 
-def _decorate(report: dict[str, Any]) -> dict[str, Any]:
-    """Scorer payload plus paid-layer fields. Breakdown keys stay byte-identical."""
-    out = dict(report)
-    digest = score_hash(report)
+class _SealedScore(dict):
+    """Score dict plus the one canonical attestation built for this request.
+
+    ``canonical`` and ``attestation_payload`` are attributes, not keys, so
+    they stay out of the JSON body. Later history, webhooks, and
+    ``GET /v1/attest`` must hash these bytes instead of calling
+    ``time.time()`` again.
+    """
+
+    canonical: bytes
+    attestation_payload: dict[str, Any]
+
+
+def _decorate(report: dict[str, Any]) -> _SealedScore:
+    """Scorer payload plus paid-layer fields. Breakdown keys stay byte-identical.
+
+    The attestation payload is built once here. ``as_of`` is that hashing
+    time (Unix seconds), fixed for every consumer of this object.
+    """
+    payload, raw, digest = canonical_for(report)
+    out = _SealedScore(report)
+    out.canonical = raw
+    out.attestation_payload = payload
     out["confidence"] = compute_confidence(report)
     out["attestation"] = {
         "score_hash": digest,
@@ -100,6 +118,8 @@ def create_app(
     scorer: TransparencyScorer | None = None,
     poster=None,
 ) -> FastAPI:
+    # Resolve once at process startup. Later scores reuse the cache.
+    resolve_scorer_version()
     cfg = settings or ApiSettings.from_env()
     db = store or Store(cfg.db_path)
     if store is None and cfg.bootstrap_key:
@@ -325,13 +345,13 @@ def create_app(
     @app.get("/v1/attest/{ticker}")
     def attest(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
         report = score_ticker(ticker, key)
-        payload = attestation_payload(report)
-        raw = canonical_bytes(payload)
-        # Exact canonical bytes, keyed by hash. Render free disk is ephemeral.
+        # Same bytes history and webhooks just stored. Do not rebuild:
+        # a second as_of = time.time() would return a hash with no row.
+        payload, raw, digest = canonical_for(report)
         db.save_attested_payload(ticker=report["ticker"], canonical=raw)
         return {
             "ticker": report["ticker"],
-            "score_hash": report["attestation"]["score_hash"],
+            "score_hash": digest,
             "algo": ATTESTATION_ALGO,
             "payload": payload,
             "chain": cfg.attestation_chain,

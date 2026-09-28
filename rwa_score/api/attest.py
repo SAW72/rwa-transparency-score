@@ -13,20 +13,32 @@ Canonical JSON (the bytes that are hashed and, once attested, stored):
 - ``ensure_ascii=True`` so non-ASCII is ``\\uXXXX`` (the resulting text is
   ASCII, which is valid UTF-8). Key order in the input dict does not matter.
 
-``scorer_version`` is the git SHA. ``RENDER_GIT_COMMIT`` (Render sets this
-at runtime) wins. If that is empty, the value is ``git rev-parse HEAD``.
-If that fails, the version is ``unknown``. It is not truncated, and it does
-not read ``SOURCE_VERSION`` or ``GIT_COMMIT``. ``/health`` still uses its
-own short SHA via :func:`rwa_score.health.deploy_git_sha`.
+``scorer_version`` is the git SHA, resolved once per process and cached:
+``RENDER_GIT_COMMIT`` (Render sets this at runtime), else one
+``git rev-parse HEAD``, else ``unknown``. A warning is logged when the
+result is ``unknown``. It is not truncated, and it does not read
+``SOURCE_VERSION`` or ``GIT_COMMIT``. ``/health`` still uses its own short
+SHA via :func:`rwa_score.health.deploy_git_sha`. A report that already
+carries ``scorer_version`` keeps that value.
 
-``as_of`` is unix seconds UTC. A report that already carries ``as_of`` keeps
-that value. Fixture scores (``data_source == "fixture"``) use ``0`` because
-there is no live observation clock — that keeps a fixture hash stable.
-Every other score uses the current UTC unix second.
+``as_of`` is the hashing time: the Unix second (UTC) at which this canonical
+payload is built. It is not a provider observation timestamp. A report that
+already carries ``as_of`` keeps that value. Fixture scores
+(``data_source == "fixture"``) use ``0`` so a fixture hash stays stable.
+Every other score uses one clock reading for that request.
 
 ``inputs_digest`` is the same SHA-256-over-canonical-JSON function applied to
-the CMC and Chainlink PoR inputs this score used. See
+the CMC and Chainlink values retained on the score report. It is not a hash
+of raw provider HTTP bodies — those are not kept. See
 :func:`attestation_inputs`.
+
+Object key order and the absence of insignificant whitespace match RFC 8785.
+``NaN`` and ``Infinity`` are rejected (``allow_nan=False``) because RFC 8785
+does not allow them. Number formatting is Python ``json.dumps``, not the
+full RFC 8785 numeric profile.
+
+Live Base Sepolia attestations use contract
+``0x2F073a3628D498d92956e7eFE2b26633eDa75b00``.
 
 The payload always includes every live pillar in ``WEIGHTS``, including
 **basis**. Omitting basis from a cited breakdown changes the hash.
@@ -36,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import time
@@ -48,6 +61,10 @@ from rwa_score.scorer import WEIGHTS
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 ATTESTATION_ALGO = "sha256"
+# Live ScoreAttestation on Base Sepolia. Verify defaults to this address.
+PINNED_ATTESTATION_CONTRACT = "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
+_log = logging.getLogger(__name__)
+_scorer_version_cache: str | None = None
 ATTESTATION_FIELDS = (
     "ticker",
     "rwa_id",
@@ -112,18 +129,33 @@ def _git_rev_parse_head() -> str:
     return (proc.stdout or "").strip()
 
 
-def _scorer_version(report: dict[str, Any]) -> str:
-    """Git SHA: ``RENDER_GIT_COMMIT``, then ``git rev-parse HEAD``, else ``unknown``.
+def clear_scorer_version_cache() -> None:
+    """Drop the process cache. Tests use this; production resolves once."""
+    global _scorer_version_cache
+    _scorer_version_cache = None
 
-    A report that already carries ``scorer_version`` keeps that value.
-    """
+
+def resolve_scorer_version() -> str:
+    """Git SHA, once per process: ``RENDER_GIT_COMMIT``, else git, else ``unknown``."""
+    global _scorer_version_cache
+    if _scorer_version_cache is not None:
+        return _scorer_version_cache
+    env = (os.environ.get("RENDER_GIT_COMMIT") or "").strip()
+    version = env or _git_rev_parse_head() or "unknown"
+    _scorer_version_cache = version
+    if version == "unknown":
+        _log.warning(
+            "scorer_version is unknown: RENDER_GIT_COMMIT is unset and git rev-parse HEAD failed"
+        )
+    return version
+
+
+def _scorer_version(report: dict[str, Any]) -> str:
+    """Git SHA for this report. An explicit ``scorer_version`` on the report wins."""
     raw = report.get("scorer_version")
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
-    env = (os.environ.get("RENDER_GIT_COMMIT") or "").strip()
-    if env:
-        return env
-    return _git_rev_parse_head() or "unknown"
+    return resolve_scorer_version()
 
 
 def attestation_inputs(report: dict[str, Any]) -> dict[str, Any]:
@@ -205,13 +237,48 @@ def attestation_payload(
 
 
 def canonical_bytes(payload: dict[str, Any]) -> bytes:
-    """Canonical JSON bytes. See the module docstring for the exact rules."""
+    """Canonical JSON bytes. See the module docstring for the exact rules.
+
+    ``allow_nan=False`` rejects ``NaN`` and ``Infinity`` (not valid JSON;
+    excluded by RFC 8785).
+    """
     return json.dumps(
         payload,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
+        allow_nan=False,
     ).encode("utf-8")
+
+
+def _peek_seal(report: dict[str, Any]) -> tuple[dict[str, Any], bytes, str] | None:
+    """Return the payload already sealed on this report, if one build exists."""
+    raw = getattr(report, "canonical", None)
+    payload = getattr(report, "attestation_payload", None)
+    if not isinstance(raw, (bytes, bytearray)) or not isinstance(payload, dict):
+        return None
+    blob = bytes(raw)
+    return payload, blob, _hash_bytes(blob)
+
+
+def canonical_for(
+    report: dict[str, Any],
+    *,
+    now: float | None = None,
+) -> tuple[dict[str, Any], bytes, str]:
+    """One payload, the exact bytes that were hashed, and ``hash_canonical`` of those bytes.
+
+    A report that already carries ``canonical`` / ``attestation_payload``
+    (see :func:`rwa_score.api.app._decorate`) is not built again, so a later
+    clock tick cannot fork the hash. Pass ``now`` only to force a new build.
+    """
+    if now is None:
+        sealed = _peek_seal(report)
+        if sealed is not None:
+            return sealed
+    payload = attestation_payload(report, now=now)
+    raw = canonical_bytes(payload)
+    return payload, raw, _hash_bytes(raw)
 
 
 def _hash_bytes(raw: bytes) -> str:
@@ -220,7 +287,8 @@ def _hash_bytes(raw: bytes) -> str:
 
 def score_hash(report: dict[str, Any], *, now: float | None = None) -> str:
     """Return ``0x`` + 32-byte hex digest of the attestation payload."""
-    return _hash_bytes(canonical_bytes(attestation_payload(report, now=now)))
+    _payload, _raw, digest = canonical_for(report, now=now)
+    return digest
 
 
 def hash_canonical(raw: bytes) -> str:
@@ -229,4 +297,6 @@ def hash_canonical(raw: bytes) -> str:
 
 
 def history_json(report: dict[str, Any]) -> str:
-    return canonical_bytes(attestation_payload(report)).decode("ascii")
+    """Canonical JSON text. Uses the sealed bytes when this request already built them."""
+    _payload, raw, _digest = canonical_for(report)
+    return raw.decode("ascii")
