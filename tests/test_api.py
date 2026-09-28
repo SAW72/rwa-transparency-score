@@ -472,33 +472,63 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
     assert hash_canonical(saved["canonical"]) == body["score_hash"]
 
 
-def test_nan_in_live_report_fails_closed_in_decorate(
+def test_nan_in_live_report_score_200_attest_422(
     tmp_path: Path, fixture_scorer: TransparencyScorer
 ) -> None:
-    """A NaN in a live report raises in _decorate. No attest, no HTTP 200."""
-    from rwa_score.api.app import _decorate
+    """Score sanitizes non-finite numbers. Attest refuses them before any write."""
+    import sqlite3
+
+    from rwa_score.api.attest import canonical_bytes
+    from rwa_score.api.auto_attest import AttesterSettings
 
     report = fixture_scorer.score("NVDA")
     report = dict(report)
     report["data_source"] = "live"
+    report["subscores"] = dict(report["subscores"])
     report["score"] = float("nan")
+    report["subscores"]["price"] = float("inf")
 
-    with pytest.raises(ValueError, match="Out of range float"):
-        _decorate(report)
+    with pytest.raises(ValueError):
+        canonical_bytes({"score": float("nan")})
 
     class _NanScorer:
         def score(self, ticker: str) -> dict[str, Any]:
             return report
 
-    client, store = _client(tmp_path, _NanScorer())  # type: ignore[arg-type]
+    settings = _settings(tmp_path)
+    store = Store(settings.db_path)
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=_NanScorer(),  # type: ignore[arg-type]
+        attester=attester,
+        start_worker=False,
+    )
+    client = TestClient(app)
     raw = store.create_key(name="paid", tier="paid")
-    with pytest.raises(ValueError, match="Out of range float"):
-        client.get("/v1/attest/NVDA", headers=_headers(raw))
-    quiet = TestClient(client.app, raise_server_exceptions=False)
-    resp = quiet.get("/v1/attest/NVDA", headers=_headers(raw))
-    assert resp.status_code != 200
+    attested = client.get("/v1/attest/NVDA", headers=_headers(raw))
+    assert attested.status_code == 422
+    body = attested.json()
+    assert body["error"] == "non_finite_value"
+    assert body["field"] == "score"
     assert store.latest_attested_payload("NVDA") is None
-    assert b"NaN" not in resp.content
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM attest_jobs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM attested_payloads").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM score_history").fetchone()[0] == 0
+
+    scored = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert scored.status_code == 200
+    scored_body = scored.json()
+    assert scored_body["score"] is None
+    assert scored_body["subscores"]["price"] is None
+    assert "NaN" not in scored.text
+    assert "Infinity" not in scored.text
 
 
 def test_attest_status_does_not_score(

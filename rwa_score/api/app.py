@@ -5,6 +5,7 @@ Wraps ``TransparencyScorer`` / ``create_client`` so numbers match Streamlit.
 
 from __future__ import annotations
 
+import math
 import time
 import secrets
 from contextlib import asynccontextmanager
@@ -82,6 +83,48 @@ class _SealedScore(dict):
 
     canonical: bytes
     attestation_payload: dict[str, Any]
+
+
+def _first_non_finite(value: Any, path: str = "") -> str | None:
+    """Dotted path of the first NaN or Infinity, or ``None`` when every number is finite."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return path or "value"
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            found = _first_non_finite(item, child)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            found = _first_non_finite(item, f"{path}[{index}]")
+            if found:
+                return found
+    return None
+
+
+def _sanitize_non_finite(value: Any) -> Any:
+    """Copy ``value`` with NaN and Infinity replaced by ``None``.
+
+    The score response uses this so ``/v1/score`` can return 200. Canonical
+    attestation bytes still use ``allow_nan=False`` and are not built from
+    the unsanitized report.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _sanitize_non_finite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_non_finite(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_non_finite(item) for item in value]
+    return value
+
+
+def _finite_score(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
 
 
 def _decorate(report: dict[str, Any]) -> _SealedScore:
@@ -202,19 +245,30 @@ def create_app(
             )
         return key
 
-    def score_ticker(symbol: str, key: ApiKey) -> dict[str, Any]:
+    def score_ticker(symbol: str, key: ApiKey, *, for_attest: bool = False) -> dict[str, Any]:
         try:
             report = get_scorer().score(symbol)
         except ScoreError as exc:
             raise _http_error(404, "not_found", str(exc)) from exc
+        bad = _first_non_finite(report)
+        if bad:
+            if for_attest:
+                raise _http_error(
+                    422,
+                    "non_finite_value",
+                    f"Non-finite value in {bad}.",
+                    field=bad,
+                )
+            report = _sanitize_non_finite(report)
         decorated = _decorate(report)
-        apply_score_side_effects(
-            db,
-            decorated,
-            key_id=key.id,
-            poster=app.state.poster,
-            timeout=cfg.webhook_timeout_seconds,
-        )
+        if _finite_score(decorated.get("score")):
+            apply_score_side_effects(
+                db,
+                decorated,
+                key_id=key.id,
+                poster=app.state.poster,
+                timeout=cfg.webhook_timeout_seconds,
+            )
         return decorated
 
     @app.get("/health")
@@ -366,7 +420,7 @@ def create_app(
 
     @app.get("/v1/attest/{ticker}")
     def attest(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        report = score_ticker(ticker, key)
+        report = score_ticker(ticker, key, for_attest=True)
         # Same bytes history and webhooks just stored. Do not rebuild:
         # a second as_of = time.time() would return a hash with no row.
         payload, raw, digest = canonical_for(report)

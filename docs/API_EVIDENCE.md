@@ -368,7 +368,7 @@ content-type: application/json
     "label": "low"
   },
   "attestation": {
-    "score_hash": "0x78b3869abfdfd6fd7bb21e99096b96303a5f18c83f5cd93216e202fdcc7d96f4",
+    "score_hash": "0x8f04e51149ac6ebbbc3931d0d16ff2776a7e357ab3bb5b2f6a5faccc474d56a7",
     "algo": "sha256",
     "fields": [
       "ticker",

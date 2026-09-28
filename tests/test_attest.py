@@ -18,6 +18,7 @@ from rwa_score.api.attest import (
     clear_scorer_version_cache,
     data_as_of,
     hash_canonical,
+    inputs_bytes,
     inputs_digest,
     recompute_inputs_digest,
     score_hash,
@@ -178,7 +179,9 @@ def test_payload_is_the_breakdown_subset(fixture_scorer: TransparencyScorer) -> 
     assert "basis" in payload["subscores"]
     assert "basis" in payload["weights"]
     assert "basis" in payload["verification"]
-    assert payload["basis"] == report["basis"]
+    assert payload["basis"]["percent_spread"] == report["basis"]["percent_spread"]
+    assert payload["basis"]["wrapper_count"] == report["basis"]["wrapper_count"]
+    assert "market_url" not in json.dumps(payload["basis"])
     assert payload["as_of"] == 0
     assert payload["data_as_of"] is None
     assert payload["scorer_version"]
@@ -349,8 +352,8 @@ def test_verify_clear_when_nothing_stored(capsys, tmp_path: Path) -> None:
     assert payload["on_chain"] is None
     assert payload["match"] is False
     assert "does not re-score" in payload["note"]
-    assert "No stored attestation payload" in payload["note"]
-    assert "pre-fix attestation, stored payload unavailable" in payload["note"]
+    assert "no stored payload" in payload["note"]
+    assert "pre-fix" not in payload["note"]
 
 
 def test_verify_tampered_bytes_exit_nonzero(capsys, tmp_path: Path) -> None:
@@ -429,7 +432,8 @@ def test_verify_contract_defaults_to_pinned(monkeypatch, capsys, tmp_path: Path)
     body = json.loads(capsys.readouterr().out)
     assert body["contract"] == PINNED_ATTESTATION_CONTRACT
     assert body["contract"] == "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
-    assert "pre-fix attestation, stored payload unavailable" in body["note"]
+    assert "no stored payload" in body["note"]
+    assert "pre-fix" not in body["note"]
 
 
 def test_inputs_digest_covers_every_pillar_and_drops_rpc(
@@ -650,6 +654,135 @@ def test_verify_missing_inputs_json_is_its_own_exit(capsys, tmp_path: Path) -> N
     assert body["match"] is False
     assert body["hash_ok"] is True
     assert "inputs were not stored" in body["note"].lower()
+
+
+def test_verify_null_inputs_with_digest_exits_missing(capsys, tmp_path: Path) -> None:
+    import sqlite3
+
+    payload = _base_payload()
+    raw = canonical_bytes(payload)
+    db = tmp_path / "null-inputs.sqlite"
+    store = Store(db)
+    store.save_attested_payload(ticker="NVDA", canonical=raw, inputs=canonical_bytes({"cmc": {"ticker": "NVDA"}}))
+    store.close()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE attested_payloads SET inputs_json = NULL WHERE ticker = 'NVDA'")
+    conn.commit()
+    conn.close()
+    code = main(["NVDA", "--offline", "--json", "--db", str(db)])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_INPUTS_MISSING
+    assert body["hash_ok"] is True
+    assert body["payload"]["inputs_digest"]
+    assert body["inputs_stored"] is False
+    assert body["match"] is False
+    assert "inputs were not stored" in body["note"].lower()
+
+
+def test_missing_row_says_no_stored_payload(capsys, tmp_path: Path) -> None:
+    db = tmp_path / "empty.sqlite"
+    Store(db).close()
+    code = main(["NVDA", "--hash", "0x" + "11" * 32, "--json", "--db", str(db)])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_NOT_STORED
+    assert "no stored payload" in body["note"]
+    assert "pre-fix" not in body["note"]
+
+
+def test_prefix_wording_only_when_hash_is_on_chain(monkeypatch, capsys, tmp_path: Path) -> None:
+    db = tmp_path / "empty.sqlite"
+    Store(db).close()
+    digest = "0x" + "ab" * 32
+
+    def attested(**_kwargs):
+        return {
+            "ok": True,
+            "chain_id": 84532,
+            "attester_ok": True,
+            "attested_at": 1,
+            "attester": "0x" + "11" * 20,
+        }
+
+    monkeypatch.setattr("rwa_score.api.verify.on_chain_verify", attested)
+    code = main(
+        ["NVDA", "--hash", digest, "--json", "--db", str(db), "--rpc-url", "http://127.0.0.1:8545"]
+    )
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_NOT_STORED
+    assert "pre-fix attestation, stored payload unavailable" in body["note"]
+    assert body["on_chain"]["ok"] is True
+
+    def absent(**_kwargs):
+        return {"ok": False, "chain_id": 84532, "attester_ok": False}
+
+    monkeypatch.setattr("rwa_score.api.verify.on_chain_verify", absent)
+    code = main(
+        ["NVDA", "--hash", digest, "--json", "--db", str(db), "--rpc-url", "http://127.0.0.1:8545"]
+    )
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_NOT_STORED
+    assert "no stored payload" in body["note"]
+    assert "pre-fix" not in body["note"]
+    assert body["on_chain"] is None
+
+
+def test_inputs_allowlist_drops_headers_keys_tokens_and_urls(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    import copy
+
+    report = copy.deepcopy(fixture_scorer.score("NVDA"))
+    report["headers"] = {"Authorization": "Bearer SECRET-HEADER"}
+    report["api_key"] = "rat_live_secret"
+    report["price"]["api_key"] = "cmc-key-secret"
+    report["price"]["headers"] = {"X-Api-Key": "cmc-header-secret"}
+    report["price"]["tokens"][0]["token"] = "sekrit-token"
+    report["price"]["tokens"][0]["market_url"] = "https://evil.example/token"
+    report["basis"]["api_key"] = "basis-key-secret"
+    report["basis"]["market_url"] = "https://evil.example/basis"
+    report["verification"]["reserves"]["meta"] = {
+        "rpc_url": "https://rpc.example/KEY",
+        "headers": {"Authorization": "Bearer por-header"},
+        "api_key": "por-key-secret",
+        "docs_url": "https://docs.example/secret",
+        "pillar": "reserves",
+        "matched": True,
+        "issuer": "Backed Finance",
+    }
+    report["heuristics"]["api_key"] = "heur-key-secret"
+    report["heuristics"]["token"] = "heur-token-secret"
+    report["issuer"] = "https://issuer.example/secret"
+    blob = inputs_bytes(report).decode("ascii")
+    payload_blob = canonical_bytes(attestation_payload(report)).decode("ascii")
+    text = blob + payload_blob
+    for secret in (
+        "SECRET-HEADER",
+        "rat_live_secret",
+        "cmc-key-secret",
+        "cmc-header-secret",
+        "sekrit-token",
+        "evil.example",
+        "basis-key-secret",
+        "rpc.example",
+        "por-header",
+        "por-key-secret",
+        "docs.example",
+        "heur-key-secret",
+        "heur-token-secret",
+        "issuer.example",
+        "api_key",
+        "rpc_url",
+        "market_url",
+        "headers",
+        "Authorization",
+        "https://",
+    ):
+        assert secret not in text
+    parsed = json.loads(blob)
+    assert parsed["verifiers"]["reserves"]["meta"]["matched"] is True
+    assert parsed["cmc"]["price"]["price"] == report["price"]["price"]
+    assert parsed["cmc"]["issuer"] is None
+    assert parsed["heuristics"]["backed"] is True
 
 
 def test_verify_hash_for_another_ticker_exits_4(capsys, tmp_path: Path) -> None:

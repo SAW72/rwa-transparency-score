@@ -33,10 +33,11 @@ already on the report (Chainlink PoR ``updated_at``), or ``null`` when the
 report has none. Fixtures have none. It is not fetched again at hash time.
 
 ``inputs_digest`` is the same SHA-256-over-canonical-JSON function applied to
-every scoring input retained on the report: the CMC price and basis blocks,
-identity fields, issuer heuristic flags, and each pillar's verifier ``meta``
-(not only Chainlink PoR). It is not a hash of raw provider HTTP bodies or of
-explanation prose. ``rpc_url`` is omitted. See :func:`attestation_inputs`.
+an allowlist of scoring inputs: the CMC price and basis blocks, identity
+fields, issuer heuristic flags, and each pillar's verifier ``meta`` (not only
+Chainlink PoR). It is not a hash of raw provider HTTP bodies or of
+explanation prose. Headers, API keys, tokens, and URLs are not on the
+allowlist, so they are never hashed or stored. See :func:`attestation_inputs`.
 Those input bytes are stored next to the canonical payload so
 :func:`recompute_inputs_digest` can rebuild the digest later.
 
@@ -103,8 +104,116 @@ _POR_INPUT_KEYS = (
     "updated_at",
     "unit",
 )
-# Transport. May embed a provider secret. Never hashed or stored.
-_SECRET_INPUT_KEYS = frozenset({"rpc_url"})
+# Keys that are transport or credentials. They are not scoring inputs.
+# Matching is exact after lowercasing and turning hyphens into underscores.
+# ``token`` is exact so the scoring field ``tokens`` stays.
+_FORBIDDEN_INPUT_KEYS = frozenset(
+    {
+        "rpc_url",
+        "url",
+        "docs_url",
+        "in_kind_docs_url",
+        "market_url",
+        "uri",
+        "href",
+        "endpoint",
+        "headers",
+        "header",
+        "authorization",
+        "cookie",
+        "api_key",
+        "apikey",
+        "x_api_key",
+        "access_token",
+        "refresh_token",
+        "token",
+        "bearer",
+        "secret",
+        "password",
+        "private_key",
+    }
+)
+_DROP = object()
+_QUOTE_ROW_SPEC: dict[str, Any] = {
+    "crypto_id": None,
+    "symbol": None,
+    "price": None,
+    "volume_24h": None,
+    "venues": None,
+    "issuer": None,
+    "source": None,
+}
+_EXCHANGE_SPEC: dict[str, Any] = {"slug": None, "name": None, "exchange_id": None}
+_TRADFI_SPEC: dict[str, Any] = {"exchange": _EXCHANGE_SPEC, "ticker": None}
+_PRICE_SPEC: dict[str, Any] = {
+    "available": None,
+    "source": None,
+    "fallback": None,
+    "crypto_id": None,
+    "percent_change_24h": None,
+    "price": None,
+    "average_tokenized_price": None,
+    "tokenized_market_cap": None,
+    "tokenized_volume_24h": None,
+    "max_deviation_pct": None,
+    "avg_basis": None,
+    "tokens": [_QUOTE_ROW_SPEC],
+    "tradfi_markets": [_TRADFI_SPEC],
+    "tradfi_venue_count": None,
+    "rwa_quotes_error": None,
+    "volume_24h": None,
+}
+_BASIS_SPEC: dict[str, Any] = {
+    "available": None,
+    "wrapper_count": None,
+    "percent_spread": None,
+    "min_price": None,
+    "max_price": None,
+    "wrappers": [_QUOTE_ROW_SPEC],
+    "source": None,
+    "tradfi_markets": [_TRADFI_SPEC],
+    "plan_blocked": None,
+    "unavailable_reason": None,
+}
+_HEURISTIC_SPEC: dict[str, Any] = {
+    "backed": None,
+    "audited": None,
+    "redeemable": None,
+    "source": None,
+    "labeled": None,
+}
+_META_SPEC: dict[str, Any] = {
+    key: None
+    for key in (
+        "pillar",
+        "matched",
+        "issuer",
+        "symbol",
+        "chain",
+        "proxy",
+        "reserves",
+        "circulating_supply",
+        "collateralization_ratio",
+        "ratio_ignored",
+        "round_id",
+        "updated_at",
+        "unit",
+        "ticker",
+        "in_kind_to_shares",
+        "kyc_or_whitelist",
+        "settlement",
+        "wrapper",
+        "audit_firm",
+        "has_big4",
+        "has_alpaca",
+        "has_one_to_one",
+        "custody_provider",
+        "has_redemption",
+        "has_burn",
+        "has_issuance",
+        "has_brokerage",
+    )
+}
 
 
 def _full_pillars(src: dict[str, Any] | None) -> dict[str, Any]:
@@ -169,17 +278,67 @@ def _scorer_version(report: dict[str, Any]) -> str:
     return resolve_scorer_version()
 
 
-def _without_secrets(value: Any) -> Any:
-    """Copy ``value`` with ``rpc_url`` removed at every level."""
-    if isinstance(value, dict):
-        return {
-            str(key): _without_secrets(item)
-            for key, item in value.items()
-            if str(key) not in _SECRET_INPUT_KEYS
-        }
-    if isinstance(value, list):
-        return [_without_secrets(item) for item in value]
+def _input_key_forbidden(key: str) -> bool:
+    norm = str(key).strip().lower().replace("-", "_")
+    if norm in _FORBIDDEN_INPUT_KEYS:
+        return True
+    if "url" in norm or "header" in norm or "api_key" in norm:
+        return True
+    if norm == "token" or norm.endswith("_token"):
+        return True
+    return False
+
+
+def _identity_field(value: Any) -> Any:
+    """Scalar identity field. URLs and nested objects become ``None``."""
+    projected = _project_scalar(value)
+    if projected is _DROP:
+        return None
+    return projected
+
+
+def _project_scalar(value: Any) -> Any:
+    """Keep a scoring scalar. A URL string is dropped."""
+    if isinstance(value, str):
+        stripped = value.strip().lower()
+        if stripped.startswith(("http://", "https://", "ws://", "wss://")):
+            return _DROP
+    if isinstance(value, (dict, list)):
+        return _DROP
     return value
+
+
+def _project(value: Any, spec: Any) -> Any:
+    """Copy ``value`` through an allowlist spec.
+
+    A dict spec keeps only those keys. A one-item list spec projects each
+    list element with that item spec. ``None`` keeps a scalar. Anything
+    else, including headers, API keys, tokens, and URLs, is left out.
+    """
+    if isinstance(spec, dict):
+        if not isinstance(value, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for key, child in spec.items():
+            if key not in value or _input_key_forbidden(key):
+                continue
+            projected = _project(value[key], child)
+            if projected is _DROP:
+                continue
+            out[key] = projected
+        return out
+    if isinstance(spec, list):
+        if not isinstance(value, list) or not spec:
+            return []
+        item_spec = spec[0]
+        rows: list[Any] = []
+        for item in value:
+            projected = _project(item, item_spec)
+            if projected is _DROP:
+                continue
+            rows.append(projected)
+        return rows
+    return _project_scalar(value)
 
 
 def data_as_of(report: dict[str, Any]) -> int | None:
@@ -228,8 +387,8 @@ def attestation_inputs(report: dict[str, Any]) -> dict[str, Any]:
 
     ``chainlink_por`` repeats the feed and round for each pillar whose
     ``source`` is ``chainlink_por``, so a PoR round can be read without
-    walking every pillar. ``rpc_url`` is left out of every block — it is
-    transport and may embed a provider secret.
+    walking every pillar. Only allowlisted scoring fields are copied.
+    Headers, API keys, tokens, and URLs are left out.
     """
     verification = report.get("verification") or {}
     verifiers: dict[str, Any] = {}
@@ -239,26 +398,28 @@ def attestation_inputs(report: dict[str, Any]) -> dict[str, Any]:
             block = verification.get(pillar) or {}
             if not isinstance(block, dict):
                 block = {}
-            meta = block.get("meta") if isinstance(block.get("meta"), dict) else {}
-            meta = _without_secrets(meta)
-            verifiers[pillar] = {"source": block.get("source"), "meta": meta}
+            meta = _project(block.get("meta"), _META_SPEC)
+            source = block.get("source")
+            if _project_scalar(source) is _DROP:
+                source = None
+            verifiers[pillar] = {"source": source, "meta": meta}
             if block.get("source") == "chainlink_por":
                 por.append(
                     {"pillar": pillar, **{key: meta.get(key) for key in _POR_INPUT_KEYS}}
                 )
     heuristics = report.get("heuristics")
     if isinstance(heuristics, dict):
-        heuristics = _without_secrets(heuristics)
+        heuristics = _project(heuristics, _HEURISTIC_SPEC)
     else:
         heuristics = None
     return {
         "cmc": {
-            "price": _without_secrets(report.get("price")),
-            "basis": _without_secrets(report.get("basis")),
-            "cik": report.get("cik"),
-            "rwa_id": report.get("rwa_id"),
-            "issuer": report.get("issuer"),
-            "data_source": report.get("data_source"),
+            "price": _project(report.get("price"), _PRICE_SPEC),
+            "basis": _project(report.get("basis"), _BASIS_SPEC),
+            "cik": _identity_field(report.get("cik")),
+            "rwa_id": _identity_field(report.get("rwa_id")),
+            "issuer": _identity_field(report.get("issuer")),
+            "data_source": _identity_field(report.get("data_source")),
         },
         "heuristics": heuristics,
         "verifiers": verifiers,
@@ -295,23 +456,30 @@ def attestation_payload(
     verification: dict[str, Any] = {}
     for key in PILLAR_KEYS:
         block = verification_in.get(key) or {}
+        source = block.get("source")
+        if _project_scalar(source) is _DROP:
+            source = None
         verification[key] = {
             "score": block.get("score"),
             "level": block.get("level"),
-            "source": block.get("source"),
+            "source": source,
         }
     return {
-        "ticker": report.get("ticker"),
+        "ticker": _identity_field(report.get("ticker")),
         "rwa_id": report.get("rwa_id"),
-        "issuer": report.get("issuer"),
+        "issuer": _identity_field(report.get("issuer")),
         "score": report.get("score"),
         "band": report.get("band"),
         "subscores": _full_pillars(report.get("subscores")),
         "weights": _full_pillars(report.get("weights") or dict(WEIGHTS)),
-        "cik": report.get("cik"),
-        "data_source": report.get("data_source"),
+        "cik": _identity_field(report.get("cik")),
+        "data_source": _identity_field(report.get("data_source")),
         "verification": verification,
-        "basis": report.get("basis"),
+        "basis": (
+            _project(report.get("basis"), _BASIS_SPEC)
+            if isinstance(report.get("basis"), dict)
+            else report.get("basis")
+        ),
         "as_of": _as_of(report, now),
         "data_as_of": data_as_of(report),
         "scorer_version": _scorer_version(report),

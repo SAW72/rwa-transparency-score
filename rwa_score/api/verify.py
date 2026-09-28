@@ -13,7 +13,9 @@ Exit codes:
   ``0`` when the local checks pass; that mode prints that nothing was
   checked on-chain.
 - ``1`` the database path does not exist, or the file is not a SQLite database
-- ``2`` nothing stored (including a pre-fix attestation with no payload row)
+- ``2`` nothing stored. The note says ``no stored payload`` unless that
+  hash is attested on-chain, in which case it says the pre-fix payload
+  is unavailable
 - ``3`` stored bytes do not match the hash key, the payload is malformed,
   or stored inputs do not recompute ``inputs_digest``
 - ``4`` the payload ticker, or the ticker on a ``--hash`` row, does not
@@ -71,9 +73,15 @@ EXIT_INPUTS_MISSING = 8
 # JSON `attested_at` is that int. cast 1.8.3 prints `1700000000 [1.7e9]`.
 VERIFY_SIG = "verify(bytes32,string)(bool,uint256,address)"
 
+NO_STORED_PAYLOAD = (
+    "no stored payload. "
+    "verify does not re-score and will not invent canonical bytes."
+)
+
+# Only when the requested hash is attested on-chain and the bytes are gone.
 NOTHING_STORED = (
     "pre-fix attestation, stored payload unavailable. "
-    "No stored attestation payload for this ticker. "
+    "The hash is on-chain and there is no stored payload for it. "
     "verify does not re-score and will not rebuild a hash attested before "
     "canonical bytes were stored. "
     "GET /v1/attest/{ticker} stores a new payload; as_of is attest time, "
@@ -324,6 +332,25 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_DB
 
     if row is None:
+        on_chain = None
+        note = NO_STORED_PAYLOAD
+        requested = args.score_hash.strip()
+        if requested and args.rpc_url.strip():
+            on_chain = on_chain_verify(
+                contract=contract,
+                rpc_url=args.rpc_url.strip(),
+                digest=requested,
+                ticker=ticker,
+                expected_attester=args.attester,
+            )
+            if (
+                on_chain.get("ok") is True
+                and on_chain.get("chain_id") == BASE_SEPOLIA_CHAIN_ID
+                and not on_chain.get("error")
+            ):
+                note = NOTHING_STORED
+            else:
+                on_chain = None
         result: dict[str, Any] = {
             "ticker": ticker,
             "stored": False,
@@ -331,10 +358,10 @@ def main(argv: list[str] | None = None) -> int:
             "payload": None,
             "canonical": None,
             "contract": contract,
-            "on_chain": None,
+            "on_chain": on_chain,
             "match": False,
             "hash_ok": False,
-            "note": NOTHING_STORED + ignored_note,
+            "note": note + ignored_note,
         }
         _emit(result, as_json=args.json)
         return EXIT_NOT_STORED

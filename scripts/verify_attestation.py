@@ -8,7 +8,8 @@
 Does not re-score. The canonical JSON must already be stored (GET /v1/attest).
 Exit codes: 0 match (or --offline local check; prints that nothing was
 checked on-chain), 1 database missing or not SQLite, 2 nothing stored
-(pre-fix attestation, stored payload unavailable), 3 bytes or inputs_digest
+(note: no stored payload, or the pre-fix wording when that hash is
+on-chain), 3 bytes or inputs_digest
 mismatch, 4 ticker / chain / verify() / attester mismatch (including
 --hash for another ticker), 5 RPC failed, 6 cast missing, 7 no RPC URL
 and --offline not passed, 8 inputs_json not stored.

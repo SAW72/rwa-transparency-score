@@ -484,7 +484,7 @@ row is exit `0` with `"match": true`. It does not use `--offline`.
 | --- | --- |
 | `0` | Stored bytes match, inputs recompute `inputs_digest`, and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
 | `1` | Database path does not exist, or the file is not SQLite. |
-| `2` | Nothing stored (`pre-fix attestation, stored payload unavailable`). |
+| `2` | Nothing stored. The note says `no stored payload`, unless that hash is attested on-chain, in which case it says `pre-fix attestation, stored payload unavailable`. |
 | `3` | Tampered or malformed bytes, or stored inputs do not recompute `inputs_digest`. |
 | `4` | Ticker mismatch, including `--hash` for another ticker; chain id is not 84532; `verify()` is false; or the attester mismatches. |
 | `5` | RPC / cast call failed. |
