@@ -30,44 +30,61 @@ is the CLI `python -m rwa_score.api.verify`.
 
 Do not change that start command. The public scorecard stays on it.
 
-## What makes `/v1` reachable
+## API service (`rwa-transparency-score-api`)
 
-Recommended: a **second** free web service, `rwa-transparency-api`, specified
-in `render.yaml`. This repo does not create it and does not deploy. You apply
-the blueprint, or you create the service in the dashboard with these fields:
+`/v1` is a second web service in `render.yaml`. The scorecard service above
+is unchanged. `/v1` is not mounted on it. The attester thread and the
+`on_chain` field run only in this API process.
+
+`create_app` in `rwa_score/api/app.py` is the factory. Every argument has a
+default, so uvicorn can call it with `--factory`. Start command:
+
+```bash
+uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT
+```
 
 | Field | Value |
 |---|---|
-| Type | Web service |
-| Name | `rwa-transparency-api` |
+| Name | `rwa-transparency-score-api` |
 | Runtime | Python |
 | Plan | Free |
 | Branch | `main` |
 | Build command | `pip install -r requirements.txt` |
-| Start command | `python -m rwa_score.api` |
+| Start command | the uvicorn line above |
 | Health check path | `/health` |
 
-`python -m rwa_score.api` runs uvicorn on `0.0.0.0:$PORT` (`PORT` is set by
-Render). The worker thread starts in that process. Put the attester key on
-**this** service only, not on the public scorecard.
+Every env var on this service is `sync: false`. `render.yaml` lists the
+names and does not contain values. You type the values in the dashboard
+after sync. A later sync will not overwrite them.
 
-Free-plan tradeoffs of the second service: it spins down after about 15
-minutes idle, so the first `/v1` call after sleep is a cold start. The sqlite
-file (`RWA_API_DB_PATH`) is on ephemeral disk. Spin-down deletes stored
-payloads, the pending queue, and API keys that exist only in that file. The
-in-process worker stops with the process, so a sleeping service does not
-send. A Render background worker, or a paid plan with a persistent disk,
-would keep the queue across sleep. That service is not added here.
+Free plan: the service spins down after about 15 minutes idle. The sqlite
+file is ephemeral, so stored payloads, the pending queue, and keys that
+exist only in that file disappear on spin-down. The poster thread stops
+with the process. A Render background worker, or a paid plan with a
+persistent disk, would keep the queue across sleep. That is not in
+`render.yaml`.
 
-Alternative: mount FastAPI on the existing scorecard process, the way Tornado
-already serves `/health` ahead of the Streamlit catch-all. That is not
-implemented. Until those routes are registered on that process, `/v1` stays
-HTML. Doing the mount later would put the attester key in the public website
-process and would still lose the sqlite file on the same free-plan spin-down.
-Keep the scorecard start command as it is.
+### Blueprint sync (Spencer)
 
-After the API service is up, `GET /health` on **its** URL is JSON and
-includes `"api": true`. The scorecard URL does not.
+This repo does not sync the blueprint and does not create the service.
+
+1. Merge this branch into the branch your blueprint tracks (today that is
+   `main`), or point the blueprint at this branch if you want the service
+   before merge.
+2. Render Dashboard → **Blueprints** → the blueprint for this repo.
+3. **Manual Sync**. Render reads `render.yaml` and adds web service
+   `rwa-transparency-score-api`. The existing `rwa-transparency-score`
+   service stays on `python -m rwa_score.health`.
+4. Open `rwa-transparency-score-api` → **Environment**. Each key from the
+   blueprint is empty because `sync: false` stored no value.
+5. Set the values from the table below. Save. Render redeploys **this**
+   service. Do not put the attester key on the scorecard service.
+6. Copy the service URL (the host Render shows, usually
+   `https://rwa-transparency-score-api.onrender.com`). That URL is
+   `API_BASE` in the end-to-end check.
+
+`GET /health` on that URL is JSON and includes `"api": true`. The scorecard
+URL does not.
 
 ## What the worker does
 
@@ -98,7 +115,7 @@ score or enqueue.
 
 ## Render settings (API service)
 
-Set these on `rwa-transparency-api`. Example shapes are not real values.
+Set these on `rwa-transparency-score-api` after Blueprint sync. Example shapes are not real values.
 `sync: false` in `render.yaml` means the dashboard holds the value.
 
 The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
@@ -254,10 +271,11 @@ down. Spin-down deletes the sqlite file, and `verify` then reports nothing
 stored even if the transaction already landed.
 
 Agents do not run this section. It sends a transaction from the key you set
-on Render.
+on Render. `API_BASE` is the `rwa-transparency-score-api` URL from the
+service page. Use the host Render shows if it is not the default below.
 
 ```bash
-export API_BASE="https://<rwa-transparency-api host>"
+export API_BASE="https://rwa-transparency-score-api.onrender.com"
 export API_KEY="rat_<the RWA_API_BOOTSTRAP_KEY you set>"
 export BASE_SEPOLIA_RPC_URL="https://<your Base Sepolia RPC host>/<key>"
 export SCORE_ATTESTATION="0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
@@ -380,7 +398,7 @@ to                   0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 ### 6.5 `verify.py` against the stored payload
 
 The stored bytes are on the API service disk, not on your laptop. Open the
-Render shell for `rwa-transparency-api` (same instance, before spin-down)
+Render shell for `rwa-transparency-score-api` (same instance, before spin-down)
 and run:
 
 ```bash

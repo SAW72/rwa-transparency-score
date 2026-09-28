@@ -56,54 +56,59 @@ services:
       - key: X_ACCESS_TOKEN_SECRET
         sync: false
 
-  # Second web service so /v1 is JSON. The scorecard service above stays
-  # on `python -m rwa_score.health`. This file does not create or deploy
-  # the service; Spencer applies the blueprint (or copies these settings)
-  # himself. Secrets are sync:false — set them in the dashboard, never here.
-  # Free plan: idle spin-down drops the sqlite file (payloads, queue, keys).
-  # A background worker or paid disk is not declared in this file.
+  # /v1 API. Every env var is sync:false — values are set in the dashboard
+  # after Blueprint sync. This file does not deploy or create the service.
+  # The attester thread and on_chain live on this service only.
   - type: web
-    name: rwa-transparency-api
+    name: rwa-transparency-score-api
     runtime: python
     plan: free
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m rwa_score.api
+    startCommand: uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: RWA_USE_FIXTURES
-        value: "0"
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: RWA_ATTESTATION_CONTRACT
-        value: "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
-      - key: RWA_ATTESTATION_CHAIN
-        value: base-sepolia
-      - key: RWA_ATTESTATION_CHAIN_ID
-        value: "84532"
-      - key: RWA_ATTEST_VALUE_CAP_WEI
-        value: "0"
-      - key: RWA_ATTEST_GAS_LIMIT
-        value: "300000"
-      - key: RWA_ATTEST_MAX_ATTEMPTS
-        value: "5"
-      - key: RWA_ATTEST_BACKOFF_SECONDS
-        value: "2.0"
-      - key: RWA_API_BOOTSTRAP_TIER
-        value: paid
-      - key: RWA_API_DB_PATH
-        value: data/rat_api.sqlite
-      - key: CMC_API_KEY
         sync: false
-      - key: BASE_SEPOLIA_RPC_URL
+      - key: PYTHONUNBUFFERED
+        sync: false
+      - key: CMC_API_KEY
         sync: false
       - key: RWA_ATTESTER_PRIVATE_KEY
         sync: false
+      - key: RWA_ATTESTATION_CONTRACT
+        sync: false
+      - key: BASE_SEPOLIA_RPC_URL
+        sync: false
+      - key: RWA_ATTESTATION_CHAIN_ID
+        sync: false
+      - key: RWA_ATTESTATION_CHAIN
+        sync: false
+      - key: RWA_ATTEST_VALUE_CAP_WEI
+        sync: false
+      - key: RWA_ATTEST_GAS_LIMIT
+        sync: false
+      - key: RWA_ATTEST_MAX_ATTEMPTS
+        sync: false
+      - key: RWA_ATTEST_BACKOFF_SECONDS
+        sync: false
+      - key: RWA_API_DB_PATH
+        sync: false
       - key: RWA_API_BOOTSTRAP_KEY
         sync: false
+      - key: RWA_API_BOOTSTRAP_TIER
+        sync: false
+      - key: RWA_API_FREE_DAILY_LIMIT
+        sync: false
+      - key: RWA_API_RATE_WINDOW_SECONDS
+        sync: false
       - key: POLYGON_RPC_URL
+        sync: false
+      - key: MATIC_RPC_URL
         sync: false
       - key: BASE_RPC_URL
         sync: false
       - key: ETH_RPC_URL
+        sync: false
+      - key: ETHEREUM_RPC_URL
         sync: false

@@ -158,21 +158,36 @@ def test_nvda_evidence_sample_matches_fixture_api(
 def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
     text = (ROOT / "render.yaml").read_text(encoding="utf-8")
     assert "python -m rwa_score.health" in text
-    assert "name: rwa-transparency-score" in text
-    assert "name: rwa-transparency-api" in text
-    scorecard, api = text.split("name: rwa-transparency-api", 1)
+    assert "name: rwa-transparency-score\n" in text
+    assert "name: rwa-transparency-score-api" in text
+    scorecard, api = text.split("name: rwa-transparency-score-api", 1)
     assert "python -m rwa_score.health" in scorecard
-    assert "python -m rwa_score.api" not in scorecard
+    assert "uvicorn rwa_score.api.app:create_app" not in scorecard
     assert "plan: free" in scorecard
-    assert "python -m rwa_score.api" in api
+    assert 'value: "0"' in scorecard
+    cmd = "uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT"
+    assert cmd in api
     assert "plan: free" in api
     assert "pip install -r requirements.txt" in api
-    assert "RWA_USE_FIXTURES" in text
-    assert 'value: "0"' in text
+    assert "value:" not in api
     assert "postgres" not in text.lower()
     assert "database" not in text.lower()
-    for secret in ("RWA_ATTESTER_PRIVATE_KEY", "BASE_SEPOLIA_RPC_URL", "RWA_API_BOOTSTRAP_KEY", "CMC_API_KEY"):
-        idx = api.index(f"- key: {secret}")
-        window = api[idx : idx + 80]
-        assert "sync: false" in window
-        assert "value:" not in window
+    keys: list[str] = []
+    lines = api.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("- key:"):
+            continue
+        key = stripped.split(":", 1)[1].strip()
+        assert lines[index + 1].strip() == "sync: false"
+        keys.append(key)
+    for required in (
+        "RWA_ATTESTER_PRIVATE_KEY",
+        "RWA_ATTESTATION_CONTRACT",
+        "BASE_SEPOLIA_RPC_URL",
+        "RWA_ATTESTATION_CHAIN_ID",
+        "RWA_API_BOOTSTRAP_KEY",
+        "CMC_API_KEY",
+        "RWA_USE_FIXTURES",
+    ):
+        assert required in keys
