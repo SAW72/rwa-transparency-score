@@ -60,10 +60,11 @@ after sync. A later sync will not overwrite them.
 
 Free plan: the service spins down after about 15 minutes idle. The sqlite
 file is ephemeral, so stored payloads, the pending queue, and keys that
-exist only in that file disappear on spin-down. The poster thread stops
-with the process. A Render background worker, or a paid plan with a
-persistent disk, would keep the queue across sleep. That is not in
-`render.yaml`.
+exist only in that file disappear on spin-down. `verify` then has no bytes
+to check, and it does not re-score. The poster thread stops with the
+process. Options, not built here: a Render persistent disk on a paid plan,
+or Postgres (`python -m rwa_score.api.migrations --dialect postgres`, applied
+by you). A background worker is a separate flag and is not in `render.yaml`.
 
 ### Blueprint sync (Spencer)
 
@@ -101,10 +102,10 @@ the minimum includes reverts).
 
 The queue is sqlite (`attest_jobs` on `RWA_API_DB_PATH`). A process restart
 keeps those rows when the file is still there. Render's free disk is
-ephemeral: spin-down deletes it, so the queue does **not** survive a free-tier
-spin-down. A Render background worker or a paid plan with a persistent disk
-is the option if you want the queue to outlive sleep. This repo does not add
-that service.
+ephemeral: spin-down deletes it, so the queue and the stored canonical
+bytes do **not** survive a free-tier spin-down. To keep them, use a Render
+persistent disk on a paid plan, or Postgres. This repo does not add either.
+A background worker is only a flag, not a service in `render.yaml`.
 
 If `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, or
 `BASE_SEPOLIA_RPC_URL` is unset, the worker is disabled and `/v1/attest`
