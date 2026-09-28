@@ -2,7 +2,7 @@
 
 RAT Score (RWA Transparency Score) — an AI-assisted risk radar for tokenized stocks. Rates issuers 0–100 on backing, proof of reserves, redemption, price integrity, disclosure, and cross-issuer basis using CoinMarketCap’s RWA API.
 
-On-chain hash lock (Base Sepolia only): [SECURITY.md](SECURITY.md).
+On-chain hash lock (Base Sepolia only): [SECURITY.md](SECURITY.md). Deploy script: [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`contracts/DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)).
 
 Judges: one command, no API key.
 
@@ -200,6 +200,7 @@ rwa_score/issuer_registry.py   Name-match heuristics + ISSUER_NOTES (equity vs d
 rwa_score/fixtures/    Demo JSON shaped like CMC RWA responses
 rwa_score/api/         Paid REST output layer (keys, quotas, history, webhooks, score hash)
 contracts/             ScoreAttestation.sol — Base Sepolia hash attestation (Foundry)
+contracts/script/DeployScoreAttestation.s.sol  Base Sepolia deploy (see contracts/DEPLOY_BASE_SEPOLIA.md)
 scripts/verify_attestation.py   Re-hash a live score and optionally read the chain
 ```
 
@@ -300,7 +301,7 @@ The captured file is the full authentic envelope (pillars, verification, basis w
 
 ### On-chain attestation (Base Sepolia)
 
-`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held.
+`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy with [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
 
 ```bash
 RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures

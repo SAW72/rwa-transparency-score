@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ScoreAttestation} from "../src/ScoreAttestation.sol";
-import {DeploySepolia} from "../script/DeploySepolia.s.sol";
+import {DeployScoreAttestation} from "../script/DeployScoreAttestation.s.sol";
 
 contract ScoreAttestationTest is Test {
     ScoreAttestation internal attestor;
@@ -27,22 +27,46 @@ contract ScoreAttestationTest is Test {
     }
 
     function test_attestStoresHashNotScore() public {
+        uint256 trusted = 1_700_000_000;
+        vm.warp(trusted);
         vm.expectEmit(true, true, true, true);
-        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, 1_700_000_000, address(this));
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
+        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, trusted, trusted, address(this));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", trusted);
 
         assertTrue(attestor.attested(sampleHash));
         ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
         assertEq(rec.scoreHash, sampleHash);
         assertEq(rec.ticker, "NVDA");
-        assertEq(rec.timestamp, 1_700_000_000);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.claimedAt, trusted);
         assertEq(rec.attester, address(this));
 
         // Storage holds the digest only — no score / band / pillar fields exist.
+        // verify's uint256 is the trusted chain time, not a caller-chosen clock.
         (bool ok, uint256 ts, address who) = attestor.verify(sampleHash, "NVDA");
         assertTrue(ok);
-        assertEq(ts, 1_700_000_000);
+        assertEq(ts, block.timestamp);
         assertEq(who, address(this));
+    }
+
+    function test_backdatedClaimedTimestampIsIgnored() public {
+        uint256 claimed = 1_700_000_000;
+        uint256 trusted = 1_800_000_000;
+        vm.warp(trusted);
+
+        vm.expectEmit(true, true, true, true);
+        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, trusted, claimed, address(this));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", claimed);
+
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.attestedAt, trusted);
+        assertEq(rec.claimedAt, claimed);
+        assertTrue(rec.claimedAt < rec.attestedAt);
+
+        (bool ok, uint256 ts,) = attestor.verify(sampleHash, "NVDA");
+        assertTrue(ok);
+        assertEq(ts, block.timestamp);
     }
 
     function test_attestRecordsMsgSenderNotCalldata() public {
@@ -175,43 +199,20 @@ contract ScoreAttestationTest is Test {
         attestor.setFee(0);
     }
 
-    function test_deployScriptRevertsOnBaseMainnet() public {
-        vm.chainId(8453);
-        DeploySepolia script = new DeploySepolia();
-        vm.expectRevert(bytes("mainnet held: deploy Base Sepolia only"));
-        script.run();
+    function test_futureClaimedTimestampIsNotTrusted() public {
+        uint256 claimed = block.timestamp + 1;
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", claimed);
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.claimedAt, claimed);
+        assertTrue(attestor.attested(sampleHash));
     }
 
-    function test_deployScriptAllowsBaseSepolia() public {
-        vm.chainId(84532);
-        DeploySepolia script = new DeploySepolia();
-        ScoreAttestation deployed = script.run();
-        assertTrue(address(deployed).code.length > 0);
-        assertEq(deployed.attestationFee(), 0.001 ether);
-        assertTrue(deployed.owner() != address(0));
-        assertTrue(deployed.authorized(deployed.owner()));
-        assertTrue(deployed.isAttester(deployed.owner()));
-    }
-
-    function test_deployScriptAllowlistsExtraAttester() public {
-        vm.chainId(84532);
-        vm.setEnv("ATTESTER_ADDRESS", vm.toString(attester));
-        DeploySepolia script = new DeploySepolia();
-        ScoreAttestation deployed = script.run();
-        assertTrue(deployed.authorized(attester));
-        assertTrue(deployed.isAttester(attester));
-        vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
-    }
-
-    function test_rejectFutureTimestamp() public {
-        vm.expectRevert(ScoreAttestation.FutureTimestamp.selector);
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", block.timestamp + 1);
-        assertFalse(attestor.attested(sampleHash));
-    }
-
-    function test_rejectZeroTimestamp() public {
-        vm.expectRevert(ScoreAttestation.EmptyTimestamp.selector);
+    function test_zeroClaimedTimestampIsNotTrusted() public {
         attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 0);
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.claimedAt, 0);
     }
 
     function test_acceptsTimestampEqualToBlock() public {
@@ -242,7 +243,7 @@ contract ScoreAttestationTest is Test {
     }
 
     function test_transferOwnershipRejectsZero() public {
-        vm.expectRevert(ScoreAttestation.ZeroAttester.selector);
+        vm.expectRevert(ScoreAttestation.ZeroOwner.selector);
         attestor.transferOwnership(address(0));
     }
 
@@ -264,6 +265,164 @@ contract ScoreAttestationTest is Test {
         ScoreAttestation zero = new ScoreAttestation(0);
         assertEq(zero.attestationFee(), 0.001 ether);
         assertTrue(zero.authorized(address(this)));
+    }
+
+    function test_transferOwnershipThenAccept() public {
+        address next = address(0x0A1E);
+        assertEq(attestor.pendingOwner(), address(0));
+
+        vm.expectEmit(true, true, false, true);
+        emit ScoreAttestation.OwnershipTransferStarted(address(this), next);
+        attestor.transferOwnership(next);
+
+        assertEq(attestor.owner(), address(this));
+        assertEq(attestor.pendingOwner(), next);
+
+        vm.expectEmit(true, true, false, true);
+        emit ScoreAttestation.OwnershipTransferred(address(this), next);
+        vm.prank(next);
+        attestor.acceptOwnership();
+
+        assertEq(attestor.owner(), next);
+        assertEq(attestor.pendingOwner(), address(0));
+        assertTrue(attestor.authorized(next));
+    }
+
+    function test_acceptOwnershipRevertsForNonPending() public {
+        address next = address(0x0A1E);
+        attestor.transferOwnership(next);
+
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotPendingOwner.selector);
+        attestor.acceptOwnership();
+
+        vm.expectRevert(ScoreAttestation.NotPendingOwner.selector);
+        attestor.acceptOwnership();
+
+        assertEq(attestor.owner(), address(this));
+        assertEq(attestor.pendingOwner(), next);
+    }
+
+    function test_oldOwnerKeepsControlUntilAccept() public {
+        address next = address(0x0A1E);
+        attestor.transferOwnership(next);
+
+        attestor.setFee(0.004 ether);
+        assertEq(attestor.attestationFee(), 0.004 ether);
+        attestor.setAttester(attester, true);
+        assertTrue(attestor.isAttester(attester));
+
+        vm.prank(next);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.setFee(0);
+
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.transferOwnership(stranger);
+
+        assertEq(attestor.owner(), address(this));
+        assertEq(attestor.pendingOwner(), next);
+
+        vm.prank(next);
+        attestor.acceptOwnership();
+
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.setFee(0.001 ether);
+
+        vm.prank(next);
+        attestor.setFee(0.005 ether);
+        assertEq(attestor.attestationFee(), 0.005 ether);
+        assertEq(attestor.owner(), next);
+    }
+
+    function test_deployScoreAttestationRevertsOffBaseSepolia() public {
+        DeployScoreAttestation script = new DeployScoreAttestation();
+        vm.chainId(8453);
+        vm.expectRevert(bytes("mainnet held: deploy Base Sepolia only"));
+        script.run();
+        vm.chainId(1);
+        vm.expectRevert(bytes("mainnet held: deploy Base Sepolia only"));
+        script.run();
+    }
+
+    function test_deployScoreAttestationDefaultsThenHandoff() public {
+        address extra = address(0xCA11);
+        vm.chainId(84532);
+        vm.setEnv("DEPLOYER", vm.toString(attester));
+        vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
+        vm.setEnv("ATTESTER_ADDRESS_2", vm.toString(address(0)));
+        vm.setEnv("ATTESTER_ADDRESS_3", vm.toString(address(0)));
+        vm.setEnv("ATTESTERS", "");
+        vm.setEnv("FINAL_OWNER", vm.toString(address(0)));
+
+        DeployScoreAttestation script = new DeployScoreAttestation();
+        ScoreAttestation deployed = script.run();
+        assertEq(deployed.attestationFee(), 0.001 ether);
+        assertEq(deployed.owner(), attester);
+        assertEq(deployed.pendingOwner(), address(0));
+        assertTrue(deployed.isAttester(attester));
+        assertTrue(deployed.authorized(attester));
+        assertFalse(deployed.isAttester(stranger));
+        assertFalse(deployed.isAttester(extra));
+
+        address listed = address(0xBEEF);
+        vm.setEnv("ATTESTER_ADDRESS", vm.toString(listed));
+        vm.setEnv("ATTESTER_ADDRESS_3", vm.toString(stranger));
+        vm.setEnv("ATTESTERS", vm.toString(extra));
+        vm.setEnv("FINAL_OWNER", vm.toString(stranger));
+        ScoreAttestation handed = script.run();
+        assertEq(handed.owner(), attester);
+        assertEq(handed.pendingOwner(), stranger);
+        assertTrue(handed.isAttester(attester));
+        assertTrue(handed.isAttester(listed));
+        assertTrue(handed.isAttester(extra));
+        assertTrue(handed.isAttester(stranger));
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        handed.setFee(0);
+        vm.prank(stranger);
+        handed.acceptOwnership();
+        assertEq(handed.owner(), stranger);
+        assertEq(handed.pendingOwner(), address(0));
+
+        vm.setEnv("FOUNDRY_CHAIN_ID", "84532");
+        vm.expectRevert(bytes("FOUNDRY_CHAIN_ID is set; refusing to deploy"));
+        script.run();
+        vm.setEnv("FOUNDRY_CHAIN_ID", "");
+    }
+
+    function test_setFeeEmitsAndRejectsAboveCap() public {
+        assertEq(attestor.MAX_FEE(), 0.1 ether);
+
+        vm.expectEmit(false, false, false, true);
+        emit ScoreAttestation.FeeUpdated(0.001 ether, 0.1 ether);
+        attestor.setFee(0.1 ether);
+        assertEq(attestor.attestationFee(), 0.1 ether);
+
+        vm.expectRevert(abi.encodeWithSelector(ScoreAttestation.FeeTooHigh.selector, 0.1 ether + 1, 0.1 ether));
+        attestor.setFee(0.1 ether + 1);
+
+        vm.expectEmit(false, false, false, true);
+        emit ScoreAttestation.FeeUpdated(0.1 ether, 0);
+        attestor.setFee(0);
+        assertEq(attestor.attestationFee(), 0);
+    }
+
+    function test_constructorRejectsFeeAboveCap() public {
+        vm.expectRevert(abi.encodeWithSelector(ScoreAttestation.FeeTooHigh.selector, 0.1 ether + 1, 0.1 ether));
+        new ScoreAttestation(0.1 ether + 1);
+
+        ScoreAttestation capped = new ScoreAttestation(attestor.MAX_FEE());
+        assertEq(capped.attestationFee(), 0.1 ether);
+    }
+
+    function test_withdrawEmitsWithdrawn() public {
+        address payable sink = payable(address(0xBEEF));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+        vm.expectEmit(true, false, false, true);
+        emit ScoreAttestation.Withdrawn(sink, 0.001 ether);
+        attestor.withdraw(sink);
+        assertEq(sink.balance, 0.001 ether);
     }
 }
 

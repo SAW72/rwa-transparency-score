@@ -1,19 +1,23 @@
 # RAT Score attestation (Base)
 
-Solidity contract that stores a **hash of a score payload**, a ticker, a timestamp, and an attester. It never stores the raw score, band, or pillar breakdown.
+Solidity contract that stores a **hash of a score payload**, a ticker, a trusted attestation time, and an attester. It never stores the raw score, band, or pillar breakdown.
+
+`attest(scoreHash, ticker, timestamp)` still takes the third argument so existing callers keep working. That argument is stored and emitted only as `claimedAt`. The trusted time (`attestedAt`, and the `uint256` returned by `verify`) is `block.timestamp`.
+
+Ownership is two-step. `transferOwnership` sets `pendingOwner` and leaves the current owner in control. The pending address must call `acceptOwnership`. There is no OpenZeppelin dependency; the handoff is implemented in the contract.
 
 Anyone who cited a RAT Score can re-hash the payload and call `verify(scoreHash, ticker)`. If the hash is missing or the ticker does not match, the cited breakdown was edited or was never attested.
 
 `attest` is **not permissionless**. Only the contract **owner** or an **allowlisted attester** (a relayer or API-held key added via `setAttester`) can lock a hash. A stranger who pays `attestationFee` cannot occupy a digest or front-run an official payload. `AlreadyAttested` still prevents a second official lock of the same hash; it does not let random payers brick official hashes.
 
-The timestamp is the observation time. It must be non-zero and not after the block. Owner changes are two-step (`transferOwnership` then `acceptOwnership`). `withdraw` pays with `call`, not the 2300-gas `transfer` stipend. A redeploy is required before Base Sepolia runs this bytecode.
+`withdraw` pays with `call`, not the 2300-gas `transfer` stipend. A redeploy is required before Base Sepolia runs this bytecode.
 
 ## Networks
 
 | Network | Chain ID | This repo |
 |---|---|---|
 | Base Sepolia | 84532 | **Allowed** — scripts + tests target this |
-| Base mainnet | 8453 | **Held** — `DeploySepolia` / `Attest` revert |
+| Base mainnet | 8453 | **Held** — `DeployScoreAttestation` / `Attest` revert |
 
 Spencer standing rule: testnets only until an explicit mainnet go. Do not add a mainnet deploy script in this PR.
 
@@ -23,7 +27,7 @@ Spencer standing rule: testnets only until an explicit mainnet go. Do not add a 
 contracts/
   src/ScoreAttestation.sol
   test/ScoreAttestation.t.sol
-  script/DeploySepolia.s.sol
+  script/DeployScoreAttestation.s.sol
   script/Attest.s.sol
 ```
 
@@ -33,28 +37,22 @@ Needs [Foundry](https://book.getfoundry.sh/getting-started/installation).
 
 ```bash
 cd contracts
-forge install foundry-rs/forge-std --no-commit
+forge install foundry-rs/forge-std@v1.16.2 --no-commit
 forge test -vv
 ```
 
 ## Deploy (Base Sepolia only)
 
-Spencer enters keys locally. **Never commit `PRIVATE_KEY`, put it in a PR, or paste it in chat.**
+Paste-and-sign steps are in [`DEPLOY_BASE_SEPOLIA.md`](DEPLOY_BASE_SEPOLIA.md). Spencer broadcasts from a Foundry keystore (`--account`). Agents never pass `--broadcast`. **Never commit a key, put it in a PR, or paste it in chat.**
+
+`script/DeployScoreAttestation.s.sol` reverts unless `block.chainid == 84532` (`mainnet held: deploy Base Sepolia only`). On `forge script` it also requires `vm.rpc("eth_chainId") == 0x14a34` and reverts if `FOUNDRY_CHAIN_ID` is set, so a spoofed `--chain-id` cannot pass. Constructor fee defaults to `0.001 ether` and cannot exceed `MAX_FEE` (0.1 ether). Extra attesters default to the zero address (none are committed in this repo). If `FINAL_OWNER` differs from the deployer, the script calls `transferOwnership` and that owner must `acceptOwnership`.
 
 ```bash
-cd contracts
-export BASE_SEPOLIA_RPC_URL=https://sepolia.base.org   # or your provider
-export PRIVATE_KEY=          # funded Sepolia key — env only
-# optional: ATTESTATION_FEE_WEI=1000000000000000  (0.001 ETH)
-# optional: ATTESTER_ADDRESS=0x...   # extra allowlisted relayer / API-held key
-
-forge script script/DeploySepolia.s.sol:DeploySepolia \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
-  --broadcast \
-  --private-key "$PRIVATE_KEY"
+# optional defaults — leave the address placeholders; do not invent a contract address
+# ATTESTATION_FEE_WEI=1000000000000000
+# ATTESTER_ADDRESS=0x...
+# FINAL_OWNER=0x...
 ```
-
-The script `require`s `block.chainid == 84532`. Pointing it at Base mainnet (or any other chain) reverts with `mainnet held: deploy Base Sepolia only`.
 
 After deploy, set the address in the API host environment (not in git):
 
@@ -73,22 +71,26 @@ RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures --json
 # → score_hash 0x…
 ```
 
-2. Submit **only that hash** (plus ticker / timestamp) from an **authorized**
+2. Submit **only that hash** (plus ticker / claimed timestamp) from an **authorized**
    key (deployer/owner or an address the owner passed to `setAttester`). The
    attester is always the broadcasting `msg.sender` — there is no attester
    argument to spoof. A stranger paying the fee cannot lock the hash.
+   `ATTEST_TIMESTAMP` is stored as `claimedAt`. The trusted time is the block time.
 
 ```bash
 cd contracts
 export ATTESTATION_CONTRACT=0x...
 export SCORE_HASH=0x...          # 32-byte hex from the client
 export TICKER=NVDA
-# optional: ATTEST_TIMESTAMP
+# optional: ATTEST_TIMESTAMP   # claimedAt only; attestedAt is block.timestamp
 
+# KEYSTORE_ACCOUNT is the ~/.foundry/keystores filename, not a raw key.
+# DEPLOYER is that account's address (`cast wallet address --account "$KEYSTORE_ACCOUNT"`).
 forge script script/Attest.s.sol:Attest \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
   --broadcast \
-  --private-key "$PRIVATE_KEY"
+  --account "$KEYSTORE_ACCOUNT" \
+  --sender "$DEPLOYER"
 ```
 
 Default fee is **0.001 ETH** per attestation (covers gas + a small revenue line). Owner can `setFee` / `withdraw`.

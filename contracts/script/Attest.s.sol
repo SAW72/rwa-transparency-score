@@ -6,7 +6,8 @@ import {ScoreAttestation} from "../src/ScoreAttestation.sol";
 
 /// @notice Submit a precomputed score hash. Never sends the raw score.
 /// Env: ATTESTATION_CONTRACT, SCORE_HASH, TICKER, ATTEST_TIMESTAMP (optional).
-/// ATTEST_TIMESTAMP must be non-zero and not after the block. Default is block.timestamp.
+/// ATTEST_TIMESTAMP is the untrusted claimedAt. The contract records
+/// block.timestamp as attestedAt. Default claimedAt is block.timestamp.
 /// The attester is always the broadcasting msg.sender. That key must be the
 /// contract owner or an address the owner passed to setAttester. There is no
 /// attester argument to spoof, and a stranger paying the fee cannot lock a hash.
