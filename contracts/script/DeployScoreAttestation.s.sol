@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Script, console2} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {ScoreAttestation} from "../src/ScoreAttestation.sol";
 
 /// @notice Deploy ScoreAttestation on Base Sepolia (chain id 84532) only.
@@ -29,6 +30,22 @@ contract DeployScoreAttestation is Script {
     function run() external returns (ScoreAttestation deployed) {
         if (block.chainid != BASE_SEPOLIA) {
             revert("mainnet held: deploy Base Sepolia only");
+        }
+        // `--chain-id` and FOUNDRY_CHAIN_ID spoof `block.chainid` without changing
+        // the endpoint. An empty value is treated as unset so a unit test can clear it.
+        if (vm.envExists("FOUNDRY_CHAIN_ID") && bytes(vm.envString("FOUNDRY_CHAIN_ID")).length != 0) {
+            revert("FOUNDRY_CHAIN_ID is set; refusing to deploy");
+        }
+        // `forge test` has no RPC. `forge script` (dry-run and broadcast) does.
+        if (
+            !vm.isContext(VmSafe.ForgeContext.Test) && !vm.isContext(VmSafe.ForgeContext.Coverage)
+                && !vm.isContext(VmSafe.ForgeContext.Snapshot)
+        ) {
+            uint256 rpcChainId = _rpcChainId();
+            if (rpcChainId != 0x14a34) {
+                revert("rpc eth_chainId is not Base Sepolia 84532");
+            }
+            console2.log("rpc eth_chainId", rpcChainId);
         }
 
         uint256 fee = vm.envOr("ATTESTATION_FEE_WEI", uint256(0.001 ether));
@@ -81,6 +98,15 @@ contract DeployScoreAttestation is Script {
                     n = _push(allowlist, n, listed[i]);
                 }
             }
+        }
+    }
+
+    /// @dev `vm.rpc("eth_chainId", "[]")` returns the quantity as raw big-endian bytes (0x14a34).
+    function _rpcChainId() internal returns (uint256 value) {
+        bytes memory raw = vm.rpc("eth_chainId", "[]");
+        if (raw.length == 0 || raw.length > 32) revert("rpc eth_chainId is not Base Sepolia 84532");
+        for (uint256 i = 0; i < raw.length; i++) {
+            value = (value << 8) | uint8(raw[i]);
         }
     }
 

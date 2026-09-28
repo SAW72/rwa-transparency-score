@@ -272,7 +272,7 @@ contract ScoreAttestationTest is Test {
     }
 
     function test_transferOwnershipRejectsZero() public {
-        vm.expectRevert(ScoreAttestation.ZeroAttester.selector);
+        vm.expectRevert(ScoreAttestation.ZeroOwner.selector);
         attestor.transferOwnership(address(0));
     }
 
@@ -410,6 +410,45 @@ contract ScoreAttestationTest is Test {
         handed.acceptOwnership();
         assertEq(handed.owner(), stranger);
         assertEq(handed.pendingOwner(), address(0));
+
+        vm.setEnv("FOUNDRY_CHAIN_ID", "84532");
+        vm.expectRevert(bytes("FOUNDRY_CHAIN_ID is set; refusing to deploy"));
+        script.run();
+        vm.setEnv("FOUNDRY_CHAIN_ID", "");
+    }
+
+    function test_setFeeEmitsAndRejectsAboveCap() public {
+        assertEq(attestor.MAX_FEE(), 0.1 ether);
+
+        vm.expectEmit(false, false, false, true);
+        emit ScoreAttestation.FeeUpdated(0.001 ether, 0.1 ether);
+        attestor.setFee(0.1 ether);
+        assertEq(attestor.attestationFee(), 0.1 ether);
+
+        vm.expectRevert(abi.encodeWithSelector(ScoreAttestation.FeeTooHigh.selector, 0.1 ether + 1, 0.1 ether));
+        attestor.setFee(0.1 ether + 1);
+
+        vm.expectEmit(false, false, false, true);
+        emit ScoreAttestation.FeeUpdated(0.1 ether, 0);
+        attestor.setFee(0);
+        assertEq(attestor.attestationFee(), 0);
+    }
+
+    function test_constructorRejectsFeeAboveCap() public {
+        vm.expectRevert(abi.encodeWithSelector(ScoreAttestation.FeeTooHigh.selector, 0.1 ether + 1, 0.1 ether));
+        new ScoreAttestation(0.1 ether + 1);
+
+        ScoreAttestation capped = new ScoreAttestation(attestor.MAX_FEE());
+        assertEq(capped.attestationFee(), 0.1 ether);
+    }
+
+    function test_withdrawEmitsWithdrawn() public {
+        address payable sink = payable(address(0xBEEF));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+        vm.expectEmit(true, false, false, true);
+        emit ScoreAttestation.Withdrawn(sink, 0.001 ether);
+        attestor.withdraw(sink);
+        assertEq(sink.balance, 0.001 ether);
     }
 }
 

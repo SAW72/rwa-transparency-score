@@ -18,9 +18,12 @@ export ATTESTER_ADDRESS_2="0x0000000000000000000000000000000000000000"
 export ATTESTER_ADDRESS_3="0x0000000000000000000000000000000000000000"
 export FINAL_OWNER="$DEPLOYER"                            # or a different checksummed owner
 export FINAL_OWNER_ACCOUNT="$KEYSTORE_ACCOUNT"            # keystore of FINAL_OWNER when they differ
-export BASESCAN_API_KEY="${ETHERSCAN_API_KEY:-}"          # env only, never paste
+export ETHERSCAN_API_KEY="${ETHERSCAN_API_KEY:-}"         # Etherscan API V2 key, env only, never paste
 export SCORE_ATTESTATION="TBD after deploy"
 export OLD_SCORE_ATTESTATION="TBD after deploy"           # not committed in this repo
+export OLD_ATTESTER="0x0000000000000000000000000000000000000000" # extra attester on the old contract
+export OLD_OWNER="0x0000000000000000000000000000000000000000"    # current owner() of the old contract
+export OLD_OWNER_ACCOUNT="<keystore-name of OLD_OWNER>"          # not a key
 export NON_ATTESTER="0x0000000000000000000000000000000000000001"
 export SCORE_HASH="0x0000000000000000000000000000000000000000000000000000000000000000"
 export TICKER="NVDA"
@@ -57,7 +60,7 @@ forge script script/DeployScoreAttestation.s.sol:DeployScoreAttestation \
   --sender "$DEPLOYER"
 ```
 
-The script reverts unless `block.chainid` is 84532. The predicted address depends on `$DEPLOYER`'s nonce at that block. Read it before deploying:
+The script reverts unless `block.chainid` is 84532. On `forge script` it also requires `eth_chainId` from the RPC to be `0x14a34` (84532) and reverts if `FOUNDRY_CHAIN_ID` is set. Do not export `FOUNDRY_CHAIN_ID` and do not pass `--chain-id`. The predicted address depends on `$DEPLOYER`'s nonce at that block. Read it before deploying:
 
 ```bash
 cast nonce "$DEPLOYER" --rpc-url "$BASE_SEPOLIA_RPC_URL"
@@ -82,18 +85,16 @@ fi
 
 Copy the logged `ScoreAttestation` address into `SCORE_ATTESTATION` in the shell only. If `FINAL_OWNER` differs from `DEPLOYER`, this broadcast already calls `transferOwnership`. `owner()` stays the deployer until `acceptOwnership`.
 
-## 3. Verify source on Basescan
+## 3. Verify source (Etherscan API V2)
 
-API key from the environment only. Do not paste it.
+API key from the environment only. Do not paste it. Foundry sends this to Etherscan API V2 for chain id 84532. Do not pass `--verifier-url`.
 
 ```bash
 CONSTRUCTOR_ARGS="$(cast abi-encode "constructor(uint256)" "$ATTESTATION_FEE_WEI")"
 forge verify-contract \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
   --chain 84532 \
-  --verifier etherscan \
-  --verifier-url "https://api-sepolia.basescan.org/api" \
-  --etherscan-api-key "$BASESCAN_API_KEY" \
+  --etherscan-api-key "$ETHERSCAN_API_KEY" \
   --constructor-args "$CONSTRUCTOR_ARGS" \
   --watch \
   "$SCORE_ATTESTATION" \
@@ -128,11 +129,17 @@ The third `getAttestation` field (`attestedAt`) must equal the `cast block` time
 Simulate a non-attester `attest`. `cast call --from` is an `eth_call`. It does not send.
 
 ```bash
-if cast call "$SCORE_ATTESTATION" "attest(bytes32,string,uint256)" "$SCORE_HASH" "$TICKER" "1" --value 1000000000000000wei --from "$NON_ATTESTER" --rpc-url "$BASE_SEPOLIA_RPC_URL"; then
-  echo "unexpected success: non-attester attest simulation"
-else
-  echo "non-attester attest reverted in simulation (no transaction sent)"
-fi
+NOT_ATTESTER_SELECTOR="$(cast sig "NotAttester()")"
+OUT="$(cast call "$SCORE_ATTESTATION" "attest(bytes32,string,uint256)" "$SCORE_HASH" "$TICKER" "1" --value 1000000000000000wei --from "$NON_ATTESTER" --rpc-url "$BASE_SEPOLIA_RPC_URL" 2>&1 || true)"
+case "$OUT" in
+  *"$NOT_ATTESTER_SELECTOR"*)
+    echo "non-attester attest reverted NotAttester ($NOT_ATTESTER_SELECTOR); no transaction sent"
+    ;;
+  *)
+    echo "FAIL: expected NotAttester selector $NOT_ATTESTER_SELECTOR"
+    printf '%s\n' "$OUT"
+    ;;
+esac
 ```
 
 ## 5. Ownership handoff
@@ -159,7 +166,31 @@ else
 fi
 ```
 
-Then repeat the read-only `owner()` / `pendingOwner()` calls from section 4. After accept, `owner()` is `FINAL_OWNER` and `pendingOwner()` is the zero address. The previous owner remains an attester until `setAttester` revokes them, and is still authorized while they are `owner()`.
+Then repeat the read-only `owner()` / `pendingOwner()` calls from section 4. After accept, `owner()` is `FINAL_OWNER` and `pendingOwner()` is the zero address.
+
+**Spencer only; agents never broadcast.** After `acceptOwnership`, `FINAL_OWNER` removes the deployer from the attester allowlist. If `FINAL_OWNER` is the deployer, skip the accept send above and still run this: the constructor allowlist entry is cleared, and that address stays authorized only because it is `owner()`.
+
+```bash
+if [ "$(cast chain-id --rpc-url "$BASE_SEPOLIA_RPC_URL")" = "84532" ]; then
+  cast send "$SCORE_ATTESTATION" "setAttester(address,bool)" "$DEPLOYER" false --rpc-url "$BASE_SEPOLIA_RPC_URL" --account "$FINAL_OWNER_ACCOUNT" --sender "$FINAL_OWNER"
+else
+  echo "skip send: chain is not Base Sepolia 84532"
+fi
+```
+
+Read-only. This must print false. It does not send.
+
+```bash
+DEPLOYER_STILL_ATTESTER="$(cast call "$SCORE_ATTESTATION" "isAttester(address)(bool)" "$DEPLOYER" --rpc-url "$BASE_SEPOLIA_RPC_URL")"
+case "$DEPLOYER_STILL_ATTESTER" in
+  false|0)
+    echo "isAttester(DEPLOYER) is false"
+    ;;
+  *)
+    echo "FAIL: isAttester(DEPLOYER) is $DEPLOYER_STILL_ATTESTER, expected false"
+    ;;
+esac
+```
 
 ## 6. Repoint list
 
@@ -183,7 +214,7 @@ Files that mention the contract or attester slot (none of these is a deployed ad
 | `README.md` | 309 | Names `RWA_ATTESTATION_CONTRACT`. No address literal. |
 | `rwa_score/api/settings.py` | 26 | `attestation_contract: str = ""` |
 | `rwa_score/api/settings.py` | 54 | Reads `RWA_ATTESTATION_CONTRACT` from the environment. |
-| `rwa_score/api/verify.py` | 96 | Same env var, default `""`. |
+| `rwa_score/api/verify.py` | 97 | Same env var, default `""`. The on-chain JSON field is `attested_at`, not `timestamp`. |
 | `rwa_score/api/app.py` | 330 | Returns `cfg.attestation_contract or None`. |
 | `scripts/verify_attestation.py` | 7 | Example uses `$RWA_ATTESTATION_CONTRACT`. |
 | `contracts/script/Attest.s.sol` | 19 | `vm.envAddress("ATTESTATION_CONTRACT")`. |
@@ -191,7 +222,7 @@ Files that mention the contract or attester slot (none of these is a deployed ad
 | `render.yaml` | — | Does not set `RWA_ATTESTATION_CONTRACT`. No line to edit. |
 | ABI JSON | — | No ABI JSON file in the repo. |
 
-Test-only addresses in `contracts/test/ScoreAttestation.t.sol` are not a production allowlist: `0xA11CE` (line 11), `0xB0B` (line 12), `0xBEEF` (line 185), `0x0A1E` (lines 300, 321, 336), `0xCA11` (line 378). Foundry's default script sender `0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38` appears only in test logs. Read-only `eth_getCode` on Base Sepolia (`https://sepolia.base.org`, chain 84532, block 47422561) returned `0x` and codesize 0 for each of those addresses. They are not contracts and not attesters on that chain.
+Test-only addresses in `contracts/test/ScoreAttestation.t.sol` are not a production allowlist: `0xA11CE` (line 11), `0xB0B` (line 12), `0xBEEF` (lines 185 and 446), `0x0A1E` (lines 300, 321, 336), `0xCA11` (line 378). Foundry's default script sender `0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38` appears only in test logs. Read-only `eth_getCode` on Base Sepolia (`https://sepolia.base.org`, chain 84532, block 47422561) returned `0x` and codesize 0 for each of those addresses. They are not contracts and not attesters on that chain.
 
 ## 7. Retire the previous contract
 
@@ -202,19 +233,38 @@ This repo does not commit the old address, so fill `OLD_SCORE_ATTESTATION` local
 ```bash
 cast codesize "$OLD_SCORE_ATTESTATION" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 cast call "$OLD_SCORE_ATTESTATION" "owner()(address)" --rpc-url "$BASE_SEPOLIA_RPC_URL"
-cast call "$OLD_SCORE_ATTESTATION" "isAttester(address)(bool)" "$DEPLOYER" --rpc-url "$BASE_SEPOLIA_RPC_URL"
+cast call "$OLD_SCORE_ATTESTATION" "isAttester(address)(bool)" "$OLD_ATTESTER" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 ```
 
-The contract that was deployable from `main` before two-step ownership has `setAttester(address,bool)` and no `renounceOwnership` and no `transferOwnership`. The owner stays authorized even after `setAttester(owner, false)` (`authorized` is `who == owner || isAttester[who]`). You cannot renounce that bytecode. Retirement is: revoke every extra attester, stop pointing clients at the address, and do not call `attest` from the owner key.
+No ScoreAttestation address is committed in this repo, so deployed bytecode was not read here. Match the send to the ABI you actually deployed:
 
-There is no production attester address in git. For each extra attester you actually allowlisted at deploy time:
+- Source on `main` at `a5d0c36` (PR #58) has `setAttester(address,bool)`, `transferOwnership(address)`, and `acceptOwnership()`. It has no `renounceOwnership`. `transferOwnership(address(0))` reverts `ZeroAttester`. The owner stays authorized after `setAttester(owner, false)` because `authorized` is `who == owner || isAttester[who]`.
+- Source before PR #58 (`b20f9a7`) has `setAttester(address,bool)` only. It has no `transferOwnership`, no `acceptOwnership`, and no `renounceOwnership`. A `transferOwnership` send to that bytecode reverts.
+
+Retirement for either ABI is: revoke each extra attester with `setAttester` from the current owner, stop pointing clients at the address, and do not call `attest` from the owner key. The send below calls only `setAttester`, which both ABIs have. It does not call `transferOwnership`.
+
+`OLD_OWNER` must equal `owner()` before the send. A mismatch skips the send and does not close the shell. `OLD_OWNER_ACCOUNT` is the keystore for `OLD_OWNER`. `OLD_ATTESTER` is one extra attester on that contract, not `ATTESTER_ADDRESS` from the new deploy.
 
 ```bash
-if [ "$(cast chain-id --rpc-url "$BASE_SEPOLIA_RPC_URL")" = "84532" ]; then
-  cast send "$OLD_SCORE_ATTESTATION" "setAttester(address,bool)" "$ATTESTER_ADDRESS" false --rpc-url "$BASE_SEPOLIA_RPC_URL" --account "$KEYSTORE_ACCOUNT" --sender "$DEPLOYER"
+ONCHAIN_OWNER="$(cast call "$OLD_SCORE_ATTESTATION" "owner()(address)" --rpc-url "$BASE_SEPOLIA_RPC_URL")"
+if [ "$(printf '%s' "$ONCHAIN_OWNER" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$OLD_OWNER" | tr '[:upper:]' '[:lower:]')" ]; then
+  if [ "$(cast chain-id --rpc-url "$BASE_SEPOLIA_RPC_URL")" = "84532" ]; then
+    cast send "$OLD_SCORE_ATTESTATION" "setAttester(address,bool)" "$OLD_ATTESTER" false --rpc-url "$BASE_SEPOLIA_RPC_URL" --account "$OLD_OWNER_ACCOUNT" --sender "$OLD_OWNER"
+  else
+    echo "skip send: chain is not Base Sepolia 84532"
+  fi
 else
-  echo "skip send: chain is not Base Sepolia 84532"
+  echo "skip send: owner() is $ONCHAIN_OWNER, signer is $OLD_OWNER"
 fi
 ```
 
-Do not call `transferOwnership` on bytecode that does not have it. On the current source, `transferOwnership(address(0))` reverts `ZeroAttester`, and `address(0)` cannot call `acceptOwnership`, so that is not a renounce. The current source also has no `renounceOwnership`.
+## 8. Indexer note
+
+Compared with ScoreAttestation on `main` (`a5d0c36`, PR #58). If the deployed bytecode is the pre-#58 source (`b20f9a7`), it also lacks the ownership events below.
+
+- `ScoreAttested` signature changed. Old: `ScoreAttested(string,bytes32,uint256,address)` and that uint256 was the caller-supplied timestamp. New: `ScoreAttested(string,bytes32,uint256,uint256,address)`. The first uint256 is `attestedAt` (`block.timestamp`). The second is `claimedAt` (the old caller timestamp). Topic0 changes. The address is still not indexed.
+- `Record` / `getAttestation` changed. Old tuple: `(bytes32 scoreHash, string ticker, uint256 timestamp, address attester)`. New tuple: `(bytes32 scoreHash, string ticker, uint256 attestedAt, address attester, uint256 claimedAt)`. The third word is still a uint256 in the same position, but the value is chain time, not the caller timestamp. `claimedAt` is appended after `attester`. `attester` stays the fourth word.
+- `verify(bytes32,string)` is still `(bool,uint256,address)`. That uint256 is `attestedAt`, not `claimedAt`. The Python helper in `rwa_score/api/verify.py` labels it `attested_at`.
+- New events: `FeeUpdated(uint256 oldFee, uint256 newFee)` from `setFee` (not from the constructor). `Withdrawn(address indexed to, uint256 amount)` after a successful `withdraw`.
+- Unchanged events that already exist on `a5d0c36`: `AttesterUpdated(address indexed,bool)`, `OwnershipTransferStarted(address indexed,address indexed)`, `OwnershipTransferred(address indexed,address indexed)`. Those three ownership-related events are absent from `b20f9a7`.
+- `transferOwnership(address(0))` on this contract reverts `ZeroOwner()`. On `a5d0c36` that call reverts `ZeroAttester()`. `setAttester(address(0))` and `withdraw(address(0))` still revert `ZeroAttester()`. New error: `FeeTooHigh(uint256,uint256)` when the fee is above `MAX_FEE` (0.1 ether). `EmptyTimestamp()` and `FutureTimestamp()` from `a5d0c36` are gone; claimed time is stored and not checked.

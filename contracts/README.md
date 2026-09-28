@@ -37,7 +37,7 @@ Needs [Foundry](https://book.getfoundry.sh/getting-started/installation).
 
 ```bash
 cd contracts
-forge install foundry-rs/forge-std --no-commit
+forge install foundry-rs/forge-std@v1.16.2 --no-commit
 forge test -vv
 ```
 
@@ -45,7 +45,7 @@ forge test -vv
 
 Paste-and-sign steps are in [`DEPLOY_BASE_SEPOLIA.md`](DEPLOY_BASE_SEPOLIA.md). Spencer broadcasts from a Foundry keystore (`--account`). Agents never pass `--broadcast`. **Never commit a key, put it in a PR, or paste it in chat.**
 
-`script/DeployScoreAttestation.s.sol` reverts unless `block.chainid == 84532` (`mainnet held: deploy Base Sepolia only`). Constructor fee defaults to `0.001 ether`. Extra attesters default to the zero address (none are committed in this repo). If `FINAL_OWNER` differs from the deployer, the script calls `transferOwnership` and that owner must `acceptOwnership`.
+`script/DeployScoreAttestation.s.sol` reverts unless `block.chainid == 84532` (`mainnet held: deploy Base Sepolia only`). On `forge script` it also requires `vm.rpc("eth_chainId") == 0x14a34` and reverts if `FOUNDRY_CHAIN_ID` is set, so a spoofed `--chain-id` cannot pass. Constructor fee defaults to `0.001 ether` and cannot exceed `MAX_FEE` (0.1 ether). Extra attesters default to the zero address (none are committed in this repo). If `FINAL_OWNER` differs from the deployer, the script calls `transferOwnership` and that owner must `acceptOwnership`.
 
 ```bash
 # optional defaults — leave the address placeholders; do not invent a contract address
@@ -84,10 +84,13 @@ export SCORE_HASH=0x...          # 32-byte hex from the client
 export TICKER=NVDA
 # optional: ATTEST_TIMESTAMP   # claimedAt only; attestedAt is block.timestamp
 
+# KEYSTORE_ACCOUNT is the ~/.foundry/keystores filename, not a raw key.
+# DEPLOYER is that account's address (`cast wallet address --account "$KEYSTORE_ACCOUNT"`).
 forge script script/Attest.s.sol:Attest \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
   --broadcast \
-  --private-key "$PRIVATE_KEY"
+  --account "$KEYSTORE_ACCOUNT" \
+  --sender "$DEPLOYER"
 ```
 
 Default fee is **0.001 ETH** per attestation (covers gas + a small revenue line). Owner can `setFee` / `withdraw`.

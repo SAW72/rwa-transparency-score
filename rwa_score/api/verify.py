@@ -23,6 +23,7 @@ from .attest import attestation_payload, canonical_bytes, score_hash
 
 # Type signature is unchanged. The uint256 is the contract's trusted
 # attestedAt (block.timestamp at attest), not the attester's claimedAt.
+# The JSON field is `attested_at` so callers do not treat it as claimedAt.
 VERIFY_SIG = "verify(bytes32,string)(bool,uint256,address)"
 
 
@@ -77,7 +78,7 @@ def on_chain_verify(
         return {"ok": False, "raw": out.strip()}
     return {
         "ok": flag.lower() in {"true", "1"},
-        "timestamp": ts,
+        "attested_at": ts,
         "attester": attester,
         "raw": out.strip(),
     }

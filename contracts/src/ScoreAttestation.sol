@@ -16,6 +16,11 @@ pragma solidity ^0.8.24;
 ///      `acceptOwnership`. The current owner keeps admin control until accept.
 contract ScoreAttestation {
     uint256 public constant DEFAULT_FEE = 0.001 ether;
+    /// @notice Ceiling for `attestationFee`. One hundred times `DEFAULT_FEE`
+    ///         (0.1 ether). A fee at the cap is still a deliberate testnet price;
+    ///         anything higher would let the owner key brick `attest` or demand
+    ///         multiple ether per hash from the attester key.
+    uint256 public constant MAX_FEE = 0.1 ether;
 
     address public owner;
     address public pendingOwner;
@@ -39,16 +44,21 @@ contract ScoreAttestation {
     event AttesterUpdated(address indexed attester, bool allowed);
     event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event FeeUpdated(uint256 oldFee, uint256 newFee);
+    event Withdrawn(address indexed to, uint256 amount);
 
     error InsufficientFee();
     error EmptyHash();
     error EmptyTicker();
     error ZeroAttester();
+    /// @notice `transferOwnership` was given the zero address. Not a renounce.
+    error ZeroOwner();
     error AlreadyAttested();
     error NotOwner();
     error NotPendingOwner();
     error NotAttester();
     error WithdrawFailed();
+    error FeeTooHigh(uint256 fee, uint256 max);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -57,7 +67,9 @@ contract ScoreAttestation {
 
     constructor(uint256 fee_) {
         owner = msg.sender;
-        attestationFee = fee_ == 0 ? DEFAULT_FEE : fee_;
+        uint256 fee = fee_ == 0 ? DEFAULT_FEE : fee_;
+        if (fee > MAX_FEE) revert FeeTooHigh(fee, MAX_FEE);
+        attestationFee = fee;
         isAttester[msg.sender] = true;
         emit AttesterUpdated(msg.sender, true);
     }
@@ -71,7 +83,7 @@ contract ScoreAttestation {
     ///         The previous owner stays an attester until `setAttester` revokes them.
     ///         The current owner keeps control until accept.
     function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert ZeroAttester();
+        if (newOwner == address(0)) revert ZeroOwner();
         pendingOwner = newOwner;
         emit OwnershipTransferStarted(owner, newOwner);
     }
@@ -141,7 +153,10 @@ contract ScoreAttestation {
     }
 
     function setFee(uint256 fee_) external onlyOwner {
+        if (fee_ > MAX_FEE) revert FeeTooHigh(fee_, MAX_FEE);
+        uint256 oldFee = attestationFee;
         attestationFee = fee_;
+        emit FeeUpdated(oldFee, fee_);
     }
 
     /// @notice Send the full balance to `to`. Uses all remaining gas, not the 2300 stipend.
@@ -154,5 +169,6 @@ contract ScoreAttestation {
             ok := call(gas(), to, amount, 0, 0, 0, 0)
         }
         if (!ok) revert WithdrawFailed();
+        emit Withdrawn(to, amount);
     }
 }
