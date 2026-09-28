@@ -43,22 +43,16 @@ forge test -vv
 
 ## Deploy (Base Sepolia only)
 
-Spencer enters keys locally. **Never commit `PRIVATE_KEY`, put it in a PR, or paste it in chat.**
+Paste-and-sign steps are in [`DEPLOY_BASE_SEPOLIA.md`](DEPLOY_BASE_SEPOLIA.md). Spencer broadcasts from a Foundry keystore (`--account`). Agents never pass `--broadcast`. **Never commit a key, put it in a PR, or paste it in chat.**
+
+`script/DeployScoreAttestation.s.sol` reverts unless `block.chainid == 84532` (`mainnet held: deploy Base Sepolia only`). Constructor fee defaults to `0.001 ether`. Extra attesters default to the zero address (none are committed in this repo). If `FINAL_OWNER` differs from the deployer, the script calls `transferOwnership` and that owner must `acceptOwnership`.
 
 ```bash
-cd contracts
-export BASE_SEPOLIA_RPC_URL=https://sepolia.base.org   # or your provider
-export PRIVATE_KEY=          # funded Sepolia key — env only
-# optional: ATTESTATION_FEE_WEI=1000000000000000  (0.001 ETH)
-# optional: ATTESTER_ADDRESS=0x...   # extra allowlisted relayer / API-held key
-
-forge script script/DeploySepolia.s.sol:DeploySepolia \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
-  --broadcast \
-  --private-key "$PRIVATE_KEY"
+# optional defaults — leave the address placeholders; do not invent a contract address
+# ATTESTATION_FEE_WEI=1000000000000000
+# ATTESTER_ADDRESS=0x...
+# FINAL_OWNER=0x...
 ```
-
-The script `require`s `block.chainid == 84532`. Pointing it at Base mainnet (or any other chain) reverts with `mainnet held: deploy Base Sepolia only`.
 
 After deploy, set the address in the API host environment (not in git):
 

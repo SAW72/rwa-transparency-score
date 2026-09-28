@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {ScoreAttestation} from "../src/ScoreAttestation.sol";
 import {DeploySepolia} from "../script/DeploySepolia.s.sol";
+import {DeployScoreAttestation} from "../script/DeployScoreAttestation.s.sol";
 
 contract ScoreAttestationTest is Test {
     ScoreAttestation internal attestor;
@@ -361,6 +362,54 @@ contract ScoreAttestationTest is Test {
         attestor.setFee(0.005 ether);
         assertEq(attestor.attestationFee(), 0.005 ether);
         assertEq(attestor.owner(), next);
+    }
+
+    function test_deployScoreAttestationRevertsOffBaseSepolia() public {
+        DeployScoreAttestation script = new DeployScoreAttestation();
+        vm.chainId(8453);
+        vm.expectRevert(bytes("mainnet held: deploy Base Sepolia only"));
+        script.run();
+        vm.chainId(1);
+        vm.expectRevert(bytes("mainnet held: deploy Base Sepolia only"));
+        script.run();
+    }
+
+    function test_deployScoreAttestationDefaultsThenHandoff() public {
+        address extra = address(0xCA11);
+        vm.chainId(84532);
+        vm.setEnv("DEPLOYER", vm.toString(attester));
+        vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
+        vm.setEnv("ATTESTER_ADDRESS_2", vm.toString(address(0)));
+        vm.setEnv("ATTESTER_ADDRESS_3", vm.toString(address(0)));
+        vm.setEnv("ATTESTERS", "");
+        vm.setEnv("FINAL_OWNER", vm.toString(address(0)));
+
+        DeployScoreAttestation script = new DeployScoreAttestation();
+        ScoreAttestation deployed = script.run();
+        assertEq(deployed.attestationFee(), 0.001 ether);
+        assertEq(deployed.owner(), attester);
+        assertEq(deployed.pendingOwner(), address(0));
+        assertTrue(deployed.isAttester(attester));
+        assertTrue(deployed.authorized(attester));
+        assertFalse(deployed.isAttester(stranger));
+        assertFalse(deployed.isAttester(extra));
+
+        vm.setEnv("ATTESTER_ADDRESS_3", vm.toString(stranger));
+        vm.setEnv("ATTESTERS", vm.toString(extra));
+        vm.setEnv("FINAL_OWNER", vm.toString(stranger));
+        ScoreAttestation handed = script.run();
+        assertEq(handed.owner(), attester);
+        assertEq(handed.pendingOwner(), stranger);
+        assertTrue(handed.isAttester(attester));
+        assertTrue(handed.isAttester(extra));
+        assertTrue(handed.isAttester(stranger));
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        handed.setFee(0);
+        vm.prank(stranger);
+        handed.acceptOwnership();
+        assertEq(handed.owner(), stranger);
+        assertEq(handed.pendingOwner(), address(0));
     }
 }
 
