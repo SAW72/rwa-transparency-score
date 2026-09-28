@@ -2,6 +2,8 @@
 
 RAT Score (RWA Transparency Score) — an AI-assisted risk radar for tokenized stocks. Rates issuers 0–100 on backing, proof of reserves, redemption, price integrity, disclosure, and cross-issuer basis using CoinMarketCap’s RWA API.
 
+On-chain hash lock (Base Sepolia only): [SECURITY.md](SECURITY.md).
+
 Judges: one command, no API key.
 
 ```bash

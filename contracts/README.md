@@ -6,6 +6,8 @@ Anyone who cited a RAT Score can re-hash the payload and call `verify(scoreHash,
 
 `attest` is **not permissionless**. Only the contract **owner** or an **allowlisted attester** (a relayer or API-held key added via `setAttester`) can lock a hash. A stranger who pays `attestationFee` cannot occupy a digest or front-run an official payload. `AlreadyAttested` still prevents a second official lock of the same hash; it does not let random payers brick official hashes.
 
+The timestamp is the observation time. It must be non-zero and not after the block. Owner changes are two-step (`transferOwnership` then `acceptOwnership`). `withdraw` pays with `call`, not the 2300-gas `transfer` stipend. A redeploy is required before Base Sepolia runs this bytecode.
+
 ## Networks
 
 | Network | Chain ID | This repo |

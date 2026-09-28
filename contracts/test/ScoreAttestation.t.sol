@@ -12,6 +12,7 @@ contract ScoreAttestationTest is Test {
     bytes32 internal sampleHash = keccak256("payload");
 
     function setUp() public {
+        vm.warp(1_800_000_000);
         attestor = new ScoreAttestation(0.001 ether);
         vm.deal(address(this), 1 ether);
         vm.deal(attester, 1 ether);
@@ -202,9 +203,75 @@ contract ScoreAttestationTest is Test {
         vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
     }
 
+    function test_rejectFutureTimestamp() public {
+        vm.expectRevert(ScoreAttestation.FutureTimestamp.selector);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", block.timestamp + 1);
+        assertFalse(attestor.attested(sampleHash));
+    }
+
+    function test_rejectZeroTimestamp() public {
+        vm.expectRevert(ScoreAttestation.EmptyTimestamp.selector);
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 0);
+    }
+
+    function test_acceptsTimestampEqualToBlock() public {
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", block.timestamp);
+        (, uint256 ts,) = attestor.verify(sampleHash, "NVDA");
+        assertEq(ts, block.timestamp);
+    }
+
+    function test_twoStepOwnership() public {
+        attestor.transferOwnership(attester);
+        assertEq(attestor.pendingOwner(), attester);
+        assertEq(attestor.owner(), address(this));
+
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotPendingOwner.selector);
+        attestor.acceptOwnership();
+
+        vm.prank(attester);
+        attestor.acceptOwnership();
+        assertEq(attestor.owner(), attester);
+        assertEq(attestor.pendingOwner(), address(0));
+
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.setFee(0);
+
+        vm.prank(attester);
+        attestor.setFee(0);
+    }
+
+    function test_transferOwnershipRejectsZero() public {
+        vm.expectRevert(ScoreAttestation.ZeroAttester.selector);
+        attestor.transferOwnership(address(0));
+    }
+
+    function test_nonOwnerCannotTransferOwnership() public {
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.transferOwnership(stranger);
+    }
+
+    function test_withdrawPaysContractThatWritesStorage() public {
+        GasHungry sink = new GasHungry();
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1);
+        attestor.withdraw(payable(address(sink)));
+        assertEq(address(sink).balance, 0.001 ether);
+        assertEq(sink.hits(), 1);
+    }
+
     function test_defaultFeeWhenConstructorZero() public {
         ScoreAttestation zero = new ScoreAttestation(0);
         assertEq(zero.attestationFee(), 0.001 ether);
         assertTrue(zero.authorized(address(this)));
+    }
+}
+
+/// @dev A receive hook that writes storage. `transfer` (2300 gas) cannot pay this.
+contract GasHungry {
+    uint256 public hits;
+
+    receive() external payable {
+        hits = 1;
     }
 }
