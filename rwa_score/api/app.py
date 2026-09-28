@@ -332,7 +332,9 @@ def create_app(
                 "Call ScoreAttestation.attest(scoreHash, ticker, timestamp) "
                 "on Base Sepolia from an authorized attester (owner or "
                 "allowlisted relayer / API-held key). Attester is msg.sender "
-                "(not calldata). The contract stores this hash only — never "
+                "(not calldata). The timestamp argument is stored only as "
+                "claimedAt; the contract records block.timestamp as attestedAt. "
+                "The contract stores this hash only — never "
                 "the raw score. Mainnet is held."
             ),
         }

@@ -2,7 +2,7 @@
 
 **Status:** Base Sepolia only. This is an operator snapshot of the score contract on `main`, not a third-party audit and not a statement that an issuer is safe.
 
-**Reviewed:** 2026-09-27. **HEAD:** `b20f9a7`. Contract: `contracts/src/ScoreAttestation.sol`.
+**Reviewed:** 2026-09-28. Contract: `contracts/src/ScoreAttestation.sol`.
 
 ## What the contract does
 
@@ -16,7 +16,7 @@ It locks a hash. It does not store the score, the band, or the pillar breakdown.
 
 ## Limits
 
-- `timestamp` is the observation time the attester submits. It cannot be zero and it cannot be after `block.timestamp`. A compromised attester key can still lock any hash with a past time. That key is the trust boundary. The contract cannot tell a wrong score from a right one.
+- `attestedAt` is `block.timestamp` at `attest`. The `timestamp` argument is stored only as `claimedAt` and is not trusted (zero, backdated, and future values are all stored as claims). A compromised attester key can still lock any hash. That key is the trust boundary. The contract cannot tell a wrong score from a right one.
 - Owner rotation is two-step: `transferOwnership`, then `acceptOwnership`. The previous owner stays on the attester list until `setAttester` revokes them. The owner remains authorized even if removed from that list.
 - `withdraw` forwards the remaining gas with `call`, so a contract wallet that writes storage can receive the fee. It does not copy returndata.
 - A payment above `attestationFee` is kept. The owner withdraws the balance.

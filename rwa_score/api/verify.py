@@ -21,6 +21,8 @@ from rwa_score.scorer import ScoreError, TransparencyScorer
 
 from .attest import attestation_payload, canonical_bytes, score_hash
 
+# Type signature is unchanged. The uint256 is the contract's trusted
+# attestedAt (block.timestamp at attest), not the attester's claimedAt.
 VERIFY_SIG = "verify(bytes32,string)(bool,uint256,address)"
 
 

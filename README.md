@@ -300,7 +300,7 @@ The captured file is the full authentic envelope (pillars, verification, basis w
 
 ### On-chain attestation (Base Sepolia)
 
-`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held.
+`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
 
 ```bash
 RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures

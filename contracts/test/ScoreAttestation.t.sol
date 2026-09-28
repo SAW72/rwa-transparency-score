@@ -27,22 +27,46 @@ contract ScoreAttestationTest is Test {
     }
 
     function test_attestStoresHashNotScore() public {
+        uint256 trusted = 1_700_000_000;
+        vm.warp(trusted);
         vm.expectEmit(true, true, true, true);
-        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, 1_700_000_000, address(this));
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 1_700_000_000);
+        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, trusted, trusted, address(this));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", trusted);
 
         assertTrue(attestor.attested(sampleHash));
         ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
         assertEq(rec.scoreHash, sampleHash);
         assertEq(rec.ticker, "NVDA");
-        assertEq(rec.timestamp, 1_700_000_000);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.claimedAt, trusted);
         assertEq(rec.attester, address(this));
 
         // Storage holds the digest only — no score / band / pillar fields exist.
+        // verify's uint256 is the trusted chain time, not a caller-chosen clock.
         (bool ok, uint256 ts, address who) = attestor.verify(sampleHash, "NVDA");
         assertTrue(ok);
-        assertEq(ts, 1_700_000_000);
+        assertEq(ts, block.timestamp);
         assertEq(who, address(this));
+    }
+
+    function test_backdatedClaimedTimestampIsIgnored() public {
+        uint256 claimed = 1_700_000_000;
+        uint256 trusted = 1_800_000_000;
+        vm.warp(trusted);
+
+        vm.expectEmit(true, true, true, true);
+        emit ScoreAttestation.ScoreAttested("NVDA", sampleHash, trusted, claimed, address(this));
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", claimed);
+
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.attestedAt, trusted);
+        assertEq(rec.claimedAt, claimed);
+        assertTrue(rec.claimedAt < rec.attestedAt);
+
+        (bool ok, uint256 ts,) = attestor.verify(sampleHash, "NVDA");
+        assertTrue(ok);
+        assertEq(ts, block.timestamp);
     }
 
     function test_attestRecordsMsgSenderNotCalldata() public {
@@ -203,15 +227,20 @@ contract ScoreAttestationTest is Test {
         vm.setEnv("ATTESTER_ADDRESS", vm.toString(address(0)));
     }
 
-    function test_rejectFutureTimestamp() public {
-        vm.expectRevert(ScoreAttestation.FutureTimestamp.selector);
-        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", block.timestamp + 1);
-        assertFalse(attestor.attested(sampleHash));
+    function test_futureClaimedTimestampIsNotTrusted() public {
+        uint256 claimed = block.timestamp + 1;
+        attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", claimed);
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.claimedAt, claimed);
+        assertTrue(attestor.attested(sampleHash));
     }
 
-    function test_rejectZeroTimestamp() public {
-        vm.expectRevert(ScoreAttestation.EmptyTimestamp.selector);
+    function test_zeroClaimedTimestampIsNotTrusted() public {
         attestor.attest{value: 0.001 ether}(sampleHash, "NVDA", 0);
+        ScoreAttestation.Record memory rec = attestor.getAttestation(sampleHash);
+        assertEq(rec.attestedAt, block.timestamp);
+        assertEq(rec.claimedAt, 0);
     }
 
     function test_acceptsTimestampEqualToBlock() public {
@@ -264,6 +293,74 @@ contract ScoreAttestationTest is Test {
         ScoreAttestation zero = new ScoreAttestation(0);
         assertEq(zero.attestationFee(), 0.001 ether);
         assertTrue(zero.authorized(address(this)));
+    }
+
+    function test_transferOwnershipThenAccept() public {
+        address next = address(0x0A1E);
+        assertEq(attestor.pendingOwner(), address(0));
+
+        vm.expectEmit(true, true, false, true);
+        emit ScoreAttestation.OwnershipTransferStarted(address(this), next);
+        attestor.transferOwnership(next);
+
+        assertEq(attestor.owner(), address(this));
+        assertEq(attestor.pendingOwner(), next);
+
+        vm.expectEmit(true, true, false, true);
+        emit ScoreAttestation.OwnershipTransferred(address(this), next);
+        vm.prank(next);
+        attestor.acceptOwnership();
+
+        assertEq(attestor.owner(), next);
+        assertEq(attestor.pendingOwner(), address(0));
+        assertTrue(attestor.authorized(next));
+    }
+
+    function test_acceptOwnershipRevertsForNonPending() public {
+        address next = address(0x0A1E);
+        attestor.transferOwnership(next);
+
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotPendingOwner.selector);
+        attestor.acceptOwnership();
+
+        vm.expectRevert(ScoreAttestation.NotPendingOwner.selector);
+        attestor.acceptOwnership();
+
+        assertEq(attestor.owner(), address(this));
+        assertEq(attestor.pendingOwner(), next);
+    }
+
+    function test_oldOwnerKeepsControlUntilAccept() public {
+        address next = address(0x0A1E);
+        attestor.transferOwnership(next);
+
+        attestor.setFee(0.004 ether);
+        assertEq(attestor.attestationFee(), 0.004 ether);
+        attestor.setAttester(attester, true);
+        assertTrue(attestor.isAttester(attester));
+
+        vm.prank(next);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.setFee(0);
+
+        vm.prank(stranger);
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.transferOwnership(stranger);
+
+        assertEq(attestor.owner(), address(this));
+        assertEq(attestor.pendingOwner(), next);
+
+        vm.prank(next);
+        attestor.acceptOwnership();
+
+        vm.expectRevert(ScoreAttestation.NotOwner.selector);
+        attestor.setFee(0.001 ether);
+
+        vm.prank(next);
+        attestor.setFee(0.005 ether);
+        assertEq(attestor.attestationFee(), 0.005 ether);
+        assertEq(attestor.owner(), next);
     }
 }
 

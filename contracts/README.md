@@ -1,12 +1,16 @@
 # RAT Score attestation (Base)
 
-Solidity contract that stores a **hash of a score payload**, a ticker, a timestamp, and an attester. It never stores the raw score, band, or pillar breakdown.
+Solidity contract that stores a **hash of a score payload**, a ticker, a trusted attestation time, and an attester. It never stores the raw score, band, or pillar breakdown.
+
+`attest(scoreHash, ticker, timestamp)` still takes the third argument so existing callers keep working. That argument is stored and emitted only as `claimedAt`. The trusted time (`attestedAt`, and the `uint256` returned by `verify`) is `block.timestamp`.
+
+Ownership is two-step. `transferOwnership` sets `pendingOwner` and leaves the current owner in control. The pending address must call `acceptOwnership`. There is no OpenZeppelin dependency; the handoff is implemented in the contract.
 
 Anyone who cited a RAT Score can re-hash the payload and call `verify(scoreHash, ticker)`. If the hash is missing or the ticker does not match, the cited breakdown was edited or was never attested.
 
 `attest` is **not permissionless**. Only the contract **owner** or an **allowlisted attester** (a relayer or API-held key added via `setAttester`) can lock a hash. A stranger who pays `attestationFee` cannot occupy a digest or front-run an official payload. `AlreadyAttested` still prevents a second official lock of the same hash; it does not let random payers brick official hashes.
 
-The timestamp is the observation time. It must be non-zero and not after the block. Owner changes are two-step (`transferOwnership` then `acceptOwnership`). `withdraw` pays with `call`, not the 2300-gas `transfer` stipend. A redeploy is required before Base Sepolia runs this bytecode.
+`withdraw` pays with `call`, not the 2300-gas `transfer` stipend. A redeploy is required before Base Sepolia runs this bytecode.
 
 ## Networks
 
@@ -73,17 +77,18 @@ RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures --json
 # → score_hash 0x…
 ```
 
-2. Submit **only that hash** (plus ticker / timestamp) from an **authorized**
+2. Submit **only that hash** (plus ticker / claimed timestamp) from an **authorized**
    key (deployer/owner or an address the owner passed to `setAttester`). The
    attester is always the broadcasting `msg.sender` — there is no attester
    argument to spoof. A stranger paying the fee cannot lock the hash.
+   `ATTEST_TIMESTAMP` is stored as `claimedAt`. The trusted time is the block time.
 
 ```bash
 cd contracts
 export ATTESTATION_CONTRACT=0x...
 export SCORE_HASH=0x...          # 32-byte hex from the client
 export TICKER=NVDA
-# optional: ATTEST_TIMESTAMP
+# optional: ATTEST_TIMESTAMP   # claimedAt only; attestedAt is block.timestamp
 
 forge script script/Attest.s.sol:Attest \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
