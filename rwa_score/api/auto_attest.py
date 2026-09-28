@@ -659,13 +659,14 @@ class AttestWorker:
 def main() -> None:
     """Drain due jobs once, then exit. For a future worker process. No send if disabled."""
     from .settings import ApiSettings
-    from .store import Store
+    from .store import open_store
 
     settings = AttesterSettings.from_env()
     if not settings.enabled:
         print(settings.disabled_reason)
         return
-    store = Store(ApiSettings.from_env().db_path)
+    cfg = ApiSettings.from_env()
+    store = open_store(path=cfg.db_path, database_url=cfg.database_url)
     worker = AttestWorker(store=store, settings=settings, autostart=False)
     try:
         while worker.process_once():

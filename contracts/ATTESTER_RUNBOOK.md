@@ -58,13 +58,12 @@ Every env var on this service is `sync: false`. `render.yaml` lists the
 names and does not contain values. You type the values in the dashboard
 after sync. A later sync will not overwrite them.
 
-Free plan: the service spins down after about 15 minutes idle. The sqlite
-file is ephemeral, so stored payloads, the pending queue, and keys that
-exist only in that file disappear on spin-down. `verify` then has no bytes
-to check, and it does not re-score. The poster thread stops with the
-process. Options, not built here: a Render persistent disk on a paid plan,
-or Postgres (`python -m rwa_score.api.migrations --dialect postgres`, applied
-by you). A background worker is a separate flag and is not in `render.yaml`.
+Free plan: the service spins down after about 15 minutes idle. With
+`DATABASE_URL` set, payloads, history, and the attest queue live in Postgres
+and survive that spin-down. With it unset, they live in the sqlite file,
+which disappears on spin-down, and `verify` then has no bytes. Render free
+Postgres expires 30 days after you create it. Move steps are below. No paid
+disk is required. A background worker is not in `render.yaml`.
 
 ### Blueprint sync (Spencer)
 
@@ -100,12 +99,12 @@ capped by `RWA_ATTEST_GAS_LIMIT` (default `300000`). A Foundry gas report on
 this contract showed `attest` median **208274** and max **210495** (24 calls;
 the minimum includes reverts).
 
-The queue is sqlite (`attest_jobs` on `RWA_API_DB_PATH`). A process restart
-keeps those rows when the file is still there. Render's free disk is
-ephemeral: spin-down deletes it, so the queue and the stored canonical
-bytes do **not** survive a free-tier spin-down. To keep them, use a Render
-persistent disk on a paid plan, or Postgres. This repo does not add either.
-A background worker is only a flag, not a service in `render.yaml`.
+The queue is `attest_jobs` in the same store as the canonical bytes and
+score history. `DATABASE_URL` selects Postgres (`postgres://` or
+`postgresql://`, `sslmode` left as the URL has it). Unset selects the sqlite
+file at `RWA_API_DB_PATH`. One worker claims with `SELECT … FOR UPDATE SKIP
+LOCKED` on Postgres. A duplicate send is still success because the worker
+checks `isAttested` before sending.
 
 If `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, or
 `BASE_SEPOLIA_RPC_URL` is unset, the worker is disabled and `/v1/attest`
@@ -135,7 +134,7 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTEST_GAS_LIMIT` | Gas cap. Default `300000` | `300000` | no |
 | `RWA_ATTEST_MAX_ATTEMPTS` | Retries before the job is failed. Default `5` | `5` | no |
 | `RWA_ATTEST_BACKOFF_SECONDS` | Base delay between retries. Default `2.0` | `2.0` | no |
-| `RWA_API_DB_PATH` | SQLite file for payloads, jobs, and keys. Default `data/rat_api.sqlite` | `data/rat_api.sqlite` | no |
+| `RWA_API_DB_PATH` | SQLite file used only when `DATABASE_URL` is unset. Default `data/rat_api.sqlite` | `data/rat_api.sqlite` | no |
 | `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot so `/v1/attest` works after spin-down wipes sqlite | `rat_` plus a long random token | yes |
 | `RWA_API_BOOTSTRAP_TIER` | Tier of that key. `/v1/attest` requires `paid` | `paid` | no |
 | `RWA_API_FREE_DAILY_LIMIT` | Daily cap for a free key. Default `50`. Attest does not accept a free key | `50` | no |
@@ -147,14 +146,53 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `BASE_RPC_URL` | Optional Chainlink PoR RPC (Base mainnet). Not the attester RPC | `https://mainnet.base.example` | yes if the URL embeds a key |
 | `ETH_RPC_URL` | Optional Chainlink PoR RPC (Ethereum) | `https://ethereum.example/v2/<key>` | yes if the URL embeds a key |
 | `ETHEREUM_RPC_URL` | Optional alias of `ETH_RPC_URL` | same | yes if the URL embeds a key |
-| `RWA_API_DATABASE_URL` | Read and ignored. Store does not open Postgres. Leave unset | `postgresql://user:pass@host/db` | yes |
-| `DATABASE_URL` | Same unused hook. Leave unset | same | yes |
+| `DATABASE_URL` | Postgres for payloads, history, and the attest queue. Set this. `postgres://` and `postgresql://` both work | `postgres://user:pass@host/db?sslmode=require` | yes |
+| `RWA_API_DATABASE_URL` | Used only when `DATABASE_URL` is unset. Same URL shapes | same | yes |
 | `HOST` | Bind address. Default `0.0.0.0`. Leave unset on Render | `0.0.0.0` | no |
 | `PORT` | Render injects this. Do not set it | `10000` | no |
 | `RENDER_GIT_COMMIT` | Render injects the full git SHA. `scorer_version` reads it first | 40 hex characters | no |
 
 `SOURCE_VERSION` and `GIT_COMMIT` do not change `scorer_version`. `/v1/score`
 and `/v1/attest` do not read `XAI_API_KEY`.
+
+## Postgres (Spencer)
+
+The API service does not create the database. `render.yaml` only lists
+`DATABASE_URL` with `sync: false`. There is no `fromDatabase` link and no
+paid disk.
+
+1. Render Dashboard → **New** → **PostgreSQL**. Name it
+   `rwa-transparency-score-db`. Plan **Free** ($0). Same region as the API
+   service.
+2. When the instance is available, copy the **Internal Database URL**. It
+   looks like `postgres://USER:PASSWORD@HOST/DATABASE`. Do not commit it.
+3. Open `rwa-transparency-score-api` → **Environment**. Set `DATABASE_URL` to
+   that URL. Save. Render redeploys the API service. Leave the scorecard
+   service alone.
+4. On the API shell, `GET /v1/attest/NVDA` (paid key) should store a row that
+   is still there after the service spins down and wakes up.
+
+**30-day limit.** Render deletes a free Postgres instance 30 days after you
+create it. Before that day, move the data to a host that does not expire:
+
+```bash
+pg_dump --format=custom --no-owner --dbname="$OLD_DATABASE_URL" --file=rat.dump
+pg_restore --no-owner --dbname="$NEW_DATABASE_URL" rat.dump
+```
+
+Set `DATABASE_URL` on the API service to the new URL. Save so that service
+redeploys. Then, on the API shell, before you drop the old instance:
+
+```bash
+python -m rwa_score.api.verify NVDA --json \
+  --contract 0x2F073a3628D498d92956e7eFE2b26633eDa75b00 \
+  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+  --attester "$ATTESTER_ADDRESS"
+```
+
+Expect `"stored": true`, `"hash_ok": true`, and `"match": true` for an
+attestation that was stored before the move. `verify` reads `DATABASE_URL`.
+It does not re-score.
 
 ## 1. Create a new attester key (Spencer, off agent machines)
 

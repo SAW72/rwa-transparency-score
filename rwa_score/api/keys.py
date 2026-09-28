@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from .settings import ApiSettings
-from .store import Store
+from .store import Store, open_store
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -29,8 +29,10 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     settings = ApiSettings.from_env()
-    path = args.db or str(settings.db_path)
-    store = Store(path)
+    if args.db.strip():
+        store = Store(args.db.strip())
+    else:
+        store = open_store(path=settings.db_path, database_url=settings.database_url)
     try:
         if args.cmd == "create":
             raw = store.create_key(name=args.name, tier=args.tier)

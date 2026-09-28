@@ -29,7 +29,7 @@ from .attest import (
 from .auto_attest import AttestWorker, AttesterSettings, on_chain_view
 from .confidence import compute_confidence
 from .settings import ApiSettings
-from .store import ApiKey, Store
+from .store import ApiKey, Store, open_store
 from .webhooks import apply_score_side_effects, assert_public_https_url
 
 BREAKDOWN_KEYS = (
@@ -127,7 +127,7 @@ def create_app(
     # Resolve once at process startup. Later scores reuse the cache.
     resolve_scorer_version()
     cfg = settings or ApiSettings.from_env()
-    db = store or Store(cfg.db_path)
+    db = store or open_store(path=cfg.db_path, database_url=cfg.database_url)
     if store is None and cfg.bootstrap_key:
         db.ensure_key(cfg.bootstrap_key, name="bootstrap", tier=cfg.bootstrap_tier)
     attester_cfg = attester if attester is not None else AttesterSettings.from_env()

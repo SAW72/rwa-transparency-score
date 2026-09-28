@@ -1,12 +1,15 @@
-"""SQLite persistence for keys, usage, history, watchlists, and webhooks.
+"""Keys, history, attested payloads, and the attest queue.
 
-Schema lives in ``rwa_score.api.migrations`` (SQLite now, Postgres SQL dump
-for a later self-hosted apply). This class does not open a hosted database.
+SQLite when no Postgres URL is set (tests and local). Postgres when
+``DATABASE_URL`` is set, so payloads, history, and pending attest jobs
+survive a free-plan spin-down. ``postgres://`` and ``postgresql://`` both
+work; ``sslmode`` stays in the URL.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import sqlite3
 import threading
@@ -15,7 +18,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .migrations import SQLITE_001 as SCHEMA, apply_sqlite_migrations
+from .migrations import SQLITE_001 as SCHEMA, apply_postgres_migrations, apply_sqlite_migrations
+from .settings import DEFAULT_DB_PATH, is_postgres_url, normalize_postgres_url
+
+_SCHEMA_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
+_CLAIM_SQL = (
+    "SELECT * FROM attest_jobs WHERE status = 'pending' AND next_attempt_at <= ? "
+    "ORDER BY id LIMIT 1"
+)
+# One worker. SKIP LOCKED is the overlap guard; isAttested makes a duplicate send a no-op.
+CLAIM_SQL_POSTGRES = _CLAIM_SQL + " FOR UPDATE SKIP LOCKED"
 
 
 def hash_key(raw: str) -> str:
@@ -126,32 +138,73 @@ def _hook_from_row(row: sqlite3.Row) -> Webhook:
 
 
 class Store:
-    """Process-local SQLite store. Swap the path for Postgres later."""
+    """SQLite file, or Postgres when ``database_url`` is set. Same methods."""
 
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-        if self.path.parent != Path("."):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        database_url: str | None = None,
+        schema: str | None = None,
+    ) -> None:
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON")
+        self._schema = schema
+        url = (database_url or "").strip()
+        if url:
+            if not is_postgres_url(url):
+                raise ValueError("database_url must start with postgres:// or postgresql://")
+            self.backend = "postgres"
+            self.path = None
+            self.database_url = url
+            import psycopg
+            from psycopg.rows import dict_row
+
+            try:
+                self._conn = psycopg.connect(normalize_postgres_url(url), row_factory=dict_row)
+            except Exception:
+                # The driver message includes the URL. Do not chain it.
+                raise RuntimeError("could not open DATABASE_URL") from None
+            if schema is not None:
+                if _SCHEMA_NAME.fullmatch(schema) is None:
+                    raise ValueError("schema name is not a safe identifier")
+                self._execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+                self._execute(f"SET search_path TO {schema}")
+                self._conn.commit()
+        else:
+            if path is None:
+                raise ValueError("sqlite path is required when DATABASE_URL is unset")
+            self.backend = "sqlite"
+            self.database_url = ""
+            self.path = Path(path)
+            if self.path.parent != Path("."):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._execute("PRAGMA foreign_keys = ON")
         self._init()
+
+    def _execute(self, sql: str, params: tuple | list = ()):
+        if self.backend == "postgres":
+            sql = sql.replace("?", "%s")
+        return self._conn.execute(sql, params)
 
     def _init(self) -> None:
         with self._lock:
+            if self.backend == "postgres":
+                apply_postgres_migrations(self._conn)
+                return
             apply_sqlite_migrations(self._conn)
             self._migrate_last_bands()
             self._conn.commit()
 
     def _migrate_last_bands(self) -> None:
         """Scope band-crossing state per API key. Drop unattributable legacy rows."""
-        info = self._conn.execute("PRAGMA table_info(last_bands)").fetchall()
+        info = self._execute("PRAGMA table_info(last_bands)").fetchall()
         names = {row["name"] for row in info}
         if "key_id" in names:
             return
-        self._conn.execute("ALTER TABLE last_bands RENAME TO last_bands_pre_tenant")
-        self._conn.execute(
+        self._execute("ALTER TABLE last_bands RENAME TO last_bands_pre_tenant")
+        self._execute(
             """
             CREATE TABLE last_bands (
                 key_id INTEGER NOT NULL REFERENCES api_keys(id),
@@ -163,7 +216,7 @@ class Store:
             )
             """
         )
-        self._conn.execute("DROP TABLE last_bands_pre_tenant")
+        self._execute("DROP TABLE last_bands_pre_tenant")
 
     def close(self) -> None:
         with self._lock:
@@ -184,35 +237,35 @@ class Store:
         prefix = raw[:12]
         now = _iso()
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT * FROM api_keys WHERE key_hash = ?", (digest,)
             ).fetchone()
             if row:
-                self._conn.execute(
+                self._execute(
                     "UPDATE api_keys SET name = ?, tier = ?, revoked_at = NULL WHERE id = ?",
                     (name, tier, row["id"]),
                 )
                 self._conn.commit()
                 return _key_from_row(
-                    self._conn.execute(
+                    self._execute(
                         "SELECT * FROM api_keys WHERE id = ?", (row["id"],)
                     ).fetchone()
                 )
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO api_keys (key_hash, key_prefix, name, tier, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (digest, prefix, name, tier, now),
             )
             self._conn.commit()
             return _key_from_row(
-                self._conn.execute(
+                self._execute(
                     "SELECT * FROM api_keys WHERE key_hash = ?", (digest,)
                 ).fetchone()
             )
 
     def _insert_key(self, raw: str, *, name: str, tier: str) -> None:
         with self._lock:
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO api_keys (key_hash, key_prefix, name, tier, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (hash_key(raw), raw[:12], name, tier, _iso()),
@@ -222,7 +275,7 @@ class Store:
     def lookup_key(self, raw: str) -> ApiKey | None:
         digest = hash_key(raw)
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT * FROM api_keys WHERE key_hash = ?", (digest,)
             ).fetchone()
         if row is None:
@@ -231,14 +284,14 @@ class Store:
 
     def list_keys(self) -> list[ApiKey]:
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT * FROM api_keys ORDER BY id"
             ).fetchall()
         return [_key_from_row(r) for r in rows]
 
     def revoke_key(self, *, prefix: str) -> int:
         with self._lock:
-            cur = self._conn.execute(
+            cur = self._execute(
                 "UPDATE api_keys SET revoked_at = ? "
                 "WHERE key_prefix = ? AND revoked_at IS NULL",
                 (_iso(), prefix),
@@ -248,7 +301,7 @@ class Store:
 
     def count_usage(self, key_id: int, *, since: float) -> int:
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT COUNT(*) AS n FROM usage_events WHERE key_id = ? AND ts > ?",
                 (key_id, since),
             ).fetchone()
@@ -267,18 +320,18 @@ class Store:
         since = now - window_seconds
         cutoff = now - (86_400.0 * 2)
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT COUNT(*) AS n FROM usage_events WHERE key_id = ? AND ts > ?",
                 (key_id, since),
             ).fetchone()
             used = int(row["n"]) if row else 0
             if limit is not None and used >= limit:
                 return False, used
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO usage_events (key_id, ts, path) VALUES (?, ?, ?)",
                 (key_id, now, path),
             )
-            self._conn.execute("DELETE FROM usage_events WHERE ts < ?", (cutoff,))
+            self._execute("DELETE FROM usage_events WHERE ts < ?", (cutoff,))
             self._conn.commit()
             return True, used + 1
 
@@ -286,11 +339,11 @@ class Store:
         stamped = time.time() if ts is None else ts
         cutoff = stamped - (86_400.0 * 2)
         with self._lock:
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO usage_events (key_id, ts, path) VALUES (?, ?, ?)",
                 (key_id, stamped, path),
             )
-            self._conn.execute("DELETE FROM usage_events WHERE ts < ?", (cutoff,))
+            self._execute("DELETE FROM usage_events WHERE ts < ?", (cutoff,))
             self._conn.commit()
 
     def record_history(
@@ -306,7 +359,7 @@ class Store:
     ) -> None:
         stamped = time.time() if scored_at is None else scored_at
         with self._lock:
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO score_history "
                 "(ticker, scored_at, score, band, payload_json, payload_hash, key_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -324,14 +377,14 @@ class Store:
         symbol = ticker.upper()
         with self._lock:
             if key_id is None:
-                rows = self._conn.execute(
+                rows = self._execute(
                     "SELECT ticker, scored_at, score, band, payload_hash, key_id "
                     "FROM score_history WHERE ticker = ? "
                     "ORDER BY scored_at DESC LIMIT ?",
                     (symbol, limit),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = self._execute(
                     "SELECT ticker, scored_at, score, band, payload_hash, key_id "
                     "FROM score_history WHERE ticker = ? AND key_id = ? "
                     "ORDER BY scored_at DESC LIMIT ?",
@@ -351,7 +404,7 @@ class Store:
 
     def get_last_band(self, key_id: int, ticker: str) -> tuple[str, float] | None:
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT band, score FROM last_bands WHERE key_id = ? AND ticker = ?",
                 (key_id, ticker.upper()),
             ).fetchone()
@@ -361,7 +414,7 @@ class Store:
 
     def set_last_band(self, key_id: int, ticker: str, band: str, score: float) -> None:
         with self._lock:
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO last_bands (key_id, ticker, band, score, updated_at) "
                 "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(key_id, ticker) DO UPDATE SET band = excluded.band, "
@@ -374,8 +427,9 @@ class Store:
         symbols = [t.strip().upper() for t in tickers if t and t.strip()]
         with self._lock:
             for symbol in symbols:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO watchlist_items (key_id, ticker) VALUES (?, ?)",
+                self._execute(
+                    "INSERT INTO watchlist_items (key_id, ticker) VALUES (?, ?) "
+                    "ON CONFLICT (key_id, ticker) DO NOTHING",
                     (key_id, symbol),
                 )
             self._conn.commit()
@@ -384,9 +438,9 @@ class Store:
     def set_watchlist(self, key_id: int, tickers: Iterable[str]) -> list[str]:
         symbols = [t.strip().upper() for t in tickers if t and t.strip()]
         with self._lock:
-            self._conn.execute("DELETE FROM watchlist_items WHERE key_id = ?", (key_id,))
+            self._execute("DELETE FROM watchlist_items WHERE key_id = ?", (key_id,))
             for symbol in symbols:
-                self._conn.execute(
+                self._execute(
                     "INSERT INTO watchlist_items (key_id, ticker) VALUES (?, ?)",
                     (key_id, symbol),
                 )
@@ -395,7 +449,7 @@ class Store:
 
     def remove_watchlist(self, key_id: int, ticker: str) -> None:
         with self._lock:
-            self._conn.execute(
+            self._execute(
                 "DELETE FROM watchlist_items WHERE key_id = ? AND ticker = ?",
                 (key_id, ticker.upper()),
             )
@@ -403,7 +457,7 @@ class Store:
 
     def get_watchlist(self, key_id: int) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT ticker FROM watchlist_items WHERE key_id = ? ORDER BY ticker",
                 (key_id,),
             ).fetchall()
@@ -411,7 +465,7 @@ class Store:
 
     def all_watchlist_tickers(self) -> list[str]:
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT DISTINCT ticker FROM watchlist_items ORDER BY ticker"
             ).fetchall()
         return [r["ticker"] for r in rows]
@@ -419,7 +473,7 @@ class Store:
     def watchlist_entries(self) -> list[tuple[int, str]]:
         """Per-tenant watchlist rows so poll can isolate last_bands / webhooks."""
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT key_id, ticker FROM watchlist_items ORDER BY key_id, ticker"
             ).fetchall()
         return [(int(r["key_id"]), str(r["ticker"])) for r in rows]
@@ -437,34 +491,31 @@ class Store:
             raise ValueError(f"unknown trigger: {trigger}")
         symbol = ticker.strip().upper() if ticker else None
         with self._lock:
-            cur = self._conn.execute(
+            row = self._execute(
                 "INSERT INTO webhooks (key_id, url, secret, ticker, trigger, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
                 (key_id, url, secret, symbol, trigger, _iso()),
-            )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT * FROM webhooks WHERE id = ?", (cur.lastrowid,)
             ).fetchone()
+            self._conn.commit()
         return _hook_from_row(row)
 
     def list_webhooks(self, key_id: int) -> list[Webhook]:
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT * FROM webhooks WHERE key_id = ? ORDER BY id", (key_id,)
             ).fetchall()
         return [_hook_from_row(r) for r in rows]
 
     def get_webhook(self, webhook_id: int) -> Webhook | None:
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT * FROM webhooks WHERE id = ?", (webhook_id,)
             ).fetchone()
         return _hook_from_row(row) if row else None
 
     def deactivate_webhook(self, key_id: int, webhook_id: int) -> bool:
         with self._lock:
-            cur = self._conn.execute(
+            cur = self._execute(
                 "UPDATE webhooks SET active = 0 WHERE id = ? AND key_id = ?",
                 (webhook_id, key_id),
             )
@@ -473,7 +524,7 @@ class Store:
 
     def active_webhooks(self, key_id: int) -> list[Webhook]:
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT * FROM webhooks WHERE active = 1 AND key_id = ? ORDER BY id",
                 (key_id,),
             ).fetchall()
@@ -489,7 +540,7 @@ class Store:
         ok: bool,
     ) -> None:
         with self._lock:
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO webhook_deliveries "
                 "(webhook_id, ticker, event, status_code, delivered_at, ok) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -511,9 +562,9 @@ class Store:
         ``inputs_digest`` can be recomputed. Same hash is idempotent.
         A different byte string under that hash is refused. A later save
         may fill ``inputs`` when the existing row has none; it may not
-        replace inputs that are already stored. Render free disk is
-        ephemeral — this row is gone after spin-down unless the sqlite
-        file lives on a persistent disk.
+        replace inputs that are already stored. Postgres keeps the row
+        across spin-down when ``DATABASE_URL`` is set. The SQLite file
+        does not.
         """
         from .attest import hash_canonical
 
@@ -524,7 +575,7 @@ class Store:
         digest = hash_canonical(raw)
         symbol = ticker.strip().upper()
         with self._lock:
-            existing = self._conn.execute(
+            existing = self._execute(
                 "SELECT canonical_json, inputs_json FROM attested_payloads WHERE score_hash = ?",
                 (digest,),
             ).fetchone()
@@ -537,7 +588,7 @@ class Store:
                 if inputs_raw is not None:
                     prior = existing["inputs_json"]
                     if prior is None:
-                        self._conn.execute(
+                        self._execute(
                             "UPDATE attested_payloads SET inputs_json = ? WHERE score_hash = ?",
                             (inputs_raw, digest),
                         )
@@ -550,7 +601,7 @@ class Store:
                                 "refusing to replace attested inputs for an existing hash"
                             )
                 return digest
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO attested_payloads "
                 "(score_hash, ticker, canonical_json, stored_at, inputs_json) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -562,7 +613,7 @@ class Store:
     def get_attested_payload(self, score_hash: str) -> dict[str, Any] | None:
         digest = score_hash.strip()
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at, "
                 "tx_hash, attested_at "
                 "FROM attested_payloads WHERE score_hash = ?",
@@ -575,11 +626,11 @@ class Store:
     def latest_attested_payload(self, ticker: str) -> dict[str, Any] | None:
         symbol = ticker.strip().upper()
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at, "
                 "tx_hash, attested_at "
                 "FROM attested_payloads WHERE ticker = ? "
-                "ORDER BY stored_at DESC, rowid DESC LIMIT 1",
+                "ORDER BY stored_at DESC, score_hash DESC LIMIT 1",
                 (symbol,),
             ).fetchone()
         if row is None:
@@ -604,7 +655,7 @@ class Store:
         now = _iso()
         with self._lock:
             if not force:
-                existing = self._conn.execute(
+                existing = self._execute(
                     "SELECT * FROM attest_jobs WHERE score_hash = ? "
                     "AND status IN ('pending', 'confirmed') "
                     "ORDER BY id DESC LIMIT 1",
@@ -612,7 +663,7 @@ class Store:
                 ).fetchone()
                 if existing is not None:
                     return _job_from_row(existing)
-            self._conn.execute(
+            self._execute(
                 "INSERT INTO attest_jobs ("
                 "score_hash, ticker, claimed_at, status, attempts, next_attempt_at, "
                 "created_at, updated_at"
@@ -620,7 +671,7 @@ class Store:
                 (digest, symbol, int(claimed_at), now, now),
             )
             self._conn.commit()
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT * FROM attest_jobs WHERE score_hash = ? ORDER BY id DESC LIMIT 1",
                 (digest,),
             ).fetchone()
@@ -629,29 +680,31 @@ class Store:
     def latest_attest_job(self, score_hash: str) -> dict[str, Any] | None:
         digest = score_hash.strip()
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT * FROM attest_jobs WHERE score_hash = ? ORDER BY id DESC LIMIT 1",
                 (digest,),
             ).fetchone()
         return _job_from_row(row) if row is not None else None
 
     def claim_next_attest_job(self, *, now: float) -> dict[str, Any] | None:
-        """Take the oldest due pending job and count one attempt. Single worker."""
+        """Take the oldest due pending job and count one attempt. Single worker.
+
+        Postgres locks the row with ``FOR UPDATE SKIP LOCKED``. SQLite uses
+        this process lock around the same select-then-update. A landed
+        duplicate is still success because the worker checks ``isAttested``.
+        """
         stamped = _iso()
+        claim_sql = CLAIM_SQL_POSTGRES if self.backend == "postgres" else _CLAIM_SQL
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM attest_jobs WHERE status = 'pending' AND next_attempt_at <= ? "
-                "ORDER BY id LIMIT 1",
-                (float(now),),
-            ).fetchone()
+            row = self._execute(claim_sql, (float(now),)).fetchone()
             if row is None:
                 return None
-            self._conn.execute(
+            self._execute(
                 "UPDATE attest_jobs SET attempts = attempts + 1, updated_at = ? WHERE id = ?",
                 (stamped, row["id"]),
             )
             self._conn.commit()
-            fresh = self._conn.execute(
+            fresh = self._execute(
                 "SELECT * FROM attest_jobs WHERE id = ?",
                 (row["id"],),
             ).fetchone()
@@ -671,14 +724,14 @@ class Store:
             raise ValueError(f"unknown job status: {status}")
         stamped = _iso()
         with self._lock:
-            row = self._conn.execute(
+            row = self._execute(
                 "SELECT score_hash, tx_hash FROM attest_jobs WHERE id = ?",
                 (job_id,),
             ).fetchone()
             if row is None:
                 return
             kept_tx = tx_hash or row["tx_hash"]
-            self._conn.execute(
+            self._execute(
                 "UPDATE attest_jobs SET status = ?, tx_hash = ?, attested_at = ?, "
                 "last_error = ?, next_attempt_at = ?, updated_at = ? WHERE id = ?",
                 (
@@ -693,12 +746,12 @@ class Store:
             )
             if status == "confirmed":
                 if kept_tx:
-                    self._conn.execute(
+                    self._execute(
                         "UPDATE attested_payloads SET tx_hash = ? WHERE score_hash = ?",
                         (kept_tx, row["score_hash"]),
                     )
                 if attested_at is not None:
-                    self._conn.execute(
+                    self._execute(
                         "UPDATE attested_payloads SET attested_at = ? WHERE score_hash = ?",
                         (int(attested_at), row["score_hash"]),
                     )
@@ -706,9 +759,16 @@ class Store:
 
     def recent_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._conn.execute(
+            rows = self._execute(
                 "SELECT webhook_id, ticker, event, status_code, delivered_at, ok "
                 "FROM webhook_deliveries ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def open_store(*, path: str | Path | None = None, database_url: str = "") -> Store:
+    """Postgres when ``database_url`` is a postgres URL. Otherwise the SQLite file."""
+    if is_postgres_url(database_url):
+        return Store(database_url=database_url)
+    return Store(path or DEFAULT_DB_PATH)

@@ -16,6 +16,22 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def is_postgres_url(url: str) -> bool:
+    raw = (url or "").strip().lower()
+    return raw.startswith("postgres://") or raw.startswith("postgresql://")
+
+
+def normalize_postgres_url(url: str) -> str:
+    """Accept ``postgres://`` and ``postgresql://``. Query string, including sslmode, stays."""
+    raw = (url or "").strip()
+    lowered = raw.lower()
+    if lowered.startswith("postgres://"):
+        return "postgresql://" + raw[len("postgres://") :]
+    if lowered.startswith("postgresql://"):
+        return raw
+    raise ValueError("DATABASE_URL must start with postgres:// or postgresql://")
+
+
 @dataclass(frozen=True)
 class ApiSettings:
     db_path: Path = DEFAULT_DB_PATH
@@ -29,7 +45,7 @@ class ApiSettings:
     max_compare_tickers: int = 8
     max_watchlist_tickers: int = 50
     webhook_timeout_seconds: float = 5.0
-    # Future hook only — Store does not open this URL (no hosted Postgres).
+    # When set, Store opens this Postgres URL. Empty means the SQLite file.
     database_url: str = ""
 
     @property
@@ -54,5 +70,5 @@ class ApiSettings:
             attestation_contract=_env("RWA_ATTESTATION_CONTRACT"),
             attestation_chain=_env("RWA_ATTESTATION_CHAIN") or "base-sepolia",
             attestation_chain_id=int(chain_id) if chain_id else BASE_SEPOLIA_CHAIN_ID,
-            database_url=_env("RWA_API_DATABASE_URL") or _env("DATABASE_URL"),
+            database_url=_env("DATABASE_URL") or _env("RWA_API_DATABASE_URL"),
         )

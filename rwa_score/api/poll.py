@@ -18,7 +18,7 @@ from rwa_score.scorer import ScoreError, TransparencyScorer
 
 from .app import _decorate
 from .settings import ApiSettings
-from .store import Store
+from .store import Store, open_store
 from .webhooks import apply_score_side_effects
 
 
@@ -30,7 +30,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = ApiSettings.from_env()
-    store = Store(args.db or str(settings.db_path))
+    if args.db.strip():
+        store = Store(args.db.strip())
+    else:
+        store = open_store(path=settings.db_path, database_url=settings.database_url)
     client = create_client(use_fixtures_mode=True if args.fixtures else None)
     scorer = TransparencyScorer(client)
     by_ticker: dict[str, list[int]] = defaultdict(list)

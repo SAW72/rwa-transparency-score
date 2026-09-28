@@ -111,18 +111,34 @@ def test_postgres_dump_is_dialect_ready_and_not_executed() -> None:
     assert "BYTEA" in sql
 
 
-def test_settings_records_postgres_url_but_store_stays_sqlite(
+def test_postgres_url_keeps_sslmode_and_sqlite_is_the_default(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("RWA_API_DATABASE_URL", "postgresql://example.invalid/rat")
+    from rwa_score.api.settings import normalize_postgres_url
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("RWA_API_DATABASE_URL", raising=False)
     monkeypatch.setenv("RWA_API_DB_PATH", str(tmp_path / "still.sqlite"))
     settings = ApiSettings.from_env()
-    assert settings.db_backend == "postgres"
-    assert settings.database_url.startswith("postgresql://")
+    assert settings.db_backend == "sqlite"
     store = Store(settings.db_path)
     store.create_key(name="local", tier="free")
     assert settings.db_path.exists()
+    assert store.backend == "sqlite"
     store.close()
+
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgres://user:secret@db.internal:5432/rat?sslmode=require",
+    )
+    chosen = ApiSettings.from_env()
+    assert chosen.db_backend == "postgres"
+    assert normalize_postgres_url(chosen.database_url) == (
+        "postgresql://user:secret@db.internal:5432/rat?sslmode=require"
+    )
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setenv("RWA_API_DATABASE_URL", "postgresql://db.internal/rat?sslmode=require")
+    assert ApiSettings.from_env().database_url.startswith("postgresql://")
 
 
 def test_apply_is_idempotent(tmp_path: Path) -> None:

@@ -1,8 +1,9 @@
-"""Versioned API schema migrations (SQLite now, Postgres-ready SQL later).
+"""Versioned API schema migrations.
 
-This process does **not** open a hosted Postgres instance. ``Store`` stays on
-local SQLite. ``dump_sql("postgres")`` prints the same revisions for a future
-self-hosted ``psql`` apply — never a paid Render database from this package.
+``Store`` applies the SQLite revisions on a file, or these Postgres revisions
+on startup when ``DATABASE_URL`` is set. ``dump_sql("postgres")`` still prints
+the same SQL. Render free Postgres expires after 30 days; that is Spencer's
+move, not a paid disk.
 """
 
 from __future__ import annotations
@@ -315,6 +316,36 @@ def apply_sqlite_migrations(conn: sqlite3.Connection) -> list[str]:
             (migration.version, _iso()),
         )
         ran.append(migration.version)
+    return ran
+
+
+def _sql_statements(script: str) -> list[str]:
+    lines = []
+    for line in script.splitlines():
+        if line.strip().startswith("--"):
+            continue
+        lines.append(line)
+    return [part.strip() for part in "\n".join(lines).split(";") if part.strip()]
+
+
+def apply_postgres_migrations(conn) -> list[str]:
+    """Apply pending revisions. Idempotent. ``conn`` is a psycopg connection."""
+    for statement in _sql_statements(SCHEMA_MIGRATIONS_TABLE):
+        conn.execute(statement)
+    rows = conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+    applied = {str(row["version"]) for row in rows}
+    ran: list[str] = []
+    for migration in MIGRATIONS:
+        if migration.version in applied:
+            continue
+        for statement in _sql_statements(migration.postgres):
+            conn.execute(statement)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (%s, %s)",
+            (migration.version, _iso()),
+        )
+        ran.append(migration.version)
+    conn.commit()
     return ran
 
 

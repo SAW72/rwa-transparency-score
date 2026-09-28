@@ -112,3 +112,5 @@ services:
         sync: false
       - key: ETHEREUM_RPC_URL
         sync: false
+      - key: DATABASE_URL
+        sync: false

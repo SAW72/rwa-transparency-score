@@ -170,8 +170,9 @@ def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
     assert "plan: free" in api
     assert "pip install -r requirements.txt" in api
     assert "value:" not in api
-    assert "postgres" not in text.lower()
-    assert "database" not in text.lower()
+    assert "fromDatabase" not in text
+    assert "\ndatabases:" not in text.lower()
+    assert "DATABASE_URL" not in scorecard
     keys: list[str] = []
     lines = api.splitlines()
     for index, line in enumerate(lines):
@@ -189,5 +190,6 @@ def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
         "RWA_API_BOOTSTRAP_KEY",
         "CMC_API_KEY",
         "RWA_USE_FIXTURES",
+        "DATABASE_URL",
     ):
         assert required in keys

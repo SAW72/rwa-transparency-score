@@ -44,7 +44,7 @@ from .attest import (
     recompute_inputs_digest,
 )
 from .settings import BASE_SEPOLIA_CHAIN_ID, ApiSettings
-from .store import Store
+from .store import Store, open_store
 
 EXIT_OK = 0
 EXIT_DB = 1
@@ -161,12 +161,6 @@ def on_chain_verify(
     }
 
 
-def _db_path(explicit: str) -> Path:
-    if explicit.strip():
-        return Path(explicit.strip())
-    return ApiSettings.from_env().db_path
-
-
 def _inputs_match(raw: bytes, claimed: Any) -> tuple[bool, dict[str, Any] | None]:
     """True when ``raw`` is canonical scoring inputs and hashes to ``claimed``."""
     try:
@@ -226,8 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--db",
-        default=os.getenv("RWA_API_DB_PATH", ""),
-        help="SQLite path (default RWA_API_DB_PATH or data/rat_api.sqlite)",
+        default="",
+        help="Force a SQLite file. Unset uses DATABASE_URL when set, else RWA_API_DB_PATH.",
     )
     parser.add_argument(
         "--contract",
@@ -249,7 +243,6 @@ def main(argv: list[str] | None = None) -> int:
 
     ticker = args.ticker.strip().upper()
     contract = (args.contract or "").strip() or PINNED_ATTESTATION_CONTRACT
-    db_path = _db_path(args.db)
     ignored = []
     if args.fixtures:
         ignored.append("--fixtures")
@@ -262,7 +255,11 @@ def main(argv: list[str] | None = None) -> int:
         print(_OBSOLETE_FLAGS, file=sys.stderr)
         ignored_note = " " + _OBSOLETE_FLAGS
 
-    if not db_path.is_file():
+    explicit_db = args.db.strip()
+    cfg = ApiSettings.from_env()
+    use_postgres = (not explicit_db) and bool(cfg.database_url)
+    db_path = Path(explicit_db) if explicit_db else cfg.db_path
+    if not use_postgres and not db_path.is_file():
         result = {
             "ticker": ticker,
             "stored": False,
@@ -285,12 +282,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_DB
 
     try:
-        store = Store(db_path)
+        if explicit_db:
+            store = Store(explicit_db)
+        else:
+            store = open_store(path=cfg.db_path, database_url=cfg.database_url)
         try:
             row = _load_stored(store, ticker, args.score_hash.strip())
         finally:
             store.close()
-    except sqlite3.Error:
+    except (sqlite3.Error, RuntimeError):
         result = {
             "ticker": ticker,
             "stored": False,
