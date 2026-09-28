@@ -55,3 +55,55 @@ services:
         sync: false
       - key: X_ACCESS_TOKEN_SECRET
         sync: false
+
+  # Second web service so /v1 is JSON. The scorecard service above stays
+  # on `python -m rwa_score.health`. This file does not create or deploy
+  # the service; Spencer applies the blueprint (or copies these settings)
+  # himself. Secrets are sync:false — set them in the dashboard, never here.
+  # Free plan: idle spin-down drops the sqlite file (payloads, queue, keys).
+  # A background worker or paid disk is not declared in this file.
+  - type: web
+    name: rwa-transparency-api
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m rwa_score.api
+    healthCheckPath: /health
+    envVars:
+      - key: RWA_USE_FIXTURES
+        value: "0"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: RWA_ATTESTATION_CONTRACT
+        value: "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
+      - key: RWA_ATTESTATION_CHAIN
+        value: base-sepolia
+      - key: RWA_ATTESTATION_CHAIN_ID
+        value: "84532"
+      - key: RWA_ATTEST_VALUE_CAP_WEI
+        value: "0"
+      - key: RWA_ATTEST_GAS_LIMIT
+        value: "300000"
+      - key: RWA_ATTEST_MAX_ATTEMPTS
+        value: "5"
+      - key: RWA_ATTEST_BACKOFF_SECONDS
+        value: "2.0"
+      - key: RWA_API_BOOTSTRAP_TIER
+        value: paid
+      - key: RWA_API_DB_PATH
+        value: data/rat_api.sqlite
+      - key: CMC_API_KEY
+        sync: false
+      - key: BASE_SEPOLIA_RPC_URL
+        sync: false
+      - key: RWA_ATTESTER_PRIVATE_KEY
+        sync: false
+      - key: RWA_API_BOOTSTRAP_KEY
+        sync: false
+      - key: POLYGON_RPC_URL
+        sync: false
+      - key: BASE_RPC_URL
+        sync: false
+      - key: ETH_RPC_URL
+        sync: false

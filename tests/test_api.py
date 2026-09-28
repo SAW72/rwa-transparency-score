@@ -472,6 +472,62 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
     assert hash_canonical(saved["canonical"]) == body["score_hash"]
 
 
+def test_attest_status_does_not_score(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    from unittest.mock import Mock
+
+    from rwa_score.api.attest import attestation_payload, canonical_bytes
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    settings = _settings(tmp_path)
+    store = Store(settings.db_path)
+    scorer = Mock()
+    scorer.score.side_effect = AssertionError("status must not score")
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        attester=attester,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    empty = client.get("/v1/attest/NVDA/status", headers=_headers(raw))
+    assert empty.status_code == 200
+    assert empty.json()["stored"] is False
+    assert empty.json()["on_chain"]["attested"] is False
+    assert empty.json()["on_chain"]["tx"] is None
+    assert empty.json()["on_chain"]["attestedAt"] is None
+
+    report = fixture_scorer.score("NVDA")
+    digest = store.save_attested_payload(
+        ticker="NVDA",
+        canonical=canonical_bytes(attestation_payload(report)),
+    )
+    job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=0)
+    store.finish_attest_job(
+        job["id"],
+        status="confirmed",
+        tx_hash="0x" + "cd" * 32,
+        attested_at=1_700_000_000,
+    )
+    body = client.get("/v1/attest/NVDA/status", headers=_headers(raw)).json()
+    assert body["stored"] is True
+    assert body["score_hash"] == digest
+    assert body["on_chain"]["attested"] is True
+    assert body["on_chain"]["tx"] == "0x" + "cd" * 32
+    assert body["on_chain"]["attestedAt"] == 1_700_000_000
+    assert body["on_chain"]["status"] == "confirmed"
+    scorer.score.assert_not_called()
+    store.close()
+
+
 def test_me_quota(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     client, store = _client(tmp_path, fixture_scorer, free_daily_limit=50)
     raw = store.create_key(name="free", tier="free")

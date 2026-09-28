@@ -155,12 +155,24 @@ def test_nvda_evidence_sample_matches_fixture_api(
     assert json.loads(fence) == sample
 
 
-def test_render_blueprint_does_not_host_paid_api() -> None:
+def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
     text = (ROOT / "render.yaml").read_text(encoding="utf-8")
     assert "python -m rwa_score.health" in text
-    assert "python -m rwa_score.api" not in text
-    assert "plan: free" in text
+    assert "name: rwa-transparency-score" in text
+    assert "name: rwa-transparency-api" in text
+    scorecard, api = text.split("name: rwa-transparency-api", 1)
+    assert "python -m rwa_score.health" in scorecard
+    assert "python -m rwa_score.api" not in scorecard
+    assert "plan: free" in scorecard
+    assert "python -m rwa_score.api" in api
+    assert "plan: free" in api
+    assert "pip install -r requirements.txt" in api
     assert "RWA_USE_FIXTURES" in text
     assert 'value: "0"' in text
     assert "postgres" not in text.lower()
     assert "database" not in text.lower()
+    for secret in ("RWA_ATTESTER_PRIVATE_KEY", "BASE_SEPOLIA_RPC_URL", "RWA_API_BOOTSTRAP_KEY", "CMC_API_KEY"):
+        idx = api.index(f"- key: {secret}")
+        window = api[idx : idx + 80]
+        assert "sync: false" in window
+        assert "value:" not in window

@@ -412,6 +412,33 @@ def create_app(
             ),
         }
 
+    @app.get("/v1/attest/{ticker}/status")
+    def attest_status(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
+        """Latest stored payload and its on-chain job. Does not score or enqueue."""
+        _ = key
+        symbol = ticker.strip().upper()
+        row = db.latest_attested_payload(symbol)
+        if row is None:
+            return {
+                "ticker": symbol,
+                "stored": False,
+                "score_hash": None,
+                "chain": cfg.attestation_chain,
+                "chain_id": cfg.attestation_chain_id,
+                "contract": cfg.attestation_contract or None,
+                "on_chain": on_chain_view(db, "0x" + "00" * 32, attester_cfg),
+            }
+        digest = row["score_hash"]
+        return {
+            "ticker": row["ticker"],
+            "stored": True,
+            "score_hash": digest,
+            "chain": cfg.attestation_chain,
+            "chain_id": cfg.attestation_chain_id,
+            "contract": cfg.attestation_contract or None,
+            "on_chain": on_chain_view(db, digest, attester_cfg),
+        }
+
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
         if isinstance(exc.detail, dict):

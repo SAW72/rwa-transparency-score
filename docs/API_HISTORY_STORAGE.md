@@ -11,7 +11,7 @@ Local **Postgres-ready** schema + migrations for paid API history. SQLite remain
 | History rows | `score_history` — ticker, scored_at, score, band, payload_json, payload_hash, optional **`key_id`** (tenant) |
 | Replay | `GET /v1/history/{ticker}` (paid) reads that key’s rows |
 
-Render’s filesystem is still ephemeral. Stored attestation bytes and the API sqlite file disappear on spin-down, restart, or deploy. Two options, neither built in this change: a Render persistent disk on a paid plan, or Postgres (self-hosted; this repo does not provision paid Render Postgres). `render.yaml` may describe a second free web service for `/v1`; it does not add a disk or a paid database.
+Render’s filesystem is still ephemeral. Stored attestation bytes and the API sqlite file disappear on spin-down, restart, or deploy. Two options, neither built in this change: a Render persistent disk on a paid plan, or Postgres (self-hosted; this repo does not provision paid Render Postgres). `render.yaml` may describe a second free web service for `/v1`; it does not add a disk or a paid database. The sqlite file on that service is still ephemeral.
 
 ## Revisions
 
