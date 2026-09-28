@@ -18,7 +18,13 @@ from rwa_score.client import create_client
 from rwa_score.health import build_health_payload
 from rwa_score.scorer import ScoreError, TransparencyScorer
 
-from .attest import ATTESTATION_ALGO, ATTESTATION_FIELDS, attestation_payload, score_hash
+from .attest import (
+    ATTESTATION_ALGO,
+    ATTESTATION_FIELDS,
+    attestation_payload,
+    canonical_bytes,
+    score_hash,
+)
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store
@@ -320,6 +326,9 @@ def create_app(
     def attest(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
         report = score_ticker(ticker, key)
         payload = attestation_payload(report)
+        raw = canonical_bytes(payload)
+        # Exact canonical bytes, keyed by hash. Render free disk is ephemeral.
+        db.save_attested_payload(ticker=report["ticker"], canonical=raw)
         return {
             "ticker": report["ticker"],
             "score_hash": report["attestation"]["score_hash"],
@@ -328,12 +337,15 @@ def create_app(
             "chain": cfg.attestation_chain,
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or None,
+            "stored": True,
             "note": (
                 "Call ScoreAttestation.attest(scoreHash, ticker, timestamp) "
                 "on Base Sepolia from an authorized attester (owner or "
                 "allowlisted relayer / API-held key). Attester is msg.sender "
                 "(not calldata). The timestamp argument is stored only as "
                 "claimedAt; the contract records block.timestamp as attestedAt. "
+                "Pass payload.as_of as that timestamp. The canonical JSON for "
+                "this hash is stored locally (Render free disk is ephemeral). "
                 "The contract stores this hash only — never "
                 "the raw score. Mainnet is held."
             ),

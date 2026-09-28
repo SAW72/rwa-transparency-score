@@ -368,7 +368,7 @@ content-type: application/json
     "label": "low"
   },
   "attestation": {
-    "score_hash": "0x41ba52792b6162ce75f02131ddd1845292cfab019b7c1537adfd9d5d2bbd5406",
+    "score_hash": "0x5cf87e47924904b64c01f88455cd4a69a63a38c28b2ffbe966a94724fe7f93ed",
     "algo": "sha256",
     "fields": [
       "ticker",
@@ -381,7 +381,10 @@ content-type: application/json
       "cik",
       "data_source",
       "verification",
-      "basis"
+      "basis",
+      "as_of",
+      "scorer_version",
+      "inputs_digest"
     ]
   }
 }

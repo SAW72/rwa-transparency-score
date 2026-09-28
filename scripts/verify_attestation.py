@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Sample client: hash a live/fixture RAT Score and check Base Sepolia.
+"""Recompute a stored RAT Score hash and optionally read Base Sepolia.
 
-    RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures
-    python scripts/verify_attestation.py NVDA --api-url http://127.0.0.1:8000 --api-key "$RWA_API_KEY"
-    python scripts/verify_attestation.py NVDA --fixtures \\
+    python scripts/verify_attestation.py NVDA --db data/rat_api.sqlite
+    python scripts/verify_attestation.py NVDA \\
         --contract "$RWA_ATTESTATION_CONTRACT" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 
+Does not re-score. The canonical JSON must already be stored (GET /v1/attest).
 Never pass a private key. This script only reads.
 """
 

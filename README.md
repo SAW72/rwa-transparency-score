@@ -274,7 +274,7 @@ curl -sS -H "X-API-Key: <REDACTED>" http://127.0.0.1:8000/v1/score/NVDA
   },
   "confidence": { "score": 0.4, "label": "low" },
   "attestation": {
-    "score_hash": "0x41ba52792b6162ce75f02131ddd1845292cfab019b7c1537adfd9d5d2bbd5406",
+    "score_hash": "0x5cf87e47924904b64c01f88455cd4a69a63a38c28b2ffbe966a94724fe7f93ed",
     "algo": "sha256"
   }
 }
@@ -301,13 +301,13 @@ The captured file is the full authentic envelope (pillars, verification, basis w
 
 ### On-chain attestation (Base Sepolia)
 
-`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical six-pillar breakdown, including **basis**). Submit with `attest(scoreHash, ticker, timestamp)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy with [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
+`GET /v1/attest/{ticker}` returns `score_hash` (SHA-256 of the canonical payload) and stores those exact JSON bytes keyed by the hash. The payload is the six-pillar breakdown, including **basis**, plus `as_of` (unix seconds UTC; `0` for fixture scores), `scorer_version` (same short git SHA as `/health`: `RENDER_GIT_COMMIT`, then `SOURCE_VERSION`, then `GIT_COMMIT`, else `unknown`), and `inputs_digest` (SHA-256 of the canonical CMC + Chainlink PoR inputs used for that score). Canonical JSON is sorted keys, compact separators, `ensure_ascii`, UTF-8. The hash function is SHA-256 of those bytes, `0x` + hex. Submit with `attest(scoreHash, ticker, as_of)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy with [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
 
 ```bash
-RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures
+python scripts/verify_attestation.py NVDA --db data/rat_api.sqlite
 ```
 
-Pass `--contract` and `--rpc-url` (or `RWA_ATTESTATION_CONTRACT` / `BASE_SEPOLIA_RPC_URL`) to read the chain. The client never needs a private key.
+`verify` recomputes the hash from the **stored** canonical JSON and does not re-score. If nothing is stored it says so and stops. Pass `--contract` and `--rpc-url` (or `RWA_ATTESTATION_CONTRACT` / `BASE_SEPOLIA_RPC_URL`) to read the chain. The client never needs a private key. The sqlite file is on Render's free ephemeral disk unless you attach storage.
 
 SQLite (`RWA_API_DB_PATH`, default `data/rat_api.sqlite`) is v1. Versioned migrations live in `rwa_score/api/migrations` (SQLite applied on boot; `python -m rwa_score.api.migrations --dialect postgres` prints a future self-hosted script). Render’s filesystem is ephemeral — use a disk or **self-hosted** Postgres before relying on keys in production. This repo does **not** provision paid Render Postgres. Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
 

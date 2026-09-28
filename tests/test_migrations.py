@@ -98,7 +98,13 @@ def test_postgres_dump_is_dialect_ready_and_not_executed() -> None:
     assert "INTEGER PRIMARY KEY" not in sql
     sqlite_sql = dump_sql("sqlite")
     assert SCHEMA in sqlite_sql or "CREATE TABLE IF NOT EXISTS score_history" in sqlite_sql
-    assert {m.version for m in MIGRATIONS} == {"001_initial", "002_history_tenant"}
+    assert {m.version for m in MIGRATIONS} == {
+        "001_initial",
+        "002_history_tenant",
+        "003_attested_payloads",
+    }
+    assert "attested_payloads" in sqlite_sql
+    assert "BYTEA" in sql
 
 
 def test_settings_records_postgres_url_but_store_stays_sqlite(
@@ -121,6 +127,6 @@ def test_apply_is_idempotent(tmp_path: Path) -> None:
     first = apply_sqlite_migrations(conn)
     second = apply_sqlite_migrations(conn)
     conn.commit()
-    assert first == ["001_initial", "002_history_tenant"]
+    assert first == ["001_initial", "002_history_tenant", "003_attested_payloads"]
     assert second == []
     conn.close()

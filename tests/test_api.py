@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rwa_score.api.app import BREAKDOWN_KEYS, create_app
+from rwa_score.api.attest import attestation_payload, canonical_bytes, hash_canonical
 from rwa_score.api.settings import ApiSettings
 from rwa_score.api.store import Store
 from rwa_score.api.webhooks import notify_crossings
@@ -459,6 +460,11 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
     assert body["chain_id"] == 84532
     assert "never the raw score" in body["note"].lower()
     assert body["contract"] is None
+    assert body["stored"] is True
+    saved = store.get_attested_payload(body["score_hash"])
+    assert saved is not None
+    assert saved["canonical"] == canonical_bytes(body["payload"])
+    assert hash_canonical(saved["canonical"]) == body["score_hash"]
 
 
 def test_me_quota(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
@@ -499,12 +505,25 @@ def test_keys_cli_create_list_revoke(tmp_path: Path, capsys: pytest.CaptureFixtu
     store.close()
 
 
-def test_verify_client_fixtures_json(capsys: pytest.CaptureFixture[str]) -> None:
+def test_verify_client_fixtures_json(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    fixture_scorer: TransparencyScorer,
+) -> None:
     from rwa_score.api.verify import main as verify_main
 
-    assert verify_main(["NVDA", "--fixtures", "--json"]) == 0
+    report = fixture_scorer.score("NVDA")
+    db = tmp_path / "verify.sqlite"
+    store = Store(db)
+    store.save_attested_payload(
+        ticker="NVDA",
+        canonical=canonical_bytes(attestation_payload(report)),
+    )
+    store.close()
+    assert verify_main(["NVDA", "--fixtures", "--json", "--db", str(db)]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["ticker"] == "NVDA"
     assert payload["score_hash"].startswith("0x")
     assert payload["payload"]["subscores"]
     assert payload["on_chain"] is None
+    assert payload["stored"] is True

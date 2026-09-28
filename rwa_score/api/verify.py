@@ -1,7 +1,13 @@
-"""Verify a live (or fixture) score hash against an optional on-chain record.
+"""Check a stored attestation payload against an optional on-chain record.
 
-Does not send transactions. On-chain read uses ``cast call`` when Foundry is
-installed and ``--rpc-url`` / ``--contract`` (or env) are set.
+Does not re-score. Does not send transactions. The canonical JSON must
+already have been stored by ``GET /v1/attest/{ticker}`` (or
+``Store.save_attested_payload``). If nothing is stored, the response says
+so and stops.
+
+On-chain read uses ``cast call`` when Foundry is installed and
+``--rpc-url`` / ``--contract`` (or env) are set. The digest passed to
+``verify`` is recomputed from the stored bytes.
 """
 
 from __future__ import annotations
@@ -12,32 +18,25 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
-import requests
-
-from rwa_score.client import create_client
-from rwa_score.scorer import ScoreError, TransparencyScorer
-
-from .attest import attestation_payload, canonical_bytes, score_hash
+from .attest import canonical_bytes, hash_canonical
+from .settings import ApiSettings
+from .store import Store
 
 # Type signature is unchanged. The uint256 is the contract's trusted
 # attestedAt (block.timestamp at attest), not the attester's claimedAt.
 # JSON `attested_at` is that int. cast 1.8.3 prints `1700000000 [1.7e9]`.
 VERIFY_SIG = "verify(bytes32,string)(bool,uint256,address)"
 
-
-def score_local(ticker: str, *, fixtures: bool | None) -> dict[str, Any]:
-    client = create_client(use_fixtures_mode=True if fixtures else None)
-    return TransparencyScorer(client).score(ticker)
-
-
-def score_via_api(ticker: str, *, api_url: str, api_key: str) -> dict[str, Any]:
-    url = api_url.rstrip("/") + f"/v1/score/{ticker}"
-    resp = requests.get(url, headers={"X-API-Key": api_key}, timeout=30)
-    if resp.status_code != 200:
-        raise SystemExit(f"API {resp.status_code}: {resp.text[:400]}")
-    return resp.json()
+NOTHING_STORED = (
+    "No stored attestation payload for this ticker. "
+    "verify does not re-score. "
+    "GET /v1/attest/{ticker} stores the canonical JSON first. "
+    "Render free disk is ephemeral, so a spin-down drops this file "
+    "unless it lives on a persistent disk."
+)
 
 
 def on_chain_verify(
@@ -84,14 +83,57 @@ def on_chain_verify(
     }
 
 
+def _db_path(explicit: str) -> Path:
+    if explicit.strip():
+        return Path(explicit.strip())
+    return ApiSettings.from_env().db_path
+
+
+def _load_stored(store: Store, ticker: str, score_hash: str) -> dict[str, Any] | None:
+    if score_hash:
+        row = store.get_attested_payload(score_hash)
+        if row is None:
+            return None
+        if row["ticker"] != ticker:
+            return None
+        return row
+    return store.latest_attested_payload(ticker)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Hash a live RAT Score and optionally check Base Sepolia."
+        description=(
+            "Recompute a stored RAT Score hash and optionally check Base Sepolia. "
+            "Does not re-score."
+        )
     )
-    parser.add_argument("ticker", help="Ticker to score, e.g. NVDA")
-    parser.add_argument("--fixtures", action="store_true", help="Use bundled demo fixtures")
-    parser.add_argument("--api-url", default=os.getenv("RWA_API_URL", ""), help="Score via HTTP API")
-    parser.add_argument("--api-key", default=os.getenv("RWA_API_KEY", ""), help="API key (env only)")
+    parser.add_argument("ticker", help="Ticker whose stored payload to check, e.g. NVDA")
+    parser.add_argument(
+        "--fixtures",
+        action="store_true",
+        help="Accepted and ignored. This command does not re-score.",
+    )
+    parser.add_argument(
+        "--api-url",
+        default="",
+        help="Accepted and ignored. This command does not re-score.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default="",
+        help="Accepted and ignored. This command does not re-score.",
+    )
+    parser.add_argument(
+        "--hash",
+        default="",
+        dest="score_hash",
+        help="Stored score hash to load (default: latest payload for the ticker)",
+    )
+    parser.add_argument(
+        "--db",
+        default=os.getenv("RWA_API_DB_PATH", ""),
+        help="SQLite path (default RWA_API_DB_PATH or data/rat_api.sqlite)",
+    )
     parser.add_argument(
         "--contract",
         default=os.getenv("RWA_ATTESTATION_CONTRACT", ""),
@@ -106,66 +148,103 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     ticker = args.ticker.strip().upper()
+    db_path = _db_path(args.db)
+    store = Store(db_path)
     try:
-        if args.api_url:
-            if not args.api_key:
-                print("API mode needs --api-key or RWA_API_KEY", file=sys.stderr)
-                return 2
-            report = score_via_api(ticker, api_url=args.api_url, api_key=args.api_key)
-        else:
-            report = score_local(ticker, fixtures=True if args.fixtures else None)
-    except ScoreError as exc:
-        print(f"ERROR — {exc}", file=sys.stderr)
-        return 1
+        row = _load_stored(store, ticker, args.score_hash.strip())
+    finally:
+        store.close()
 
-    digest = report.get("attestation", {}).get("score_hash") or score_hash(report)
-    payload = attestation_payload(report)
-    result: dict[str, Any] = {
-        "ticker": report.get("ticker") or ticker,
-        "score": report.get("score"),
-        "band": report.get("band"),
-        "score_hash": digest,
+    ignored = []
+    if args.fixtures:
+        ignored.append("--fixtures")
+    if args.api_url:
+        ignored.append("--api-url")
+    if args.api_key:
+        ignored.append("--api-key")
+    ignored_note = ""
+    if ignored:
+        ignored_note = " Ignored " + ", ".join(ignored) + " (no live re-score)."
+
+    if row is None:
+        result: dict[str, Any] = {
+            "ticker": ticker,
+            "stored": False,
+            "score_hash": None,
+            "payload": None,
+            "canonical": None,
+            "on_chain": None,
+            "match": None,
+            "note": NOTHING_STORED + ignored_note,
+        }
+        _emit(result, as_json=args.json)
+        return 0
+
+    raw = row["canonical"]
+    recomputed = hash_canonical(raw)
+    payload = json.loads(raw.decode("utf-8"))
+    # Re-canonicalizing after a key-order shuffle must match the stored bytes.
+    hash_ok = recomputed == row["score_hash"] and canonical_bytes(payload) == raw
+    result = {
+        "ticker": payload.get("ticker") or ticker,
+        "stored": True,
+        "score": payload.get("score"),
+        "band": payload.get("band"),
+        "score_hash": recomputed,
+        "stored_hash": row["score_hash"],
+        "hash_ok": hash_ok,
         "algo": "sha256",
         "payload": payload,
-        "canonical": canonical_bytes(payload).decode("ascii"),
+        "canonical": raw.decode("ascii"),
         "on_chain": None,
         "match": None,
         "note": (
-            "Re-hash the payload locally and compare to score_hash. "
-            "If they differ, the cited breakdown was edited. "
+            "Hash recomputed from the stored canonical JSON. "
+            "No live re-score. "
             "The contract stores this hash only — never the raw score. "
-            "Mainnet is held; deploy Base Sepolia only."
+            "Mainnet is held; read Base Sepolia only."
+            + ignored_note
         ),
     }
+    if not hash_ok:
+        result["note"] += " Stored bytes do not match the hash key."
 
     if args.contract and args.rpc_url:
         chain = on_chain_verify(
             contract=args.contract,
             rpc_url=args.rpc_url,
-            digest=digest,
-            ticker=result["ticker"],
+            digest=recomputed,
+            ticker=str(result["ticker"]),
         )
         result["on_chain"] = chain
-        if chain and chain.get("ok") is True:
+        if chain and chain.get("ok") is True and hash_ok:
             result["match"] = True
         elif chain and "error" not in chain:
             result["match"] = False
     elif args.contract or args.rpc_url:
         result["note"] += " Set both --contract and --rpc-url (or env) to read the chain."
 
-    if args.json:
-        print(json.dumps(result, indent=2))
-    else:
-        print(f"{result['ticker']} score={result['score']} [{result['band']}]")
-        print(f"score_hash {result['score_hash']}")
-        print(f"canonical  {result['canonical']}")
-        if result["on_chain"] is None:
-            print("on-chain   (skipped — pass --contract and --rpc-url to verify)")
-        else:
-            print(f"on-chain   {result['on_chain']}")
-            print(f"match      {result['match']}")
-        print(result["note"])
+    _emit(result, as_json=args.json)
     return 0
+
+
+def _emit(result: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2))
+        return
+    if not result.get("stored"):
+        print(f"{result['ticker']}: nothing stored")
+        print(result["note"])
+        return
+    print(f"{result['ticker']} score={result['score']} [{result['band']}]")
+    print(f"score_hash {result['score_hash']}")
+    print(f"canonical  {result['canonical']}")
+    if result["on_chain"] is None:
+        print("on-chain   (skipped — pass --contract and --rpc-url to verify)")
+    else:
+        print(f"on-chain   {result['on_chain']}")
+        print(f"match      {result['match']}")
+    print(result["note"])
 
 
 if __name__ == "__main__":

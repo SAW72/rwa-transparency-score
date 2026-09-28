@@ -167,6 +167,31 @@ CREATE INDEX IF NOT EXISTS idx_history_key_ticker
     ON score_history(key_id, ticker, scored_at);
 """
 
+# Exact canonical JSON bytes for a hash that was attested. Render's free
+# disk is ephemeral: this file disappears on spin-down unless a disk or
+# self-hosted Postgres is attached. The table is local SQLite only.
+SQLITE_003 = """
+CREATE TABLE IF NOT EXISTS attested_payloads (
+    score_hash TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    canonical_json BLOB NOT NULL,
+    stored_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attested_payloads_ticker
+    ON attested_payloads(ticker, stored_at);
+"""
+
+POSTGRES_003 = """
+CREATE TABLE IF NOT EXISTS attested_payloads (
+    score_hash TEXT PRIMARY KEY,
+    ticker TEXT NOT NULL,
+    canonical_json BYTEA NOT NULL,
+    stored_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attested_payloads_ticker
+    ON attested_payloads(ticker, stored_at);
+"""
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -178,6 +203,7 @@ class Migration:
 MIGRATIONS: tuple[Migration, ...] = (
     Migration("001_initial", SQLITE_001, POSTGRES_001),
     Migration("002_history_tenant", SQLITE_002, POSTGRES_002),
+    Migration("003_attested_payloads", SQLITE_003, POSTGRES_003),
 )
 
 

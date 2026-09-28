@@ -73,6 +73,18 @@ def _key_from_row(row: sqlite3.Row) -> ApiKey:
     )
 
 
+def _payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    raw = row["canonical_json"]
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    return {
+        "score_hash": row["score_hash"],
+        "ticker": row["ticker"],
+        "canonical": bytes(raw),
+        "stored_at": row["stored_at"],
+    }
+
+
 def _hook_from_row(row: sqlite3.Row) -> Webhook:
     ticker = row["ticker"]
     return Webhook(
@@ -458,6 +470,66 @@ class Store:
                 (webhook_id, ticker.upper(), event, status_code, time.time(), int(ok)),
             )
             self._conn.commit()
+
+    def save_attested_payload(self, *, ticker: str, canonical: bytes) -> str:
+        """Store the exact canonical JSON bytes, keyed by their SHA-256.
+
+        Same hash is idempotent. A different byte string under that hash
+        cannot happen if the key is ``hash_canonical(canonical)``. Render
+        free disk is ephemeral — this row is gone after spin-down unless
+        the sqlite file lives on a persistent disk.
+        """
+        from .attest import hash_canonical
+
+        if not isinstance(canonical, (bytes, bytearray)):
+            raise TypeError("canonical payload must be bytes")
+        raw = bytes(canonical)
+        digest = hash_canonical(raw)
+        symbol = ticker.strip().upper()
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT canonical_json FROM attested_payloads WHERE score_hash = ?",
+                (digest,),
+            ).fetchone()
+            if existing is not None:
+                stored = existing["canonical_json"]
+                if isinstance(stored, str):
+                    stored = stored.encode("utf-8")
+                if bytes(stored) != raw:
+                    raise ValueError("refusing to replace attested payload bytes for an existing hash")
+                return digest
+            self._conn.execute(
+                "INSERT INTO attested_payloads (score_hash, ticker, canonical_json, stored_at) "
+                "VALUES (?, ?, ?, ?)",
+                (digest, symbol, raw, _iso()),
+            )
+            self._conn.commit()
+        return digest
+
+    def get_attested_payload(self, score_hash: str) -> dict[str, Any] | None:
+        digest = score_hash.strip()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT score_hash, ticker, canonical_json, stored_at "
+                "FROM attested_payloads WHERE score_hash = ?",
+                (digest,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _payload_from_row(row)
+
+    def latest_attested_payload(self, ticker: str) -> dict[str, Any] | None:
+        symbol = ticker.strip().upper()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT score_hash, ticker, canonical_json, stored_at "
+                "FROM attested_payloads WHERE ticker = ? "
+                "ORDER BY stored_at DESC, rowid DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _payload_from_row(row)
 
     def recent_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
