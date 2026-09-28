@@ -6,11 +6,12 @@
         --contract "$RWA_ATTESTATION_CONTRACT" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 
 Does not re-score. The canonical JSON must already be stored (GET /v1/attest).
-Exits non-zero if the database is missing or unreadable, nothing is stored
-(pre-fix attestation, stored payload unavailable), the bytes do not match,
-the payload is malformed, stored inputs do not recompute inputs_digest,
-the payload ticker differs from the request, the chain is not Base Sepolia
-(84532), the attester mismatches, the RPC fails, or cast is missing.
+Exit codes: 0 match (or --offline local check; prints that nothing was
+checked on-chain), 1 database missing or not SQLite, 2 nothing stored
+(pre-fix attestation, stored payload unavailable), 3 bytes or inputs_digest
+mismatch, 4 ticker / chain / verify() / attester mismatch (including
+--hash for another ticker), 5 RPC failed, 6 cast missing, 7 no RPC URL
+and --offline not passed, 8 inputs_json not stored.
 A missing --db path is an error and is not created.
 --contract defaults to 0x2F073a3628D498d92956e7eFE2b26633eDa75b00.
 --fixtures / --api-url / --api-key warn and do not re-score.

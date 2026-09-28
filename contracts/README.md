@@ -103,7 +103,7 @@ python scripts/verify_attestation.py NVDA \
   --attester "$ATTESTER_ADDRESS"
 ```
 
-`--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. `--fixtures` is obsolete and only warns. `cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key. It exits non-zero when nothing is stored, the bytes do not match, the chain id is not 84532, the attester mismatches, the RPC fails, or `cast` is missing.
+`--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. `--fixtures` is obsolete and only warns. `cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key. Exit codes are `0` match (or `--offline` local check), `1` database, `2` nothing stored, `3` bytes or inputs mismatch, `4` ticker / chain / attester, `5` RPC, `6` `cast` missing, `7` no RPC URL and no `--offline`, `8` `inputs_json` missing. The table is in the root README.
 
 ## Hash algorithm
 

@@ -8,18 +8,28 @@ command exits non-zero and does not invent a payload.
 
 Exit codes:
 
-- ``0`` stored bytes match their hash, and any chain read matched
+- ``0`` stored bytes match their hash, stored inputs recompute
+  ``inputs_digest``, and the chain read matched. ``--offline`` is also
+  ``0`` when the local checks pass; that mode prints that nothing was
+  checked on-chain.
 - ``1`` the database path does not exist, or the file is not a SQLite database
 - ``2`` nothing stored (including a pre-fix attestation with no payload row)
 - ``3`` stored bytes do not match the hash key, the payload is malformed,
   or stored inputs do not recompute ``inputs_digest``
-- ``4`` payload ticker does not match the request, chain id is not 84532,
-  verify() is false, or the attester mismatches
+- ``4`` the payload ticker, or the ticker on a ``--hash`` row, does not
+  match the request; chain id is not 84532; verify() is false; or the
+  attester mismatches
 - ``5`` RPC / cast call failed
 - ``6`` a chain read was requested but ``cast`` is not on ``PATH``
+- ``7`` no ``--rpc-url`` and ``BASE_SEPOLIA_RPC_URL`` is unset, and
+  ``--offline`` was not passed. Nothing was checked on-chain.
+- ``8`` the row has no ``inputs_json``, so ``inputs_digest`` cannot be
+  re-derived
 
 On-chain read uses ``cast chain-id`` and ``cast call`` when ``--rpc-url``
-is set. The contract defaults to the pinned Base Sepolia deployment.
+(or ``BASE_SEPOLIA_RPC_URL``) is set. The contract defaults to the pinned
+Base Sepolia deployment. Without a URL, pass ``--offline`` to check
+stored bytes only.
 The digest passed to ``verify`` is recomputed from the stored bytes.
 ``--fixtures``, ``--api-url``, and ``--api-key`` are obsolete: they warn
 on stderr and do not re-score.
@@ -53,6 +63,8 @@ EXIT_HASH_MISMATCH = 3
 EXIT_NO_MATCH = 4
 EXIT_RPC_ERROR = 5
 EXIT_CAST_MISSING = 6
+EXIT_CHAIN_UNCHECKED = 7
+EXIT_INPUTS_MISSING = 8
 
 # Type signature is unchanged. The uint256 is the contract's trusted
 # attestedAt (block.timestamp at attest), not the attester's claimedAt.
@@ -180,12 +192,8 @@ def _inputs_match(raw: bytes, claimed: Any) -> tuple[bool, dict[str, Any] | None
 
 def _load_stored(store: Store, ticker: str, score_hash: str) -> dict[str, Any] | None:
     if score_hash:
-        row = store.get_attested_payload(score_hash)
-        if row is None:
-            return None
-        if row["ticker"] != ticker:
-            return None
-        return row
+        # A row for another ticker is a mismatch (exit 4), not "not stored".
+        return store.get_attested_payload(score_hash)
     return store.latest_attested_payload(ticker)
 
 
@@ -239,6 +247,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Expected attester address (env RWA_ATTESTER_ADDRESS). Required for a chain match.",
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Check stored bytes only. Prints that nothing was checked on-chain. "
+            "Without this flag, a missing --rpc-url and BASE_SEPOLIA_RPC_URL is an error."
+        ),
+    )
     args = parser.parse_args(argv)
 
     ticker = args.ticker.strip().upper()
@@ -419,7 +435,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         result["inputs_stored"] = False
         result["inputs_digest_ok"] = None
+        result["match"] = False
         result["note"] += " Scoring inputs were not stored; inputs_digest cannot be re-derived."
+        _emit(result, as_json=args.json)
+        return EXIT_INPUTS_MISSING
 
     if args.rpc_url.strip():
         chain = on_chain_verify(
@@ -457,9 +476,22 @@ def main(argv: list[str] | None = None) -> int:
                 result["note"] += " On-chain verify() is not true."
             _emit(result, as_json=args.json)
             return EXIT_NO_MATCH
-    else:
+    elif args.offline:
         result["match"] = None
-        result["note"] += " Pass --rpc-url to read the chain (contract defaults to the pinned address)."
+        result["offline"] = True
+        result["note"] += (
+            " Offline: nothing was checked on-chain. "
+            "Stored bytes and inputs_digest were checked locally only."
+        )
+    else:
+        result["match"] = False
+        result["note"] += (
+            " Nothing was checked on-chain. "
+            "Pass --rpc-url or set BASE_SEPOLIA_RPC_URL, "
+            "or pass --offline to check stored bytes only."
+        )
+        _emit(result, as_json=args.json)
+        return EXIT_CHAIN_UNCHECKED
 
     _emit(result, as_json=args.json)
     return EXIT_OK
@@ -477,7 +509,10 @@ def _emit(result: dict[str, Any], *, as_json: bool) -> None:
     print(f"score_hash {result['score_hash']}")
     print(f"canonical  {result['canonical']}")
     if result["on_chain"] is None:
-        print("on-chain   (skipped — pass --contract and --rpc-url to verify)")
+        if result.get("offline"):
+            print("on-chain   offline — nothing was checked on-chain")
+        else:
+            print("on-chain   not checked — pass --rpc-url or --offline")
     else:
         print(f"on-chain   {result['on_chain']}")
         print(f"match      {result['match']}")

@@ -25,10 +25,13 @@ from rwa_score.api.attest import (
 from rwa_score.api.store import Store
 from rwa_score.api.verify import (
     EXIT_CAST_MISSING,
+    EXIT_CHAIN_UNCHECKED,
     EXIT_DB,
     EXIT_HASH_MISMATCH,
+    EXIT_INPUTS_MISSING,
     EXIT_NO_MATCH,
     EXIT_NOT_STORED,
+    EXIT_OK,
     EXIT_RPC_ERROR,
     main,
 )
@@ -249,10 +252,12 @@ def test_stored_bytes_round_trip(tmp_path: Path, fixture_scorer: TransparencySco
 def _seed(tmp_path: Path, ticker: str = "NVDA") -> Path:
     payload = _base_payload()
     payload["ticker"] = ticker
+    inputs = {"cmc": {"ticker": ticker}}
+    payload["inputs_digest"] = recompute_inputs_digest(inputs)
     raw = canonical_bytes(payload)
     db = tmp_path / "verify.sqlite"
     store = Store(db)
-    store.save_attested_payload(ticker=ticker, canonical=raw)
+    store.save_attested_payload(ticker=ticker, canonical=raw, inputs=canonical_bytes(inputs))
     store.close()
     return db
 
@@ -303,11 +308,25 @@ def test_verify_json_parses_cast_183_attested_at(
 
 
 def test_verify_does_not_call_the_scorer(monkeypatch, capsys, tmp_path: Path) -> None:
+    monkeypatch.delenv("BASE_SEPOLIA_RPC_URL", raising=False)
     db = _seed(tmp_path)
     score = Mock(side_effect=AssertionError("scorer called"))
     monkeypatch.setattr("rwa_score.scorer.TransparencyScorer.score", score)
-    code = main(["NVDA", "--fixtures", "--api-url", "http://example", "--api-key", "rat_x", "--json", "--db", str(db)])
-    assert code == 0
+    code = main(
+        [
+            "NVDA",
+            "--fixtures",
+            "--api-url",
+            "http://example",
+            "--api-key",
+            "rat_x",
+            "--offline",
+            "--json",
+            "--db",
+            str(db),
+        ]
+    )
+    assert code == EXIT_OK
     score.assert_not_called()
     captured = capsys.readouterr()
     assert "obsolete" in captured.err.lower()
@@ -487,11 +506,14 @@ def test_verify_recomputes_stored_inputs(capsys, tmp_path: Path, fixture_scorer:
     store = Store(db)
     store.save_attested_payload(ticker="NVDA", canonical=raw, inputs=inputs)
     store.close()
-    code = main(["NVDA", "--json", "--db", str(db)])
-    assert code == 0
+    code = main(["NVDA", "--offline", "--json", "--db", str(db)])
+    assert code == EXIT_OK
     body = json.loads(capsys.readouterr().out)
     assert body["inputs_stored"] is True
     assert body["inputs_digest_ok"] is True
+    assert body["offline"] is True
+    assert body["match"] is None
+    assert "nothing was checked on-chain" in body["note"].lower()
     assert recompute_inputs_digest(body["inputs"]) == body["payload"]["inputs_digest"]
 
     conn = __import__("sqlite3").connect(db)
@@ -567,9 +589,85 @@ def test_verify_flags_legacy_payload_missing_new_fields(capsys, tmp_path: Path) 
     store.save_attested_payload(ticker="NVDA", canonical=raw)
     store.close()
     code = main(["NVDA", "--json", "--db", str(db)])
-    assert code == 0
+    assert code == EXIT_INPUTS_MISSING
     body = json.loads(capsys.readouterr().out)
     assert body["legacy"] is True
     assert body["hash_ok"] is True
-    assert body["match"] is None
+    assert body["inputs_stored"] is False
+    assert body["match"] is False
     assert "Legacy payload is missing" in body["note"]
+    assert "inputs were not stored" in body["note"].lower()
+
+
+def test_verify_exit_codes_are_distinct() -> None:
+    codes = (
+        EXIT_OK,
+        EXIT_DB,
+        EXIT_NOT_STORED,
+        EXIT_HASH_MISMATCH,
+        EXIT_NO_MATCH,
+        EXIT_RPC_ERROR,
+        EXIT_CAST_MISSING,
+        EXIT_CHAIN_UNCHECKED,
+        EXIT_INPUTS_MISSING,
+    )
+    assert codes == tuple(range(9))
+    assert len(set(codes)) == len(codes)
+
+
+def test_verify_without_rpc_fails_closed_unless_offline(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("BASE_SEPOLIA_RPC_URL", raising=False)
+    db = _seed(tmp_path)
+    code = main(["NVDA", "--json", "--db", str(db)])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_CHAIN_UNCHECKED
+    assert body["match"] is False
+    assert body["hash_ok"] is True
+    assert "nothing was checked on-chain" in body["note"].lower()
+
+    code = main(["NVDA", "--offline", "--json", "--db", str(db)])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_OK
+    assert body["match"] is None
+    assert body["offline"] is True
+    assert "nothing was checked on-chain" in body["note"].lower()
+
+
+def test_verify_missing_inputs_json_is_its_own_exit(capsys, tmp_path: Path) -> None:
+    payload = _base_payload()
+    raw = canonical_bytes(payload)
+    db = tmp_path / "no-inputs.sqlite"
+    store = Store(db)
+    store.save_attested_payload(ticker="NVDA", canonical=raw)
+    store.close()
+    code = main(["NVDA", "--offline", "--json", "--db", str(db)])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_INPUTS_MISSING
+    assert code not in (EXIT_OK, EXIT_HASH_MISMATCH, EXIT_NOT_STORED)
+    assert body["inputs_stored"] is False
+    assert body["match"] is False
+    assert body["hash_ok"] is True
+    assert "inputs were not stored" in body["note"].lower()
+
+
+def test_verify_hash_for_another_ticker_exits_4(capsys, tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["ticker"] = "TSLA"
+    inputs = {"cmc": {"ticker": "TSLA"}}
+    payload["inputs_digest"] = recompute_inputs_digest(inputs)
+    raw = canonical_bytes(payload)
+    digest = hash_canonical(raw)
+    db = tmp_path / "cross.sqlite"
+    store = Store(db)
+    store.save_attested_payload(ticker="TSLA", canonical=raw, inputs=canonical_bytes(inputs))
+    store.close()
+    code = main(["NVDA", "--hash", digest, "--json", "--db", str(db)])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_NO_MATCH
+    assert code != EXIT_NOT_STORED
+    assert body["stored"] is True
+    assert body["ticker_ok"] is False
+    assert body["payload_ticker"] == "TSLA"
+    assert body["match"] is False

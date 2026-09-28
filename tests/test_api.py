@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rwa_score.api.app import BREAKDOWN_KEYS, create_app
-from rwa_score.api.attest import attestation_payload, canonical_bytes, hash_canonical
+from rwa_score.api.attest import attestation_payload, canonical_bytes, hash_canonical, inputs_bytes
 from rwa_score.api.settings import ApiSettings
 from rwa_score.api.store import Store
 from rwa_score.api.webhooks import notify_crossings
@@ -472,6 +472,35 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
     assert hash_canonical(saved["canonical"]) == body["score_hash"]
 
 
+def test_nan_in_live_report_fails_closed_in_decorate(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    """A NaN in a live report raises in _decorate. No attest, no HTTP 200."""
+    from rwa_score.api.app import _decorate
+
+    report = fixture_scorer.score("NVDA")
+    report = dict(report)
+    report["data_source"] = "live"
+    report["score"] = float("nan")
+
+    with pytest.raises(ValueError, match="Out of range float"):
+        _decorate(report)
+
+    class _NanScorer:
+        def score(self, ticker: str) -> dict[str, Any]:
+            return report
+
+    client, store = _client(tmp_path, _NanScorer())  # type: ignore[arg-type]
+    raw = store.create_key(name="paid", tier="paid")
+    with pytest.raises(ValueError, match="Out of range float"):
+        client.get("/v1/attest/NVDA", headers=_headers(raw))
+    quiet = TestClient(client.app, raise_server_exceptions=False)
+    resp = quiet.get("/v1/attest/NVDA", headers=_headers(raw))
+    assert resp.status_code != 200
+    assert store.latest_attested_payload("NVDA") is None
+    assert b"NaN" not in resp.content
+
+
 def test_attest_status_does_not_score(
     tmp_path: Path, fixture_scorer: TransparencyScorer
 ) -> None:
@@ -579,9 +608,10 @@ def test_verify_client_fixtures_json(
     store.save_attested_payload(
         ticker="NVDA",
         canonical=canonical_bytes(attestation_payload(report)),
+        inputs=inputs_bytes(report),
     )
     store.close()
-    assert verify_main(["NVDA", "--fixtures", "--json", "--db", str(db)]) == 0
+    assert verify_main(["NVDA", "--fixtures", "--offline", "--json", "--db", str(db)]) == 0
     captured = capsys.readouterr()
     assert "obsolete" in captured.err.lower()
     payload = json.loads(captured.out)

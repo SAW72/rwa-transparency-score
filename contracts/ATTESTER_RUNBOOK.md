@@ -476,7 +476,21 @@ to                   0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 ### 6.5 `verify.py` against the stored payload
 
 The stored bytes are in the API service database (`DATABASE_URL`), not on
-your laptop. Open the Render shell for `rwa-transparency-score-api` and run:
+your laptop. Open the Render shell for `rwa-transparency-score-api` and run
+the command below. It passes `--rpc-url` and `--attester`, so a confirmed
+row is exit `0` with `"match": true`. It does not use `--offline`.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Stored bytes match, inputs recompute `inputs_digest`, and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
+| `1` | Database path does not exist, or the file is not SQLite. |
+| `2` | Nothing stored (`pre-fix attestation, stored payload unavailable`). |
+| `3` | Tampered or malformed bytes, or stored inputs do not recompute `inputs_digest`. |
+| `4` | Ticker mismatch, including `--hash` for another ticker; chain id is not 84532; `verify()` is false; or the attester mismatches. |
+| `5` | RPC / cast call failed. |
+| `6` | A chain read was requested but `cast` is not on `PATH`. |
+| `7` | No `--rpc-url` and `BASE_SEPOLIA_RPC_URL` unset, and `--offline` was not passed. |
+| `8` | The row has no `inputs_json`. |
 
 ```bash
 python -m rwa_score.api.verify NVDA --json \
