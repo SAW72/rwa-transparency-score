@@ -12,15 +12,20 @@ import pytest
 from rwa_score.api.attest import (
     ATTESTATION_FIELDS,
     PINNED_ATTESTATION_CONTRACT,
+    attestation_inputs,
     attestation_payload,
     canonical_bytes,
     clear_scorer_version_cache,
+    data_as_of,
     hash_canonical,
+    inputs_digest,
+    recompute_inputs_digest,
     score_hash,
 )
 from rwa_score.api.store import Store
 from rwa_score.api.verify import (
     EXIT_CAST_MISSING,
+    EXIT_DB,
     EXIT_HASH_MISMATCH,
     EXIT_NO_MATCH,
     EXIT_NOT_STORED,
@@ -40,6 +45,7 @@ CAST_183_VERIFY = (
 def _base_payload() -> dict:
     return {
         "as_of": 1_700_000_000,
+        "data_as_of": None,
         "band": "GREEN",
         "basis": {"available": True, "percent_spread": 1.25},
         "cik": "0001045810",
@@ -85,6 +91,7 @@ _FIELD_MUTATIONS = [
     ("verification", {"backing": {"score": 1.0, "level": "x", "source": "y"}}),
     ("basis", {"available": False}),
     ("as_of", 1_700_000_001),
+    ("data_as_of", 1_700_000_050),
     ("scorer_version", "abcdef1"),
     ("inputs_digest", "0x" + "cd" * 32),
 ]
@@ -170,6 +177,7 @@ def test_payload_is_the_breakdown_subset(fixture_scorer: TransparencyScorer) -> 
     assert "basis" in payload["verification"]
     assert payload["basis"] == report["basis"]
     assert payload["as_of"] == 0
+    assert payload["data_as_of"] is None
     assert payload["scorer_version"]
     assert payload["inputs_digest"].startswith("0x")
     assert len(payload["inputs_digest"]) == 66
@@ -323,6 +331,7 @@ def test_verify_clear_when_nothing_stored(capsys, tmp_path: Path) -> None:
     assert payload["match"] is False
     assert "does not re-score" in payload["note"]
     assert "No stored attestation payload" in payload["note"]
+    assert "pre-fix attestation, stored payload unavailable" in payload["note"]
 
 
 def test_verify_tampered_bytes_exit_nonzero(capsys, tmp_path: Path) -> None:
@@ -401,3 +410,166 @@ def test_verify_contract_defaults_to_pinned(monkeypatch, capsys, tmp_path: Path)
     body = json.loads(capsys.readouterr().out)
     assert body["contract"] == PINNED_ATTESTATION_CONTRACT
     assert body["contract"] == "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
+    assert "pre-fix attestation, stored payload unavailable" in body["note"]
+
+
+def test_inputs_digest_covers_every_pillar_and_drops_rpc(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    report = fixture_scorer.score("NVDA")
+    original = inputs_digest(report)
+    assert original == recompute_inputs_digest(attestation_inputs(report))
+    assert "rpc_url" not in canonical_bytes(attestation_inputs(report)).decode("ascii")
+
+    backing = dict(report)
+    verification = {key: dict(value) for key, value in report["verification"].items()}
+    backing_block = dict(verification["backing"])
+    backing_block["meta"] = dict(backing_block.get("meta") or {})
+    backing_block["meta"]["matched"] = not backing_block["meta"].get("matched")
+    verification["backing"] = backing_block
+    backing["verification"] = verification
+    assert inputs_digest(backing) != original
+
+    prose = dict(report)
+    prose["explanations"] = dict(report["explanations"])
+    prose["explanations"]["backing"] = "rewritten explanation"
+    assert inputs_digest(prose) == original
+
+    with_secret = dict(report)
+    secret_verification = {key: dict(value) for key, value in report["verification"].items()}
+    reserves = dict(secret_verification["reserves"])
+    reserves["meta"] = dict(reserves.get("meta") or {})
+    reserves["meta"]["rpc_url"] = "https://secret.example/KEY"
+    reserves["source"] = "chainlink_por"
+    secret_verification["reserves"] = reserves
+    with_secret["verification"] = secret_verification
+    blob = canonical_bytes(attestation_inputs(with_secret)).decode("ascii")
+    assert "secret" not in blob
+    assert "rpc_url" not in blob
+    assert data_as_of(report) is None
+    stamped = dict(with_secret)
+    stamped_verification = {key: dict(value) for key, value in secret_verification.items()}
+    stamped_reserves = dict(stamped_verification["reserves"])
+    stamped_reserves["meta"] = dict(stamped_reserves["meta"])
+    stamped_reserves["meta"]["updated_at"] = 1_700_000_111
+    stamped_verification["reserves"] = stamped_reserves
+    stamped["verification"] = stamped_verification
+    assert data_as_of(stamped) == 1_700_000_111
+    assert attestation_payload(stamped)["data_as_of"] == 1_700_000_111
+
+
+def test_verify_rejects_payload_ticker_mismatch(capsys, tmp_path: Path) -> None:
+    payload = _base_payload()
+    payload["ticker"] = "TSLA"
+    raw = canonical_bytes(payload)
+    db = tmp_path / "cross.sqlite"
+    store = Store(db)
+    store.save_attested_payload(ticker="NVDA", canonical=raw)
+    store.close()
+    code = main(["NVDA", "--json", "--db", str(db)])
+    assert code == EXIT_NO_MATCH
+    body = json.loads(capsys.readouterr().out)
+    assert body["match"] is False
+    assert body["ticker"] == "NVDA"
+    assert body["ticker_ok"] is False
+    assert body["payload_ticker"] == "TSLA"
+    assert "does not match the requested ticker" in body["note"]
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_verify_recomputes_stored_inputs(capsys, tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+    from rwa_score.api.attest import inputs_bytes
+
+    report = fixture_scorer.score("NVDA")
+    raw = canonical_bytes(attestation_payload(report))
+    inputs = inputs_bytes(report)
+    db = tmp_path / "inputs.sqlite"
+    store = Store(db)
+    store.save_attested_payload(ticker="NVDA", canonical=raw, inputs=inputs)
+    store.close()
+    code = main(["NVDA", "--json", "--db", str(db)])
+    assert code == 0
+    body = json.loads(capsys.readouterr().out)
+    assert body["inputs_stored"] is True
+    assert body["inputs_digest_ok"] is True
+    assert recompute_inputs_digest(body["inputs"]) == body["payload"]["inputs_digest"]
+
+    conn = __import__("sqlite3").connect(db)
+    conn.execute(
+        "UPDATE attested_payloads SET inputs_json = ? WHERE ticker = 'NVDA'",
+        (canonical_bytes({"cmc": {"price": 1}}),),
+    )
+    conn.commit()
+    conn.close()
+    code = main(["NVDA", "--json", "--db", str(db)])
+    assert code == EXIT_HASH_MISMATCH
+    body = json.loads(capsys.readouterr().out)
+    assert body["inputs_digest_ok"] is False
+    assert body["match"] is False
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_verify_malformed_payload_is_clean_json(capsys, tmp_path: Path) -> None:
+    import sqlite3
+
+    db = _seed(tmp_path)
+    cases = [
+        b'{"ticker":"NVDA","score":',
+        b"\xff\xfe{}",
+        b"[1,2]",
+    ]
+    for blob in cases:
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE attested_payloads SET canonical_json = ? WHERE ticker = 'NVDA'", (blob,))
+        conn.commit()
+        conn.close()
+        code = main(["NVDA", "--json", "--db", str(db)])
+        captured = capsys.readouterr()
+        assert code == EXIT_HASH_MISMATCH
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+        body = json.loads(captured.out)
+        assert body["error"] == "malformed_payload"
+        assert body["match"] is False
+
+    corrupt = tmp_path / "corrupt.sqlite"
+    corrupt.write_bytes(b"this is not a database")
+    code = main(["NVDA", "--json", "--db", str(corrupt)])
+    captured = capsys.readouterr()
+    assert code == EXIT_DB
+    assert "Traceback" not in captured.err
+    body = json.loads(captured.out)
+    assert body["error"] == "database_error"
+    assert body["match"] is False
+
+
+def test_verify_missing_db_is_not_created(capsys, tmp_path: Path) -> None:
+    missing = tmp_path / "no" / "such" / "dir" / "x.sqlite"
+    code = main(["NVDA", "--json", "--db", str(missing)])
+    captured = capsys.readouterr()
+    assert code == EXIT_DB
+    assert not missing.exists()
+    assert not missing.parent.exists()
+    assert "Traceback" not in captured.err
+    body = json.loads(captured.out)
+    assert body["error"] == "database_missing"
+    assert body["match"] is False
+    assert body["stored"] is False
+
+
+def test_verify_flags_legacy_payload_missing_new_fields(capsys, tmp_path: Path) -> None:
+    payload = _base_payload()
+    for key in ("as_of", "data_as_of", "scorer_version", "inputs_digest"):
+        payload.pop(key)
+    raw = canonical_bytes(payload)
+    db = tmp_path / "legacy.sqlite"
+    store = Store(db)
+    store.save_attested_payload(ticker="NVDA", canonical=raw)
+    store.close()
+    code = main(["NVDA", "--json", "--db", str(db)])
+    assert code == 0
+    body = json.loads(capsys.readouterr().out)
+    assert body["legacy"] is True
+    assert body["hash_ok"] is True
+    assert body["match"] is None
+    assert "Legacy payload is missing" in body["note"]

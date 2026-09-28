@@ -73,14 +73,21 @@ def _key_from_row(row: sqlite3.Row) -> ApiKey:
     )
 
 
+def _blob(value: Any) -> bytes | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return bytes(value)
+
+
 def _payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
-    raw = row["canonical_json"]
-    if isinstance(raw, str):
-        raw = raw.encode("utf-8")
+    keys = set(row.keys())
     return {
         "score_hash": row["score_hash"],
         "ticker": row["ticker"],
-        "canonical": bytes(raw),
+        "canonical": _blob(row["canonical_json"]),
+        "inputs": _blob(row["inputs_json"]) if "inputs_json" in keys else None,
         "stored_at": row["stored_at"],
     }
 
@@ -471,24 +478,35 @@ class Store:
             )
             self._conn.commit()
 
-    def save_attested_payload(self, *, ticker: str, canonical: bytes) -> str:
+    def save_attested_payload(
+        self,
+        *,
+        ticker: str,
+        canonical: bytes,
+        inputs: bytes | None = None,
+    ) -> str:
         """Store the exact canonical JSON bytes, keyed by their SHA-256.
 
-        Same hash is idempotent. A different byte string under that hash
-        cannot happen if the key is ``hash_canonical(canonical)``. Render
-        free disk is ephemeral — this row is gone after spin-down unless
-        the sqlite file lives on a persistent disk.
+        ``inputs`` is the canonical scoring-input JSON (see
+        ``attestation_inputs``), stored beside the payload so
+        ``inputs_digest`` can be recomputed. Same hash is idempotent.
+        A different byte string under that hash is refused. A later save
+        may fill ``inputs`` when the existing row has none; it may not
+        replace inputs that are already stored. Render free disk is
+        ephemeral — this row is gone after spin-down unless the sqlite
+        file lives on a persistent disk.
         """
         from .attest import hash_canonical
 
         if not isinstance(canonical, (bytes, bytearray)):
             raise TypeError("canonical payload must be bytes")
         raw = bytes(canonical)
+        inputs_raw = None if inputs is None else bytes(inputs)
         digest = hash_canonical(raw)
         symbol = ticker.strip().upper()
         with self._lock:
             existing = self._conn.execute(
-                "SELECT canonical_json FROM attested_payloads WHERE score_hash = ?",
+                "SELECT canonical_json, inputs_json FROM attested_payloads WHERE score_hash = ?",
                 (digest,),
             ).fetchone()
             if existing is not None:
@@ -497,11 +515,27 @@ class Store:
                     stored = stored.encode("utf-8")
                 if bytes(stored) != raw:
                     raise ValueError("refusing to replace attested payload bytes for an existing hash")
+                if inputs_raw is not None:
+                    prior = existing["inputs_json"]
+                    if prior is None:
+                        self._conn.execute(
+                            "UPDATE attested_payloads SET inputs_json = ? WHERE score_hash = ?",
+                            (inputs_raw, digest),
+                        )
+                        self._conn.commit()
+                    else:
+                        if isinstance(prior, str):
+                            prior = prior.encode("utf-8")
+                        if bytes(prior) != inputs_raw:
+                            raise ValueError(
+                                "refusing to replace attested inputs for an existing hash"
+                            )
                 return digest
             self._conn.execute(
-                "INSERT INTO attested_payloads (score_hash, ticker, canonical_json, stored_at) "
-                "VALUES (?, ?, ?, ?)",
-                (digest, symbol, raw, _iso()),
+                "INSERT INTO attested_payloads "
+                "(score_hash, ticker, canonical_json, stored_at, inputs_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (digest, symbol, raw, _iso(), inputs_raw),
             )
             self._conn.commit()
         return digest
@@ -510,7 +544,7 @@ class Store:
         digest = score_hash.strip()
         with self._lock:
             row = self._conn.execute(
-                "SELECT score_hash, ticker, canonical_json, stored_at "
+                "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at "
                 "FROM attested_payloads WHERE score_hash = ?",
                 (digest,),
             ).fetchone()
@@ -522,7 +556,7 @@ class Store:
         symbol = ticker.strip().upper()
         with self._lock:
             row = self._conn.execute(
-                "SELECT score_hash, ticker, canonical_json, stored_at "
+                "SELECT score_hash, ticker, canonical_json, inputs_json, stored_at "
                 "FROM attested_payloads WHERE ticker = ? "
                 "ORDER BY stored_at DESC, rowid DESC LIMIT 1",
                 (symbol,),

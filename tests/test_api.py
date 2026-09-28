@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -630,3 +631,97 @@ def test_live_mode_hash_matches_stored_bytes_when_clock_advances(
     ).fetchone()
     assert history["payload_hash"] == body["score_hash"]
     assert history["payload_json"].encode("utf-8") == saved["canonical"]
+
+
+def _live_scorer():
+    from rwa_score.scorer import TransparencyScorer
+    from tests.conftest import RecordingClient
+
+    inner = TransparencyScorer(RecordingClient(), use_live_verifiers=False)
+
+    class _Flip:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def score(self, ticker: str) -> dict[str, Any]:
+            report = dict(inner.score(ticker))
+            assert report["data_source"] == "live"
+            self.n += 1
+            if self.n % 2 == 1:
+                report["score"] = 90.0
+                report["band"] = "GREEN"
+            else:
+                report["score"] = 12.0
+                report["band"] = "RED"
+            return report
+
+    return _Flip()
+
+
+def _assert_attest_bytes_match(body: dict[str, Any], store: Store) -> None:
+    saved = store.get_attested_payload(body["score_hash"])
+    assert saved is not None
+    assert hash_canonical(saved["canonical"]) == body["score_hash"]
+    assert saved["canonical"] == canonical_bytes(body["payload"])
+    assert saved["inputs"] is not None
+    assert hash_canonical(saved["inputs"]) == body["payload"]["inputs_digest"]
+
+
+def test_real_clock_second_boundary_hash_matches_stored_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Wall clock crosses a second between seal and the attest response."""
+    import rwa_score.api.app as app_mod
+
+    monkeypatch.delenv("RWA_USE_FIXTURES", raising=False)
+    real = app_mod.apply_score_side_effects
+
+    def delayed(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        time.sleep(1.05)
+
+    monkeypatch.setattr(app_mod, "apply_score_side_effects", delayed)
+    client, store = _client(tmp_path, _live_scorer())
+    raw = store.create_key(name="paid", tier="paid")
+    before = time.time()
+    attest = client.get("/v1/attest/NVDA", headers=_headers(raw))
+    after = time.time()
+    assert attest.status_code == 200
+    assert after - before >= 1.0
+    assert int(after) != int(before)
+    body = attest.json()
+    _assert_attest_bytes_match(body, store)
+    assert body["payload"]["as_of"] == int(json.loads(store.get_attested_payload(body["score_hash"])["canonical"])["as_of"])
+    assert int(before) <= body["payload"]["as_of"] <= int(after)
+
+
+def test_slow_webhook_real_clock_hash_matches_stored_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A band-cross webhook that takes over a second must not fork the hash."""
+    monkeypatch.delenv("RWA_USE_FIXTURES", raising=False)
+    posted: list[float] = []
+
+    def slow_poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
+        time.sleep(1.1)
+        posted.append(time.time())
+        return 200, True
+
+    client, store = _client(tmp_path, _live_scorer(), poster=slow_poster)
+    raw = store.create_key(name="paid", tier="paid")
+    created = client.post(
+        "/v1/webhooks",
+        headers=_headers(raw),
+        json={"url": "https://example.test/hook", "secret": "s", "trigger": "band_cross"},
+    )
+    assert created.status_code == 200
+    first = client.get("/v1/attest/NVDA", headers=_headers(raw))
+    assert first.status_code == 200
+    assert posted == []
+    _assert_attest_bytes_match(first.json(), store)
+    second = client.get("/v1/attest/NVDA", headers=_headers(raw))
+    assert second.status_code == 200
+    assert len(posted) == 1
+    body = second.json()
+    _assert_attest_bytes_match(body, store)
+    assert body["score_hash"] != first.json()["score_hash"]

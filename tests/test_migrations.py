@@ -102,7 +102,9 @@ def test_postgres_dump_is_dialect_ready_and_not_executed() -> None:
         "001_initial",
         "002_history_tenant",
         "003_attested_payloads",
+        "004_attestation_inputs",
     }
+    assert "inputs_json BYTEA" in sql
     assert "attested_payloads" in sqlite_sql
     assert "BYTEA" in sql
 
@@ -127,6 +129,11 @@ def test_apply_is_idempotent(tmp_path: Path) -> None:
     first = apply_sqlite_migrations(conn)
     second = apply_sqlite_migrations(conn)
     conn.commit()
-    assert first == ["001_initial", "002_history_tenant", "003_attested_payloads"]
+    assert first == [
+        "001_initial",
+        "002_history_tenant",
+        "003_attested_payloads",
+        "004_attestation_inputs",
+    ]
     assert second == []
     conn.close()

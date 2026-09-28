@@ -9,9 +9,12 @@ command exits non-zero and does not invent a payload.
 Exit codes:
 
 - ``0`` stored bytes match their hash, and any chain read matched
-- ``2`` nothing stored
-- ``3`` stored bytes do not match the hash key (tamper or corruption)
-- ``4`` chain id is not 84532, verify() is false, or the attester mismatches
+- ``1`` the database path does not exist, or the file is not a SQLite database
+- ``2`` nothing stored (including a pre-fix attestation with no payload row)
+- ``3`` stored bytes do not match the hash key, the payload is malformed,
+  or stored inputs do not recompute ``inputs_digest``
+- ``4`` payload ticker does not match the request, chain id is not 84532,
+  verify() is false, or the attester mismatches
 - ``5`` RPC / cast call failed
 - ``6`` a chain read was requested but ``cast`` is not on ``PATH``
 
@@ -28,16 +31,23 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from .attest import PINNED_ATTESTATION_CONTRACT, canonical_bytes, hash_canonical
+from .attest import (
+    PINNED_ATTESTATION_CONTRACT,
+    canonical_bytes,
+    hash_canonical,
+    recompute_inputs_digest,
+)
 from .settings import BASE_SEPOLIA_CHAIN_ID, ApiSettings
 from .store import Store
 
 EXIT_OK = 0
+EXIT_DB = 1
 EXIT_NOT_STORED = 2
 EXIT_HASH_MISMATCH = 3
 EXIT_NO_MATCH = 4
@@ -50,18 +60,21 @@ EXIT_CAST_MISSING = 6
 VERIFY_SIG = "verify(bytes32,string)(bool,uint256,address)"
 
 NOTHING_STORED = (
+    "pre-fix attestation, stored payload unavailable. "
     "No stored attestation payload for this ticker. "
-    "verify does not re-score. "
-    "GET /v1/attest/{ticker} stores the canonical JSON first. "
-    "Hashes attested before stored payloads existed, or dropped when "
-    "Render's free disk spun down, cannot be reconstructed. "
-    "Re-run GET /v1/attest to store a new payload (as_of is hashing time, "
-    "so the new hash differs). "
+    "verify does not re-score and will not rebuild a hash attested before "
+    "canonical bytes were stored. "
+    "GET /v1/attest/{ticker} stores a new payload; as_of is attest time, "
+    "so that new hash differs from the pre-fix hash. "
+    "Hashes dropped when Render's free disk spun down are the same case: "
+    "the bytes are gone. "
     "A persistent disk (paid plan) or Postgres keeps the bytes across spin-down."
 )
 
+_LEGACY_FIELDS = ("as_of", "data_as_of", "scorer_version", "inputs_digest")
+
 _OBSOLETE_FLAGS = (
-    "WARNING: --fixtures, --api-url, and --api-key do not re-score and are obsolete. "
+    "WARNING: --fixtures, --api-url, and --api-key are Ignored. They do not re-score and are obsolete. "
     "verify only checks canonical bytes already stored by GET /v1/attest. "
     "Older on-chain hashes with no stored row cannot be rebuilt from fixtures or the API."
 )
@@ -154,6 +167,23 @@ def _db_path(explicit: str) -> Path:
     return ApiSettings.from_env().db_path
 
 
+def _inputs_match(raw: bytes, claimed: Any) -> tuple[bool, dict[str, Any] | None]:
+    """True when ``raw`` is canonical scoring inputs and hashes to ``claimed``."""
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False, None
+    if not isinstance(parsed, dict):
+        return False, None
+    try:
+        if canonical_bytes(parsed) != raw:
+            return False, parsed
+        recomputed = recompute_inputs_digest(parsed)
+    except (TypeError, ValueError):
+        return False, parsed
+    return recomputed == claimed, parsed
+
+
 def _load_stored(store: Store, ticker: str, score_hash: str) -> dict[str, Any] | None:
     if score_hash:
         row = store.get_attested_payload(score_hash)
@@ -220,12 +250,6 @@ def main(argv: list[str] | None = None) -> int:
     ticker = args.ticker.strip().upper()
     contract = (args.contract or "").strip() or PINNED_ATTESTATION_CONTRACT
     db_path = _db_path(args.db)
-    store = Store(db_path)
-    try:
-        row = _load_stored(store, ticker, args.score_hash.strip())
-    finally:
-        store.close()
-
     ignored = []
     if args.fixtures:
         ignored.append("--fixtures")
@@ -237,6 +261,51 @@ def main(argv: list[str] | None = None) -> int:
     if ignored:
         print(_OBSOLETE_FLAGS, file=sys.stderr)
         ignored_note = " " + _OBSOLETE_FLAGS
+
+    if not db_path.is_file():
+        result = {
+            "ticker": ticker,
+            "stored": False,
+            "score_hash": None,
+            "payload": None,
+            "canonical": None,
+            "contract": contract,
+            "on_chain": None,
+            "match": False,
+            "hash_ok": False,
+            "error": "database_missing",
+            "note": (
+                f"Database does not exist ({db_path}). "
+                "verify does not create an empty database. "
+                "A missing path is not the same as nothing attested."
+                + ignored_note
+            ),
+        }
+        _emit(result, as_json=args.json)
+        return EXIT_DB
+
+    try:
+        store = Store(db_path)
+        try:
+            row = _load_stored(store, ticker, args.score_hash.strip())
+        finally:
+            store.close()
+    except sqlite3.Error:
+        result = {
+            "ticker": ticker,
+            "stored": False,
+            "score_hash": None,
+            "payload": None,
+            "canonical": None,
+            "contract": contract,
+            "on_chain": None,
+            "match": False,
+            "hash_ok": False,
+            "error": "database_error",
+            "note": "Database file is not a valid SQLite database." + ignored_note,
+        }
+        _emit(result, as_json=args.json)
+        return EXIT_DB
 
     if row is None:
         result: dict[str, Any] = {
@@ -262,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     payload: dict[str, Any] | None
     try:
         parsed = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         parsed = None
     if isinstance(parsed, dict):
         try:
@@ -276,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     hash_ok = recomputed == row["score_hash"] and recanon
     canonical_text = raw.decode("utf-8", errors="replace")
     result = {
-        "ticker": (payload or {}).get("ticker") or ticker,
+        "ticker": ticker,
         "stored": True,
         "score": None if payload is None else payload.get("score"),
         "band": None if payload is None else payload.get("band"),
@@ -292,25 +361,72 @@ def main(argv: list[str] | None = None) -> int:
         "note": (
             "Hash recomputed from the stored canonical JSON. "
             "No live re-score. "
-            "inputs_digest covers report fields, not raw provider bodies. "
-            "as_of is hashing time (Unix seconds). "
+            "inputs_digest covers every scoring input retained on the report, "
+            "not raw provider bodies. "
+            "as_of is attest time (Unix seconds when the payload was hashed), "
+            "not the provider observation time (data_as_of). "
             "The contract stores this hash only — never the raw score. "
             "Mainnet is held; read Base Sepolia only."
             + ignored_note
         ),
     }
     if not hash_ok:
-        result["note"] += " Stored bytes do not match the hash key."
+        if not isinstance(parsed, dict):
+            result["error"] = "malformed_payload"
+            result["note"] += " Malformed stored payload."
+        else:
+            result["note"] += " Stored bytes do not match the hash key."
         result["match"] = False
         _emit(result, as_json=args.json)
         return EXIT_HASH_MISMATCH
+
+    assert payload is not None
+    payload_ticker = str(payload.get("ticker") or "").strip().upper()
+    row_ticker = str(row.get("ticker") or "").strip().upper()
+    if payload_ticker != ticker or row_ticker != ticker:
+        result["match"] = False
+        result["ticker_ok"] = False
+        result["payload_ticker"] = payload.get("ticker")
+        result["note"] += (
+            " Payload ticker does not match the requested ticker. "
+            f"Requested {ticker}; payload says {payload.get('ticker')!r}; "
+            f"row says {row.get('ticker')!r}."
+        )
+        _emit(result, as_json=args.json)
+        return EXIT_NO_MATCH
+    result["ticker_ok"] = True
+
+    missing_fields = [name for name in _LEGACY_FIELDS if name not in payload]
+    if missing_fields:
+        result["legacy"] = True
+        result["note"] += (
+            " Legacy payload is missing "
+            + ", ".join(missing_fields)
+            + "."
+        )
+
+    inputs_blob = row.get("inputs")
+    if isinstance(inputs_blob, (bytes, bytearray)) and inputs_blob:
+        inputs_ok, parsed_inputs = _inputs_match(bytes(inputs_blob), payload.get("inputs_digest"))
+        result["inputs_stored"] = True
+        result["inputs_digest_ok"] = inputs_ok
+        result["inputs"] = parsed_inputs
+        if not inputs_ok:
+            result["match"] = False
+            result["note"] += " Stored inputs do not recompute inputs_digest."
+            _emit(result, as_json=args.json)
+            return EXIT_HASH_MISMATCH
+    else:
+        result["inputs_stored"] = False
+        result["inputs_digest_ok"] = None
+        result["note"] += " Scoring inputs were not stored; inputs_digest cannot be re-derived."
 
     if args.rpc_url.strip():
         chain = on_chain_verify(
             contract=contract,
             rpc_url=args.rpc_url.strip(),
             digest=recomputed,
-            ticker=str(result["ticker"]),
+            ticker=ticker,
             expected_attester=args.attester,
         )
         result["on_chain"] = chain

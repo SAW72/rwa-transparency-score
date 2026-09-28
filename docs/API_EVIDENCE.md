@@ -368,7 +368,7 @@ content-type: application/json
     "label": "low"
   },
   "attestation": {
-    "score_hash": "0x5cf87e47924904b64c01f88455cd4a69a63a38c28b2ffbe966a94724fe7f93ed",
+    "score_hash": "0x78b3869abfdfd6fd7bb21e99096b96303a5f18c83f5cd93216e202fdcc7d96f4",
     "algo": "sha256",
     "fields": [
       "ticker",
@@ -383,6 +383,7 @@ content-type: application/json
       "verification",
       "basis",
       "as_of",
+      "data_as_of",
       "scorer_version",
       "inputs_digest"
     ]
@@ -391,5 +392,7 @@ content-type: application/json
 ```
 
 `confidence.label` is `low` here because fixture/offline mode skips live attestation verifiers (heuristic fallback on backing / reserves / redemption). The score band is still GREEN from the fixture pillars.
+
+`score_hash` above is locked to `scorer_version` `unknown` (`RENDER_GIT_COMMIT=unknown`). A git checkout or a Render deploy that sets `RENDER_GIT_COMMIT` produces a different hash. `as_of` in that payload is attest time and is `0` for this fixture, not a calendar time. `data_as_of` is null here because the fixture has no provider observation timestamp.
 
 The product Disclaimer on the README still applies. This sample is demo-fixture data, not an audited attestation.

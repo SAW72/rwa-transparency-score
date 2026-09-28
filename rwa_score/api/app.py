@@ -22,6 +22,7 @@ from .attest import (
     ATTESTATION_ALGO,
     ATTESTATION_FIELDS,
     canonical_for,
+    inputs_bytes,
     resolve_scorer_version,
 )
 from .confidence import compute_confidence
@@ -348,7 +349,11 @@ def create_app(
         # Same bytes history and webhooks just stored. Do not rebuild:
         # a second as_of = time.time() would return a hash with no row.
         payload, raw, digest = canonical_for(report)
-        db.save_attested_payload(ticker=report["ticker"], canonical=raw)
+        db.save_attested_payload(
+            ticker=report["ticker"],
+            canonical=raw,
+            inputs=inputs_bytes(report),
+        )
         return {
             "ticker": report["ticker"],
             "score_hash": digest,
@@ -364,8 +369,13 @@ def create_app(
                 "allowlisted relayer / API-held key). Attester is msg.sender "
                 "(not calldata). The timestamp argument is stored only as "
                 "claimedAt; the contract records block.timestamp as attestedAt. "
-                "Pass payload.as_of as that timestamp. The canonical JSON for "
-                "this hash is stored locally (Render free disk is ephemeral). "
+                "Pass payload.as_of as that timestamp. as_of is attest time: "
+                "the Unix second when this payload was hashed, not when the "
+                "data was observed. Fixture scores use as_of 0, which is not "
+                "a calendar time. data_as_of is the latest provider observation "
+                "time already on the report, or null. The canonical JSON for "
+                "this hash is stored locally, with the scoring inputs beside it "
+                "(Render free disk is ephemeral). "
                 "The contract stores this hash only — never "
                 "the raw score. Mainnet is held."
             ),

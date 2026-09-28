@@ -6,8 +6,12 @@
         --contract "$RWA_ATTESTATION_CONTRACT" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 
 Does not re-score. The canonical JSON must already be stored (GET /v1/attest).
-Exits non-zero if nothing is stored, the bytes do not match, the chain is not
-Base Sepolia (84532), the attester mismatches, the RPC fails, or cast is missing.
+Exits non-zero if the database is missing or unreadable, nothing is stored
+(pre-fix attestation, stored payload unavailable), the bytes do not match,
+the payload is malformed, stored inputs do not recompute inputs_digest,
+the payload ticker differs from the request, the chain is not Base Sepolia
+(84532), the attester mismatches, the RPC fails, or cast is missing.
+A missing --db path is an error and is not created.
 --contract defaults to 0x2F073a3628D498d92956e7eFE2b26633eDa75b00.
 --fixtures / --api-url / --api-key warn and do not re-score.
 Never pass a private key. This script only reads.

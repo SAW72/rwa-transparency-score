@@ -21,16 +21,24 @@ result is ``unknown``. It is not truncated, and it does not read
 SHA via :func:`rwa_score.health.deploy_git_sha`. A report that already
 carries ``scorer_version`` keeps that value.
 
-``as_of`` is the hashing time: the Unix second (UTC) at which this canonical
-payload is built. It is not a provider observation timestamp. A report that
+``as_of`` is the attest time: the Unix second (UTC) at which this canonical
+payload is hashed. It is not a provider observation timestamp. A report that
 already carries ``as_of`` keeps that value. Fixture scores
-(``data_source == "fixture"``) use ``0`` so a fixture hash stays stable.
+(``data_source == "fixture"``) use ``0`` so a fixture hash stays stable —
+that ``0`` is not a calendar time, and it must not be read as one.
 Every other score uses one clock reading for that request.
 
+``data_as_of`` is separate. It is the latest provider observation time
+already on the report (Chainlink PoR ``updated_at``), or ``null`` when the
+report has none. Fixtures have none. It is not fetched again at hash time.
+
 ``inputs_digest`` is the same SHA-256-over-canonical-JSON function applied to
-the CMC and Chainlink values retained on the score report. It is not a hash
-of raw provider HTTP bodies — those are not kept. See
-:func:`attestation_inputs`.
+every scoring input retained on the report: the CMC price and basis blocks,
+identity fields, issuer heuristic flags, and each pillar's verifier ``meta``
+(not only Chainlink PoR). It is not a hash of raw provider HTTP bodies or of
+explanation prose. ``rpc_url`` is omitted. See :func:`attestation_inputs`.
+Those input bytes are stored next to the canonical payload so
+:func:`recompute_inputs_digest` can rebuild the digest later.
 
 Object key order and the absence of insignificant whitespace match RFC 8785.
 ``NaN`` and ``Infinity`` are rejected (``allow_nan=False``) because RFC 8785
@@ -78,6 +86,7 @@ ATTESTATION_FIELDS = (
     "verification",
     "basis",
     "as_of",
+    "data_as_of",
     "scorer_version",
     "inputs_digest",
 )
@@ -94,6 +103,8 @@ _POR_INPUT_KEYS = (
     "updated_at",
     "unit",
 )
+# Transport. May embed a provider secret. Never hashed or stored.
+_SECRET_INPUT_KEYS = frozenset({"rpc_url"})
 
 
 def _full_pillars(src: dict[str, Any] | None) -> dict[str, Any]:
@@ -158,8 +169,48 @@ def _scorer_version(report: dict[str, Any]) -> str:
     return resolve_scorer_version()
 
 
+def _without_secrets(value: Any) -> Any:
+    """Copy ``value`` with ``rpc_url`` removed at every level."""
+    if isinstance(value, dict):
+        return {
+            str(key): _without_secrets(item)
+            for key, item in value.items()
+            if str(key) not in _SECRET_INPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_secrets(item) for item in value]
+    return value
+
+
+def data_as_of(report: dict[str, Any]) -> int | None:
+    """Latest provider observation time already on the report, or ``None``.
+
+    Reads Chainlink PoR ``updated_at`` only. Does not call the clock and
+    does not fetch a provider. Fixtures and scores with no round timestamp
+    return ``None``.
+    """
+    verification = report.get("verification") or {}
+    latest: int | None = None
+    if not isinstance(verification, dict):
+        return None
+    for pillar in PILLAR_KEYS:
+        block = verification.get(pillar) or {}
+        if not isinstance(block, dict):
+            continue
+        meta = block.get("meta") or {}
+        if not isinstance(meta, dict) or meta.get("updated_at") is None:
+            continue
+        try:
+            stamp = int(meta["updated_at"])
+        except (TypeError, ValueError):
+            continue
+        if latest is None or stamp > latest:
+            latest = stamp
+    return latest
+
+
 def attestation_inputs(report: dict[str, Any]) -> dict[str, Any]:
-    """CMC and Chainlink PoR inputs this score used.
+    """Every scoring input retained on the report.
 
     The scorer does not keep raw HTTP bodies. The CMC block is the quote
     and market-pair values it kept (``price``, ``basis``) plus ``cik``,
@@ -167,40 +218,71 @@ def attestation_inputs(report: dict[str, Any]) -> dict[str, Any]:
     journal is not included: a warm directory cache drops endpoints on
     the next score of the same ticker, and that must not change the hash.
 
-    The Chainlink block is one object per pillar whose verification
-    ``source`` is ``chainlink_por``. Fields are the feed and the round that
-    was scored. ``rpc_url`` is left out — it is transport and may embed a
-    provider secret.
+    ``heuristics`` is the issuer name-list flags that set backing, reserves,
+    and redemption when the live verifier did not run.
+
+    ``verifiers`` is one object per pillar, including non-PoR pillars.
+    Each object is ``source`` plus ``meta`` (the verifier's raw observations).
+    Explanation prose (``evidence``, ``notes``, ``explanations``) is an
+    output, not an input, and is left out.
+
+    ``chainlink_por`` repeats the feed and round for each pillar whose
+    ``source`` is ``chainlink_por``, so a PoR round can be read without
+    walking every pillar. ``rpc_url`` is left out of every block — it is
+    transport and may embed a provider secret.
     """
     verification = report.get("verification") or {}
+    verifiers: dict[str, Any] = {}
     por: list[dict[str, Any]] = []
     if isinstance(verification, dict):
         for pillar in PILLAR_KEYS:
             block = verification.get(pillar) or {}
             if not isinstance(block, dict):
-                continue
-            if block.get("source") != "chainlink_por":
-                continue
-            meta = block.get("meta") or {}
-            if not isinstance(meta, dict):
-                meta = {}
-            por.append({"pillar": pillar, **{key: meta.get(key) for key in _POR_INPUT_KEYS}})
+                block = {}
+            meta = block.get("meta") if isinstance(block.get("meta"), dict) else {}
+            meta = _without_secrets(meta)
+            verifiers[pillar] = {"source": block.get("source"), "meta": meta}
+            if block.get("source") == "chainlink_por":
+                por.append(
+                    {"pillar": pillar, **{key: meta.get(key) for key in _POR_INPUT_KEYS}}
+                )
+    heuristics = report.get("heuristics")
+    if isinstance(heuristics, dict):
+        heuristics = _without_secrets(heuristics)
+    else:
+        heuristics = None
     return {
         "cmc": {
-            "price": report.get("price"),
-            "basis": report.get("basis"),
+            "price": _without_secrets(report.get("price")),
+            "basis": _without_secrets(report.get("basis")),
             "cik": report.get("cik"),
             "rwa_id": report.get("rwa_id"),
             "issuer": report.get("issuer"),
             "data_source": report.get("data_source"),
         },
+        "heuristics": heuristics,
+        "verifiers": verifiers,
         "chainlink_por": por,
     }
 
 
 def inputs_digest(report: dict[str, Any]) -> str:
-    """``0x`` + SHA-256 of the canonical CMC / Chainlink input JSON."""
-    return _hash_bytes(canonical_bytes(attestation_inputs(report)))
+    """``0x`` + SHA-256 of the canonical scoring-input JSON."""
+    return recompute_inputs_digest(attestation_inputs(report))
+
+
+def recompute_inputs_digest(inputs: dict[str, Any]) -> str:
+    """``0x`` + SHA-256 of already-built scoring inputs.
+
+    ``verify`` calls this on the bytes stored next to the payload. The
+    result must equal ``payload["inputs_digest"]``.
+    """
+    return _hash_bytes(canonical_bytes(inputs))
+
+
+def inputs_bytes(report: dict[str, Any]) -> bytes:
+    """Canonical JSON bytes of :func:`attestation_inputs`. Stored beside the payload."""
+    return canonical_bytes(attestation_inputs(report))
 
 
 def attestation_payload(
@@ -231,6 +313,7 @@ def attestation_payload(
         "verification": verification,
         "basis": report.get("basis"),
         "as_of": _as_of(report, now),
+        "data_as_of": data_as_of(report),
         "scorer_version": _scorer_version(report),
         "inputs_digest": inputs_digest(report),
     }

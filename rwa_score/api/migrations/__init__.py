@@ -192,6 +192,17 @@ CREATE INDEX IF NOT EXISTS idx_attested_payloads_ticker
     ON attested_payloads(ticker, stored_at);
 """
 
+# Scoring inputs (canonical JSON) stored beside the payload so inputs_digest
+# can be recomputed without re-scoring. Nullable: rows written before this
+# revision have no inputs blob.
+SQLITE_004 = """
+ALTER TABLE attested_payloads ADD COLUMN inputs_json BLOB;
+"""
+
+POSTGRES_004 = """
+ALTER TABLE attested_payloads ADD COLUMN IF NOT EXISTS inputs_json BYTEA;
+"""
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -204,6 +215,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration("001_initial", SQLITE_001, POSTGRES_001),
     Migration("002_history_tenant", SQLITE_002, POSTGRES_002),
     Migration("003_attested_payloads", SQLITE_003, POSTGRES_003),
+    Migration("004_attestation_inputs", SQLITE_004, POSTGRES_004),
 )
 
 
