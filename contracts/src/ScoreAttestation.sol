@@ -13,6 +13,7 @@ contract ScoreAttestation {
     uint256 public constant DEFAULT_FEE = 0.001 ether;
 
     address public owner;
+    address public pendingOwner;
     uint256 public attestationFee;
 
     struct Record {
@@ -29,14 +30,20 @@ contract ScoreAttestation {
 
     event ScoreAttested(string ticker, bytes32 scoreHash, uint256 timestamp, address attester);
     event AttesterUpdated(address indexed attester, bool allowed);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     error InsufficientFee();
     error EmptyHash();
     error EmptyTicker();
+    error EmptyTimestamp();
+    error FutureTimestamp();
     error ZeroAttester();
     error AlreadyAttested();
     error NotOwner();
+    error NotPendingOwner();
     error NotAttester();
+    error WithdrawFailed();
 
     constructor(uint256 fee_) {
         owner = msg.sender;
@@ -48,6 +55,24 @@ contract ScoreAttestation {
     /// @notice Owner is always authorized, even if later removed from the map.
     function authorized(address who) public view returns (bool) {
         return who == owner || isAttester[who];
+    }
+
+    /// @notice Start a two-step owner rotation. `newOwner` must call `acceptOwnership`.
+    ///         The previous owner stays an attester until `setAttester` revokes them.
+    function transferOwnership(address newOwner) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (newOwner == address(0)) revert ZeroAttester();
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    /// @notice Finish a two-step rotation. Only the pending owner can accept.
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        address previous = owner;
+        owner = msg.sender;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previous, owner);
     }
 
     /// @notice Allowlist or revoke a relayer / API-held key. Owner only.
@@ -67,6 +92,9 @@ contract ScoreAttestation {
         if (msg.value < attestationFee) revert InsufficientFee();
         if (scoreHash == bytes32(0)) revert EmptyHash();
         if (bytes(ticker).length == 0) revert EmptyTicker();
+        if (timestamp == 0) revert EmptyTimestamp();
+        // Observation time may be in the past. It may not be in the future.
+        if (timestamp > block.timestamp) revert FutureTimestamp();
         if (attested[scoreHash]) revert AlreadyAttested();
 
         address attester = msg.sender;
@@ -111,9 +139,16 @@ contract ScoreAttestation {
         attestationFee = fee_;
     }
 
+    /// @notice Send the full balance to `to`. Uses all remaining gas, not the 2300 stipend.
     function withdraw(address payable to) external {
         if (msg.sender != owner) revert NotOwner();
         if (to == address(0)) revert ZeroAttester();
-        to.transfer(address(this).balance);
+        uint256 amount = address(this).balance;
+        bool ok;
+        assembly {
+            // out-size 0: do not copy a returndata bomb into memory.
+            ok := call(gas(), to, amount, 0, 0, 0, 0)
+        }
+        if (!ok) revert WithdrawFailed();
     }
 }

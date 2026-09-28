@@ -16,11 +16,12 @@ It locks a hash. It does not store the score, the band, or the pillar breakdown.
 
 ## Limits
 
-- `timestamp` is an argument. It is not `block.timestamp`. A compromised owner or attester key can lock any hash with any time. That key is the trust boundary. The contract cannot tell a wrong score from a right one.
-- There is no `transferOwnership`. The deployer stays the only address that can change attesters, change the fee, or withdraw. The owner remains authorized even if removed from the attester map.
-- `withdraw` uses `transfer`, which forwards 2300 gas. A contract recipient that needs more gas reverts, and the ETH stays in the contract.
+- `timestamp` is the observation time the attester submits. It cannot be zero and it cannot be after `block.timestamp`. A compromised attester key can still lock any hash with a past time. That key is the trust boundary. The contract cannot tell a wrong score from a right one.
+- Owner rotation is two-step: `transferOwnership`, then `acceptOwnership`. The previous owner stays on the attester list until `setAttester` revokes them. The owner remains authorized even if removed from that list.
+- `withdraw` forwards the remaining gas with `call`, so a contract wallet that writes storage can receive the fee. It does not copy returndata.
 - A payment above `attestationFee` is kept. The owner withdraws the balance.
 - A locked hash does not mean the off-chain score was computed correctly. It means an authorized key published that hash.
+- This bytecode is not what is already on Base Sepolia until that deployment is replaced. Do not treat an older deployment as having these checks.
 
 ## Not claimed
 
