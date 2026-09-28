@@ -21,11 +21,16 @@ from fastapi.testclient import TestClient
 from rwa_score.api.app import create_app
 from rwa_score.api.attest import attestation_payload, canonical_bytes
 from rwa_score.api.auto_attest import (
+    HARD_GAS_CAP,
+    PINNED_ATTESTATION_CONTRACT,
+    RECEIPT_TIMEOUT_SECONDS,
+    RPC_TIMEOUT_SECONDS,
     AlreadyAttestedError,
     AttestWorker,
     AttesterSettings,
     TerminalAttestError,
     Web3Chain,
+    _assert_dedicated_attester,
     redact,
 )
 from rwa_score.api.settings import ApiSettings
@@ -280,8 +285,9 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
                 "create",
                 "--rpc-url",
                 rpc,
-                "--private-key",
-                ANVIL_ACCOUNT_0,
+                "--unlocked",
+                "--from",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
                 "--broadcast",
                 "src/ScoreAttestation.sol:ScoreAttestation",
                 "--constructor-args",
@@ -309,8 +315,9 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
                 "true",
                 "--rpc-url",
                 rpc,
-                "--private-key",
-                ANVIL_ACCOUNT_0,
+                "--unlocked",
+                "--from",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
             ],
             stdout=subprocess.DEVNULL,
         )
@@ -323,8 +330,9 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
                 "0",
                 "--rpc-url",
                 rpc,
-                "--private-key",
-                ANVIL_ACCOUNT_0,
+                "--unlocked",
+                "--from",
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
             ],
             stdout=subprocess.DEVNULL,
         )
@@ -336,6 +344,7 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
             gas_limit=300_000,
             max_attempts=3,
             backoff_seconds=0.0,
+            enforce_contract_pin=False,
         )
         chain = Web3Chain(settings)
         assert chain.chain_id() == 84532
@@ -375,6 +384,117 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_sca_refuses_unpinned_contract_and_wrong_configured_chain(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    store = Store(tmp_path / "pin.sqlite")
+    digest, claimed = _seed(store, fixture_scorer)
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    bad_contract = _settings("0x" + "77" * 32, contract="0x" + "ab" * 20)
+    worker = _worker(store, bad_contract, chain)
+    assert worker.process_once(now=1.0) is True
+    assert "pinned" in (store.latest_attest_job(digest)["last_error"] or "")
+    chain.chain_id.assert_not_called()
+    chain.attest.assert_not_called()
+
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed, force=True)
+    bad_chain = _settings("0x" + "77" * 32, chain_id=1)
+    worker = _worker(store, bad_chain, chain)
+    assert worker.process_once(now=2.0) is True
+    failed = store.latest_attest_job(digest)
+    assert failed["status"] == "failed"
+    assert "configured chain id" in (failed["last_error"] or "")
+    chain.attest.assert_not_called()
+
+
+def test_sca_refuses_hash_the_scorer_did_not_store(tmp_path: Path) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    store = Store(tmp_path / "unstored.sqlite")
+    digest = "0x" + "ab" * 32
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=0)
+    worker = _worker(store, _settings("0x" + "88" * 32), chain)
+    assert worker.process_once(now=1.0) is True
+    job = store.latest_attest_job(digest)
+    assert job["status"] == "failed"
+    assert "not stored" in (job["last_error"] or "")
+    chain.attest.assert_not_called()
+    chain.chain_id.assert_not_called()
+
+
+def test_sca_timeout_after_send_is_success_when_verify_is_true(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.side_effect = [
+        (False, 0, "0x" + "00" * 20),
+        (True, 1_700_000_222, "0x" + "cd" * 20),
+    ]
+    chain.attest.side_effect = TimeoutError("receipt timeout")
+    store = Store(tmp_path / "timeout.sqlite")
+    digest, claimed = _seed(store, fixture_scorer)
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    worker = _worker(store, _settings("0x" + "99" * 32), chain)
+    assert worker.process_once(now=1.0) is True
+    job = store.latest_attest_job(digest)
+    assert job["status"] == "confirmed"
+    assert job["attested_at"] == 1_700_000_222
+    assert "failed" not in (job["last_error"] or "")
+
+
+def test_sca_gas_cap_and_subject_bounds(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    store = Store(tmp_path / "bounds.sqlite")
+    digest, claimed = _seed(store, fixture_scorer)
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    worker = _worker(store, _settings("0x" + "ab" * 32, gas_limit=HARD_GAS_CAP + 1), chain)
+    assert worker.process_once(now=1.0) is True
+    assert "gas cap" in (store.latest_attest_job(digest)["last_error"] or "")
+    chain.attest.assert_not_called()
+    assert RPC_TIMEOUT_SECONDS <= 30
+    assert RECEIPT_TIMEOUT_SECONDS <= 120
+    assert HARD_GAS_CAP == 500_000
+    with pytest.raises(TerminalAttestError):
+        _assert_dedicated_attester(
+            signer="0x" + "11" * 20,
+            owner="0x" + "11" * 20,
+            is_attester=True,
+        )
+    with pytest.raises(TerminalAttestError):
+        _assert_dedicated_attester(
+            signer="0x" + "22" * 20,
+            owner="0x" + "11" * 20,
+            is_attester=False,
+        )
+
+
+def test_sca_unauthenticated_attest_does_not_enqueue(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    api = ApiSettings(db_path=tmp_path / "api.sqlite")
+    store = Store(api.db_path)
+    app = create_app(settings=api, store=store, scorer=fixture_scorer, start_worker=False)
+    resp = TestClient(app).get("/v1/attest/NVDA")
+    assert resp.status_code == 401
+    assert store.latest_attested_payload("NVDA") is None
+
+
+def test_sca_no_private_key_flag_in_signer_or_runbook() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for rel in (
+        "rwa_score/api/auto_attest.py",
+        "contracts/ATTESTER_RUNBOOK.md",
+        "rwa_score/api/app.py",
+    ):
+        assert "--private-key" not in (root / rel).read_text(encoding="utf-8")
+    assert PINNED_ATTESTATION_CONTRACT == "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
 
 
 def test_web3_chain_refuses_to_build_when_disabled() -> None:

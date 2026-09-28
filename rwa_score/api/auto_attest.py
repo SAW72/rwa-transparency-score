@@ -17,13 +17,16 @@ API says so. It does not crash and it does not send.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from rwa_score.api.attest import hash_canonical
 from rwa_score.api.settings import BASE_SEPOLIA_CHAIN_ID
 
 logger = logging.getLogger(__name__)
@@ -36,9 +39,17 @@ DISABLED_REASON = (
     "No transaction was sent."
 )
 DEFAULT_GAS_LIMIT = 300_000
+# Hard ceiling. Env may set a lower cap. Measured attest max is about 210495.
+HARD_GAS_CAP = 500_000
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_SECONDS = 2.0
+RPC_TIMEOUT_SECONDS = 20
+RECEIPT_TIMEOUT_SECONDS = 60
+# Fixture scores use as_of 0. Anything past year 2100 is not a unix second.
+AS_OF_MAX = 4_102_444_800
+PINNED_ATTESTATION_CONTRACT = "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
+_TICKER_RE = re.compile(r"[A-Za-z0-9]{1,16}")
 
 _ATTEST_ABI = [
     {
@@ -73,6 +84,20 @@ _ATTEST_ABI = [
         "inputs": [],
         "outputs": [{"name": "", "type": "uint256"}],
     },
+    {
+        "name": "owner",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "address"}],
+    },
+    {
+        "name": "isAttester",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "who", "type": "address"}],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
 ]
 
 
@@ -102,6 +127,8 @@ class _RedactFilter(logging.Filter):
                 redact(item, self._secret) if isinstance(item, str) else item
                 for item in record.args
             )
+        record.exc_info = None
+        record.exc_text = None
         return True
 
 
@@ -109,7 +136,10 @@ def _env_int(name: str, default: int) -> int:
     raw = (os.getenv(name) or "").strip()
     if not raw:
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -132,6 +162,8 @@ class AttesterSettings:
         gas_limit: int = DEFAULT_GAS_LIMIT,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
+        chain_id: int = BASE_SEPOLIA_CHAIN_ID,
+        enforce_contract_pin: bool = True,
     ) -> None:
         self._private_key = (private_key or "").strip()
         self.contract = (contract or "").strip()
@@ -140,6 +172,8 @@ class AttesterSettings:
         self.gas_limit = int(gas_limit)
         self.max_attempts = int(max_attempts)
         self.backoff_seconds = float(backoff_seconds)
+        self.chain_id = int(chain_id)
+        self.enforce_contract_pin = bool(enforce_contract_pin)
         if self._private_key:
             logger.addFilter(_RedactFilter(self._private_key))
 
@@ -181,6 +215,7 @@ class AttesterSettings:
             gas_limit=_env_int("RWA_ATTEST_GAS_LIMIT", DEFAULT_GAS_LIMIT),
             max_attempts=_env_int("RWA_ATTEST_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS),
             backoff_seconds=_env_float("RWA_ATTEST_BACKOFF_SECONDS", DEFAULT_BACKOFF_SECONDS),
+            chain_id=_env_int("RWA_ATTESTATION_CHAIN_ID", BASE_SEPOLIA_CHAIN_ID),
         )
 
 
@@ -223,7 +258,50 @@ def _hash_bytes(score_hash: str) -> bytes:
         raw = raw[2:]
     if len(raw) != 64:
         raise TerminalAttestError("score hash must be 32 bytes")
-    return bytes.fromhex(raw)
+    try:
+        return bytes.fromhex(raw)
+    except ValueError as exc:
+        raise TerminalAttestError("score hash must be 32 bytes") from None
+
+
+def _validate_subject(score_hash: str, ticker: str, claimed_at: int) -> None:
+    """Ticker, 32-byte hash, and a unix as_of. Raises before any send."""
+    _hash_bytes(score_hash)
+    symbol = str(ticker or "")
+    if _TICKER_RE.fullmatch(symbol) is None:
+        raise TerminalAttestError("ticker must be 1-16 letters or digits")
+    when = int(claimed_at)
+    if when < 0 or when > AS_OF_MAX:
+        raise TerminalAttestError("as_of is not a unix second")
+
+
+def _assert_dedicated_attester(*, signer: str, owner: str, is_attester: bool) -> None:
+    """The signer is an allowlisted attester, not the contract owner."""
+    if signer.lower() == owner.lower():
+        raise TerminalAttestError("refusing owner key; use a dedicated attester")
+    if not is_attester:
+        raise TerminalAttestError("signer is not an attester on this contract")
+
+
+def _require_stored(store: Any, job: dict[str, Any]) -> None:
+    """Only hashes this process stored from the scorer may be sent."""
+    row = store.get_attested_payload(job["score_hash"])
+    if row is None:
+        raise TerminalAttestError("refusing hash that was not stored by the scorer")
+    raw = row["canonical"]
+    if hash_canonical(raw) != row["score_hash"] or row["score_hash"] != job["score_hash"]:
+        raise TerminalAttestError("stored payload does not match its hash")
+    payload = json.loads(raw.decode("utf-8"))
+    if str(payload.get("ticker")) != str(job["ticker"]):
+        raise TerminalAttestError("ticker does not match stored payload")
+    if int(payload.get("as_of")) != int(job["claimed_at"]):
+        raise TerminalAttestError("as_of does not match stored payload")
+    _validate_subject(job["score_hash"], str(job["ticker"]), int(job["claimed_at"]))
+
+
+def _tx_hex(tx_hash: Any) -> str:
+    text = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+    return text if text.startswith("0x") else "0x" + text
 
 
 def _is_already(exc: BaseException) -> bool:
@@ -241,8 +319,13 @@ class Web3Chain:
         from web3 import Web3
 
         self._settings = settings
-        self._w3 = Web3(Web3.HTTPProvider(settings.rpc_url, request_kwargs={"timeout": 20}))
-        self._account = Account.from_key(settings.private_key)
+        self._w3 = Web3(
+            Web3.HTTPProvider(settings.rpc_url, request_kwargs={"timeout": RPC_TIMEOUT_SECONDS})
+        )
+        try:
+            self._account = Account.from_key(settings.private_key)
+        except Exception:
+            raise TerminalAttestError("invalid attester key") from None
         self._contract = self._w3.eth.contract(
             address=Web3.to_checksum_address(settings.contract),
             abi=_ATTEST_ABI,
@@ -296,12 +379,16 @@ class Web3Chain:
             raise TerminalAttestError(
                 f"refusing eth_chainId {chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
             )
+        owner = str(self._contract.functions.owner().call())
+        allowed = bool(self._contract.functions.isAttester(self._account.address).call())
+        _assert_dedicated_attester(signer=self._account.address, owner=owner, is_attester=allowed)
         if self._nonce is None:
             self._nonce = int(
                 self._w3.eth.get_transaction_count(self._account.address, "pending")
             )
         nonce = self._nonce
         fn = self._contract.functions.attest(_hash_bytes(score_hash), ticker, int(claimed_at))
+        tx_hash = None
         try:
             tx = fn.build_transaction(
                 {
@@ -317,24 +404,47 @@ class Web3Chain:
             if raw is None:
                 raw = signed.rawTransaction
             tx_hash = self._w3.eth.send_raw_transaction(raw)
+            self._nonce = nonce + 1
+            receipt = self._w3.eth.wait_for_transaction_receipt(
+                tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS
+            )
         except Exception as exc:
             self._nonce = None
             if _is_already(exc):
-                raise AlreadyAttestedError("AlreadyAttested") from exc
-            raise
-        self._nonce = nonce + 1
-        try:
-            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        except Exception:
-            self._nonce = None
-            raise
+                raise AlreadyAttestedError("AlreadyAttested") from None
+            if tx_hash is not None:
+                landed = self._landed(tx_hash, score_hash, ticker)
+                if landed:
+                    return landed
+            raise RuntimeError(redact(str(exc), self._settings.private_key)) from None
         if int(receipt.status) != 1:
             self._nonce = None
+            landed = self._landed(tx_hash, score_hash, ticker)
+            if landed:
+                return landed
             reason = _revert_blob(self._w3, tx)
             if _is_already(RuntimeError(reason)):
-                raise AlreadyAttestedError("AlreadyAttested")
-            raise RuntimeError(redact(f"attest receipt status 0: {reason}", self._settings.private_key))
-        return tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+                raise AlreadyAttestedError("AlreadyAttested") from None
+            raise RuntimeError(
+                redact(f"attest receipt status 0: {reason}", self._settings.private_key)
+            ) from None
+        return _tx_hex(tx_hash)
+
+    def _landed(self, tx_hash: Any, score_hash: str, ticker: str) -> str | None:
+        """Receipt or verify says the hash is on chain. Do not mark that as failed."""
+        try:
+            receipt = self._w3.eth.get_transaction_receipt(tx_hash)
+        except Exception:
+            receipt = None
+        if receipt is not None and int(getattr(receipt, "status", 0)) == 1:
+            return _tx_hex(tx_hash)
+        try:
+            ok, _ts, _who = self.verify(score_hash, ticker)
+        except Exception:
+            ok = False
+        if ok:
+            return _tx_hex(tx_hash)
+        return None
 
 
 def _revert_blob(w3: Any, tx: dict[str, Any]) -> str:
@@ -347,6 +457,17 @@ def _revert_blob(w3: Any, tx: dict[str, Any]) -> str:
 
 def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> SendOutcome:
     """Pre-check ``verify``, then send. ``AlreadyAttested`` is success."""
+    if int(settings.chain_id) != BASE_SEPOLIA_CHAIN_ID:
+        raise TerminalAttestError(
+            f"refusing configured chain id {settings.chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
+        )
+    if settings.enforce_contract_pin and settings.contract.lower() != PINNED_ATTESTATION_CONTRACT.lower():
+        raise TerminalAttestError(
+            f"refusing contract; pinned to {PINNED_ATTESTATION_CONTRACT}"
+        )
+    if settings.gas_limit <= 0 or settings.gas_limit > HARD_GAS_CAP:
+        raise TerminalAttestError(f"gas cap must be 1..{HARD_GAS_CAP}")
+    _validate_subject(str(job["score_hash"]), str(job["ticker"]), int(job["claimed_at"]))
     chain_id = int(chain.chain_id())
     if chain_id != BASE_SEPOLIA_CHAIN_ID:
         raise TerminalAttestError(
@@ -375,6 +496,13 @@ def send_one(job: dict[str, Any], chain: Chain, settings: AttesterSettings) -> S
             attested_at=int(ts2) if ok2 else None,
             already=True,
         )
+    except TerminalAttestError:
+        raise
+    except Exception:
+        ok_late, ts_late, _who_late = chain.verify(job["score_hash"], job["ticker"])
+        if ok_late:
+            return SendOutcome(tx_hash=None, attested_at=int(ts_late), already=True)
+        raise
     ok3, ts3, _who3 = chain.verify(job["score_hash"], job["ticker"])
     return SendOutcome(
         tx_hash=tx_hash,
@@ -483,6 +611,7 @@ class AttestWorker:
             return False
         secret = self.settings.private_key
         try:
+            _require_stored(self.store, job)
             outcome = send_one(job, self.chain(), self.settings)
         except TerminalAttestError as exc:
             safe = redact(str(exc), secret)

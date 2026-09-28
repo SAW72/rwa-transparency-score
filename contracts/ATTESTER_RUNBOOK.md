@@ -1,9 +1,10 @@
 # Attester runbook (Spencer only)
 
 Agents never broadcast, never deploy, and never read or commit a private key.
-Every `cast send` below is **Spencer only**. Use `cast send --account`. Do not
-pass `--private-key`. Create the attester key on your own machine, not on an
-agent machine, and put it in the Render dashboard yourself.
+Every `cast send` below is **Spencer only**. Use `cast send --account` and a
+keystore. Do not put the key on the command line. Create the attester key on
+your own machine, not on an agent machine, and put it in the Render dashboard
+yourself.
 
 Live contract (Base Sepolia, chain id **84532** only):
 
@@ -262,6 +263,44 @@ fi
 Read-only follow-up: `isAttester` should be false. The owner stays authorized
 even if removed from the attester list. Revoking the dedicated key does not
 remove the owner.
+
+The worker refuses to sign if its address is `owner()`. Use a dedicated
+attester. Keep that address's balance small (section 4): `setFee(0)` means
+the only spend is gas.
+
+## 5b. Rotate the attester (Spencer only)
+
+Order is fixed: revoke the old key, then allow the new one. Do not leave
+both set unless you mean to. The new key is another keystore you created
+off any agent machine. Set `RWA_ATTESTER_PRIVATE_KEY` on
+`rwa-transparency-score-api` to the new key only after `isAttester` for the
+new address is true, and remove the old key from the dashboard.
+
+```bash
+export OLD_ATTESTER="<address currently allowlisted>"
+export NEW_ATTESTER="<address of the new keystore>"
+```
+
+**Spencer only. Agents never broadcast.**
+
+```bash
+if [ "$(cast chain-id --rpc-url "$BASE_SEPOLIA_RPC_URL")" = "84532" ]; then
+  cast send "$SCORE_ATTESTATION" "setAttester(address,bool)" "$OLD_ATTESTER" false \
+    --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+    --account "$OWNER_ACCOUNT" \
+    --sender "$OWNER"
+  cast send "$SCORE_ATTESTATION" "setAttester(address,bool)" "$NEW_ATTESTER" true \
+    --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+    --account "$OWNER_ACCOUNT" \
+    --sender "$OWNER"
+else
+  echo "skip send: chain is not Base Sepolia 84532"
+fi
+```
+
+Read-only: `isAttester` is false for `OLD_ATTESTER` and true for `NEW_ATTESTER`.
+`owner()` is still `0x714b8546E5F006E0E74ec23FbafcF8e7F33a081f`. Top up
+`NEW_ATTESTER` with the section 4 value (`0.002ether`), not more.
 
 ## 6. Live end-to-end check (Spencer only, Base Sepolia)
 
