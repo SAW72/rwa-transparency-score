@@ -10,7 +10,9 @@
 Does not re-score. Save the JSON ``POST /v1/attest/{ticker}`` returned and
 pass it as ``--payload-file``. The API does not keep a copy.
 Exit codes: 0 match (or --offline local check; prints that nothing was
-checked on-chain), 1 payload file missing or not a bundle, 3 bytes or
+checked on-chain), 1 ran without --payload-file (message: supply
+--payload-file (the JSON returned by POST /v1/attest); same exit when
+the path is missing or the file is not a bundle), 3 bytes or
 inputs_digest mismatch, 4 ticker / chain / attested / verify() / attester /
 receipt mismatch (including --hash for another ticker), 5 RPC failed,
 6 cast missing, 7 no RPC URL and --offline not passed.

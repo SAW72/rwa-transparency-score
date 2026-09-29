@@ -552,18 +552,34 @@ to                   0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 
 ### 6.5 `verify.py` against the saved payload
 
-Save the POST body. The API does not keep it. Pass that file as
-`--payload-file`. The command below passes `--rpc-url` and `--attester`,
-so a confirmed bundle is exit `0` with `"match": true`. It does not use
-`--offline`. The chain read uses `attested`, `getAttestation`, `verify`,
-and the `ScoreAttested` log on `tx_hash`. The digest is SHA-256 of the
-canonical bytes. The contract stores that hash. It does not keccak the
-payload.
+The live check is: `POST /v1/attest/NVDA` (section 6.3), save that JSON
+to a file, then verify the file. The API does not keep a copy. Do not
+POST again here. `/tmp/nvda-attest.json` is the response from 6.3.
+
+```bash
+python -m rwa_score.api.verify NVDA --json \
+  --payload-file /tmp/nvda-attest.json \
+  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+  --attester "$ATTESTER_ADDRESS"
+```
+
+Expected process exit code: `0`. Expected JSON has `"match": true`.
+
+A run with no `--payload-file` exits `1` and prints
+`supply --payload-file (the JSON returned by POST /v1/attest)`.
+It does not say that a stored payload is missing.
+
+The command passes `--payload-file`, `--rpc-url`, and `--attester`. It
+does not use `--offline`. The chain read uses `attested`,
+`getAttestation`, `verify`, and the `ScoreAttested` log on `tx_hash`.
+The digest is SHA-256 of the canonical bytes. The contract stores that
+hash. It does not keccak the payload. `--contract` defaults to the
+pinned address.
 
 | Exit | Meaning |
 | --- | --- |
 | `0` | Canonical bytes match their hash and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
-| `1` | `--payload-file` is missing, does not exist, or is not a payload bundle. |
+| `1` | Ran without `--payload-file`. The message is `supply --payload-file (the JSON returned by POST /v1/attest)`. The same exit is used when the path does not exist or the file is not a bundle. |
 | `3` | Tampered or malformed bytes, or inputs in the file do not recompute `inputs_digest`. |
 | `4` | Ticker mismatch, chain id is not 84532, `attested` / `verify()` is false, the attester mismatches, or the receipt event does not match. |
 | `5` | RPC / cast call failed. |
@@ -571,17 +587,6 @@ payload.
 | `7` | No `--rpc-url` and `BASE_SEPOLIA_RPC_URL` unset, and `--offline` was not passed. |
 
 Exit `2` (nothing stored) and exit `8` (inputs missing) are retired.
-
-```bash
-cp /tmp/nvda-attest.json /tmp/nvda.payload.json
-python -m rwa_score.api.verify NVDA --json \
-  --payload-file /tmp/nvda.payload.json \
-  --contract 0x2F073a3628D498d92956e7eFE2b26633eDa75b00 \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
-  --attester "$ATTESTER_ADDRESS"
-```
-
-Expected process exit code: `0`.
 
 Expected JSON fields:
 

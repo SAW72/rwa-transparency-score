@@ -382,9 +382,16 @@ def test_verify_requires_payload_file(capsys) -> None:
     assert payload["on_chain"] is None
     assert payload["match"] is False
     assert "does not re-score" in payload["note"]
-    assert "payload-file is required" in payload["note"]
+    assert "supply --payload-file (the JSON returned by POST /v1/attest)" in payload["note"]
     assert "no stored payload" not in payload["note"]
+    assert "nothing stored" not in payload["note"]
     assert "pre-fix" not in payload["note"]
+    plain = main(["NVDA"])
+    assert plain == EXIT_DB
+    text = capsys.readouterr().out
+    assert "supply --payload-file (the JSON returned by POST /v1/attest)" in text
+    assert "no stored payload" not in text
+    assert "nothing stored" not in text
 
 
 def test_verify_tampered_bytes_exit_nonzero(capsys, tmp_path: Path) -> None:
@@ -693,8 +700,9 @@ def test_missing_payload_file_is_exit_1(capsys) -> None:
     body = json.loads(capsys.readouterr().out)
     assert code == EXIT_DB
     assert code != EXIT_NOT_STORED
-    assert "payload-file is required" in body["note"]
+    assert "supply --payload-file (the JSON returned by POST /v1/attest)" in body["note"]
     assert "no stored payload" not in body["note"]
+    assert "nothing stored" not in body["note"]
     assert "pre-fix" not in body["note"]
 
 

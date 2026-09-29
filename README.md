@@ -311,7 +311,7 @@ python scripts/verify_attestation.py NVDA --payload-file nvda.json --rpc-url "$B
 | Exit | Meaning |
 | --- | --- |
 | `0` | Canonical bytes match their hash and the chain read matched (`attested`, `getAttestation`, `verify`, and the receipt event when `tx_hash` is present). Also `0` with `--offline` when the local checks pass; the output says nothing was checked on-chain. Inputs are checked only when the file includes them. |
-| `1` | `--payload-file` is missing, does not exist, or is not a payload bundle. A missing path is not created. |
+| `1` | Ran without `--payload-file`. The message is `supply --payload-file (the JSON returned by POST /v1/attest)`. The same exit is used when the path does not exist or the file is not a bundle. A missing path is not created. This is not a stored-row error. |
 | `3` | Tampered or malformed bytes, or inputs in the file do not recompute `inputs_digest`. |
 | `4` | Ticker mismatch, chain id is not 84532, `attested` / `verify()` is false, the attester mismatches, or the receipt event does not match. |
 | `5` | RPC / cast call failed. |

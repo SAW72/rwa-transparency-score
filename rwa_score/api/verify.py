@@ -16,7 +16,10 @@ Exit codes:
   ``--offline`` is also ``0`` when the local checks pass; that mode
   prints that nothing was checked on-chain. Inputs are checked only
   when the file includes them.
-- ``1`` ``--payload-file`` is missing, does not exist, or is not a bundle
+- ``1`` ran without ``--payload-file``. The message is
+  ``supply --payload-file (the JSON returned by POST /v1/attest)``.
+  The same exit is used when the path does not exist or the file is not
+  a bundle. It is not a stored-row error.
 - ``3`` bytes do not match the hash, the payload is malformed, or inputs
   in the file do not recompute ``inputs_digest``
 - ``4`` ticker mismatch, chain id is not 84532, ``attested`` / ``verify``
@@ -59,6 +62,8 @@ from .settings import BASE_SEPOLIA_CHAIN_ID
 
 EXIT_OK = 0
 EXIT_DB = 1
+# Spoken when the flag is omitted. Exit 1. Not a stored-row error.
+PAYLOAD_FILE_SUPPLY = "supply --payload-file (the JSON returned by POST /v1/attest)"
 # Retired. Nothing is stored, so a missing file is exit 1, not a missing row.
 EXIT_NOT_STORED = 2
 EXIT_HASH_MISMATCH = 3
@@ -529,9 +534,8 @@ def main(argv: list[str] | None = None) -> int:
             "hash_ok": False,
             "error": "payload_missing",
             "note": (
-                "--payload-file is required. "
-                "Save the JSON from POST /v1/attest/{ticker} and pass that file. "
-                "verify does not re-score and does not invent canonical bytes."
+                PAYLOAD_FILE_SUPPLY
+                + ". verify does not re-score and does not invent canonical bytes."
                 + ignored_note
             ),
         }
@@ -706,7 +710,6 @@ def _emit(result: dict[str, Any], *, as_json: bool) -> None:
         print(json.dumps(result, indent=2))
         return
     if not result.get("stored"):
-        print(f"{result['ticker']}: nothing stored")
         print(result["note"])
         return
     print(f"{result['ticker']} score={result['score']} [{result['band']}]")

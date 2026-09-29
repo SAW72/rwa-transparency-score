@@ -99,11 +99,12 @@ Default fee is **0.001 ETH** per attestation (covers gas + a small revenue line)
 
 ```bash
 python scripts/verify_attestation.py NVDA \
+  --payload-file /tmp/nvda-attest.json \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
   --attester "$ATTESTER_ADDRESS"
 ```
 
-`--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. `--fixtures` is obsolete and only warns. `cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key. Exit codes are `0` match (or `--offline` local check), `1` database, `2` nothing stored, `3` bytes or inputs mismatch, `4` ticker / chain / attester, `5` RPC, `6` `cast` missing, `7` no RPC URL and no `--offline`, `8` `inputs_json` missing. The table is in the root README.
+`--payload-file` is the JSON returned by `POST /v1/attest`. Omitting it exits `1` with `supply --payload-file (the JSON returned by POST /v1/attest)`. `--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. `--fixtures` is obsolete and only warns. `cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key. Live exits are `0`, `1`, `3`, `4`, `5`, `6`, `7`. Exit `2` and exit `8` are retired. The table is in the root README.
 
 ## Hash algorithm
 
