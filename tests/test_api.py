@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,14 +11,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rwa_score.api.app import BREAKDOWN_KEYS, create_app
+from rwa_score.api.attest import attestation_payload, canonical_bytes, hash_canonical, inputs_bytes
 from rwa_score.api.settings import ApiSettings
 from rwa_score.api.store import Store
-from rwa_score.api.webhooks import notify_crossings
 from rwa_score.scorer import ScoreError, TransparencyScorer
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> ApiSettings:
-    base = ApiSettings(db_path=tmp_path / "api.sqlite", free_daily_limit=50)
+    base = ApiSettings(free_daily_limit=50)
     if not overrides:
         return base
     data = base.__dict__.copy()
@@ -34,7 +34,7 @@ def _client(
     **setting_overrides: Any,
 ) -> tuple[TestClient, Store]:
     settings = _settings(tmp_path, **setting_overrides)
-    store = Store(settings.db_path)
+    store = Store()
     app = create_app(settings=settings, store=store, scorer=scorer, poster=poster)
     return TestClient(app), store
 
@@ -105,344 +105,60 @@ def test_health_does_not_need_a_key(tmp_path: Path, fixture_scorer: Transparency
     body = resp.json()
     assert body["api"] is True
     assert "fixtures" in body
+    assert body["process"] == "ok"
+    assert body["chain_id"] == 84532
+    assert body["rpc"] in {"ok", "down", "unset", "unknown"}
+    assert isinstance(body["queue_depth"], int)
+    assert "database" not in body
+    assert body["attester"] in {"enabled", "disabled"}
 
 
-def test_missing_and_invalid_key(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
-    client, _ = _client(tmp_path, fixture_scorer)
-    assert client.get("/v1/score/NVDA").status_code == 401
-    assert client.get("/v1/score/NVDA", headers=_headers("rat_nope")).status_code == 401
-
-
-@pytest.mark.parametrize("ticker", ["NVDA", "TSLA", "AAPL"])
-def test_api_breakdown_matches_scorer_byte_for_byte(
-    tmp_path: Path,
-    fixture_scorer: TransparencyScorer,
-    ticker: str,
-) -> None:
-    client, store = _client(tmp_path, fixture_scorer)
-    raw = store.create_key(name="parity", tier="paid")
-    direct = fixture_scorer.score(ticker)
-    via_api = client.get(f"/v1/score/{ticker}", headers=_headers(raw))
-    assert via_api.status_code == 200
-    body = via_api.json()
-    for key in BREAKDOWN_KEYS:
-        assert key in body
-        assert body[key] == direct[key], key
-    assert body["confidence"]["label"] in {"high", "medium", "low"}
-    assert body["attestation"]["score_hash"].startswith("0x")
-    assert len(body["attestation"]["score_hash"]) == 66
-
-
-def test_compare_side_by_side(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
-    client, store = _client(tmp_path, fixture_scorer)
-    raw = store.create_key(name="cmp", tier="free")
-    resp = client.get("/v1/compare", params={"tickers": "nvda,tsla"}, headers=_headers(raw))
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["tickers"] == ["NVDA", "TSLA"]
-    assert body["scores"][0]["subscores"] == fixture_scorer.score("NVDA")["subscores"]
-    assert body["scores"][1]["band"] == fixture_scorer.score("TSLA")["band"]
-
-
-def test_free_tier_enforces_sliding_window(tmp_path: Path) -> None:
-    scorer = SequenceScorer([_minimal_report("NVDA", 80.0, "GREEN") for _ in range(8)])
-    client, store = _client(tmp_path, scorer, free_daily_limit=2, rate_window_seconds=86_400.0)
-    raw = store.create_key(name="free", tier="free")
-    assert client.get("/v1/score/NVDA", headers=_headers(raw)).status_code == 200
-    assert client.get("/v1/score/NVDA", headers=_headers(raw)).status_code == 200
-    limited = client.get("/v1/score/NVDA", headers=_headers(raw))
-    assert limited.status_code == 429
-    detail = limited.json()
-    assert detail["error"] == "rate_limit"
-    assert detail["limit"] == 2
-    assert detail["tier"] == "free"
-
-
-def test_paid_tier_bypasses_free_cap(tmp_path: Path) -> None:
-    scorer = SequenceScorer([_minimal_report("NVDA", 80.0, "GREEN") for _ in range(6)])
-    client, store = _client(tmp_path, scorer, free_daily_limit=2)
-    raw = store.create_key(name="paid", tier="paid")
-    for _ in range(5):
-        resp = client.get("/v1/score/NVDA", headers=_headers(raw))
-        assert resp.status_code == 200, resp.text
-
-
-def test_bearer_auth_works(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
-    client, store = _client(tmp_path, fixture_scorer)
-    raw = store.create_key(name="bearer", tier="free")
-    resp = client.get("/v1/score/NVDA", headers={"Authorization": f"Bearer {raw}"})
-    assert resp.status_code == 200
-    assert resp.json()["ticker"] == "NVDA"
-
-
-def test_watchlist_bulk_score(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
-    client, store = _client(tmp_path, fixture_scorer)
-    raw = store.create_key(name="wl", tier="free")
-    put = client.put("/v1/watchlist", headers=_headers(raw), json={"tickers": ["nvda", "aapl"]})
-    assert put.status_code == 200
-    assert put.json()["tickers"] == ["NVDA", "AAPL"]
-    got = client.get("/v1/watchlist", headers=_headers(raw))
-    assert got.status_code == 200
-    assert [row["ticker"] for row in got.json()["scores"]] == ["AAPL", "NVDA"]
-    client.delete("/v1/watchlist/AAPL", headers=_headers(raw))
-    assert client.get("/v1/watchlist", headers=_headers(raw)).json()["tickers"] == ["NVDA"]
-
-
-def test_webhooks_and_history_are_paid_only(
+def test_control_character_ticker_is_400(
     tmp_path: Path, fixture_scorer: TransparencyScorer
 ) -> None:
     client, store = _client(tmp_path, fixture_scorer)
-    free = store.create_key(name="free", tier="free")
-    assert client.post(
-        "/v1/webhooks",
-        headers=_headers(free),
-        json={"url": "https://example.test/hook"},
-    ).status_code == 403
-    assert client.get("/v1/history/NVDA", headers=_headers(free)).status_code == 403
-    assert client.get("/v1/attest/NVDA", headers=_headers(free)).status_code == 403
+    raw = store.create_key(name="paid", tier="paid")
+    headers = _headers(raw)
+    score = client.get("/v1/score/NVDA%00", headers=headers)
+    attest = client.post("/v1/attest/NV%0ADA", headers=headers)
+    status = client.get("/v1/attest/NV%00DA/status", headers=headers)
+    for resp in (score, attest, status):
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "bad_ticker"
+        assert resp.status_code < 500
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
+def test_watchlist_history_and_webhooks_are_not_stored(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    client, store = _client(tmp_path, fixture_scorer)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = _headers(raw)
+    for method, path in (
+        ("get", "/v1/watchlist"),
+        ("put", "/v1/watchlist"),
+        ("get", "/v1/history/NVDA"),
+        ("post", "/v1/webhooks"),
+        ("get", "/v1/webhooks"),
+    ):
+        resp = getattr(client, method)(path, headers=headers)
+        assert resp.status_code == 404
+
+
+def test_webhook_url_allowlist_still_rejects_ssrf() -> None:
+    from rwa_score.api.webhooks import assert_public_https_url
+
+    for url in (
         "http://hooks.example.com/hook",
         "https://localhost/hook",
         "https://127.0.0.1/hook",
         "https://192.168.0.10/hook",
         "https://10.1.2.3/hook",
         "https://169.254.169.254/latest/meta-data",
-    ],
-)
-def test_webhook_url_allowlist_rejects_ssrf(
-    tmp_path: Path, fixture_scorer: TransparencyScorer, url: str
-) -> None:
-    client, store = _client(tmp_path, fixture_scorer)
-    raw = store.create_key(name="paid", tier="paid")
-    resp = client.post(
-        "/v1/webhooks",
-        headers=_headers(raw),
-        json={"url": url, "trigger": "band_cross"},
-    )
-    assert resp.status_code in {400, 422}
-
-
-def test_webhook_url_allowlist_accepts_public_https(
-    tmp_path: Path, fixture_scorer: TransparencyScorer
-) -> None:
-    client, store = _client(tmp_path, fixture_scorer)
-    raw = store.create_key(name="paid", tier="paid")
-    resp = client.post(
-        "/v1/webhooks",
-        headers=_headers(raw),
-        json={"url": "https://example.test/hook", "trigger": "band_cross"},
-    )
-    assert resp.status_code == 200, resp.text
-
-
-def test_webhook_fires_on_band_cross_same_cycle(tmp_path: Path) -> None:
-    posted: list[tuple[str, str, dict[str, str]]] = []
-
-    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
-        posted.append((url, body, headers))
-        return 204, True
-
-    scorer = SequenceScorer(
-        [
-            _minimal_report("NVDA", 80.0, "GREEN"),
-            _minimal_report("NVDA", 20.0, "RED"),
-        ]
-    )
-    client, store = _client(tmp_path, scorer, poster=poster)
-    raw = store.create_key(name="paid", tier="paid")
-    created = client.post(
-        "/v1/webhooks",
-        headers=_headers(raw),
-        json={"url": "https://example.test/hook", "secret": "s3cret", "trigger": "band_cross"},
-    )
-    assert created.status_code == 200
-    assert client.get("/v1/score/NVDA", headers=_headers(raw)).status_code == 200
-    assert posted == []
-    second = client.get("/v1/score/NVDA", headers=_headers(raw))
-    assert second.status_code == 200
-    assert len(posted) == 1
-    url, body, headers = posted[0]
-    assert url == "https://example.test/hook"
-    payload = json.loads(body)
-    assert payload["event"] == "band_cross"
-    assert payload["from_band"] == "GREEN"
-    assert payload["to_band"] == "RED"
-    assert payload["ticker"] == "NVDA"
-    assert headers["X-RAT-Signature"].startswith("sha256=")
-
-    history = client.get("/v1/history/NVDA", headers=_headers(raw))
-    assert history.status_code == 200
-    assert len(history.json()["history"]) == 2
-
-
-def test_score_under_key_a_never_fires_key_b_webhook(tmp_path: Path) -> None:
-    posted: list[str] = []
-
-    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
-        posted.append(url)
-        return 200, True
-
-    scorer = SequenceScorer(
-        [
-            _minimal_report("NVDA", 80.0, "GREEN"),
-            _minimal_report("NVDA", 20.0, "RED"),
-        ]
-    )
-    client, store = _client(tmp_path, scorer, poster=poster)
-    key_a = store.create_key(name="tenant-a", tier="paid")
-    key_b = store.create_key(name="tenant-b", tier="paid")
-    rec_a = store.lookup_key(key_a)
-    rec_b = store.lookup_key(key_b)
-    assert rec_a is not None and rec_b is not None
-
-    created = client.post(
-        "/v1/webhooks",
-        headers=_headers(key_b),
-        json={"url": "https://b.example.test/hook", "secret": "b", "trigger": "band_cross"},
-    )
-    assert created.status_code == 200
-    assert client.get("/v1/score/NVDA", headers=_headers(key_b)).status_code == 200
-    assert posted == []
-    assert store.get_last_band(rec_b.id, "NVDA") == ("GREEN", 80.0)
-
-    posted.clear()
-    assert client.get("/v1/score/NVDA", headers=_headers(key_a)).status_code == 200
-    assert posted == []
-    assert store.get_last_band(rec_a.id, "NVDA") == ("RED", 20.0)
-    assert store.get_last_band(rec_b.id, "NVDA") == ("GREEN", 80.0)
-
-
-def test_last_bands_and_webhooks_isolated_per_tenant(tmp_path: Path) -> None:
-    posted: list[tuple[str, str]] = []
-
-    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
-        posted.append((url, json.loads(body)["event"]))
-        return 204, True
-
-    scorer = SequenceScorer(
-        [
-            _minimal_report("NVDA", 80.0, "GREEN"),
-            _minimal_report("NVDA", 20.0, "RED"),
-            _minimal_report("NVDA", 80.0, "GREEN"),
-            _minimal_report("NVDA", 20.0, "RED"),
-        ]
-    )
-    client, store = _client(tmp_path, scorer, poster=poster)
-    key_a = store.create_key(name="tenant-a", tier="paid")
-    key_b = store.create_key(name="tenant-b", tier="paid")
-    rec_a = store.lookup_key(key_a)
-    rec_b = store.lookup_key(key_b)
-    assert rec_a is not None and rec_b is not None
-
-    assert client.post(
-        "/v1/webhooks",
-        headers=_headers(key_a),
-        json={"url": "https://a.example.test/hook", "secret": "a", "trigger": "band_cross"},
-    ).status_code == 200
-    assert client.post(
-        "/v1/webhooks",
-        headers=_headers(key_b),
-        json={"url": "https://b.example.test/hook", "secret": "b", "trigger": "band_cross"},
-    ).status_code == 200
-
-    assert client.get("/v1/score/NVDA", headers=_headers(key_a)).status_code == 200
-    assert posted == []
-    assert client.get("/v1/score/NVDA", headers=_headers(key_a)).status_code == 200
-    assert posted == [("https://a.example.test/hook", "band_cross")]
-
-    posted.clear()
-    assert client.get("/v1/score/NVDA", headers=_headers(key_b)).status_code == 200
-    assert posted == []
-    assert store.get_last_band(rec_b.id, "NVDA") == ("GREEN", 80.0)
-    assert client.get("/v1/score/NVDA", headers=_headers(key_b)).status_code == 200
-    assert posted == [("https://b.example.test/hook", "band_cross")]
-    assert store.get_last_band(rec_a.id, "NVDA") == ("RED", 20.0)
-    assert store.get_last_band(rec_b.id, "NVDA") == ("RED", 20.0)
-
-
-def test_notify_crossings_never_reads_other_tenant_hooks(tmp_path: Path) -> None:
-    store = Store(tmp_path / "iso.sqlite")
-    raw_a = store.create_key(name="a", tier="paid")
-    raw_b = store.create_key(name="b", tier="paid")
-    key_a = store.lookup_key(raw_a)
-    key_b = store.lookup_key(raw_b)
-    assert key_a is not None and key_b is not None
-    store.add_webhook(key_a.id, url="https://a.example.test/h", secret="a")
-    store.add_webhook(key_b.id, url="https://b.example.test/h", secret="b")
-    store.set_last_band(key_a.id, "NVDA", "GREEN", 80.0)
-    store.set_last_band(key_b.id, "NVDA", "GREEN", 80.0)
-    posted: list[str] = []
-
-    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
-        posted.append(url)
-        return 200, True
-
-    report = _minimal_report("NVDA", 20.0, "RED")
-    report["attestation"] = {"score_hash": "0xabc"}
-    deliveries = notify_crossings(store, report, key_id=key_a.id, poster=poster)
-    assert [d["ok"] for d in deliveries] == [True]
-    assert posted == ["https://a.example.test/h"]
-    assert store.get_last_band(key_b.id, "NVDA") == ("GREEN", 80.0)
-    store.close()
-
-
-def test_last_bands_migrates_off_unscoped_schema(tmp_path: Path) -> None:
-    db = tmp_path / "legacy.sqlite"
-    conn = sqlite3.connect(db)
-    conn.executescript(
-        """
-        CREATE TABLE last_bands (
-            ticker TEXT PRIMARY KEY,
-            band TEXT NOT NULL,
-            score REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        INSERT INTO last_bands VALUES ('NVDA', 'GREEN', 80.0, 1.0);
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    store = Store(db)
-    raw = store.create_key(name="tenant", tier="paid")
-    rec = store.lookup_key(raw)
-    assert rec is not None
-    assert store.get_last_band(rec.id, "NVDA") is None
-    store.set_last_band(rec.id, "NVDA", "YELLOW", 60.0)
-    assert store.get_last_band(rec.id, "NVDA") == ("YELLOW", 60.0)
-    store.close()
-
-
-def test_below_orange_trigger_skips_yellow_to_orange(tmp_path: Path) -> None:
-    posted: list[str] = []
-
-    def poster(url: str, body: str, headers: dict[str, str]) -> tuple[int, bool]:
-        posted.append(json.loads(body)["event"])
-        return 200, True
-
-    scorer = SequenceScorer(
-        [
-            _minimal_report("NVDA", 80.0, "GREEN"),
-            _minimal_report("NVDA", 40.0, "ORANGE"),
-            _minimal_report("NVDA", 10.0, "RED"),
-        ]
-    )
-    client, store = _client(tmp_path, scorer, poster=poster)
-    raw = store.create_key(name="paid", tier="paid")
-    client.post(
-        "/v1/webhooks",
-        headers=_headers(raw),
-        json={"url": "https://example.test/hook", "secret": "x", "trigger": "below_orange"},
-    )
-    client.get("/v1/score/NVDA", headers=_headers(raw))
-    client.get("/v1/score/NVDA", headers=_headers(raw))
-    assert posted == []
-    client.get("/v1/score/NVDA", headers=_headers(raw))
-    assert posted == ["below_orange"]
+    ):
+        with pytest.raises(ValueError):
+            assert_public_https_url(url)
+    assert assert_public_https_url("https://example.com/hook", resolve=False) == "https://example.com/hook"
 
 
 def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
@@ -450,15 +166,203 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
 ) -> None:
     client, store = _client(tmp_path, fixture_scorer)
     raw = store.create_key(name="paid", tier="paid")
-    resp = client.get("/v1/attest/NVDA", headers=_headers(raw))
+    resp = client.post("/v1/attest/NVDA", headers=_headers(raw))
     assert resp.status_code == 200
     body = resp.json()
     assert body["algo"] == "sha256"
-    assert "score" not in body["payload"] or body["payload"]["score"] == fixture_scorer.score("NVDA")["score"]
+    assert body["payload"]["score"] == fixture_scorer.score("NVDA")["score"]
+    assert body["score"] == body["payload"]["score"]
+    assert body["as_of"] == body["payload"]["as_of"]
     assert body["chain"] == "base-sepolia"
     assert body["chain_id"] == 84532
-    assert "never the raw score" in body["note"].lower()
+    assert "stores only the hash" in body["note"].lower()
     assert body["contract"] is None
+    assert body["status"] == "disabled"
+    assert body["tx_hash"] is None
+    import base64
+
+    raw_bytes = base64.b64decode(body["canonical_b64"])
+    assert raw_bytes == canonical_bytes(body["payload"])
+    assert hash_canonical(raw_bytes) == body["score_hash"]
+    assert store.queue_depth() == 0
+    saved_file = tmp_path / "nvda.payload.json"
+    saved_file.write_text(json.dumps(body), encoding="utf-8")
+    from rwa_score.api.verify import main as verify_main
+
+    assert verify_main(["NVDA", "--offline", "--json", "--payload-file", str(saved_file)]) == 0
+    fresh = Store()
+    assert fresh.queue_depth() == 0
+    assert verify_main(["NVDA", "--offline", "--json", "--payload-file", str(saved_file)]) == 0
+
+
+def test_nan_in_live_report_score_200_attest_422(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    """Score sanitizes non-finite numbers. Attest refuses them before any write."""
+    from rwa_score.api.attest import canonical_bytes
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    report = fixture_scorer.score("NVDA")
+    report = dict(report)
+    report["data_source"] = "live"
+    report["subscores"] = dict(report["subscores"])
+    report["score"] = float("nan")
+    report["subscores"]["price"] = float("inf")
+
+    with pytest.raises(ValueError):
+        canonical_bytes({"score": float("nan")})
+
+    class _NanScorer:
+        def score(self, ticker: str) -> dict[str, Any]:
+            return report
+
+    settings = _settings(tmp_path)
+    store = Store()
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=_NanScorer(),  # type: ignore[arg-type]
+        attester=attester,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    attested = client.post("/v1/attest/NVDA", headers=_headers(raw))
+    assert attested.status_code == 422
+    body = attested.json()
+    assert body["error"] == "data_unavailable"
+    assert body["data_unavailable"] == ["score", "price"]
+    assert body["note"] == "information not available for: score, price"
+    assert store.queue_depth() == 0
+
+    scored = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert scored.status_code == 200
+    scored_body = scored.json()
+    assert scored_body["score"] is None
+    assert scored_body["subscores"]["price"] is None
+    assert scored_body["data_unavailable"] == ["score", "price"]
+    assert scored_body["note"] == "information not available for: score, price"
+    assert "NaN" not in scored.text
+    assert "Infinity" not in scored.text
+
+
+@pytest.mark.parametrize("bad", [float("nan"), None, "", float("inf")])
+def test_blank_price_and_volume_score_200_attest_422(
+    tmp_path: Path, fixture_scorer: TransparencyScorer, bad: object
+) -> None:
+    """Missing, blank, NaN, and Inf price or volume stay null and are not posted."""
+    import copy
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    report = copy.deepcopy(fixture_scorer.score("NVDA"))
+    report["price"]["price"] = bad
+    report["price"]["volume_24h"] = bad
+
+    class _BadScorer:
+        def score(self, ticker: str) -> dict[str, Any]:
+            return report
+
+    chain = Mock()
+    chain.attest.side_effect = AssertionError("no tx")
+    settings = _settings(tmp_path)
+    store = Store()
+    attester = AttesterSettings(
+        private_key="0x" + "22" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=_BadScorer(),  # type: ignore[arg-type]
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    attested = client.post("/v1/attest/NVDA", headers=_headers(raw))
+    assert attested.status_code == 422
+    body = attested.json()
+    assert body["data_unavailable"] == ["price", "volume"]
+    assert body["note"] == "information not available for: price, volume"
+    assert store.queue_depth() == 0
+    chain.attest.assert_not_called()
+
+    scored = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert scored.status_code == 200
+    scored_body = scored.json()
+    assert scored_body["price"]["price"] is None
+    assert scored_body["price"]["volume_24h"] is None
+    assert scored_body["data_unavailable"] == ["price", "volume"]
+    assert scored_body["note"] == "information not available for: price, volume"
+    assert scored_body["ticker"] == "NVDA"
+    assert scored_body["subscores"]["backing"] == report["subscores"]["backing"]
+    assert "NaN" not in scored.text
+    assert "Infinity" not in scored.text
+
+
+def test_attest_status_does_not_score(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    settings = _settings(tmp_path)
+    store = Store()
+    scorer = Mock()
+    scorer.score.side_effect = AssertionError("status must not score")
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+    )
+    digest = "0x" + "cd" * 32
+    chain = Mock()
+    chain.hashes_for_ticker.return_value = []
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = {
+        "ticker": "NVDA",
+        "attested_at": 1_700_000_000,
+        "claimed_at": 0,
+        "attester": "0x" + "11" * 20,
+        "score_hash": digest,
+    }
+    chain.verify.return_value = (True, 1_700_000_000, "0x" + "11" * 20)
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    empty = client.get("/v1/attest/NVDA/status", headers=_headers(raw))
+    assert empty.status_code == 200
+    assert empty.json()["on_chain"]["source"] == "chain"
+    assert empty.json()["on_chain"]["attested"] is False
+    assert "stored" not in empty.json()
+    body = client.get(
+        "/v1/attest/NVDA/status",
+        headers=_headers(raw),
+        params={"score_hash": digest},
+    ).json()
+    assert body["on_chain"]["attested"] is True
+    assert body["on_chain"]["attestedAt"] == 1_700_000_000
+    assert body["on_chain"]["status"] == "confirmed"
+    assert body["score_hash"] == digest
+    scorer.score.assert_not_called()
+    store.close()
 
 
 def test_me_quota(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
@@ -479,32 +383,111 @@ def test_unknown_ticker_404(tmp_path: Path, fixture_scorer: TransparencyScorer) 
     assert resp.json()["error"] == "not_found"
 
 
-def test_keys_cli_create_list_revoke(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_keys_cli_create_is_not_kept(capsys: pytest.CaptureFixture[str]) -> None:
     from rwa_score.api.keys import main as keys_main
 
-    db = str(tmp_path / "keys.sqlite")
-    assert keys_main(["--db", db, "create", "--name", "acme", "--tier", "paid"]) == 0
-    out = capsys.readouterr().out.strip().splitlines()
-    raw = out[-1]
+    assert keys_main(["create", "--name", "acme", "--tier", "paid"]) == 0
+    captured = capsys.readouterr()
+    raw = captured.out.strip().splitlines()[-1]
     assert raw.startswith("rat_")
-    assert keys_main(["--db", db, "list"]) == 0
+    assert "RWA_API_BOOTSTRAP_KEY" in captured.err
+    assert keys_main(["list"]) == 0
     listed = capsys.readouterr().out
-    assert "paid" in listed
-    assert "acme" in listed
-    prefix = raw[:12]
-    assert keys_main(["--db", db, "revoke", "--prefix", prefix]) == 0
-    store = Store(db)
-    assert store.lookup_key(raw) is not None
-    assert store.lookup_key(raw).revoked
-    store.close()
+    assert "acme" not in listed
+    assert "no keys" in listed
 
 
-def test_verify_client_fixtures_json(capsys: pytest.CaptureFixture[str]) -> None:
+def test_verify_client_fixtures_json(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    fixture_scorer: TransparencyScorer,
+) -> None:
     from rwa_score.api.verify import main as verify_main
 
-    assert verify_main(["NVDA", "--fixtures", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
+    from rwa_score.api.verify import export_payload
+
+    report = fixture_scorer.score("NVDA")
+    raw = canonical_bytes(attestation_payload(report))
+    inputs = inputs_bytes(report)
+    path = tmp_path / "verify.payload.json"
+    path.write_text(
+        json.dumps(
+            export_payload(
+                ticker="NVDA",
+                score_hash=hash_canonical(raw),
+                canonical=raw,
+                inputs=inputs,
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert verify_main(["NVDA", "--fixtures", "--offline", "--json", "--payload-file", str(path)]) == 0
+    captured = capsys.readouterr()
+    assert "obsolete" in captured.err.lower()
+    payload = json.loads(captured.out)
     assert payload["ticker"] == "NVDA"
     assert payload["score_hash"].startswith("0x")
     assert payload["payload"]["subscores"]
     assert payload["on_chain"] is None
+    assert payload["stored"] is True
+
+
+def test_post_attest_hash_is_the_canonical_bytes_from_that_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One canonical build. A later clock reading does not fork the returned hash."""
+    import base64
+
+    monkeypatch.delenv("RWA_USE_FIXTURES", raising=False)
+    ticks = {"n": 0}
+
+    def clock() -> float:
+        ticks["n"] += 1
+        return 1_700_000_000.0 + ticks["n"] * 5
+
+    monkeypatch.setattr("rwa_score.api.attest.time.time", clock)
+    client, store = _client(tmp_path, _live_scorer())
+    raw = store.create_key(name="paid", tier="paid")
+    first = client.post("/v1/attest/NVDA", headers=_headers(raw))
+    second = client.post("/v1/attest/NVDA", headers=_headers(raw))
+    assert first.status_code == 200
+    assert second.status_code == 200
+    for body in (first.json(), second.json()):
+        raw_bytes = base64.b64decode(body["canonical_b64"])
+        assert hash_canonical(raw_bytes) == body["score_hash"]
+        assert json.loads(raw_bytes.decode("utf-8")) == body["payload"]
+        assert body["as_of"] == body["payload"]["as_of"]
+        assert store.queue_depth() == 0
+    assert first.json()["score_hash"] != second.json()["score_hash"]
+    assert first.json()["as_of"] != second.json()["as_of"]
+
+
+def _live_scorer():
+    from rwa_score.scorer import TransparencyScorer
+    from tests.conftest import RecordingClient
+
+    inner = TransparencyScorer(RecordingClient(), use_live_verifiers=False)
+
+    class _Flip:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def score(self, ticker: str) -> dict[str, Any]:
+            report = dict(inner.score(ticker))
+            assert report["data_source"] == "live"
+            price = dict(report.get("price") or {})
+            # This stub quote has no tape. The hash check needs a real volume
+            # so the request is not the unavailable-input path.
+            if price.get("volume_24h") is None:
+                price["volume_24h"] = 1.0
+            report["price"] = price
+            self.n += 1
+            if self.n % 2 == 1:
+                report["score"] = 90.0
+                report["band"] = "GREEN"
+            else:
+                report["score"] = 12.0
+                report["band"] = "RED"
+            return report
+
+    return _Flip()

@@ -55,3 +55,62 @@ services:
         sync: false
       - key: X_ACCESS_TOKEN_SECRET
         sync: false
+
+  # /v1 API. Every env var is sync:false — values are set in the dashboard
+  # after Blueprint sync. This file does not deploy or create the service.
+  # The attester thread and on_chain live on this service only.
+  - type: web
+    name: rwa-transparency-score-api
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: RWA_USE_FIXTURES
+        sync: false
+      - key: PYTHONUNBUFFERED
+        sync: false
+      - key: CMC_API_KEY
+        sync: false
+      - key: RWA_ATTESTER_PRIVATE_KEY
+        sync: false
+      - key: RWA_ATTESTATION_CONTRACT
+        sync: false
+      - key: BASE_SEPOLIA_RPC_URL
+        sync: false
+      - key: RWA_ATTESTATION_CHAIN_ID
+        sync: false
+      - key: RWA_ATTESTATION_CHAIN
+        sync: false
+      - key: RWA_ATTEST_VALUE_CAP_WEI
+        sync: false
+      - key: RWA_ATTEST_GAS_LIMIT
+        sync: false
+      - key: RWA_ATTEST_MAX_ATTEMPTS
+        sync: false
+      - key: RWA_ATTEST_BACKOFF_SECONDS
+        sync: false
+      - key: RWA_ATTEST_BROADCAST_DEADLINE_SECONDS
+        sync: false
+      - key: RWA_ATTEST_WAIT_SECONDS
+        sync: false
+      - key: RWA_API_BOOTSTRAP_KEY
+        sync: false
+      - key: RWA_API_BOOTSTRAP_TIER
+        sync: false
+      - key: RWA_API_FREE_DAILY_LIMIT
+        sync: false
+      - key: RWA_API_RATE_WINDOW_SECONDS
+        sync: false
+      - key: POLYGON_RPC_URL
+        sync: false
+      - key: MATIC_RPC_URL
+        sync: false
+      - key: BASE_RPC_URL
+        sync: false
+      - key: ETH_RPC_URL
+        sync: false
+      - key: ETHEREUM_RPC_URL
+        sync: false

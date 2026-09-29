@@ -162,7 +162,7 @@ def notify_crossings(
             continue
         event = matched[0]
         body_obj = _payload(report, old_band=old_band, event=event)
-        body = json.dumps(body_obj, sort_keys=True, separators=(",", ":"))
+        body = json.dumps(body_obj, sort_keys=True, separators=(",", ":"), allow_nan=False)
         headers = {
             "Content-Type": "application/json",
             "X-RAT-Signature": sign_body(hook.secret, body),
@@ -189,14 +189,23 @@ def apply_score_side_effects(
     poster: DeliverFn | None = None,
     timeout: float = 5.0,
 ) -> None:
-    from .attest import history_json, score_hash
+    """Record history and fire webhooks from one canonical payload.
 
-    digest = score_hash(report)
+    ``score_hash`` and ``history_json`` must not be built separately: each
+    call used to read the clock again, so the webhook hash and the stored
+    bytes could diverge.
+    """
+    from .attest import canonical_for
+
+    _payload, raw, digest = canonical_for(report)
+    attestation = report.get("attestation")
+    if isinstance(attestation, dict):
+        attestation["score_hash"] = digest
     store.record_history(
         ticker=report["ticker"],
         score=float(report["score"]),
         band=str(report["band"]),
-        payload_json=history_json(report),
+        payload_json=raw.decode("ascii"),
         payload_hash=digest,
         key_id=key_id,
     )

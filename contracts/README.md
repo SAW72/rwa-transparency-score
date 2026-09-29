@@ -98,13 +98,14 @@ Default fee is **0.001 ETH** per attestation (covers gas + a small revenue line)
 3. Re-verify:
 
 ```bash
-python scripts/verify_attestation.py NVDA --fixtures \
-  --contract "$ATTESTATION_CONTRACT" \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL"
+python scripts/verify_attestation.py NVDA \
+  --payload-file /tmp/nvda-attest.json \
+  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
+  --attester "$ATTESTER_ADDRESS"
 ```
 
-`cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key.
+`--payload-file` is the JSON returned by `POST /v1/attest`. Omitting it exits `1` with `supply --payload-file (the JSON returned by POST /v1/attest)`. `--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. `--fixtures` is obsolete and only warns. `cast` must be on `PATH` for the on-chain read. The script never sends a transaction and never reads a private key. Live exits are `0`, `1`, `3`, `4`, `5`, `6`, `7`. Exit `2` and exit `8` are retired. The table is in the root README.
 
 ## Hash algorithm
 
-`sha256` of canonical JSON (sorted keys, no whitespace) over ticker, rwa_id, issuer, score, band, **full** subscores and weights (all six live pillars, including **basis**), cik, data_source, verification `{score, level, source}` per pillar (including basis), and the basis meta block. See `rwa_score/api/attest.py`. A cited breakdown that silently drops basis will not match.
+`sha256` of canonical JSON (sorted keys, no whitespace, UTF-8, no NaN/Infinity — RFC 8785 key order, Python number formatting) over ticker, rwa_id, issuer, score, band, **full** subscores and weights (all six live pillars, including **basis**), cik, data_source, verification `{score, level, source}` per pillar (including basis), the basis meta block, `as_of` (attest time, Unix seconds; `0` for fixtures), `data_as_of` (latest provider observation time already on the report, or null), `scorer_version`, and `inputs_digest`. `inputs_digest` hashes every scoring input kept on the report (CMC price and basis, identity, heuristic flags, and every pillar's verifier meta). It does not hash raw provider HTTP bodies or explanation prose. Headers, API keys, tokens, and URLs are not on the scoring-input allowlist. The input JSON is stored beside the payload. See `rwa_score/api/attest.py`. A cited breakdown that silently drops basis will not match. The published NVDA fixture hash assumes `scorer_version` is `unknown`.

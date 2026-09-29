@@ -22,14 +22,23 @@ from rwa_score.scorer import TransparencyScorer
 
 
 @pytest.fixture(autouse=True)
+def _no_live_attester_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never read a real attester key. Anvil tests set a dev key themselves."""
+    monkeypatch.delenv("RWA_ATTESTER_PRIVATE_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _clear_search_catalog_memo() -> None:
     """Isolate lazy class-shard memos across tests."""
+    from rwa_score.api.attest import clear_scorer_version_cache
     from rwa_score.ticker_search import clear_catalog_cache
 
     clear_catalog_cache()
+    clear_scorer_version_cache()
     _clear_app_catalog_shards()
     yield
     clear_catalog_cache()
+    clear_scorer_version_cache()
     _clear_app_catalog_shards()
 
 

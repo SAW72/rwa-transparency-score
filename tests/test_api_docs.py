@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from rwa_score.api.app import BREAKDOWN_KEYS, create_app
@@ -57,12 +58,12 @@ def test_webhook_poster_disables_redirects() -> None:
     assert "allow_redirects=False" in src
 
 
-def test_readme_documents_tenant_scoped_webhooks() -> None:
+def test_readme_documents_live_attest_and_saved_payload() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "per tenant" in text
-    assert "never fires key B" in text
-    assert "does not follow HTTP redirects" in text
+    assert "POST /v1/attest" in text
+    assert "--payload-file" in text
     assert "authorized attester" in text
+    assert "no score store" in text.lower() or "does not store the score" in text.lower() or "not stored" in text.lower()
 
 
 def test_deploy_script_holds_mainnet() -> None:
@@ -130,15 +131,19 @@ def test_docs_do_not_embed_secrets() -> None:
 def test_nvda_evidence_sample_matches_fixture_api(
     tmp_path: Path,
     fixture_scorer: TransparencyScorer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The published fixture hash is locked with scorer_version "unknown".
+    # Resolution order is test_scorer_version_fallback_order.
+    monkeypatch.setenv("RENDER_GIT_COMMIT", "unknown")
     sample = json.loads(EVIDENCE_JSON.read_text(encoding="utf-8"))
     assert sample["ticker"] == "NVDA"
     assert sample["data_source"] == "fixture"
     for key in BREAKDOWN_KEYS:
         assert key in sample
 
-    settings = ApiSettings(db_path=tmp_path / "api.sqlite")
-    store = Store(settings.db_path)
+    settings = ApiSettings()
+    store = Store()
     app = create_app(settings=settings, store=store, scorer=fixture_scorer)
     raw = store.create_key(name="docs-evidence", tier="paid")
     body = TestClient(app).get("/v1/score/NVDA", headers={"X-API-Key": raw}).json()
@@ -150,12 +155,41 @@ def test_nvda_evidence_sample_matches_fixture_api(
     assert json.loads(fence) == sample
 
 
-def test_render_blueprint_does_not_host_paid_api() -> None:
+def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
     text = (ROOT / "render.yaml").read_text(encoding="utf-8")
     assert "python -m rwa_score.health" in text
-    assert "python -m rwa_score.api" not in text
-    assert "plan: free" in text
-    assert "RWA_USE_FIXTURES" in text
-    assert 'value: "0"' in text
-    assert "postgres" not in text.lower()
-    assert "database" not in text.lower()
+    assert "name: rwa-transparency-score\n" in text
+    assert "name: rwa-transparency-score-api" in text
+    scorecard, api = text.split("name: rwa-transparency-score-api", 1)
+    assert "python -m rwa_score.health" in scorecard
+    assert "uvicorn rwa_score.api.app:create_app" not in scorecard
+    assert "plan: free" in scorecard
+    assert 'value: "0"' in scorecard
+    cmd = "uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT"
+    assert cmd in api
+    assert "plan: free" in api
+    assert "pip install -r requirements.txt" in api
+    assert "fromDatabase" not in text
+    assert "\ndatabases:" not in text.lower()
+    assert "DATABASE_URL" not in scorecard
+    keys: list[str] = []
+    lines = api.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("- key:"):
+            continue
+        key = stripped.split(":", 1)[1].strip()
+        nxt = lines[index + 1].strip()
+        assert nxt == "sync: false"
+        keys.append(key)
+    for required in (
+        "RWA_ATTESTER_PRIVATE_KEY",
+        "RWA_ATTESTATION_CONTRACT",
+        "BASE_SEPOLIA_RPC_URL",
+        "RWA_ATTESTATION_CHAIN_ID",
+        "RWA_API_BOOTSTRAP_KEY",
+        "CMC_API_KEY",
+        "RWA_USE_FIXTURES",
+        "RWA_ATTEST_WAIT_SECONDS",
+    ):
+        assert required in keys

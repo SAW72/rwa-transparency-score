@@ -219,7 +219,7 @@ Files that mention the contract or attester slot (none of these is a deployed ad
 | `scripts/verify_attestation.py` | 7 | Example uses `$RWA_ATTESTATION_CONTRACT`. |
 | `contracts/script/Attest.s.sol` | 19 | `vm.envAddress("ATTESTATION_CONTRACT")`. |
 | `contracts/script/DeployScoreAttestation.s.sol` | 90 | `ATTESTER_ADDRESS` defaults to the zero address (`NO_ATTESTER`). |
-| `render.yaml` | — | Does not set `RWA_ATTESTATION_CONTRACT`. No line to edit. |
+| `render.yaml` | API service | Lists `RWA_ATTESTATION_CONTRACT` on `rwa-transparency-score-api` with `sync: false`. The address is not in the file. Set it in the dashboard. |
 | ABI JSON | — | No ABI JSON file in the repo. |
 
 Test-only addresses in `contracts/test/ScoreAttestation.t.sol` are not a production allowlist: `0xA11CE` (line 10), `0xB0B` (line 11), `0xBEEF` (lines 184, 368, and 420), `0x0A1E` (lines 271, 292, 307), `0xCA11` (line 349). Foundry's default script sender `0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38` is not in the test source. Read-only `eth_getCode` on Base Sepolia (`https://sepolia.base.org`, chain 84532, block 47422561) returned `0x` and codesize 0 for that address and for each test address above. They are not contracts and not attesters on that chain.

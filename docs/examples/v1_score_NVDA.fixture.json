@@ -316,7 +316,7 @@
     "label": "low"
   },
   "attestation": {
-    "score_hash": "0x41ba52792b6162ce75f02131ddd1845292cfab019b7c1537adfd9d5d2bbd5406",
+    "score_hash": "0x8f04e51149ac6ebbbc3931d0d16ff2776a7e357ab3bb5b2f6a5faccc474d56a7",
     "algo": "sha256",
     "fields": [
       "ticker",
@@ -329,7 +329,11 @@
       "cik",
       "data_source",
       "verification",
-      "basis"
+      "basis",
+      "as_of",
+      "data_as_of",
+      "scorer_version",
+      "inputs_digest"
     ]
   }
 }
