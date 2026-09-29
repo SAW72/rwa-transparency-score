@@ -79,40 +79,56 @@ class _SealedScore(dict):
     attestation_payload: dict[str, Any]
 
 
-def _first_non_finite(value: Any, path: str = "") -> str | None:
-    """Dotted path of the first NaN or Infinity, or ``None`` when every number is finite."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return path or "value"
-    if isinstance(value, dict):
-        for key, item in value.items():
-            child = f"{path}.{key}" if path else str(key)
-            found = _first_non_finite(item, child)
-            if found:
-                return found
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            found = _first_non_finite(item, f"{path}[{index}]")
-            if found:
-                return found
-    return None
+# Scalar inputs the score reads. ``volume_24h`` is reported as ``volume``.
+_UNAVAILABLE_LABELS = {
+    "price": "price",
+    "volume": "volume",
+    "volume_24h": "volume",
+    "tokenized_volume_24h": "volume",
+}
 
 
-def _sanitize_non_finite(value: Any) -> Any:
-    """Copy ``value`` with NaN and Infinity replaced by ``None``.
+def _unavailable_note(names: list[str]) -> str:
+    return "information not available for: " + ", ".join(names)
 
-    The score response uses this so ``/v1/score`` can return 200. Canonical
-    attestation bytes still use ``allow_nan=False`` and are not built from
-    the unsanitized report.
+
+def _remember(names: list[str], label: str) -> None:
+    if label not in names:
+        names.append(label)
+
+
+def _scrub_value(value: Any, key: str | None, names: list[str]) -> Any:
+    """Copy ``value``. NaN, Infinity, and blank price/volume become ``None``.
+
+    ``names`` collects the public labels, in first-seen order. Optional nulls
+    on other keys stay null and are not listed. Canonical bytes still use
+    ``allow_nan=False`` and are not built from the unsanitized report.
     """
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
     if isinstance(value, dict):
-        return {key: _sanitize_non_finite(item) for key, item in value.items()}
+        return {
+            item_key: _scrub_value(item, str(item_key), names)
+            for item_key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_sanitize_non_finite(item) for item in value]
+        return [_scrub_value(item, key, names) for item in value]
     if isinstance(value, tuple):
-        return [_sanitize_non_finite(item) for item in value]
+        return [_scrub_value(item, key, names) for item in value]
+    label = _UNAVAILABLE_LABELS.get(key) if key else None
+    non_finite = isinstance(value, float) and not math.isfinite(value)
+    blank = isinstance(value, str) and value.strip() == ""
+    if non_finite:
+        _remember(names, label or (key or "value"))
+        return None
+    if label is not None and (value is None or blank):
+        _remember(names, label)
+        return None
     return value
+
+
+def _scrub_report(report: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    names: list[str] = []
+    cleaned = _scrub_value(report, None, names)
+    return cleaned, names
 
 
 def _finite_score(value: Any) -> bool:
@@ -288,17 +304,20 @@ def create_app(
             report = get_scorer().score(symbol)
         except ScoreError as exc:
             raise _http_error(404, "not_found", str(exc)) from exc
-        bad = _first_non_finite(report)
-        if bad:
-            if for_attest:
-                raise _http_error(
-                    422,
-                    "non_finite_value",
-                    f"Non-finite value in {bad}.",
-                    field=bad,
-                )
-            report = _sanitize_non_finite(report)
-        decorated = _decorate(report)
+        cleaned, missing = _scrub_report(report)
+        if for_attest and missing:
+            note = _unavailable_note(missing)
+            raise _http_error(
+                422,
+                "data_unavailable",
+                note,
+                data_unavailable=missing,
+                note=note,
+            )
+        decorated = _decorate(cleaned)
+        if missing:
+            decorated["data_unavailable"] = missing
+            decorated["note"] = _unavailable_note(missing)
         return decorated
 
     @app.get("/health", response_model=None)

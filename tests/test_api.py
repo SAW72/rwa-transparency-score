@@ -235,8 +235,9 @@ def test_nan_in_live_report_score_200_attest_422(
     attested = client.post("/v1/attest/NVDA", headers=_headers(raw))
     assert attested.status_code == 422
     body = attested.json()
-    assert body["error"] == "non_finite_value"
-    assert body["field"] == "score"
+    assert body["error"] == "data_unavailable"
+    assert body["data_unavailable"] == ["score", "price"]
+    assert body["note"] == "information not available for: score, price"
     assert store.queue_depth() == 0
 
     scored = client.get("/v1/score/NVDA", headers=_headers(raw))
@@ -244,6 +245,66 @@ def test_nan_in_live_report_score_200_attest_422(
     scored_body = scored.json()
     assert scored_body["score"] is None
     assert scored_body["subscores"]["price"] is None
+    assert scored_body["data_unavailable"] == ["score", "price"]
+    assert scored_body["note"] == "information not available for: score, price"
+    assert "NaN" not in scored.text
+    assert "Infinity" not in scored.text
+
+
+@pytest.mark.parametrize("bad", [float("nan"), None, "", float("inf")])
+def test_blank_price_and_volume_score_200_attest_422(
+    tmp_path: Path, fixture_scorer: TransparencyScorer, bad: object
+) -> None:
+    """Missing, blank, NaN, and Inf price or volume stay null and are not posted."""
+    import copy
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    report = copy.deepcopy(fixture_scorer.score("NVDA"))
+    report["price"]["price"] = bad
+    report["price"]["volume_24h"] = bad
+
+    class _BadScorer:
+        def score(self, ticker: str) -> dict[str, Any]:
+            return report
+
+    chain = Mock()
+    chain.attest.side_effect = AssertionError("no tx")
+    settings = _settings(tmp_path)
+    store = Store()
+    attester = AttesterSettings(
+        private_key="0x" + "22" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=_BadScorer(),  # type: ignore[arg-type]
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    attested = client.post("/v1/attest/NVDA", headers=_headers(raw))
+    assert attested.status_code == 422
+    body = attested.json()
+    assert body["data_unavailable"] == ["price", "volume"]
+    assert body["note"] == "information not available for: price, volume"
+    assert store.queue_depth() == 0
+    chain.attest.assert_not_called()
+
+    scored = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert scored.status_code == 200
+    scored_body = scored.json()
+    assert scored_body["price"]["price"] is None
+    assert scored_body["price"]["volume_24h"] is None
+    assert scored_body["data_unavailable"] == ["price", "volume"]
+    assert scored_body["note"] == "information not available for: price, volume"
+    assert scored_body["ticker"] == "NVDA"
+    assert scored_body["subscores"]["backing"] == report["subscores"]["backing"]
     assert "NaN" not in scored.text
     assert "Infinity" not in scored.text
 
@@ -414,6 +475,12 @@ def _live_scorer():
         def score(self, ticker: str) -> dict[str, Any]:
             report = dict(inner.score(ticker))
             assert report["data_source"] == "live"
+            price = dict(report.get("price") or {})
+            # This stub quote has no tape. The hash check needs a real volume
+            # so the request is not the unavailable-input path.
+            if price.get("volume_24h") is None:
+                price["volume_24h"] = 1.0
+            report["price"] = price
             self.n += 1
             if self.n % 2 == 1:
                 report["score"] = 90.0
