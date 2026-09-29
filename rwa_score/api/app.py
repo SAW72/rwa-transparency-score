@@ -38,6 +38,7 @@ from .auto_attest import (
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store, open_store
+from .verify import export_payload
 from .webhooks import apply_score_side_effects, assert_public_https_url
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,25 @@ def _control_ticker(symbol: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in symbol)
 
 
+def _rpc_status(worker: AttestWorker, settings: AttesterSettings) -> str:
+    """``ok``, ``down``, ``unset``, or ``unknown``. Uses a chain already built."""
+    rpc = (getattr(settings, "rpc_url", "") or "").strip()
+    chain = getattr(worker, "_chain", None)
+    if chain is None:
+        return "unset" if not rpc else "unknown"
+    reader = getattr(chain, "chain_id", None)
+    if not callable(reader):
+        return "unknown"
+    try:
+        live = int(reader())
+    except Exception:
+        return "down"
+    expected = int(getattr(settings, "chain_id", 0) or 0)
+    if expected and live != expected:
+        return "down"
+    return "ok"
+
+
 def _attester_balance(worker: AttestWorker, settings: AttesterSettings) -> str:
     """``ok``, ``low``, or ``unknown``. Does not open a new RPC client."""
     floor = int(getattr(settings, "min_balance_wei", 0) or 0)
@@ -200,12 +220,12 @@ def create_app(
     # Resolve once at process startup. Later scores reuse the cache.
     resolve_scorer_version()
     cfg = settings or ApiSettings.from_env()
-    db = store or open_store(path=cfg.db_path, database_url=cfg.database_url)
+    db = store or open_store()
     if store is None and cfg.bootstrap_key:
         db.ensure_key(cfg.bootstrap_key, name="bootstrap", tier=cfg.bootstrap_tier)
     attester_cfg = attester if attester is not None else AttesterSettings.from_env()
     if attester is None:
-        guard_live_attester(attester_cfg, database_url=cfg.database_url)
+        guard_live_attester(attester_cfg)
     logger.info(
         "store backend=%s attester=%s",
         db.backend,
@@ -315,13 +335,12 @@ def create_app(
         payload = build_health_payload()
         payload["api"] = True
         payload["version"] = __version__
-        payload["store"] = db.backend
+        payload["process"] = "ok"
         payload["attester"] = "enabled" if attester_cfg.enabled else "disabled"
+        payload["chain_id"] = cfg.attestation_chain_id
+        payload["rpc"] = _rpc_status(worker, attester_cfg)
         payload["attester_balance"] = _attester_balance(worker, attester_cfg)
-        db_ok = db.ping()
-        payload["database"] = "ok" if db_ok else "down"
-        if not db_ok:
-            return JSONResponse(status_code=503, content=payload)
+        payload["queue_depth"] = db.queue_depth()
         return payload
 
     @app.get("/v1/me")
@@ -486,11 +505,19 @@ def create_app(
                 )
                 worker.kick()
         chain_view = on_chain_view(db, digest, attester_cfg, admission=admission)
+        saved = db.get_attested_payload(digest)
+        canonical_payload = export_payload(
+            ticker=report["ticker"],
+            score_hash=digest,
+            canonical=raw if saved is None else saved["canonical"],
+            inputs=None if saved is None else saved.get("inputs"),
+        )
         return {
             "ticker": report["ticker"],
             "score_hash": digest,
             "algo": ATTESTATION_ALGO,
             "payload": payload,
+            "canonical_payload": canonical_payload,
             "chain": cfg.attestation_chain,
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or None,
@@ -508,10 +535,11 @@ def create_app(
                 "a calendar time. data_as_of is the latest provider observation "
                 "time already on the report, or null. When the attester worker "
                 "is enabled it enqueues that call off this response, using "
-                "these same canonical bytes. The canonical JSON and scoring "
-                "inputs are stored locally (Render free disk is ephemeral). "
-                "The contract stores this hash only — never "
-                "the raw score. Mainnet is held."
+                "these same canonical bytes. canonical_payload is the exact "
+                "bytes (base64) plus scoring inputs. Save it and pass "
+                "--payload-file to verify after a restart, because the "
+                "in-memory store is dropped. The contract stores this hash "
+                "only — never the raw score. Mainnet is held."
             ),
         }
 
@@ -538,6 +566,12 @@ def create_app(
             "ticker": row["ticker"],
             "stored": True,
             "score_hash": digest,
+            "canonical_payload": export_payload(
+                ticker=row["ticker"],
+                score_hash=digest,
+                canonical=row["canonical"],
+                inputs=row.get("inputs"),
+            ),
             "chain": cfg.attestation_chain,
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or None,

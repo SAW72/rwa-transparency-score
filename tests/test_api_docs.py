@@ -142,8 +142,8 @@ def test_nvda_evidence_sample_matches_fixture_api(
     for key in BREAKDOWN_KEYS:
         assert key in sample
 
-    settings = ApiSettings(db_path=tmp_path / "api.sqlite")
-    store = Store(settings.db_path)
+    settings = ApiSettings()
+    store = Store()
     app = create_app(settings=settings, store=store, scorer=fixture_scorer)
     raw = store.create_key(name="docs-evidence", tier="paid")
     body = TestClient(app).get("/v1/score/NVDA", headers={"X-API-Key": raw}).json()
@@ -193,6 +193,6 @@ def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
         "RWA_API_BOOTSTRAP_KEY",
         "CMC_API_KEY",
         "RWA_USE_FIXTURES",
-        "DATABASE_URL",
+        "RWA_STORE_MAX_ENTRIES",
     ):
         assert required in keys

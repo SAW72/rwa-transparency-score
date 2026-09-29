@@ -104,8 +104,8 @@ def test_unset_env_disables_worker_and_api_still_responds(
     settings = AttesterSettings.from_env()
     assert settings.enabled is False
     assert "No transaction was sent" in settings.disabled_reason
-    api = ApiSettings(db_path=tmp_path / "api.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     app = create_app(
         settings=api,
         store=store,
@@ -138,8 +138,8 @@ def test_private_key_never_in_logs_response_or_repr(
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 0
     chain.attest.side_effect = RuntimeError(f"rpc exploded while using {key}")
-    api = ApiSettings(db_path=tmp_path / "api.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, settings, chain)
@@ -169,7 +169,7 @@ def test_private_key_never_in_logs_response_or_repr(
 def test_wrong_chain_is_terminal_and_does_not_send(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     chain = Mock()
     chain.chain_id.return_value = 1
-    store = Store(tmp_path / "jobs.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, _settings("0x" + "22" * 32), chain)
@@ -194,7 +194,7 @@ def test_already_attested_revert_counts_as_success(
         (True, 1_700_000_111, "0x" + "ab" * 20),
     ]
     chain.attest.side_effect = AlreadyAttestedError("AlreadyAttested")
-    store = Store(tmp_path / "jobs.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, _settings("0x" + "33" * 32), chain)
@@ -211,7 +211,7 @@ def test_verify_precheck_skips_send(tmp_path: Path, fixture_scorer: Transparency
     chain = Mock()
     chain.chain_id.return_value = 84532
     chain.verify.return_value = (True, 42, "0x" + "cd" * 20)
-    store = Store(tmp_path / "jobs.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, _settings("0x" + "44" * 32), chain)
@@ -228,7 +228,7 @@ def test_fee_above_cap_does_not_send(tmp_path: Path, fixture_scorer: Transparenc
     chain.chain_id.return_value = 84532
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 1
-    store = Store(tmp_path / "jobs.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, _settings("0x" + "55" * 32, value_cap_wei=0), chain)
@@ -244,7 +244,7 @@ def test_retries_then_succeeds(tmp_path: Path, fixture_scorer: TransparencyScore
     chain = Mock()
     chain.chain_id.side_effect = [ConnectionError("down"), ConnectionError("down"), 84532]
     chain.verify.return_value = (True, 7, "0x" + "11" * 20)
-    store = Store(tmp_path / "jobs.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     settings = _settings("0x" + "66" * 32, max_attempts=4, backoff_seconds=0.0)
@@ -261,7 +261,7 @@ def test_retries_then_succeeds(tmp_path: Path, fixture_scorer: TransparencyScore
 
 
 def test_disabled_worker_process_once_is_a_no_op(tmp_path: Path) -> None:
-    store = Store(tmp_path / "off.sqlite")
+    store = Store()
     worker = AttestWorker(store=store, settings=AttesterSettings(), autostart=False)
     assert worker.process_once() is False
     worker.kick()
@@ -370,7 +370,7 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
         chain = Web3Chain(settings)
         assert chain.chain_id() == 84532
         assert chain.fee_wei() == 0
-        store = Store(tmp_path / "anvil.sqlite")
+        store = Store()
         digest, claimed = _seed(store, fixture_scorer)
         assert digest != "0x" + "00" * 32
         store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
@@ -412,7 +412,7 @@ def test_sca_refuses_unpinned_contract_and_wrong_configured_chain(
 ) -> None:
     chain = Mock()
     chain.chain_id.return_value = 84532
-    store = Store(tmp_path / "pin.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     bad_contract = _settings("0x" + "77" * 32, contract="0x" + "ab" * 20)
@@ -435,7 +435,7 @@ def test_sca_refuses_unpinned_contract_and_wrong_configured_chain(
 def test_sca_refuses_hash_the_scorer_did_not_store(tmp_path: Path) -> None:
     chain = Mock()
     chain.chain_id.return_value = 84532
-    store = Store(tmp_path / "unstored.sqlite")
+    store = Store()
     digest = "0x" + "ab" * 32
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=0)
     worker = _worker(store, _settings("0x" + "88" * 32), chain)
@@ -458,7 +458,7 @@ def test_sca_timeout_after_send_is_success_when_verify_is_true(
         (True, 1_700_000_222, "0x" + "cd" * 20),
     ]
     chain.attest.side_effect = TimeoutError("receipt timeout")
-    store = Store(tmp_path / "timeout.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, _settings("0x" + "99" * 32), chain)
@@ -472,7 +472,7 @@ def test_sca_timeout_after_send_is_success_when_verify_is_true(
 def test_sca_gas_cap_and_subject_bounds(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     chain = Mock()
     chain.chain_id.return_value = 84532
-    store = Store(tmp_path / "bounds.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, _settings("0x" + "ab" * 32, gas_limit=HARD_GAS_CAP + 1), chain)
@@ -499,8 +499,8 @@ def test_sca_gas_cap_and_subject_bounds(tmp_path: Path, fixture_scorer: Transpar
 def test_sca_unauthenticated_attest_does_not_enqueue(
     tmp_path: Path, fixture_scorer: TransparencyScorer
 ) -> None:
-    api = ApiSettings(db_path=tmp_path / "api.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     app = create_app(settings=api, store=store, scorer=fixture_scorer, start_worker=False)
     resp = TestClient(app).get("/v1/attest/NVDA")
     assert resp.status_code == 401
@@ -526,7 +526,8 @@ def test_web3_chain_refuses_to_build_when_disabled() -> None:
 def test_runbook_single_worker_key_import_and_rotation_order() -> None:
     text = (ROOT / "contracts" / "ATTESTER_RUNBOOK.md").read_text(encoding="utf-8")
     assert "One worker only" in text
-    assert "FOR UPDATE SKIP LOCKED" in text
+    assert "in memory" in text
+    assert "lost on restart" in text
     assert "broadcast_pending" in text
     new_at = text.index('"setAttester(address,bool)" "$NEW_ATTESTER" true')
     old_at = text.index('"setAttester(address,bool)" "$OLD_ATTESTER" false')
@@ -570,8 +571,8 @@ def test_b3_secret_rpc_key_absent_from_db_logs_and_status(
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 0
     chain.attest.side_effect = RuntimeError(f"rpc down {rpc}")
-    api = ApiSettings(db_path=tmp_path / "b3.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, settings, chain)
@@ -615,8 +616,8 @@ def test_rpc_url_never_in_last_error_status_or_any_logger(
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 0
     chain.attest.side_effect = RuntimeError(f"provider rejected {leaked}")
-    api = ApiSettings(db_path=tmp_path / "api.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, settings, chain)
@@ -682,8 +683,8 @@ def test_min_interval_does_not_enqueue_or_send(
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 0
     chain.attest.return_value = "0x" + "ab" * 32
-    api = ApiSettings(db_path=tmp_path / "gap.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     app = create_app(
         settings=api,
         store=store,
@@ -719,8 +720,8 @@ def test_min_interval_does_not_enqueue_or_send(
 
 def test_daily_cap_does_not_enqueue(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     settings = _settings("0x" + "56" * 32, min_interval_seconds=0, daily_tx_cap=1)
-    api = ApiSettings(db_path=tmp_path / "cap.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     app = create_app(
         settings=api,
         store=store,
@@ -869,7 +870,7 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
             raise TimeoutError("receipt timeout")
 
         chain._w3.eth.wait_for_transaction_receipt = _timeout  # type: ignore[method-assign]
-        store = Store(tmp_path / "timeout-lands.sqlite")
+        store = Store()
         digest, claimed = _seed(store, fixture_scorer)
         store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
         worker = AttestWorker(store=store, settings=settings, chain=chain, autostart=False)
@@ -931,7 +932,7 @@ def test_crash_recovery_polls_saved_hash_and_does_not_resend(
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.landed_hash.return_value = "0x" + "cd" * 32
     chain.attest.side_effect = AssertionError("must not send again")
-    store = Store(tmp_path / "crash.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     store.note_submitted_tx(job["id"], tx_hash="0x" + "cd" * 32, nonce=3)
@@ -956,15 +957,11 @@ def test_broadcast_fails_only_after_deadline_when_nonce_is_taken(
     chain.get_tx.return_value = None
     chain.transaction_count.return_value = 0
     chain.attest.side_effect = AssertionError("must not send again")
-    store = Store(tmp_path / "drop.sqlite")
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     store.note_submitted_tx(job["id"], tx_hash="0x" + "ab" * 32, nonce=0)
-    store._execute(
-        "UPDATE attest_jobs SET broadcast_at = ? WHERE id = ?",
-        (time.time() - 120, job["id"]),
-    )
-    store._commit()
+    store._jobs[job["id"]]["broadcast_at"] = time.time() - 120
     worker = _worker(
         store,
         _settings("0x" + "62" * 32, broadcast_deadline_seconds=30),
@@ -1008,8 +1005,8 @@ def test_low_balance_does_not_send(
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 0
     chain.attest.return_value = "0x" + "ab" * 32
-    api = ApiSettings(db_path=tmp_path / "bal.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     digest, claimed = _seed(store, fixture_scorer)
     store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
     worker = _worker(store, settings, chain)
@@ -1036,8 +1033,10 @@ def test_low_balance_does_not_send(
     assert health.status_code == 200
     assert health.json()["attester_balance"] == "low"
     assert health.json()["attester"] == "enabled"
-    assert health.json()["store"] == "sqlite"
-    assert health.json()["database"] == "ok"
+    assert health.json()["process"] == "ok"
+    assert health.json()["chain_id"] == 84532
+    assert isinstance(health.json()["queue_depth"], int)
+    assert "database" not in health.json()
 
 
 def test_hourly_cap_does_not_enqueue(
@@ -1049,8 +1048,8 @@ def test_hourly_cap_does_not_enqueue(
         hourly_tx_cap=1,
         daily_tx_cap=48,
     )
-    api = ApiSettings(db_path=tmp_path / "hour.sqlite")
-    store = Store(api.db_path)
+    api = ApiSettings()
+    store = Store()
     app = create_app(
         settings=api,
         store=store,
@@ -1072,8 +1071,7 @@ def test_hourly_cap_does_not_enqueue(
     assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
 
 
-def test_sqlite_and_fixtures_refuse_a_live_attester(
-    tmp_path: Path,
+def test_fixtures_refuse_a_live_attester_and_memory_does_not(
     fixture_scorer: TransparencyScorer,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1082,16 +1080,19 @@ def test_sqlite_and_fixtures_refuse_a_live_attester(
     monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
     monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("RWA_USE_FIXTURES", "1")
-    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("RENDER", raising=False)
-    api = ApiSettings(db_path=tmp_path / "refuse.sqlite")
+    api = ApiSettings()
     app = create_app(settings=api, scorer=fixture_scorer, start_worker=False)
     reason = app.state.attester.disabled_reason
     assert app.state.attester.enabled is False
-    assert "DATABASE_URL" in reason
     assert "RWA_USE_FIXTURES" in reason
     assert "No transaction was sent" in reason
     health = TestClient(app).get("/health")
     assert health.status_code == 200
     assert health.json()["attester"] == "disabled"
-    assert health.json()["store"] == "sqlite"
+    assert health.json()["process"] == "ok"
+    assert "database" not in health.json()
+
+    monkeypatch.setenv("RWA_USE_FIXTURES", "0")
+    live = create_app(settings=api, scorer=fixture_scorer, start_worker=False)
+    assert live.state.attester.enabled is True

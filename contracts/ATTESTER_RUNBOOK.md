@@ -54,16 +54,15 @@ uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT
 | Start command | the uvicorn line above |
 | Health check path | `/health` |
 
-Every env var on this service is `sync: false`. `render.yaml` lists the
-names and does not contain values. You type the values in the dashboard
-after sync. A later sync will not overwrite them.
+Env vars on this service are `sync: false`, except `RWA_ATTEST_ENABLED`,
+which `render.yaml` sets to `false`. You type the other values in the
+dashboard after sync. A later sync will not overwrite them.
 
-Free plan: the service spins down after about 15 minutes idle. With
-`DATABASE_URL` set, payloads, history, and the attest queue live in Postgres
-and survive that spin-down. With it unset, they live in the sqlite file,
-which disappears on spin-down, and `verify` then has no bytes. Render free
-Postgres expires 30 days after you create it. Move steps are below. No paid
-disk is required. A background worker is not in `render.yaml`.
+Free plan: the service spins down after about 15 minutes idle. Scores,
+inputs, history, and the attest queue live in memory and are lost on
+restart. Save `canonical_payload` from `GET /v1/attest/{ticker}` if you
+need to check the bytes later. No disk and no database. A background
+worker is not in `render.yaml`.
 
 ### Blueprint sync (Spencer)
 
@@ -99,12 +98,9 @@ capped by `RWA_ATTEST_GAS_LIMIT` (default `300000`). A Foundry gas report on
 this contract showed `attest` median **208274** and max **210495** (24 calls;
 the minimum includes reverts).
 
-The queue is `attest_jobs` in the same store as the canonical bytes and
-score history. `DATABASE_URL` selects Postgres (`postgres://` or
-`postgresql://`, `sslmode` left as the URL has it). Unset selects the sqlite
-file at `RWA_API_DB_PATH`. One worker claims with `SELECT … FOR UPDATE SKIP
-LOCKED` on Postgres. A duplicate send is still success because the worker
-checks `isAttested` before sending.
+The queue is in the same in-memory store as the canonical bytes and score
+history. A restart drops it. One worker. A duplicate send is still success
+because the worker checks `isAttested` before sending.
 
 Fees are EIP-1559. The worker sets `maxFeePerGas` and `maxPriorityFeePerGas`
 on every send. `RWA_ATTEST_MAX_FEE_GWEI` (default `20`) is clamped to a hard
@@ -125,17 +121,15 @@ URL, is not returned.
 is `true` (also `1`, `yes`, or `on`). `RWA_ATTEST_MIN_BALANCE_WEI` (default
 `50000000000000`, about 0.00005 ETH) stops sends while the signer is below
 that floor. Status and `/health` report `low_balance` / `attester_balance`.
-`/health` also runs `SELECT 1` and returns 503 when the database is down.
-It includes `store` (`postgres` or `sqlite`) and `attester` (`enabled` or
-`disabled`).
+`/health` reports process status, attester enabled or disabled, chain id,
+RPC reachability, attester balance against the floor, and queue depth. It
+does not probe a database.
 
-The attester does not start when `DATABASE_URL` is unset, when `RENDER` is
-set without that URL, or when `RWA_USE_FIXTURES=1` and the attester would
-otherwise be enabled. `RWA_ATTEST_ENABLED` is `false` in `render.yaml`.
-Nothing sends until that value is turned on. A claim sets `next_attempt_at`
-about 90 seconds ahead so a second process cannot send the same job while
-the first is still broadcasting. The moment `send` returns a hash, that
-hash and its nonce are committed before the receipt wait.
+The attester does not start when `RWA_USE_FIXTURES=1` and it would otherwise
+be enabled. `RWA_ATTEST_ENABLED` is `false` in `render.yaml`. Nothing sends
+until that value is turned on. The moment `send` returns a hash, that hash
+and its nonce are recorded before the receipt wait. `isAttested` is checked
+on-chain before any send, so a restart cannot double-post.
 
 ## One worker only
 
@@ -146,10 +140,10 @@ Render deploys overlap: the old process stays up until the new one passes
 its health check, so two processes can hold the key at once. The design
 copes like this:
 
-- Postgres claims the job with `SELECT … FOR UPDATE SKIP LOCKED`, so only
-  one process takes a given row. SQLite holds the process lock around the
-  same claim. Keep the API service at **one instance**.
-- After broadcast, the job row stores `tx_hash` and `nonce` before the
+- Keep the API service at **one instance**. The queue is in memory, so a
+  second process does not see the first process's jobs. `isAttested`
+  before every send is what stops a restart from posting twice.
+- After broadcast, the job stores `tx_hash` and `nonce` before the
   receipt wait. A receipt timeout moves the job to `broadcast_pending`.
   The worker does not send another transaction for that job.
 - On startup, and in the worker loop, a reconciler polls that saved hash's
@@ -198,8 +192,8 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTEST_MIN_BALANCE_WEI` | Stop sending when the signer balance is below this. Default `50000000000000` | `50000000000000` | no |
 | `RWA_ATTEST_ENABLED` | Kill switch. Only `1`, `true`, `yes`, or `on` sends. `render.yaml` sets `false`. Default off | `false` | no |
 | `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` | Seconds to poll a broadcast before the drop check. Default `1800` | `1800` | no |
-| `RWA_API_DB_PATH` | SQLite file used only when `DATABASE_URL` is unset. Default `data/rat_api.sqlite` | `data/rat_api.sqlite` | no |
-| `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot so `/v1/attest` works after spin-down wipes sqlite | `rat_` plus a long random token | yes |
+| `RWA_STORE_MAX_ENTRIES` | Cap on in-memory history, payloads, jobs, usage, and deliveries. Default `1000`. Hard max `10000` in code | `1000` | no |
+| `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot. The key list is in memory and is lost on restart | `rat_` plus a long random token | yes |
 | `RWA_API_BOOTSTRAP_TIER` | Tier of that key. `/v1/attest` requires `paid` | `paid` | no |
 | `RWA_API_FREE_DAILY_LIMIT` | Daily cap for a free key. Default `50`. Attest does not accept a free key | `50` | no |
 | `RWA_API_RATE_WINDOW_SECONDS` | Window for that cap. Default `86400` | `86400` | no |
@@ -210,8 +204,6 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `BASE_RPC_URL` | Optional Chainlink PoR RPC (Base mainnet). Not the attester RPC | `https://mainnet.base.example` | yes if the URL embeds a key |
 | `ETH_RPC_URL` | Optional Chainlink PoR RPC (Ethereum) | `https://ethereum.example/v2/<key>` | yes if the URL embeds a key |
 | `ETHEREUM_RPC_URL` | Optional alias of `ETH_RPC_URL` | same | yes if the URL embeds a key |
-| `DATABASE_URL` | Postgres for payloads, history, and the attest queue. Set this. `postgres://` and `postgresql://` both work | `postgres://user:pass@host/db?sslmode=require` | yes |
-| `RWA_API_DATABASE_URL` | Used only when `DATABASE_URL` is unset. Same URL shapes | same | yes |
 | `HOST` | Bind address. Default `0.0.0.0`. Leave unset on Render | `0.0.0.0` | no |
 | `PORT` | Render injects this. Do not set it | `10000` | no |
 | `RENDER_GIT_COMMIT` | Render injects the full git SHA. `scorer_version` reads it first | 40 hex characters | no |
@@ -219,44 +211,18 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 `SOURCE_VERSION` and `GIT_COMMIT` do not change `scorer_version`. `/v1/score`
 and `/v1/attest` do not read `XAI_API_KEY`.
 
-## Postgres (Spencer)
+## Scores are in memory
 
-The API service does not create the database. `render.yaml` only lists
-`DATABASE_URL` with `sync: false`. There is no `fromDatabase` link and no
-paid disk.
+Scores, inputs, history, and the attest queue live in the API process.
+They are lost on restart and on free-plan spin-down. There is no Render
+Postgres, no `DATABASE_URL`, and no dump or restore step.
 
-1. Render Dashboard → **New** → **PostgreSQL**. Name it
-   `rwa-transparency-score-db`. Plan **Free** ($0). Same region as the API
-   service.
-2. When the instance is available, copy the **Internal Database URL**. It
-   looks like `postgres://USER:PASSWORD@HOST/DATABASE`. Do not commit it.
-3. Open `rwa-transparency-score-api` → **Environment**. Set `DATABASE_URL` to
-   that URL. Save. Render redeploys the API service. Leave the scorecard
-   service alone.
-4. On the API shell, `GET /v1/attest/NVDA` (paid key) should store a row that
-   is still there after the service spins down and wakes up.
+Save `canonical_payload` from `GET /v1/attest/{ticker}` (or status) while
+the process is up. After a restart, check those bytes with
+`verify --payload-file`. The on-chain hash remains. `isAttested` before
+every send stops a second post of the same digest.
 
-**30-day limit.** Render deletes a free Postgres instance 30 days after you
-create it. Before that day, move the data to a host that does not expire:
-
-```bash
-pg_dump --format=custom --no-owner --dbname="$OLD_DATABASE_URL" --file=rat.dump
-pg_restore --no-owner --dbname="$NEW_DATABASE_URL" rat.dump
-```
-
-Set `DATABASE_URL` on the API service to the new URL. Save so that service
-redeploys. Then, on the API shell, before you drop the old instance:
-
-```bash
-python -m rwa_score.api.verify NVDA --json \
-  --contract 0x2F073a3628D498d92956e7eFE2b26633eDa75b00 \
-  --rpc-url "$BASE_SEPOLIA_RPC_URL" \
-  --attester "$ATTESTER_ADDRESS"
-```
-
-Expect `"stored": true`, `"hash_ok": true`, and `"match": true` for an
-attestation that was stored before the move. `verify` reads `DATABASE_URL`.
-It does not re-score.
+Future (out of scope): persistent DB only if we go mainnet or partner with a data provider like CoinMarketCap (API signups).
 
 ## 1. Create a new attester key (Spencer, off agent machines)
 
@@ -437,9 +403,9 @@ section 4 value (`0.002ether`) after it is allowlisted, not more.
 ## 6. Live end-to-end check (Spencer only, Base Sepolia)
 
 Do this after steps 1–3, with the API service up, `isAttester` true, and
-`attestationFee` `0`. Run it in one sitting, before the free service spins
-down. Spin-down deletes the sqlite file, and `verify` then reports nothing
-stored even if the transaction already landed.
+`attestationFee` `0`. Run it in one sitting. Scores are in memory and are
+lost on restart. Save `canonical_payload` before the service spins down if
+you still want `verify` to see the bytes. The chain record stays.
 
 Agents do not run this section. It sends a transaction from the key you set
 on Render. `API_BASE` is the `rwa-transparency-score-api` URL from the
@@ -566,27 +532,30 @@ from                 <ATTESTER_ADDRESS>
 to                   0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 ```
 
-### 6.5 `verify.py` against the stored payload
+### 6.5 `verify.py` against the saved payload
 
-The stored bytes are in the API service database (`DATABASE_URL`), not on
-your laptop. Open the Render shell for `rwa-transparency-score-api` and run
-the command below. It passes `--rpc-url` and `--attester`, so a confirmed
-row is exit `0` with `"match": true`. It does not use `--offline`.
+The bytes are in the API process memory, and they are lost on restart.
+`/tmp/nvda-status.json` from the poll above includes `canonical_payload`.
+Write that object to a file and pass `--payload-file`. The command below
+passes `--rpc-url` and `--attester`, so a confirmed bundle is exit `0`
+with `"match": true`. It does not use `--offline`.
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Stored bytes match, inputs recompute `inputs_digest`, and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
-| `1` | Database path does not exist, or the file is not SQLite. |
-| `2` | Nothing stored. The note says `no stored payload`, unless that hash is attested on-chain, in which case it says `pre-fix attestation, stored payload unavailable`. |
-| `3` | Tampered or malformed bytes, or stored inputs do not recompute `inputs_digest`. |
+| `0` | Saved bytes match, inputs recompute `inputs_digest`, and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
+| `1` | `--payload-file` does not exist, or the file is not a payload bundle. |
+| `2` | Nothing saved. The note says `no stored payload`, unless that hash is attested on-chain, in which case it says `pre-fix attestation, stored payload unavailable`. |
+| `3` | Tampered or malformed bytes, or saved inputs do not recompute `inputs_digest`. |
 | `4` | Ticker mismatch, including `--hash` for another ticker; chain id is not 84532; `verify()` is false; or the attester mismatches. |
 | `5` | RPC / cast call failed. |
 | `6` | A chain read was requested but `cast` is not on `PATH`. |
 | `7` | No `--rpc-url` and `BASE_SEPOLIA_RPC_URL` unset, and `--offline` was not passed. |
-| `8` | The row has no `inputs_json`. |
+| `8` | The bundle has no inputs. |
 
 ```bash
+python3 -c 'import json; json.dump(json.load(open("/tmp/nvda-status.json"))["canonical_payload"], open("/tmp/nvda.payload.json","w"))'
 python -m rwa_score.api.verify NVDA --json \
+  --payload-file /tmp/nvda.payload.json \
   --contract 0x2F073a3628D498d92956e7eFE2b26633eDa75b00 \
   --rpc-url "$BASE_SEPOLIA_RPC_URL" \
   --attester "$ATTESTER_ADDRESS"
@@ -611,7 +580,7 @@ Expected JSON fields:
 }
 ```
 
-`match` is `true` only when the stored bytes recompute to that hash, the
-chain id is 84532, and the on-chain attester is `$ATTESTER_ADDRESS`. A laptop
-run against an empty local sqlite file exits `2` with `"stored": false`. That
-is the wrong machine.
+`match` is `true` only when the saved bytes recompute to that hash, the
+chain id is 84532, and the on-chain attester is `$ATTESTER_ADDRESS`. A run
+with no `--payload-file` exits `2` with `"stored": false`, because this
+process does not share the API's memory.

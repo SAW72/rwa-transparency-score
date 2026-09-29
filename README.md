@@ -227,7 +227,7 @@ The scoring engine, verifiers, and fixtures stay **MIT-open**. What you pay for 
 
 ### Get an API key
 
-Self-host (prints the secret once; the DB stores only a SHA-256 hash):
+Self-host prints a secret once. The API process keeps only a SHA-256 hash, in memory. Set `RWA_API_BOOTSTRAP_KEY` to that secret so a restart can recreate it:
 
 ```bash
 python -m rwa_score.api.keys create --name "my-app" --tier free
@@ -306,31 +306,31 @@ The captured file is the full authentic envelope (pillars, verification, basis w
 `GET /v1/attest/{ticker}` builds the canonical payload **once**, stores those exact JSON bytes, and returns `hash_canonical` of the same bytes (history and webhooks use that build too). The payload is the six-pillar breakdown, including **basis**, plus `as_of` (attest time: the Unix second UTC when the payload is hashed; `0` for fixture scores, which is not a calendar time and is not a provider observation time), `data_as_of` (the latest Chainlink observation time already on the report, or null), `scorer_version` (the git SHA, resolved once per process: `RENDER_GIT_COMMIT`, else one `git rev-parse HEAD`, else `unknown` with a warning), and `inputs_digest` (SHA-256 of an allowlist of scoring inputs: CMC price and basis, identity fields, issuer heuristic flags, and each pillar's verifier meta, including non-PoR pillars; not raw provider HTTP bodies and not explanation prose). Headers, API keys, tokens, and URLs are not on that allowlist, so they are never hashed or stored. Those input bytes are stored beside the canonical payload so `verify` can recompute the digest. Canonical JSON is sorted keys, compact separators, `ensure_ascii`, UTF-8, and `allow_nan=False` (NaN and Infinity are rejected). Key order and the lack of insignificant whitespace follow RFC 8785; number formatting is Python's `json.dumps`, not the full RFC 8785 numeric profile. The hash function is SHA-256 of those bytes, `0x` + hex. Submit with `attest(scoreHash, ticker, as_of)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy with [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
 
 ```bash
-# Local bytes only. Exit 0 when the stored row is intact. The output says nothing was checked on-chain.
-python scripts/verify_attestation.py NVDA --db data/rat_api.sqlite --offline
+# Local bytes only. Exit 0 when the saved bundle is intact. The output says nothing was checked on-chain.
+python scripts/verify_attestation.py NVDA --payload-file nvda.json --offline
 
 # Chain read. Exit 0 only when match is true (chain id 84532, verify() true, attester matches).
 # --attester, or the RWA_ATTESTER_ADDRESS environment variable, is the expected attester.
-python scripts/verify_attestation.py NVDA --rpc-url "$BASE_SEPOLIA_RPC_URL" --attester "$RWA_ATTESTER_ADDRESS"
+python scripts/verify_attestation.py NVDA --payload-file nvda.json --rpc-url "$BASE_SEPOLIA_RPC_URL" --attester "$RWA_ATTESTER_ADDRESS"
 ```
 
-`verify` recomputes the hash from the **stored** canonical JSON and does not re-score. Malformed payloads and a corrupt database print JSON, not a traceback. `--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. Pass `--rpc-url` (or `BASE_SEPOLIA_RPC_URL`) to read the chain. Pass `--attester` or set `RWA_ATTESTER_ADDRESS` to the expected attester; a chain read without it does not match. With neither a URL nor `--offline`, the command exits `7` and does not treat the row as confirmed. `--fixtures`, `--api-url`, and `--api-key` are obsolete: they warn and do not re-score. The client never needs a private key. Set `DATABASE_URL` (`postgres://` or `postgresql://`) and the stored payloads, scoring inputs, history, and attest queue live in Postgres across spin-down. Unset, they stay in the sqlite file, which a spin-down drops. Render free Postgres expires after 30 days. Hashes attested before a stored row existed cannot be reconstructed.
+`verify` recomputes the hash from the **saved** canonical JSON and does not re-score. The digest is SHA-256 of those bytes, the same `bytes32` the contract stores. Malformed payloads and a corrupt payload file print JSON, not a traceback. `--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. Pass `--rpc-url` (or `BASE_SEPOLIA_RPC_URL`) to read the chain. Pass `--attester` or set `RWA_ATTESTER_ADDRESS` to the expected attester; a chain read without it does not match. With neither a URL nor `--offline`, the command exits `7` and does not treat the bundle as confirmed. `--fixtures`, `--api-url`, and `--api-key` are obsolete: they warn and do not re-score. The client never needs a private key. Scores, inputs, history, and the attest queue live in the API process memory and are lost on restart. Save `canonical_payload` from `GET /v1/attest/{ticker}` and pass `--payload-file`. Hashes attested before those bytes were saved cannot be reconstructed.
 
 | Exit | Meaning |
 | --- | --- |
 | `0` | Stored bytes match, inputs recompute `inputs_digest`, and the chain read matched. Also `0` with `--offline` when those local checks pass; the output says nothing was checked on-chain. |
-| `1` | Database path does not exist, or the file is not SQLite. A missing `--db` is not created. |
+| `1` | `--payload-file` does not exist, or the file is not a payload bundle. A missing path is not created. |
 | `2` | Nothing stored. The note says `no stored payload`, unless that hash is attested on-chain, in which case it says `pre-fix attestation, stored payload unavailable`. |
 | `3` | Tampered or malformed bytes, or stored inputs do not recompute `inputs_digest`. |
 | `4` | Ticker mismatch (payload, or a `--hash` row for another ticker), chain id is not 84532, `verify()` is false, or the attester mismatches. |
 | `5` | RPC / cast call failed. |
 | `6` | A chain read was requested but `cast` is not on `PATH`. |
 | `7` | No `--rpc-url` and `BASE_SEPOLIA_RPC_URL` unset, and `--offline` was not passed. Nothing was checked on-chain. |
-| `8` | The row has no `inputs_json`, so `inputs_digest` cannot be re-derived. |
+| `8` | The bundle has no inputs, so `inputs_digest` cannot be re-derived. |
 
 When `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, and `BASE_SEPOLIA_RPC_URL` are all set, `GET /v1/attest/{ticker}` enqueues `attest(scoreHash, ticker, as_of)` on a single in-process worker (not on the HTTP response). The hash is the one canonical build from that request. If any of those is unset, the worker stays disabled and the API says so. The key is env-only. Sends are Spencer-only: [`contracts/ATTESTER_RUNBOOK.md`](contracts/ATTESTER_RUNBOOK.md). Render's live service is still the Streamlit app; this worker runs with the API process, not the current start command.
 
-SQLite (`RWA_API_DB_PATH`, default `data/rat_api.sqlite`) is the backend when `DATABASE_URL` is unset. Versioned migrations live in `rwa_score/api/migrations` and run on startup for SQLite or Postgres. This repo does not create a Render database. Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
+The store is in memory, capped by `RWA_STORE_MAX_ENTRIES` (default 1000, hard max 10000). Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
 
 ## Tests
 

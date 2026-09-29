@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -20,7 +19,7 @@ from rwa_score.scorer import ScoreError, TransparencyScorer
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> ApiSettings:
-    base = ApiSettings(db_path=tmp_path / "api.sqlite", free_daily_limit=50)
+    base = ApiSettings(free_daily_limit=50)
     if not overrides:
         return base
     data = base.__dict__.copy()
@@ -36,7 +35,7 @@ def _client(
     **setting_overrides: Any,
 ) -> tuple[TestClient, Store]:
     settings = _settings(tmp_path, **setting_overrides)
-    store = Store(settings.db_path)
+    store = Store()
     app = create_app(settings=settings, store=store, scorer=scorer, poster=poster)
     return TestClient(app), store
 
@@ -107,8 +106,11 @@ def test_health_does_not_need_a_key(tmp_path: Path, fixture_scorer: Transparency
     body = resp.json()
     assert body["api"] is True
     assert "fixtures" in body
-    assert body["database"] == "ok"
-    assert body["store"] == "sqlite"
+    assert body["process"] == "ok"
+    assert body["chain_id"] == 84532
+    assert body["rpc"] in {"ok", "down", "unset", "unknown"}
+    assert isinstance(body["queue_depth"], int)
+    assert "database" not in body
     assert body["attester"] in {"enabled", "disabled"}
 
 
@@ -383,7 +385,7 @@ def test_last_bands_and_webhooks_isolated_per_tenant(tmp_path: Path) -> None:
 
 
 def test_notify_crossings_never_reads_other_tenant_hooks(tmp_path: Path) -> None:
-    store = Store(tmp_path / "iso.sqlite")
+    store = Store()
     raw_a = store.create_key(name="a", tier="paid")
     raw_b = store.create_key(name="b", tier="paid")
     key_a = store.lookup_key(raw_a)
@@ -408,24 +410,8 @@ def test_notify_crossings_never_reads_other_tenant_hooks(tmp_path: Path) -> None
     store.close()
 
 
-def test_last_bands_migrates_off_unscoped_schema(tmp_path: Path) -> None:
-    db = tmp_path / "legacy.sqlite"
-    conn = sqlite3.connect(db)
-    conn.executescript(
-        """
-        CREATE TABLE last_bands (
-            ticker TEXT PRIMARY KEY,
-            band TEXT NOT NULL,
-            score REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        INSERT INTO last_bands VALUES ('NVDA', 'GREEN', 80.0, 1.0);
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    store = Store(db)
+def test_new_key_starts_without_a_band() -> None:
+    store = Store()
     raw = store.create_key(name="tenant", tier="paid")
     rec = store.lookup_key(raw)
     assert rec is not None
@@ -486,14 +472,22 @@ def test_attest_endpoint_returns_hash_not_for_chain_storage_of_score(
     assert saved is not None
     assert saved["canonical"] == canonical_bytes(body["payload"])
     assert hash_canonical(saved["canonical"]) == body["score_hash"]
+    bundle = body["canonical_payload"]
+    assert bundle["score_hash"] == body["score_hash"]
+    saved_file = tmp_path / "nvda.payload.json"
+    saved_file.write_text(json.dumps(bundle), encoding="utf-8")
+    from rwa_score.api.verify import main as verify_main
+
+    assert verify_main(["NVDA", "--offline", "--json", "--payload-file", str(saved_file)]) == 0
+    fresh = Store()
+    assert fresh.latest_attested_payload("NVDA") is None
+    assert verify_main(["NVDA", "--offline", "--json", "--payload-file", str(saved_file)]) == 0
 
 
 def test_nan_in_live_report_score_200_attest_422(
     tmp_path: Path, fixture_scorer: TransparencyScorer
 ) -> None:
     """Score sanitizes non-finite numbers. Attest refuses them before any write."""
-    import sqlite3
-
     from rwa_score.api.attest import canonical_bytes
     from rwa_score.api.auto_attest import AttesterSettings
 
@@ -512,7 +506,7 @@ def test_nan_in_live_report_score_200_attest_422(
             return report
 
     settings = _settings(tmp_path)
-    store = Store(settings.db_path)
+    store = Store()
     attester = AttesterSettings(
         private_key="0x" + "11" * 32,
         contract="0x" + "ab" * 20,
@@ -533,10 +527,8 @@ def test_nan_in_live_report_score_200_attest_422(
     assert body["error"] == "non_finite_value"
     assert body["field"] == "score"
     assert store.latest_attested_payload("NVDA") is None
-    with sqlite3.connect(store.path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM attest_jobs").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM attested_payloads").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM score_history").fetchone()[0] == 0
+    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 0
+    assert store.get_history("NVDA") == []
 
     scored = client.get("/v1/score/NVDA", headers=_headers(raw))
     assert scored.status_code == 200
@@ -556,7 +548,7 @@ def test_attest_status_does_not_score(
     from rwa_score.api.auto_attest import AttesterSettings
 
     settings = _settings(tmp_path)
-    store = Store(settings.db_path)
+    store = Store()
     scorer = Mock()
     scorer.score.side_effect = AssertionError("status must not score")
     attester = AttesterSettings(
@@ -621,24 +613,18 @@ def test_unknown_ticker_404(tmp_path: Path, fixture_scorer: TransparencyScorer) 
     assert resp.json()["error"] == "not_found"
 
 
-def test_keys_cli_create_list_revoke(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_keys_cli_create_is_not_kept(capsys: pytest.CaptureFixture[str]) -> None:
     from rwa_score.api.keys import main as keys_main
 
-    db = str(tmp_path / "keys.sqlite")
-    assert keys_main(["--db", db, "create", "--name", "acme", "--tier", "paid"]) == 0
-    out = capsys.readouterr().out.strip().splitlines()
-    raw = out[-1]
+    assert keys_main(["create", "--name", "acme", "--tier", "paid"]) == 0
+    captured = capsys.readouterr()
+    raw = captured.out.strip().splitlines()[-1]
     assert raw.startswith("rat_")
-    assert keys_main(["--db", db, "list"]) == 0
+    assert "RWA_API_BOOTSTRAP_KEY" in captured.err
+    assert keys_main(["list"]) == 0
     listed = capsys.readouterr().out
-    assert "paid" in listed
-    assert "acme" in listed
-    prefix = raw[:12]
-    assert keys_main(["--db", db, "revoke", "--prefix", prefix]) == 0
-    store = Store(db)
-    assert store.lookup_key(raw) is not None
-    assert store.lookup_key(raw).revoked
-    store.close()
+    assert "acme" not in listed
+    assert "no keys" in listed
 
 
 def test_verify_client_fixtures_json(
@@ -648,16 +634,24 @@ def test_verify_client_fixtures_json(
 ) -> None:
     from rwa_score.api.verify import main as verify_main
 
+    from rwa_score.api.verify import export_payload
+
     report = fixture_scorer.score("NVDA")
-    db = tmp_path / "verify.sqlite"
-    store = Store(db)
-    store.save_attested_payload(
-        ticker="NVDA",
-        canonical=canonical_bytes(attestation_payload(report)),
-        inputs=inputs_bytes(report),
+    raw = canonical_bytes(attestation_payload(report))
+    inputs = inputs_bytes(report)
+    path = tmp_path / "verify.payload.json"
+    path.write_text(
+        json.dumps(
+            export_payload(
+                ticker="NVDA",
+                score_hash=hash_canonical(raw),
+                canonical=raw,
+                inputs=inputs,
+            )
+        ),
+        encoding="utf-8",
     )
-    store.close()
-    assert verify_main(["NVDA", "--fixtures", "--offline", "--json", "--db", str(db)]) == 0
+    assert verify_main(["NVDA", "--fixtures", "--offline", "--json", "--payload-file", str(path)]) == 0
     captured = capsys.readouterr()
     assert "obsolete" in captured.err.lower()
     payload = json.loads(captured.out)
@@ -734,10 +728,7 @@ def test_live_mode_hash_matches_stored_bytes_when_clock_advances(
     assert second.status_code == 200
     assert len(posted) == 1
 
-    rows = store._conn.execute(
-        "SELECT payload_json, payload_hash FROM score_history WHERE ticker = ? ORDER BY id",
-        ("NVDA",),
-    ).fetchall()
+    rows = [row for row in store._history if row["ticker"] == "NVDA"]
     assert len(rows) == 2
     for row in rows:
         blob = row["payload_json"].encode("utf-8")
@@ -761,10 +752,7 @@ def test_live_mode_hash_matches_stored_bytes_when_clock_advances(
     assert body["payload"]["as_of"] == sealed_at[2]
     assert "canonical" not in body
     assert len(sealed_at) == 3
-    history = store._conn.execute(
-        "SELECT payload_json, payload_hash FROM score_history WHERE ticker = ? ORDER BY id DESC LIMIT 1",
-        ("NVDA",),
-    ).fetchone()
+    history = [row for row in store._history if row["ticker"] == "NVDA"][-1]
     assert history["payload_hash"] == body["score_hash"]
     assert history["payload_json"].encode("utf-8") == saved["canonical"]
 

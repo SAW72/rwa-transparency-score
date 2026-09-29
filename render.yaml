@@ -106,7 +106,7 @@ services:
         value: "false"
       - key: RWA_ATTEST_BROADCAST_DEADLINE_SECONDS
         sync: false
-      - key: RWA_API_DB_PATH
+      - key: RWA_STORE_MAX_ENTRIES
         sync: false
       - key: RWA_API_BOOTSTRAP_KEY
         sync: false
@@ -125,6 +125,4 @@ services:
       - key: ETH_RPC_URL
         sync: false
       - key: ETHEREUM_RPC_URL
-        sync: false
-      - key: DATABASE_URL
         sync: false

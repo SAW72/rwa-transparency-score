@@ -2,24 +2,19 @@
 
 Enqueue on ``GET /v1/attest``. A single background thread sends
 ``attest(scoreHash, ticker, as_of)`` and is not on the HTTP response path.
-The pending queue is the sqlite ``attest_jobs`` table, so a process restart
-keeps the work **when the sqlite file is still on disk**.
+The queue lives in process memory. A restart drops it. ``isAttested`` is
+checked before every send so a restart cannot post the same digest twice.
 
-Render's free web service disk is ephemeral. A spin-down deletes that file.
-This module does not add a second Render service. A Render background worker
-or a paid plan with a persistent disk is the way to keep the queue across
-spin-down. Spencer sets the attester key on Render himself. This process
-reads ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
+Spencer sets the attester key on Render himself. This process reads
+``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
 
 If ``RWA_ATTEST_ENABLED`` is not true, or the key, contract, or RPC is unset,
 the worker stays disabled and the API says so. It does not crash and it
-does not send. A missing ``DATABASE_URL`` (or ``RWA_USE_FIXTURES=1``) also
-refuses to start the attester.
+does not send. ``RWA_USE_FIXTURES=1`` also refuses to start the attester.
 
-One API instance only. During a Render deploy the old process and the new
-one overlap. Postgres claims with ``FOR UPDATE SKIP LOCKED``. A job that
-has already been broadcast is never sent again. The worker polls that
-saved hash until it lands. Do not run a second worker on this key.
+One API instance only. A job that has already been broadcast is never sent
+again. The worker polls that saved hash until it lands. Do not run a second
+worker on this key.
 """
 
 from __future__ import annotations
@@ -613,43 +608,34 @@ def admission_block(store: Any, settings: AttesterSettings, ticker: str) -> str 
     return None
 
 
-def guard_live_attester(settings: AttesterSettings, *, database_url: str) -> None:
-    """Refuse to send when the queue is ephemeral or scores are fixtures.
+def guard_live_attester(settings: AttesterSettings) -> None:
+    """Refuse to send when scores are fixtures.
 
     Called on the production path (``from_env``). Tests that pass an
-    ``AttesterSettings`` instance are left alone.
+    ``AttesterSettings`` instance are left alone. The queue is in memory
+    on purpose. ``isAttested`` before every send is what stops a restart
+    from posting the same digest twice.
     """
-    from rwa_score.api.settings import is_postgres_url
     from rwa_score.client import use_fixtures
 
-    postgres = is_postgres_url(database_url)
-    render = bool((os.getenv("RENDER") or "").strip() or (os.getenv("RENDER_SERVICE_ID") or "").strip())
     would_send = bool(
         settings.attest_enabled and settings.private_key and settings.contract and settings.rpc_url
     )
-    reasons: list[str] = []
-    if not postgres and (render or would_send):
-        reasons.append(
-            "DATABASE_URL is unset, so the attester will not start on ephemeral SQLite. "
-            "No transaction was sent."
-        )
     if use_fixtures() and would_send:
-        reasons.append(
+        settings.refuse(
             "RWA_USE_FIXTURES is set while the attester is enabled. "
             "The attester will not start. No transaction was sent."
         )
-    if reasons:
-        settings.refuse(" ".join(reasons))
         logger.warning("attester refused: %s", settings.disabled_reason)
 
 
 class Web3Chain:
     """One signer, one nonce stream. Do not run a second worker on this key.
 
-    A Render deploy can overlap two processes. The database claim lock
-    (``FOR UPDATE SKIP LOCKED``) gives a new send to one of them. Once a
+    A Render deploy can overlap two processes. Run one instance. Once a
     hash is stored, this sender does not broadcast another transaction for
-    that job. The reconciler polls the saved hash.
+    that job. The reconciler polls the saved hash. ``isAttested`` is
+    checked before every send so a restart cannot post the same digest twice.
     """
 
     def __init__(self, settings: AttesterSettings) -> None:
@@ -1384,16 +1370,14 @@ class AttestWorker:
 
 def main() -> None:
     """Drain due jobs once, then exit. For a future worker process. No send if disabled."""
-    from .settings import ApiSettings
     from .store import open_store
 
     settings = AttesterSettings.from_env()
-    cfg = ApiSettings.from_env()
-    guard_live_attester(settings, database_url=cfg.database_url)
+    guard_live_attester(settings)
     if not settings.enabled:
         print(settings.disabled_reason)
         return
-    store = open_store(path=cfg.db_path, database_url=cfg.database_url)
+    store = open_store()
     worker = AttestWorker(store=store, settings=settings, autostart=False)
     try:
         worker.recover_broadcasts()

@@ -1,38 +1,40 @@
-"""Check a stored attestation payload against an optional on-chain record.
+"""Check saved canonical bytes against an optional on-chain record.
 
-Does not re-score. Does not send transactions. The canonical JSON must
-already have been stored by ``GET /v1/attest/{ticker}`` (or
-``Store.save_attested_payload``). Hashes attested before those bytes were
-stored, or lost when Render's free disk spun down, have no row. This
-command exits non-zero and does not invent a payload.
+Does not re-score. Does not send transactions. The API keeps those bytes
+in memory and drops them on restart. Save ``canonical_payload`` from
+``GET /v1/attest/{ticker}`` (or the status endpoint) and pass it as
+``--payload-file``. This command exits non-zero and does not invent a payload.
+
+The digest is SHA-256 of the canonical bytes (the ``bytes32`` the contract
+stores). It is not a keccak of the raw JSON.
 
 Exit codes:
 
-- ``0`` stored bytes match their hash, stored inputs recompute
+- ``0`` saved bytes match their hash, saved inputs recompute
   ``inputs_digest``, and the chain read matched. ``--offline`` is also
   ``0`` when the local checks pass; that mode prints that nothing was
   checked on-chain.
-- ``1`` the database path does not exist, or the file is not a SQLite database
-- ``2`` nothing stored. The note says ``no stored payload`` unless that
+- ``1`` ``--payload-file`` does not exist, or the file is not a payload bundle
+- ``2`` nothing saved. The note says ``no stored payload`` unless that
   hash is attested on-chain, in which case it says the pre-fix payload
   is unavailable
-- ``3`` stored bytes do not match the hash key, the payload is malformed,
-  or stored inputs do not recompute ``inputs_digest``
-- ``4`` the payload ticker, or the ticker on a ``--hash`` row, does not
+- ``3`` saved bytes do not match the hash, the payload is malformed,
+  or saved inputs do not recompute ``inputs_digest``
+- ``4`` the payload ticker, or the ticker on a ``--hash`` file, does not
   match the request; chain id is not 84532; verify() is false; or the
   attester mismatches
 - ``5`` RPC / cast call failed
 - ``6`` a chain read was requested but ``cast`` is not on ``PATH``
 - ``7`` no ``--rpc-url`` and ``BASE_SEPOLIA_RPC_URL`` is unset, and
   ``--offline`` was not passed. Nothing was checked on-chain.
-- ``8`` the row has no ``inputs_json``, so ``inputs_digest`` cannot be
+- ``8`` the bundle has no inputs, so ``inputs_digest`` cannot be
   re-derived
 
 On-chain read uses ``cast chain-id`` and ``cast call`` when ``--rpc-url``
 (or ``BASE_SEPOLIA_RPC_URL``) is set. The contract defaults to the pinned
 Base Sepolia deployment. Without a URL, pass ``--offline`` to check
-stored bytes only.
-The digest passed to ``verify`` is recomputed from the stored bytes.
+saved bytes only.
+The digest passed to ``verify`` is recomputed from the saved bytes.
 ``--fixtures``, ``--api-url``, and ``--api-key`` are obsolete: they warn
 on stderr and do not re-score.
 """
@@ -40,10 +42,10 @@ on stderr and do not re-score.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -55,8 +57,7 @@ from .attest import (
     hash_canonical,
     recompute_inputs_digest,
 )
-from .settings import BASE_SEPOLIA_CHAIN_ID, ApiSettings
-from .store import Store, open_store
+from .settings import BASE_SEPOLIA_CHAIN_ID
 
 EXIT_OK = 0
 EXIT_DB = 1
@@ -86,9 +87,8 @@ NOTHING_STORED = (
     "canonical bytes were stored. "
     "GET /v1/attest/{ticker} stores a new payload; as_of is attest time, "
     "so that new hash differs from the pre-fix hash. "
-    "Hashes dropped when Render's free disk spun down are the same case: "
-    "the bytes are gone. "
-    "A persistent disk (paid plan) or Postgres keeps the bytes across spin-down."
+    "A restart drops the in-memory bytes. Save canonical_payload from "
+    "GET /v1/attest/{ticker} and pass --payload-file."
 )
 
 _LEGACY_FIELDS = ("as_of", "data_as_of", "scorer_version", "inputs_digest")
@@ -198,11 +198,53 @@ def _inputs_match(raw: bytes, claimed: Any) -> tuple[bool, dict[str, Any] | None
     return recomputed == claimed, parsed
 
 
-def _load_stored(store: Store, ticker: str, score_hash: str) -> dict[str, Any] | None:
-    if score_hash:
-        # A row for another ticker is a mismatch (exit 4), not "not stored".
-        return store.get_attested_payload(score_hash)
-    return store.latest_attested_payload(ticker)
+def export_payload(
+    *,
+    ticker: str,
+    score_hash: str,
+    canonical: bytes,
+    inputs: bytes | None,
+) -> dict[str, Any]:
+    """JSON bundle a caller can save and pass to ``verify --payload-file``."""
+    return {
+        "ticker": ticker,
+        "score_hash": score_hash,
+        "canonical_b64": base64.b64encode(bytes(canonical)).decode("ascii"),
+        "inputs_b64": None if inputs is None else base64.b64encode(bytes(inputs)).decode("ascii"),
+    }
+
+
+def load_payload_file(path: Path) -> dict[str, Any]:
+    """Read a ``canonical_payload`` bundle. Raises ``ValueError`` when it is not one."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("payload file is not a JSON bundle") from exc
+    if not isinstance(data, dict) or "canonical_b64" not in data:
+        raise ValueError("payload file is not a JSON bundle")
+    try:
+        canonical = base64.b64decode(data["canonical_b64"], validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("payload file canonical bytes are not base64") from exc
+    inputs_field = data.get("inputs_b64", None)
+    inputs: bytes | None
+    if inputs_field is None:
+        inputs = None
+    else:
+        try:
+            inputs = base64.b64decode(inputs_field, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("payload file inputs are not base64") from exc
+    claimed = str(data.get("score_hash") or "").strip()
+    return {
+        "score_hash": claimed or hash_canonical(canonical),
+        "ticker": str(data.get("ticker") or ""),
+        "canonical": canonical,
+        "inputs": inputs,
+        "stored_at": None,
+        "tx_hash": None,
+        "attested_at": None,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -232,12 +274,16 @@ def main(argv: list[str] | None = None) -> int:
         "--hash",
         default="",
         dest="score_hash",
-        help="Stored score hash to load (default: latest payload for the ticker)",
+        help="Score hash the payload file must carry (default: the hash in the file)",
     )
     parser.add_argument(
-        "--db",
+        "--payload-file",
         default="",
-        help="Force a SQLite file. Unset uses DATABASE_URL when set, else RWA_API_DB_PATH.",
+        help=(
+            "JSON bundle from GET /v1/attest canonical_payload "
+            "(ticker, score_hash, canonical_b64, inputs_b64). "
+            "Required to check bytes after the API process has restarted."
+        ),
     )
     parser.add_argument(
         "--contract",
@@ -279,57 +325,52 @@ def main(argv: list[str] | None = None) -> int:
         print(_OBSOLETE_FLAGS, file=sys.stderr)
         ignored_note = " " + _OBSOLETE_FLAGS
 
-    explicit_db = args.db.strip()
-    cfg = ApiSettings.from_env()
-    use_postgres = (not explicit_db) and bool(cfg.database_url)
-    db_path = Path(explicit_db) if explicit_db else cfg.db_path
-    if not use_postgres and not db_path.is_file():
-        result = {
-            "ticker": ticker,
-            "stored": False,
-            "score_hash": None,
-            "payload": None,
-            "canonical": None,
-            "contract": contract,
-            "on_chain": None,
-            "match": False,
-            "hash_ok": False,
-            "error": "database_missing",
-            "note": (
-                f"Database does not exist ({db_path}). "
-                "verify does not create an empty database. "
-                "A missing path is not the same as nothing attested."
-                + ignored_note
-            ),
-        }
-        _emit(result, as_json=args.json)
-        return EXIT_DB
-
-    try:
-        if explicit_db:
-            store = Store(explicit_db)
-        else:
-            store = open_store(path=cfg.db_path, database_url=cfg.database_url)
+    payload_path = args.payload_file.strip()
+    row: dict[str, Any] | None = None
+    if payload_path:
+        path = Path(payload_path)
+        if not path.is_file():
+            result = {
+                "ticker": ticker,
+                "stored": False,
+                "score_hash": None,
+                "payload": None,
+                "canonical": None,
+                "contract": contract,
+                "on_chain": None,
+                "match": False,
+                "hash_ok": False,
+                "error": "payload_missing",
+                "note": (
+                    f"Payload file does not exist ({path}). "
+                    "verify does not create one. "
+                    "A missing file is not the same as nothing attested."
+                    + ignored_note
+                ),
+            }
+            _emit(result, as_json=args.json)
+            return EXIT_DB
         try:
-            row = _load_stored(store, ticker, args.score_hash.strip())
-        finally:
-            store.close()
-    except (sqlite3.Error, RuntimeError):
-        result = {
-            "ticker": ticker,
-            "stored": False,
-            "score_hash": None,
-            "payload": None,
-            "canonical": None,
-            "contract": contract,
-            "on_chain": None,
-            "match": False,
-            "hash_ok": False,
-            "error": "database_error",
-            "note": "Database file is not a valid SQLite database." + ignored_note,
-        }
-        _emit(result, as_json=args.json)
-        return EXIT_DB
+            row = load_payload_file(path)
+        except ValueError:
+            result = {
+                "ticker": ticker,
+                "stored": False,
+                "score_hash": None,
+                "payload": None,
+                "canonical": None,
+                "contract": contract,
+                "on_chain": None,
+                "match": False,
+                "hash_ok": False,
+                "error": "payload_error",
+                "note": "Payload file is not a canonical_payload bundle." + ignored_note,
+            }
+            _emit(result, as_json=args.json)
+            return EXIT_DB
+        requested = args.score_hash.strip()
+        if requested and row["score_hash"] != requested:
+            row = None
 
     if row is None:
         on_chain = None

@@ -18,22 +18,24 @@ from rwa_score.scorer import ScoreError, TransparencyScorer
 
 from .app import _decorate
 from .settings import ApiSettings
-from .store import Store, open_store
+from .store import open_store
 from .webhooks import apply_score_side_effects
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Score watchlists and fire band-cross webhooks.")
-    parser.add_argument("--db", default="")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Score watchlists in this process and fire band-cross webhooks. "
+            "Watchlists live in the API process memory and are empty here "
+            "unless this process is the API."
+        )
+    )
     parser.add_argument("--fixtures", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     settings = ApiSettings.from_env()
-    if args.db.strip():
-        store = Store(args.db.strip())
-    else:
-        store = open_store(path=settings.db_path, database_url=settings.database_url)
+    store = open_store()
     client = create_client(use_fixtures_mode=True if args.fixtures else None)
     scorer = TransparencyScorer(client)
     by_ticker: dict[str, list[int]] = defaultdict(list)
