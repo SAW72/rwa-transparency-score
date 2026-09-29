@@ -38,7 +38,7 @@ fields, issuer heuristic flags, and each pillar's verifier ``meta`` (not only
 Chainlink PoR). It is not a hash of raw provider HTTP bodies or of
 explanation prose. Headers, API keys, tokens, and URLs are not on the
 allowlist, so they are never hashed or stored. See :func:`attestation_inputs`.
-Those input bytes are stored next to the canonical payload so
+Those input bytes are returned on the POST body so
 :func:`recompute_inputs_digest` can rebuild the digest later.
 
 Object key order and the absence of insignificant whitespace match RFC 8785.
@@ -435,14 +435,14 @@ def inputs_digest(report: dict[str, Any]) -> str:
 def recompute_inputs_digest(inputs: dict[str, Any]) -> str:
     """``0x`` + SHA-256 of already-built scoring inputs.
 
-    ``verify`` calls this on the bytes stored next to the payload. The
+    ``verify`` calls this on the input bytes from ``--payload-file``. The
     result must equal ``payload["inputs_digest"]``.
     """
     return _hash_bytes(canonical_bytes(inputs))
 
 
 def inputs_bytes(report: dict[str, Any]) -> bytes:
-    """Canonical JSON bytes of :func:`attestation_inputs`. Stored beside the payload."""
+    """Canonical JSON bytes of :func:`attestation_inputs`. Returned on the POST body."""
     return canonical_bytes(attestation_inputs(report))
 
 

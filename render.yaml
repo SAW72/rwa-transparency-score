@@ -106,7 +106,7 @@ services:
         value: "false"
       - key: RWA_ATTEST_BROADCAST_DEADLINE_SECONDS
         sync: false
-      - key: RWA_STORE_MAX_ENTRIES
+      - key: RWA_ATTEST_WAIT_SECONDS
         sync: false
       - key: RWA_API_BOOTSTRAP_KEY
         sync: false

@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from rwa_score.api.app import create_app
-from rwa_score.api.attest import attestation_payload, canonical_bytes
+from rwa_score.api.attest import attestation_payload, canonical_bytes, hash_canonical
 from rwa_score.api.auto_attest import (
     HARD_DAILY_TX_CAP,
     HARD_GAS_CAP,
@@ -81,12 +81,11 @@ def _settings(key: str = "", **overrides: object) -> AttesterSettings:
     return AttesterSettings(**data)  # type: ignore[arg-type]
 
 
-def _seed(store: Store, scorer: TransparencyScorer) -> tuple[str, int]:
+def _seed(scorer: TransparencyScorer) -> tuple[str, int, bytes]:
     report = scorer.score("NVDA")
     payload = attestation_payload(report)
     raw = canonical_bytes(payload)
-    digest = store.save_attested_payload(ticker="NVDA", canonical=raw)
-    return digest, int(payload["as_of"])
+    return hash_canonical(raw), int(payload["as_of"]), raw
 
 
 def _worker(store: Store, settings: AttesterSettings, chain: Mock) -> AttestWorker:
@@ -114,13 +113,14 @@ def test_unset_env_disables_worker_and_api_still_responds(
         start_worker=False,
     )
     raw = store.create_key(name="paid", tier="paid")
-    resp = TestClient(app).get("/v1/attest/NVDA", headers={"X-API-Key": raw})
+    resp = TestClient(app).post("/v1/attest/NVDA", headers={"X-API-Key": raw})
     assert resp.status_code == 200
     body = resp.json()
-    assert body["on_chain"]["worker"] == "disabled"
-    assert body["on_chain"]["attested"] is False
-    assert body["on_chain"]["tx"] is None
-    assert store.latest_attest_job(body["score_hash"]) is None
+    assert body["status"] == "disabled"
+    assert body["tx_hash"] is None
+    assert body["canonical_b64"]
+    assert body["payload"]["ticker"] == "NVDA"
+    assert store.inflight_for_hash(body["score_hash"]) is None
 
 
 def test_private_key_never_in_logs_response_or_repr(
@@ -140,15 +140,15 @@ def test_private_key_never_in_logs_response_or_repr(
     chain.attest.side_effect = RuntimeError(f"rpc exploded while using {key}")
     api = ApiSettings()
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, settings, chain)
     with caplog.at_level(logging.DEBUG, logger="rwa_score.api.auto_attest"):
         logging.getLogger("rwa_score.api.auto_attest").info("settings %s", settings)
-        assert worker.process_once(now=1_000.0) is True
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    blob = caplog.text + repr(settings) + str(job.get("last_error"))
+        result = worker.submit(
+            canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+        )
+    assert result.status == "failed"
+    blob = caplog.text + repr(settings) + str(result.error)
     assert key not in blob
     assert "11" * 32 not in blob
     assert redact(f"leak {key}", key) == "leak [redacted]"
@@ -161,23 +161,23 @@ def test_private_key_never_in_logs_response_or_repr(
         start_worker=False,
     )
     raw = store.create_key(name="paid", tier="paid")
-    resp = TestClient(app).get("/v1/attest/NVDA", headers={"X-API-Key": raw})
+    resp = TestClient(app).post("/v1/attest/NVDA", headers={"X-API-Key": raw})
     assert key not in resp.text
     assert "11" * 32 not in resp.text
+    assert result.error not in resp.text
 
 
 def test_wrong_chain_is_terminal_and_does_not_send(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     chain = Mock()
     chain.chain_id.return_value = 1
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, _settings("0x" + "22" * 32), chain)
-    assert worker.process_once(now=1_000.0) is True
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert job["status"] == "failed"
-    assert "84532" in (job["last_error"] or "")
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+    )
+    assert result.status == "failed"
+    assert "84532" in (result.error or "")
     chain.attest.assert_not_called()
     chain.verify.assert_not_called()
     assert worker.process_once(now=2_000.0) is False
@@ -195,16 +195,14 @@ def test_already_attested_revert_counts_as_success(
     ]
     chain.attest.side_effect = AlreadyAttestedError("AlreadyAttested")
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, _settings("0x" + "33" * 32), chain)
-    assert worker.process_once(now=1_000.0) is True
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert job["status"] == "confirmed"
-    payload = store.get_attested_payload(digest)
-    assert payload is not None
-    assert payload["attested_at"] == 1_700_000_111
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+    )
+    assert result.status == "confirmed"
+    assert result.attested_at == 1_700_000_111
+    assert store.queue_depth() == 0
 
 
 def test_verify_precheck_skips_send(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
@@ -212,15 +210,14 @@ def test_verify_precheck_skips_send(tmp_path: Path, fixture_scorer: Transparency
     chain.chain_id.return_value = 84532
     chain.verify.return_value = (True, 42, "0x" + "cd" * 20)
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, _settings("0x" + "44" * 32), chain)
-    assert worker.process_once(now=1_000.0) is True
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+    )
     chain.attest.assert_not_called()
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert job["status"] == "confirmed"
-    assert job["attested_at"] == 42
+    assert result.status == "confirmed"
+    assert result.attested_at == 42
 
 
 def test_fee_above_cap_does_not_send(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
@@ -229,35 +226,34 @@ def test_fee_above_cap_does_not_send(tmp_path: Path, fixture_scorer: Transparenc
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 1
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, _settings("0x" + "55" * 32, value_cap_wei=0), chain)
-    assert worker.process_once(now=1_000.0) is True
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+    )
     chain.attest.assert_not_called()
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert job["status"] == "failed"
-    assert "RWA_ATTEST_VALUE_CAP_WEI" in (job["last_error"] or "")
+    assert result.status == "failed"
+    assert "RWA_ATTEST_VALUE_CAP_WEI" in (result.error or "")
 
 
-def test_retries_then_succeeds(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+def test_pre_broadcast_errors_can_be_retried(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+    """A send that never broadcast may be tried again. A broadcast is never resent."""
     chain = Mock()
     chain.chain_id.side_effect = [ConnectionError("down"), ConnectionError("down"), 84532]
     chain.verify.return_value = (True, 7, "0x" + "11" * 20)
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     settings = _settings("0x" + "66" * 32, max_attempts=4, backoff_seconds=0.0)
     worker = _worker(store, settings, chain)
-    assert worker.process_once(now=10.0) is True
-    assert store.latest_attest_job(digest)["status"] == "pending"
-    assert worker.process_once(now=10.0) is True
-    assert store.latest_attest_job(digest)["status"] == "pending"
-    assert worker.process_once(now=10.0) is True
-    job = store.latest_attest_job(digest)
-    assert job["status"] == "confirmed"
-    assert job["attempts"] == 3
+    first = worker.submit(canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=10.0)
+    assert first.status == "failed"
+    second = worker.submit(canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=10.0)
+    assert second.status == "failed"
+    third = worker.submit(canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=10.0)
+    assert third.status == "confirmed"
+    assert third.attested_at == 7
     chain.attest.assert_not_called()
+    assert store.queue_depth() == 0
 
 
 def test_disabled_worker_process_once_is_a_no_op(tmp_path: Path) -> None:
@@ -366,39 +362,70 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
             max_attempts=3,
             backoff_seconds=0.0,
             enforce_contract_pin=False,
+            wait_seconds=10,
         )
         chain = Web3Chain(settings)
         assert chain.chain_id() == 84532
         assert chain.fee_wei() == 0
         store = Store()
-        digest, claimed = _seed(store, fixture_scorer)
+        digest, claimed, raw_bytes = _seed(fixture_scorer)
         assert digest != "0x" + "00" * 32
-        store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
         worker = AttestWorker(store=store, settings=settings, chain=chain, autostart=False)
-        assert worker.process_once() is True
-        first = store.latest_attest_job(digest)
-        assert first is not None
-        assert first["status"] == "confirmed"
-        assert first["tx_hash"]
-        payload = store.get_attested_payload(digest)
-        assert payload is not None
-        assert payload["attested_at"]
-        assert payload["tx_hash"] == first["tx_hash"]
-        nonce_after = chain._w3.eth.get_transaction_count(chain.address)
-        store.enqueue_attest_job(
-            score_hash=digest, ticker="NVDA", claimed_at=claimed, force=True
+        first = worker.submit(
+            canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
         )
-        assert worker.process_once() is True
-        second = store.latest_attest_job(digest)
-        assert second is not None
-        assert second["id"] != first["id"]
-        assert second["status"] == "confirmed"
-        nonce_rerun = chain._w3.eth.get_transaction_count(chain.address)
+        assert first.status == "confirmed"
+        assert first.tx_hash
+        assert first.attested_at
+        assert store.queue_depth() == 0
+        nonce_after = chain._w3.eth.get_transaction_count(chain.address, "pending")
+        second = worker.submit(
+            canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
+        )
+        assert second.status == "confirmed"
+        assert second.tx_hash is None or second.tx_hash == first.tx_hash
+        nonce_rerun = chain._w3.eth.get_transaction_count(chain.address, "pending")
         assert nonce_rerun == nonce_after
         ok, ts, who = chain.verify(digest, "NVDA")
         assert ok is True
-        assert ts == payload["attested_at"]
+        assert ts == first.attested_at
         assert who.lower() == chain.address.lower()
+        import base64
+        import json
+
+        from rwa_score.api.verify import main as verify_main
+
+        saved = tmp_path / "nvda-attest.json"
+        saved.write_text(
+            json.dumps(
+                {
+                    "ticker": "NVDA",
+                    "score_hash": digest,
+                    "canonical_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    "payload": json.loads(raw_bytes.decode("utf-8")),
+                    "tx_hash": first.tx_hash,
+                    "as_of": claimed,
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            verify_main(
+                [
+                    "NVDA",
+                    "--json",
+                    "--payload-file",
+                    str(saved),
+                    "--rpc-url",
+                    rpc,
+                    "--contract",
+                    address,
+                    "--attester",
+                    chain.address,
+                ]
+            )
+            == 0
+        )
     finally:
         proc.terminate()
         try:
@@ -413,36 +440,38 @@ def test_sca_refuses_unpinned_contract_and_wrong_configured_chain(
     chain = Mock()
     chain.chain_id.return_value = 84532
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     bad_contract = _settings("0x" + "77" * 32, contract="0x" + "ab" * 20)
     worker = _worker(store, bad_contract, chain)
-    assert worker.process_once(now=1.0) is True
-    assert "pinned" in (store.latest_attest_job(digest)["last_error"] or "")
+    refused = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1.0
+    )
+    assert refused.status == "failed"
+    assert "pinned" in (refused.error or "")
     chain.chain_id.assert_not_called()
     chain.attest.assert_not_called()
 
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed, force=True)
     bad_chain = _settings("0x" + "77" * 32, chain_id=1)
     worker = _worker(store, bad_chain, chain)
-    assert worker.process_once(now=2.0) is True
-    failed = store.latest_attest_job(digest)
-    assert failed["status"] == "failed"
-    assert "configured chain id" in (failed["last_error"] or "")
+    failed = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=2.0
+    )
+    assert failed.status == "failed"
+    assert "configured chain id" in (failed.error or "")
     chain.attest.assert_not_called()
 
 
-def test_sca_refuses_hash_the_scorer_did_not_store(tmp_path: Path) -> None:
+def test_sca_refuses_a_hash_not_from_this_request(tmp_path: Path) -> None:
     chain = Mock()
     chain.chain_id.return_value = 84532
     store = Store()
     digest = "0x" + "ab" * 32
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=0)
     worker = _worker(store, _settings("0x" + "88" * 32), chain)
-    assert worker.process_once(now=1.0) is True
-    job = store.latest_attest_job(digest)
-    assert job["status"] == "failed"
-    assert "not stored" in (job["last_error"] or "")
+    result = worker.submit(
+        canonical=b"{}", score_hash=digest, ticker="NVDA", claimed_at=0, now=1.0
+    )
+    assert result.status == "failed"
+    assert "not computed from this request" in (result.error or "")
     chain.attest.assert_not_called()
     chain.chain_id.assert_not_called()
 
@@ -459,25 +488,27 @@ def test_sca_timeout_after_send_is_success_when_verify_is_true(
     ]
     chain.attest.side_effect = TimeoutError("receipt timeout")
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, _settings("0x" + "99" * 32), chain)
-    assert worker.process_once(now=1.0) is True
-    job = store.latest_attest_job(digest)
-    assert job["status"] == "confirmed"
-    assert job["attested_at"] == 1_700_000_222
-    assert "failed" not in (job["last_error"] or "")
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1.0
+    )
+    assert result.status == "confirmed"
+    assert result.attested_at == 1_700_000_222
+    assert result.error is None
 
 
 def test_sca_gas_cap_and_subject_bounds(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     chain = Mock()
     chain.chain_id.return_value = 84532
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, _settings("0x" + "ab" * 32, gas_limit=HARD_GAS_CAP + 1), chain)
-    assert worker.process_once(now=1.0) is True
-    assert "gas cap" in (store.latest_attest_job(digest)["last_error"] or "")
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1.0
+    )
+    assert result.status == "failed"
+    assert "gas cap" in (result.error or "")
     chain.attest.assert_not_called()
     assert RPC_TIMEOUT_SECONDS <= 30
     assert RECEIPT_TIMEOUT_SECONDS <= 120
@@ -502,9 +533,9 @@ def test_sca_unauthenticated_attest_does_not_enqueue(
     api = ApiSettings()
     store = Store()
     app = create_app(settings=api, store=store, scorer=fixture_scorer, start_worker=False)
-    resp = TestClient(app).get("/v1/attest/NVDA")
+    resp = TestClient(app).post("/v1/attest/NVDA")
     assert resp.status_code == 401
-    assert store.latest_attested_payload("NVDA") is None
+    assert store.queue_depth() == 0
 
 
 def test_sca_no_private_key_flag_in_signer_or_runbook() -> None:
@@ -573,17 +604,17 @@ def test_b3_secret_rpc_key_absent_from_db_logs_and_status(
     chain.attest.side_effect = RuntimeError(f"rpc down {rpc}")
     api = ApiSettings()
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, settings, chain)
     settings.max_attempts = 1
     with caplog.at_level(logging.INFO):
         logging.getLogger("web3").error("provider %s", rpc)
         logging.getLogger("rwa_score.api").error("status leaked %s", rpc)
-        assert worker.process_once(now=1_000.0) is True
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert "SECRETRPCKEY123" not in (job["last_error"] or "")
+        result = worker.submit(
+            canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+        )
+    assert result.status == "failed"
+    assert "SECRETRPCKEY123" not in (result.error or "")
     assert "SECRETRPCKEY123" not in caplog.text
     assert rpc not in caplog.text
     app = create_app(
@@ -595,11 +626,16 @@ def test_b3_secret_rpc_key_absent_from_db_logs_and_status(
         start_worker=False,
     )
     raw = store.create_key(name="paid", tier="paid")
+    posted = TestClient(app).post("/v1/attest/NVDA", headers={"X-API-Key": raw})
+    assert posted.status_code == 200
+    assert posted.json()["reason"] == "attest_failed"
+    assert posted.json()["message"] == "The attest job failed."
+    assert (result.error or "missing-error") not in posted.text
     resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
     assert resp.status_code == 200
     assert "SECRETRPCKEY123" not in resp.text
     assert rpc not in resp.text
-    assert resp.json()["on_chain"]["reason"] == "attest_failed"
+    assert (result.error or "missing-error") not in resp.text
 
 
 def test_rpc_url_never_in_last_error_status_or_any_logger(
@@ -618,18 +654,17 @@ def test_rpc_url_never_in_last_error_status_or_any_logger(
     chain.attest.side_effect = RuntimeError(f"provider rejected {leaked}")
     api = ApiSettings()
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, settings, chain)
     with caplog.at_level(logging.INFO):
         logging.getLogger("web3.providers").info("dial %s", leaked)
         logging.getLogger("rwa_score.api.app").error("app blew up on %s", rpc)
         logging.getLogger().warning("root saw %s", leaked)
-        assert worker.process_once(now=1_000.0) is True
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert job["status"] == "failed"
-    blob = (job["last_error"] or "") + caplog.text
+        result = worker.submit(
+            canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+        )
+    assert result.status == "failed"
+    blob = (result.error or "") + caplog.text
     assert rpc.lower() not in blob.lower()
     assert "abcdefgh12345678" not in blob.lower()
     assert "zzyyxxww99887766" not in blob.lower()
@@ -643,15 +678,17 @@ def test_rpc_url_never_in_last_error_status_or_any_logger(
         start_worker=False,
     )
     raw = store.create_key(name="paid", tier="paid")
-    resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
-    assert resp.status_code == 200
-    body = resp.json()["on_chain"]
+    posted = TestClient(app).post("/v1/attest/NVDA", headers={"X-API-Key": raw})
+    assert posted.status_code == 200
+    body = posted.json()
     assert body["reason"] == "attest_failed"
     assert body["message"] == "The attest job failed."
+    resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
+    assert resp.status_code == 200
     assert rpc.lower() not in resp.text.lower()
     assert "abcdefgh12345678" not in resp.text.lower()
     assert "zzyyxxww99887766" not in resp.text.lower()
-    assert job["last_error"] not in resp.text
+    assert (result.error or "missing-error") not in resp.text
 
 
 def test_fee_clamp_and_env_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -696,53 +733,62 @@ def test_min_interval_does_not_enqueue_or_send(
     client = TestClient(app)
     raw = store.create_key(name="paid", tier="paid")
     headers = {"X-API-Key": raw}
-    first = client.get("/v1/attest/NVDA", headers=headers)
+    first = client.post("/v1/attest/NVDA", headers=headers)
     assert first.status_code == 200
-    assert first.json()["on_chain"].get("reason") != "min_interval"
-    second = client.get("/v1/attest/NVDA", headers=headers)
+    assert first.json().get("reason") != "min_interval"
+    assert first.json()["status"] == "pending"
+    store.drop_inflight(first.json()["tx_hash"])
+    second = client.post("/v1/attest/NVDA", headers=headers)
     assert second.status_code == 200
-    throttled = second.json()["on_chain"]
-    assert throttled["status"] == "throttled"
-    assert throttled["reason"] == "min_interval"
-    assert "minimum interval" in throttled["message"]
-    assert "No transaction was sent" in throttled["message"]
-    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+    assert second.json()["status"] == "throttled"
+    assert second.json()["reason"] == "min_interval"
+    assert "minimum interval" in second.json()["message"]
+    assert "No transaction was sent" in second.json()["message"]
+    assert store.count_sends_since(0) == 1
     for _ in range(2):
-        extra = client.get("/v1/attest/NVDA", headers=headers)
+        extra = client.post("/v1/attest/NVDA", headers=headers)
         assert extra.status_code == 200
-        assert extra.json()["on_chain"]["reason"] == "min_interval"
-    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
-    worker = _worker(store, settings, chain)
-    assert worker.process_once(now=time.time()) is True
+        assert extra.json()["reason"] == "min_interval"
+    assert store.count_sends_since(0) == 1
     chain.attest.assert_called_once()
-    assert worker.process_once(now=time.time() + 10) is False
+    worker = _worker(store, settings, chain)
+    assert worker.process_once(now=time.time()) is False
+    chain.attest.assert_called_once()
 
 
 def test_daily_cap_does_not_enqueue(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     settings = _settings("0x" + "56" * 32, min_interval_seconds=0, daily_tx_cap=1)
     api = ApiSettings()
     store = Store()
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.fee_wei.return_value = 0
+    chain.attest.return_value = "0x" + "ab" * 32
     app = create_app(
         settings=api,
         store=store,
         scorer=fixture_scorer,
         attester=settings,
+        chain=chain,
         start_worker=False,
     )
     client = TestClient(app)
     raw = store.create_key(name="paid", tier="paid")
     headers = {"X-API-Key": raw}
-    first = client.get("/v1/attest/NVDA", headers=headers)
+    first = client.post("/v1/attest/NVDA", headers=headers)
     assert first.status_code == 200
-    assert first.json()["on_chain"].get("reason") != "daily_cap"
-    second = client.get("/v1/attest/NVDA", headers=headers)
+    assert first.json().get("reason") != "daily_cap"
+    assert first.json()["status"] == "pending"
+    store.drop_inflight(first.json()["tx_hash"])
+    second = client.post("/v1/attest/NVDA", headers=headers)
     assert second.status_code == 200
-    throttled = second.json()["on_chain"]
-    assert throttled["status"] == "throttled"
-    assert throttled["reason"] == "daily_cap"
-    assert "Daily attest" in throttled["message"]
-    assert "No transaction was sent" in throttled["message"]
-    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+    assert second.json()["status"] == "throttled"
+    assert second.json()["reason"] == "daily_cap"
+    assert "Daily attest" in second.json()["message"]
+    assert "No transaction was sent" in second.json()["message"]
+    assert store.count_sends_since(0) == 1
+    chain.attest.assert_called_once()
 
 
 def _forge_deploy(rpc: str) -> str:
@@ -854,6 +900,7 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
             enforce_contract_pin=False,
             min_interval_seconds=0,
             max_fee_gwei=20,
+            wait_seconds=30,
         )
         chain = Web3Chain(settings)
         chain._w3.provider.make_request("anvil_setAutomine", [False])
@@ -871,15 +918,16 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
 
         chain._w3.eth.wait_for_transaction_receipt = _timeout  # type: ignore[method-assign]
         store = Store()
-        digest, claimed = _seed(store, fixture_scorer)
-        store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+        digest, claimed, raw_bytes = _seed(fixture_scorer)
         worker = AttestWorker(store=store, settings=settings, chain=chain, autostart=False)
-        assert worker.process_once() is True
-        pending = store.latest_attest_job(digest)
+        submitted = worker.submit(
+            canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
+        )
+        assert submitted.status == "pending"
+        assert submitted.tx_hash
+        pending = store.get_inflight(submitted.tx_hash)
         assert pending is not None
-        assert pending["status"] == "broadcast_pending"
         assert pending["nonce"] == 0
-        assert pending["tx_hash"]
         assert pending["broadcast_at"] is not None
         saved_hash = pending["tx_hash"]
         first_tx = chain._w3.eth.get_transaction(saved_hash)
@@ -890,32 +938,25 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
         assert nonce_lookups == ["pending"]
         # Still unmined. Reconcile must not sign a replacement.
         assert worker.process_once(now=time.time() + 30) is True
-        waiting = store.latest_attest_job(digest)
+        waiting = store.get_inflight(saved_hash)
         assert waiting is not None
-        assert waiting["status"] == "broadcast_pending"
         assert waiting["tx_hash"] == saved_hash
         assert waiting["nonce"] == 0
         assert waiting["known_tx_hashes"] == [saved_hash]
         assert nonce_lookups == ["pending"]
         chain._w3.provider.make_request("evm_mine", [])
         assert worker.process_once(now=time.time() + 60) is True
-        job = store.latest_attest_job(digest)
-        assert job is not None
-        assert job["status"] == "confirmed"
-        assert job["tx_hash"]
-        assert job["known_tx_hashes"] == [saved_hash]
-        receipt = chain._w3.eth.get_transaction_receipt(job["tx_hash"])
+        assert store.get_inflight(saved_hash) is None
+        receipt = chain._w3.eth.get_transaction_receipt(saved_hash)
         assert int(receipt["status"]) == 1
         mined = receipt["transactionHash"]
         mined_hex = mined.hex() if hasattr(mined, "hex") else str(mined)
         if not mined_hex.startswith("0x"):
             mined_hex = "0x" + mined_hex
-        assert job["tx_hash"].lower() == mined_hex.lower()
+        assert saved_hash.lower() == mined_hex.lower()
         assert nonce_lookups == ["pending"]
         assert chain._w3.eth.get_transaction_count(chain.address) == 1
-        payload = store.get_attested_payload(digest)
-        assert payload is not None
-        assert payload["tx_hash"].lower() == mined_hex.lower()
+        assert store.queue_depth() == 0
     finally:
         proc.terminate()
         try:
@@ -933,16 +974,17 @@ def test_crash_recovery_polls_saved_hash_and_does_not_resend(
     chain.landed_hash.return_value = "0x" + "cd" * 32
     chain.attest.side_effect = AssertionError("must not send again")
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
-    store.note_submitted_tx(job["id"], tx_hash="0x" + "cd" * 32, nonce=3)
+    digest, claimed, _raw = _seed(fixture_scorer)
+    store.note_broadcast(
+        tx_hash="0x" + "cd" * 32,
+        nonce=3,
+        score_hash=digest,
+        ticker="NVDA",
+        claimed_at=claimed,
+    )
     worker = _worker(store, _settings("0x" + "61" * 32), chain)
     assert worker.recover_broadcasts(now=time.time()) == 1
-    saved = store.latest_attest_job(digest)
-    assert saved is not None
-    assert saved["status"] == "confirmed"
-    assert saved["tx_hash"] == "0x" + "cd" * 32
-    assert saved["nonce"] == 3
+    assert store.get_inflight("0x" + "cd" * 32) is None
     chain.attest.assert_not_called()
 
 
@@ -958,25 +1000,28 @@ def test_broadcast_fails_only_after_deadline_when_nonce_is_taken(
     chain.transaction_count.return_value = 0
     chain.attest.side_effect = AssertionError("must not send again")
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
-    store.note_submitted_tx(job["id"], tx_hash="0x" + "ab" * 32, nonce=0)
-    store._jobs[job["id"]]["broadcast_at"] = time.time() - 120
+    digest, claimed, _raw = _seed(fixture_scorer)
+    started = time.time() - 120
+    store.note_broadcast(
+        tx_hash="0x" + "ab" * 32,
+        nonce=0,
+        score_hash=digest,
+        ticker="NVDA",
+        claimed_at=claimed,
+        now=started,
+    )
     worker = _worker(
         store,
         _settings("0x" + "62" * 32, broadcast_deadline_seconds=30),
         chain,
     )
     assert worker.process_once(now=time.time()) is True
-    waiting = store.latest_attest_job(digest)
+    waiting = store.get_inflight("0x" + "ab" * 32)
     assert waiting is not None
-    assert waiting["status"] == "broadcast_pending"
+    assert waiting["nonce"] == 0
     chain.transaction_count.return_value = 1
     assert worker.process_once(now=time.time() + 30) is True
-    failed = store.latest_attest_job(digest)
-    assert failed is not None
-    assert failed["status"] == "failed"
-    assert failed["tx_hash"] == "0x" + "ab" * 32
+    assert store.get_inflight("0x" + "ab" * 32) is None
     chain.attest.assert_not_called()
 
 
@@ -1007,15 +1052,14 @@ def test_low_balance_does_not_send(
     chain.attest.return_value = "0x" + "ab" * 32
     api = ApiSettings()
     store = Store()
-    digest, claimed = _seed(store, fixture_scorer)
-    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
     worker = _worker(store, settings, chain)
-    assert worker.process_once(now=1_000.0) is True
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+    )
     chain.attest.assert_not_called()
-    job = store.latest_attest_job(digest)
-    assert job is not None
-    assert job["status"] == "pending"
-    assert job["last_error"] == "low_balance"
+    assert result.status == "low_balance"
+    assert result.reason == "low_balance"
     app = create_app(
         settings=api,
         store=store,
@@ -1025,10 +1069,12 @@ def test_low_balance_does_not_send(
         start_worker=False,
     )
     raw = store.create_key(name="paid", tier="paid")
-    resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
+    resp = TestClient(app).post("/v1/attest/NVDA", headers={"X-API-Key": raw})
     assert resp.status_code == 200
-    assert resp.json()["on_chain"]["reason"] == "low_balance"
-    assert "No transaction was sent" in resp.json()["on_chain"]["message"]
+    assert resp.json()["status"] == "low_balance"
+    assert resp.json()["reason"] == "low_balance"
+    assert "No transaction was sent" in resp.json()["message"]
+    assert store.queue_depth() == 0
     health = TestClient(app).get("/health")
     assert health.status_code == 200
     assert health.json()["attester_balance"] == "low"
@@ -1050,25 +1096,34 @@ def test_hourly_cap_does_not_enqueue(
     )
     api = ApiSettings()
     store = Store()
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.fee_wei.return_value = 0
+    chain.attest.return_value = "0x" + "ab" * 32
     app = create_app(
         settings=api,
         store=store,
         scorer=fixture_scorer,
         attester=settings,
+        chain=chain,
         start_worker=False,
     )
     client = TestClient(app)
     raw = store.create_key(name="paid", tier="paid")
     headers = {"X-API-Key": raw}
-    first = client.get("/v1/attest/NVDA", headers=headers)
+    first = client.post("/v1/attest/NVDA", headers=headers)
     assert first.status_code == 200
-    assert first.json()["on_chain"].get("reason") != "hourly_cap"
-    second = client.get("/v1/attest/AAPL", headers=headers)
+    assert first.json().get("reason") != "hourly_cap"
+    assert first.json()["status"] == "pending"
+    second = client.post("/v1/attest/AAPL", headers=headers)
     assert second.status_code == 200
-    body = second.json()["on_chain"]
+    body = second.json()
+    assert body["status"] == "throttled"
     assert body["reason"] == "hourly_cap"
     assert "No transaction was sent" in body["message"]
-    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+    assert store.count_sends_since(0) == 1
+    chain.attest.assert_called_once()
 
 
 def test_fixtures_refuse_a_live_attester_and_memory_does_not(

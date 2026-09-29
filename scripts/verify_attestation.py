@@ -7,18 +7,21 @@
         --contract "$RWA_ATTESTATION_CONTRACT" --rpc-url "$BASE_SEPOLIA_RPC_URL" \\
         --attester "$RWA_ATTESTER_ADDRESS"
 
-Does not re-score. Save ``canonical_payload`` from ``GET /v1/attest`` (or
-status). The API keeps those bytes in memory and drops them on restart.
+Does not re-score. Save the JSON ``POST /v1/attest/{ticker}`` returned and
+pass it as ``--payload-file``. The API does not keep a copy.
 Exit codes: 0 match (or --offline local check; prints that nothing was
-checked on-chain), 1 payload file missing or not a bundle, 2 nothing saved
-(note: no stored payload, or the pre-fix wording when that hash is
-on-chain), 3 bytes or inputs_digest mismatch, 4 ticker / chain / verify() /
-attester mismatch (including --hash for another ticker), 5 RPC failed,
-6 cast missing, 7 no RPC URL and --offline not passed, 8 inputs not in the
-bundle. A missing --payload-file path is an error and is not created.
+checked on-chain), 1 payload file missing or not a bundle, 3 bytes or
+inputs_digest mismatch, 4 ticker / chain / attested / verify() / attester /
+receipt mismatch (including --hash for another ticker), 5 RPC failed,
+6 cast missing, 7 no RPC URL and --offline not passed.
+Exit 2 (nothing stored) and exit 8 (inputs missing) are retired. A file
+without inputs is still checked from the canonical bytes.
+A missing --payload-file path is an error and is not created.
 --contract defaults to 0x2F073a3628D498d92956e7eFE2b26633eDa75b00.
 --fixtures / --api-url / --api-key warn and do not re-score.
-The digest is SHA-256 of the canonical bytes, not keccak of the raw JSON.
+The digest is SHA-256 of the canonical bytes. The contract stores that
+bytes32; it does not keccak the payload. Ticker equality inside verify
+uses keccak256 of the ticker string only.
 Never pass a private key. This script only reads.
 """
 

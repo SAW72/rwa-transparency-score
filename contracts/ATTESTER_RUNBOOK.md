@@ -58,11 +58,13 @@ Env vars on this service are `sync: false`, except `RWA_ATTEST_ENABLED`,
 which `render.yaml` sets to `false`. You type the other values in the
 dashboard after sync. A later sync will not overwrite them.
 
-Free plan: the service spins down after about 15 minutes idle. Scores,
-inputs, history, and the attest queue live in memory and are lost on
-restart. Save `canonical_payload` from `GET /v1/attest/{ticker}` if you
-need to check the bytes later. No disk and no database. A background
-worker is not in `render.yaml`.
+Free plan: the service spins down after about 15 minutes idle. There is
+no score store, no disk, and no database. `POST /v1/attest/{ticker}`
+computes the score live and returns the payload. Save that JSON. The only
+in-memory attester state is a pending transaction (`tx_hash` and nonce)
+until the receipt lands, plus rate-limit counters. That pending-tx state
+is lost on restart. That is safe because every send checks `attested`
+first. A background worker is not in `render.yaml`.
 
 ### Blueprint sync (Spencer)
 
@@ -88,34 +90,36 @@ URL does not.
 
 ## What the worker does
 
-`GET /v1/attest/{ticker}` stores the canonical payload and enqueues
-`attest(scoreHash, ticker, as_of)` off the HTTP response. One thread holds
-the nonce. It reads `eth_chainId` and refuses anything other than 84532. It
-calls `verify` first. `AlreadyAttested` on a retry counts as success. It pays
+`POST /v1/attest/{ticker}` scores live, hashes the canonical bytes from
+that request, checks `attested`, and broadcasts
+`attest(scoreHash, ticker, as_of)`. The response includes the score,
+`as_of`, the hash, the canonical bytes (base64 and parsed JSON),
+`tx_hash`, and `pending` or `confirmed`. One thread holds the nonce. It
+reads `eth_chainId` and refuses anything other than 84532. It calls
+`verify` first. `AlreadyAttested` counts as success. It pays
 `attestationFee()` and will not send if that fee is above
 `RWA_ATTEST_VALUE_CAP_WEI` (default `0`, which matches `setFee(0)`). Gas is
 capped by `RWA_ATTEST_GAS_LIMIT` (default `300000`). A Foundry gas report on
 this contract showed `attest` median **208274** and max **210495** (24 calls;
 the minimum includes reverts).
 
-The queue is in the same in-memory store as the canonical bytes and score
-history. A restart drops it. One worker. A duplicate send is still success
-because the worker checks `isAttested` before sending.
+There is no score store. Pending-tx state is in memory: `tx_hash` and
+nonce until the receipt lands. A restart drops it. One worker. A duplicate
+send is still success because the worker checks `attested` before sending.
 
 Fees are EIP-1559. The worker sets `maxFeePerGas` and `maxPriorityFeePerGas`
 on every send. `RWA_ATTEST_MAX_FEE_GWEI` (default `20`) is clamped to a hard
 ceiling of `100` gwei in code. A broadcast is not replaced. The saved hash
 is polled until it mines.
 
-Drain protection sits in front of the queue. `RWA_ATTEST_MIN_INTERVAL_SECONDS`
-(default `300`) is the minimum gap between enqueues for one ticker.
+Drain protection sits in front of the send. `RWA_ATTEST_MIN_INTERVAL_SECONDS`
+(default `300`) is the minimum gap between broadcasts for one ticker.
 `RWA_ATTEST_HOURLY_CAP` (default `4`, hard max `24`) and
-`RWA_ATTEST_DAILY_CAP` (default `8`, hard max `48`) cap how many jobs are
-created. When a limit hits, the API does not enqueue and does not send.
-`on_chain.reason` is `min_interval`, `hourly_cap`, or `daily_cap`, and
-`on_chain.message` says no transaction was sent. A failed job's status
-reason is the code `attest_failed`. The raw exception, including the RPC
-URL, is not returned.
+`RWA_ATTEST_DAILY_CAP` (default `8`, hard max `48`) cap how many transactions
+are broadcast. When a limit hits, the API does not send. The response
+`reason` is `min_interval`, `hourly_cap`, or `daily_cap`, and `message`
+says no transaction was sent. A failed send's `reason` is the code
+`attest_failed`. The raw exception, including the RPC URL, is not returned.
 
 `RWA_ATTEST_ENABLED` defaults off. Nothing is signed or broadcast until it
 is `true` (also `1`, `yes`, or `on`). `RWA_ATTEST_MIN_BALANCE_WEI` (default
@@ -128,7 +132,7 @@ does not probe a database.
 The attester does not start when `RWA_USE_FIXTURES=1` and it would otherwise
 be enabled. `RWA_ATTEST_ENABLED` is `false` in `render.yaml`. Nothing sends
 until that value is turned on. The moment `send` returns a hash, that hash
-and its nonce are recorded before the receipt wait. `isAttested` is checked
+and its nonce are recorded before the receipt wait. `attested` is checked
 on-chain before any send, so a restart cannot double-post.
 
 ## One worker only
@@ -140,17 +144,17 @@ Render deploys overlap: the old process stays up until the new one passes
 its health check, so two processes can hold the key at once. The design
 copes like this:
 
-- Keep the API service at **one instance**. The queue is in memory, so a
-  second process does not see the first process's jobs. `isAttested`
-  before every send is what stops a restart from posting twice.
-- After broadcast, the job stores `tx_hash` and `nonce` before the
-  receipt wait. A receipt timeout moves the job to `broadcast_pending`.
-  The worker does not send another transaction for that job.
+- Keep the API service at **one instance**. Pending-tx state is in memory,
+  so a second process does not see the first process's broadcasts.
+  `attested` before every send is what stops a restart from posting twice.
+- After broadcast, the process stores `tx_hash` and `nonce` before the
+  receipt wait. A receipt timeout leaves that entry `broadcast_pending`.
+  The worker does not send another transaction for that hash.
 - On startup, and in the worker loop, a reconciler polls that saved hash's
-  receipt and `isAttested` until it lands or
+  receipt and `attested` until it lands or
   `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` (default `1800`) has passed.
 - The job is marked failed only when the receipt is still missing,
-  `isAttested` is false, and the account nonce has moved past the saved
+  `attested` is false, and the account nonce has moved past the saved
   nonce on a different transaction. A landed transaction is confirmed with
   the hash from its receipt.
 
@@ -161,9 +165,11 @@ If `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, or
 `BASE_SEPOLIA_RPC_URL` is unset, the worker is disabled and `/v1/attest`
 says so. The API does not crash and does not send.
 
-`GET /v1/attest/{ticker}` scores again on every call. Do not poll it.
-`GET /v1/attest/{ticker}/status` reads the latest stored job and does not
-score or enqueue.
+`POST /v1/attest/{ticker}` scores again on every call. Do not poll it.
+`GET /v1/attest/{ticker}/status` reads the chain only, by `tx_hash`
+(receipt plus `ScoreAttested`) or by `score_hash` (`attested`,
+`getAttestation`, `verify`). It does not score and it does not read
+process memory.
 
 ## Render settings (API service)
 
@@ -192,7 +198,7 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTEST_MIN_BALANCE_WEI` | Stop sending when the signer balance is below this. Default `50000000000000` | `50000000000000` | no |
 | `RWA_ATTEST_ENABLED` | Kill switch. Only `1`, `true`, `yes`, or `on` sends. `render.yaml` sets `false`. Default off | `false` | no |
 | `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` | Seconds to poll a broadcast before the drop check. Default `1800` | `1800` | no |
-| `RWA_STORE_MAX_ENTRIES` | Cap on in-memory history, payloads, jobs, usage, and deliveries. Default `1000`. Hard max `10000` in code | `1000` | no |
+| `RWA_ATTEST_WAIT_SECONDS` | How long POST waits for a receipt before returning `pending`. Default `0` (return as soon as the tx is broadcast) | `0` | no |
 | `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot. The key list is in memory and is lost on restart | `rat_` plus a long random token | yes |
 | `RWA_API_BOOTSTRAP_TIER` | Tier of that key. `/v1/attest` requires `paid` | `paid` | no |
 | `RWA_API_FREE_DAILY_LIMIT` | Daily cap for a free key. Default `50`. Attest does not accept a free key | `50` | no |
@@ -211,16 +217,19 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 `SOURCE_VERSION` and `GIT_COMMIT` do not change `scorer_version`. `/v1/score`
 and `/v1/attest` do not read `XAI_API_KEY`.
 
-## Scores are in memory
+## No score store
 
-Scores, inputs, history, and the attest queue live in the API process.
-They are lost on restart and on free-plan spin-down. There is no Render
-Postgres, no `DATABASE_URL`, and no dump or restore step.
+Live calculation plus contract posting only. There is no database and no
+score, payload, or history cache. The caller saves the JSON
+`POST /v1/attest/{ticker}` returns and passes that file to
+`verify --payload-file` later. The on-chain record is the hash only.
 
-Save `canonical_payload` from `GET /v1/attest/{ticker}` (or status) while
-the process is up. After a restart, check those bytes with
-`verify --payload-file`. The on-chain hash remains. `isAttested` before
-every send stops a second post of the same digest.
+The only in-memory attester state is pending-tx state (`tx_hash` and
+nonce) until the receipt lands, plus rate-limit and transaction-cap
+counters. It is in memory and is lost on restart and on free-plan
+spin-down. That is safe because every send checks `attested` first and a
+broadcast is never resent. There is no Render Postgres, no `DATABASE_URL`,
+and no dump or restore step.
 
 Future (out of scope): persistent DB only if we go mainnet or partner with a data provider like CoinMarketCap (API signups).
 
@@ -403,9 +412,10 @@ section 4 value (`0.002ether`) after it is allowlisted, not more.
 ## 6. Live end-to-end check (Spencer only, Base Sepolia)
 
 Do this after steps 1–3, with the API service up, `isAttester` true, and
-`attestationFee` `0`. Run it in one sitting. Scores are in memory and are
-lost on restart. Save `canonical_payload` before the service spins down if
-you still want `verify` to see the bytes. The chain record stays.
+`attestationFee` `0`. Run it in one sitting. The API does not keep the
+payload. Save the POST body before the service spins down if you still
+want `verify` to see the bytes. The chain record stays. Pending-tx state
+is in memory and is lost on restart.
 
 Agents do not run this section. It sends a transaction from the key you set
 on Render. `API_BASE` is the `rwa-transparency-score-api` URL from the
@@ -460,55 +470,63 @@ PY
 Expected print: `score <number> <BAND> 0x<64 hex>`. This hash is not the
 attested hash. The next call scores again and `as_of` moves.
 
-### 6.3 Enqueue one attest, then read `on_chain`
+### 6.3 Post one attest, then read the chain
 
-Call attest **once**:
+Call attest **once**. This is a POST. It scores live, hashes those bytes,
+checks `attested`, and broadcasts. Save the body. The API does not keep it.
 
 ```bash
-curl -sS -H "X-API-Key: $API_KEY" "$API_BASE/v1/attest/NVDA" -o /tmp/nvda-attest.json
+curl -sS -X POST -H "X-API-Key: $API_KEY" "$API_BASE/v1/attest/NVDA" -o /tmp/nvda-attest.json
 python3 - <<'PY'
 import json
 body = json.load(open("/tmp/nvda-attest.json"))
-oc = body["on_chain"]
-assert body["stored"] is True
+assert body["ticker"] == "NVDA"
 assert body["chain_id"] == 84532
 assert body["contract"] == "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
-assert oc["worker"] == "enabled"
-print(body["score_hash"], oc)
+assert body["algo"] == "sha256"
+assert body["score_hash"].startswith("0x") and len(body["score_hash"]) == 66
+assert body["canonical_b64"]
+assert isinstance(body["payload"], dict)
+assert body["status"] in {"pending", "confirmed"}
+print(body["status"], body["score_hash"], body["tx_hash"])
 PY
 ```
 
-Expected first body: `on_chain.worker` is `enabled`. `attested` may still be
-`false`, `tx` `null`, `attestedAt` `null`, `status` `pending`, because the
-send is off the response. `score_hash` is `0x` plus 64 hex characters.
+Expected: `status` is `pending` or `confirmed`. `tx_hash` is `0x` plus 64
+hex characters when a transaction was broadcast. `score_hash` is the
+SHA-256 of `canonical_b64`. Keep `/tmp/nvda-attest.json`.
 
-Poll status (this does not score again):
+Poll status by that tx hash. This reads the chain only. It does not score
+and it does not read process memory:
 
 ```bash
 python3 - <<'PY'
-import json, os, time, urllib.request
-url = os.environ["API_BASE"].rstrip("/") + "/v1/attest/NVDA/status"
+import json, os, time, urllib.parse, urllib.request
+posted = json.load(open("/tmp/nvda-attest.json"))
+tx = posted.get("tx_hash") or ""
+query = urllib.parse.urlencode({"tx_hash": tx, "score_hash": posted["score_hash"]})
+url = os.environ["API_BASE"].rstrip("/") + "/v1/attest/NVDA/status?" + query
 req = urllib.request.Request(url, headers={"X-API-Key": os.environ["API_KEY"]})
 for i in range(12):
     with urllib.request.urlopen(req, timeout=120) as resp:
         body = json.load(resp)
     oc = body["on_chain"]
-    print(i, oc)
-    if oc.get("attested") is True and oc.get("tx") and oc.get("attestedAt") is not None:
+    print(i, body.get("status"), oc.get("attested"), oc.get("tx"))
+    if oc.get("attested") is True and oc.get("attestedAt") is not None:
         json.dump(body, open("/tmp/nvda-status.json", "w"))
         raise SystemExit(0)
     time.sleep(5)
-raise SystemExit("on_chain did not confirm")
+raise SystemExit("chain did not confirm")
 PY
 ```
 
-Expected: the script exits 0. The last printed dict has `"attested": true`,
-`"tx"` of `0x` plus 64 hex characters, `"attestedAt"` an integer,
-`"worker": "enabled"`, and `"status": "confirmed"`. Save the tx:
+Expected: the script exits 0. `on_chain.attested` is true, `on_chain.tx` is
+`0x` plus 64 hex characters, `on_chain.attestedAt` is an integer, and
+`status` is `confirmed`. Save the tx:
 
 ```bash
-export TX="$(python3 -c 'import json; print(json.load(open("/tmp/nvda-status.json"))["on_chain"]["tx"])')"
-export SCORE_HASH="$(python3 -c 'import json; print(json.load(open("/tmp/nvda-status.json"))["score_hash"])')"
+export TX="$(python3 -c 'import json; print(json.load(open("/tmp/nvda-status.json"))["tx_hash"])')"
+export SCORE_HASH="$(python3 -c 'import json; print(json.load(open("/tmp/nvda-attest.json"))["score_hash"])')"
 echo "$TX"
 ```
 
@@ -534,26 +552,28 @@ to                   0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 
 ### 6.5 `verify.py` against the saved payload
 
-The bytes are in the API process memory, and they are lost on restart.
-`/tmp/nvda-status.json` from the poll above includes `canonical_payload`.
-Write that object to a file and pass `--payload-file`. The command below
-passes `--rpc-url` and `--attester`, so a confirmed bundle is exit `0`
-with `"match": true`. It does not use `--offline`.
+Save the POST body. The API does not keep it. Pass that file as
+`--payload-file`. The command below passes `--rpc-url` and `--attester`,
+so a confirmed bundle is exit `0` with `"match": true`. It does not use
+`--offline`. The chain read uses `attested`, `getAttestation`, `verify`,
+and the `ScoreAttested` log on `tx_hash`. The digest is SHA-256 of the
+canonical bytes. The contract stores that hash. It does not keccak the
+payload.
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Saved bytes match, inputs recompute `inputs_digest`, and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
-| `1` | `--payload-file` does not exist, or the file is not a payload bundle. |
-| `2` | Nothing saved. The note says `no stored payload`, unless that hash is attested on-chain, in which case it says `pre-fix attestation, stored payload unavailable`. |
-| `3` | Tampered or malformed bytes, or saved inputs do not recompute `inputs_digest`. |
-| `4` | Ticker mismatch, including `--hash` for another ticker; chain id is not 84532; `verify()` is false; or the attester mismatches. |
+| `0` | Canonical bytes match their hash and the chain read matched. `--offline` is also `0` when the local checks pass, and it prints that nothing was checked on-chain. |
+| `1` | `--payload-file` is missing, does not exist, or is not a payload bundle. |
+| `3` | Tampered or malformed bytes, or inputs in the file do not recompute `inputs_digest`. |
+| `4` | Ticker mismatch, chain id is not 84532, `attested` / `verify()` is false, the attester mismatches, or the receipt event does not match. |
 | `5` | RPC / cast call failed. |
 | `6` | A chain read was requested but `cast` is not on `PATH`. |
 | `7` | No `--rpc-url` and `BASE_SEPOLIA_RPC_URL` unset, and `--offline` was not passed. |
-| `8` | The bundle has no inputs. |
+
+Exit `2` (nothing stored) and exit `8` (inputs missing) are retired.
 
 ```bash
-python3 -c 'import json; json.dump(json.load(open("/tmp/nvda-status.json"))["canonical_payload"], open("/tmp/nvda.payload.json","w"))'
+cp /tmp/nvda-attest.json /tmp/nvda.payload.json
 python -m rwa_score.api.verify NVDA --json \
   --payload-file /tmp/nvda.payload.json \
   --contract 0x2F073a3628D498d92956e7eFE2b26633eDa75b00 \
@@ -582,5 +602,6 @@ Expected JSON fields:
 
 `match` is `true` only when the saved bytes recompute to that hash, the
 chain id is 84532, and the on-chain attester is `$ATTESTER_ADDRESS`. A run
-with no `--payload-file` exits `2` with `"stored": false`, because this
-process does not share the API's memory.
+with no `--payload-file` exits `1`. Exit `2` is retired: there is no stored
+row to miss. `"stored": true` in this JSON means the file loaded, not that
+the API kept a copy.

@@ -198,7 +198,7 @@ rwa_score/x_client.py  X API v2 media + tweet (OAuth 1.0a); skip if credentials 
 rwa_score/share.py     Fixture score-card CLI; posts to X only when X_* env is set
 rwa_score/issuer_registry.py   Name-match heuristics + ISSUER_NOTES (equity vs debt)
 rwa_score/fixtures/    Demo JSON shaped like CMC RWA responses
-rwa_score/api/         Paid REST output layer (keys, quotas, history, webhooks, score hash)
+rwa_score/api/         Paid REST output layer (keys, quotas, live score hash)
 contracts/             ScoreAttestation.sol — Base Sepolia hash attestation (Foundry)
 contracts/script/DeployScoreAttestation.s.sol  Base Sepolia deploy (see contracts/DEPLOY_BASE_SEPOLIA.md)
 scripts/verify_attestation.py   Re-hash a live score and optionally read the chain
@@ -288,22 +288,14 @@ The captured file is the full authentic envelope (pillars, verification, basis w
 |---|---|---|
 | GET | `/v1/score/{ticker}` | free + paid |
 | GET | `/v1/compare?tickers=a,b,c` | free + paid |
-| GET / PUT / POST / DELETE | `/v1/watchlist` | free + paid |
-| GET | `/v1/history/{ticker}` | paid |
-| POST / GET / DELETE | `/v1/webhooks` | paid |
-| GET | `/v1/attest/{ticker}` | paid |
+| POST | `/v1/attest/{ticker}` | paid |
+| GET | `/v1/attest/{ticker}/status` | paid; chain read only |
 | GET | `/v1/me` | free + paid |
 | GET | `/health` | open |
 
-### Webhooks
-
-`POST /v1/webhooks` with `{"url": "https://…", "trigger": "band_cross"}` or `"below_orange"` (new band is RED). URLs must be **https** to a public host — localhost, RFC1918, link-local, and `169.254.169.254` are rejected. Delivery **does not follow HTTP redirects** (an allowlisted host must not bounce to a private IP).
-
-**v1 delivery:** synchronous HTTP POST in the **same scoring cycle** as the request that observed the crossing (`GET /v1/score`, compare, watchlist). First observation of a ticker **for that API key** is stored and does not fire. Band-crossing state (`last_bands`) and webhook fan-out are **per tenant** — a score authenticated with key A never fires key B's webhooks. The same per-key check runs for every saved watchlist row when you run `python -m rwa_score.api.poll` (cron / background worker). Body is HMAC-SHA256 signed (`X-RAT-Signature: sha256=…`) with the webhook secret.
-
 ### On-chain attestation (Base Sepolia)
 
-`GET /v1/attest/{ticker}` builds the canonical payload **once**, stores those exact JSON bytes, and returns `hash_canonical` of the same bytes (history and webhooks use that build too). The payload is the six-pillar breakdown, including **basis**, plus `as_of` (attest time: the Unix second UTC when the payload is hashed; `0` for fixture scores, which is not a calendar time and is not a provider observation time), `data_as_of` (the latest Chainlink observation time already on the report, or null), `scorer_version` (the git SHA, resolved once per process: `RENDER_GIT_COMMIT`, else one `git rev-parse HEAD`, else `unknown` with a warning), and `inputs_digest` (SHA-256 of an allowlist of scoring inputs: CMC price and basis, identity fields, issuer heuristic flags, and each pillar's verifier meta, including non-PoR pillars; not raw provider HTTP bodies and not explanation prose). Headers, API keys, tokens, and URLs are not on that allowlist, so they are never hashed or stored. Those input bytes are stored beside the canonical payload so `verify` can recompute the digest. Canonical JSON is sorted keys, compact separators, `ensure_ascii`, UTF-8, and `allow_nan=False` (NaN and Infinity are rejected). Key order and the lack of insignificant whitespace follow RFC 8785; number formatting is Python's `json.dumps`, not the full RFC 8785 numeric profile. The hash function is SHA-256 of those bytes, `0x` + hex. Submit with `attest(scoreHash, ticker, as_of)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy with [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
+`POST /v1/attest/{ticker}` scores live, builds the canonical payload **once**, and returns that hash plus the exact bytes. The score is not stored. The payload is the six-pillar breakdown, including **basis**, plus `as_of` (attest time: the Unix second UTC when the payload is hashed; `0` for fixture scores, which is not a calendar time and is not a provider observation time), `data_as_of` (the latest Chainlink observation time already on the report, or null), `scorer_version` (the git SHA, resolved once per process: `RENDER_GIT_COMMIT`, else one `git rev-parse HEAD`, else `unknown` with a warning), and `inputs_digest` (SHA-256 of an allowlist of scoring inputs: CMC price and basis, identity fields, issuer heuristic flags, and each pillar's verifier meta, including non-PoR pillars; not raw provider HTTP bodies and not explanation prose). Headers, API keys, tokens, and URLs are not on that allowlist, so they are never hashed. The response includes those input bytes as base64 when they were computed in the same request, so `verify` can recompute `inputs_digest` if they are present. Canonical JSON is sorted keys, compact separators, `ensure_ascii`, UTF-8, and `allow_nan=False` (NaN and Infinity are rejected). Key order and the lack of insignificant whitespace follow RFC 8785; number formatting is Python's `json.dumps`, not the full RFC 8785 numeric profile. The hash function is SHA-256 of those bytes, `0x` + hex. Submit with `attest(scoreHash, ticker, as_of)` from an **authorized attester** (contract owner or an allowlisted relayer / API-held key). The `timestamp` argument is stored only as `claimedAt`; the contract records `block.timestamp` as `attestedAt`. Attester is `msg.sender`, not calldata — a stranger paying the fee cannot occupy a hash. See [`contracts/README.md`](contracts/README.md). Deploy with [`contracts/script/DeployScoreAttestation.s.sol`](contracts/script/DeployScoreAttestation.s.sol) ([`DEPLOY_BASE_SEPOLIA.md`](contracts/DEPLOY_BASE_SEPOLIA.md)). Deploy scripts **revert on any chain except Base Sepolia (84532)**. Mainnet is held. Ownership handoff is two-step (`transferOwnership`, then `acceptOwnership`).
 
 ```bash
 # Local bytes only. Exit 0 when the saved bundle is intact. The output says nothing was checked on-chain.
@@ -314,23 +306,23 @@ python scripts/verify_attestation.py NVDA --payload-file nvda.json --offline
 python scripts/verify_attestation.py NVDA --payload-file nvda.json --rpc-url "$BASE_SEPOLIA_RPC_URL" --attester "$RWA_ATTESTER_ADDRESS"
 ```
 
-`verify` recomputes the hash from the **saved** canonical JSON and does not re-score. The digest is SHA-256 of those bytes, the same `bytes32` the contract stores. Malformed payloads and a corrupt payload file print JSON, not a traceback. `--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. Pass `--rpc-url` (or `BASE_SEPOLIA_RPC_URL`) to read the chain. Pass `--attester` or set `RWA_ATTESTER_ADDRESS` to the expected attester; a chain read without it does not match. With neither a URL nor `--offline`, the command exits `7` and does not treat the bundle as confirmed. `--fixtures`, `--api-url`, and `--api-key` are obsolete: they warn and do not re-score. The client never needs a private key. Scores, inputs, history, and the attest queue live in the API process memory and are lost on restart. Save `canonical_payload` from `GET /v1/attest/{ticker}` and pass `--payload-file`. Hashes attested before those bytes were saved cannot be reconstructed.
+`verify` recomputes the hash from `--payload-file` (the JSON `POST /v1/attest/{ticker}` returned) and does not re-score. The digest is SHA-256 of those canonical bytes, the `bytes32` the contract stores. The contract does not keccak the payload. It checks `attested`, `getAttestation`, `verify`, and the `ScoreAttested` log when `tx_hash` is in the file. Malformed payloads and a corrupt payload file print JSON, not a traceback. `--contract` defaults to `0x2F073a3628D498d92956e7eFE2b26633eDa75b00`. Pass `--rpc-url` (or `BASE_SEPOLIA_RPC_URL`) to read the chain. Pass `--attester` or set `RWA_ATTESTER_ADDRESS` to the expected attester; a chain read without it does not match. With neither a URL nor `--offline`, the command exits `7` and does not treat the bundle as confirmed. `--fixtures`, `--api-url`, and `--api-key` are obsolete: they warn and do not re-score. The client never needs a private key. Save the POST body. The API does not keep a copy.
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Stored bytes match, inputs recompute `inputs_digest`, and the chain read matched. Also `0` with `--offline` when those local checks pass; the output says nothing was checked on-chain. |
-| `1` | `--payload-file` does not exist, or the file is not a payload bundle. A missing path is not created. |
-| `2` | Nothing stored. The note says `no stored payload`, unless that hash is attested on-chain, in which case it says `pre-fix attestation, stored payload unavailable`. |
-| `3` | Tampered or malformed bytes, or stored inputs do not recompute `inputs_digest`. |
-| `4` | Ticker mismatch (payload, or a `--hash` row for another ticker), chain id is not 84532, `verify()` is false, or the attester mismatches. |
+| `0` | Canonical bytes match their hash and the chain read matched (`attested`, `getAttestation`, `verify`, and the receipt event when `tx_hash` is present). Also `0` with `--offline` when the local checks pass; the output says nothing was checked on-chain. Inputs are checked only when the file includes them. |
+| `1` | `--payload-file` is missing, does not exist, or is not a payload bundle. A missing path is not created. |
+| `3` | Tampered or malformed bytes, or inputs in the file do not recompute `inputs_digest`. |
+| `4` | Ticker mismatch, chain id is not 84532, `attested` / `verify()` is false, the attester mismatches, or the receipt event does not match. |
 | `5` | RPC / cast call failed. |
 | `6` | A chain read was requested but `cast` is not on `PATH`. |
 | `7` | No `--rpc-url` and `BASE_SEPOLIA_RPC_URL` unset, and `--offline` was not passed. Nothing was checked on-chain. |
-| `8` | The bundle has no inputs, so `inputs_digest` cannot be re-derived. |
 
-When `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, and `BASE_SEPOLIA_RPC_URL` are all set, `GET /v1/attest/{ticker}` enqueues `attest(scoreHash, ticker, as_of)` on a single in-process worker (not on the HTTP response). The hash is the one canonical build from that request. If any of those is unset, the worker stays disabled and the API says so. The key is env-only. Sends are Spencer-only: [`contracts/ATTESTER_RUNBOOK.md`](contracts/ATTESTER_RUNBOOK.md). Render's live service is still the Streamlit app; this worker runs with the API process, not the current start command.
+Exit `2` (nothing stored / missing row) and exit `8` (inputs missing) are retired. There is no stored row, and a file without inputs is still checked from the canonical bytes.
 
-The store is in memory, capped by `RWA_STORE_MAX_ENTRIES` (default 1000, hard max 10000). Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
+When `RWA_ATTEST_ENABLED` is true and `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, and `BASE_SEPOLIA_RPC_URL` are set, `POST /v1/attest/{ticker}` checks `attested` and broadcasts `attest(scoreHash, ticker, as_of)` for the hash computed in that request. It returns `pending` or `confirmed` immediately, or after `RWA_ATTEST_WAIT_SECONDS` (default `0`). Only that request's bytes are hashed. There is no arbitrary-hash input. If the attester is disabled, the response still returns the score and payload with status `disabled` and sends nothing. The key is env-only. Sends are Spencer-only: [`contracts/ATTESTER_RUNBOOK.md`](contracts/ATTESTER_RUNBOOK.md).
+
+There is no score store. The caller saves the POST body and passes `--payload-file`. In-flight transaction state (tx hash and nonce) is in memory and is lost on restart. Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
 
 ## Tests
 

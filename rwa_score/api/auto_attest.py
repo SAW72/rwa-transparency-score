@@ -1,9 +1,14 @@
 """In-process attester for the current Base Sepolia ScoreAttestation.
 
-Enqueue on ``GET /v1/attest``. A single background thread sends
-``attest(scoreHash, ticker, as_of)`` and is not on the HTTP response path.
-The queue lives in process memory. A restart drops it. ``isAttested`` is
-checked before every send so a restart cannot post the same digest twice.
+``POST /v1/attest/{ticker}`` scores live, hashes the canonical bytes from
+that request, checks ``attested`` on chain, and broadcasts. The HTTP
+handler returns immediately, or after ``RWA_ATTEST_WAIT_SECONDS``.
+
+The only pending-transaction state is an in-flight map of ``tx_hash`` and
+``nonce`` (plus the subject needed to poll ``attested``). A restart drops
+it. That is safe because every send checks ``attested`` first and a
+broadcast is never resent. The background thread only reconciles receipts.
+It does not keep scores.
 
 Spencer sets the attester key on Render himself. This process reads
 ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
@@ -12,9 +17,7 @@ If ``RWA_ATTEST_ENABLED`` is not true, or the key, contract, or RPC is unset,
 the worker stays disabled and the API says so. It does not crash and it
 does not send. ``RWA_USE_FIXTURES=1`` also refuses to start the attester.
 
-One API instance only. A job that has already been broadcast is never sent
-again. The worker polls that saved hash until it lands. Do not run a second
-worker on this key.
+One API instance only. Do not run a second worker on this key.
 """
 
 from __future__ import annotations
@@ -58,6 +61,8 @@ DEFAULT_HOURLY_TX_CAP = 4
 DEFAULT_MIN_BALANCE_WEI = 50_000_000_000_000
 # How long a broadcast may stay unresolved before the drop check is allowed.
 DEFAULT_BROADCAST_DEADLINE_SECONDS = 30 * 60
+# POST returns as soon as the tx is broadcast unless this is raised.
+DEFAULT_WAIT_SECONDS = 0.0
 BROADCAST_POLL_SECONDS = 15.0
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
@@ -130,6 +135,51 @@ _ATTEST_ABI = [
         "stateMutability": "view",
         "inputs": [{"name": "who", "type": "address"}],
         "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "name": "attested",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "", "type": "bytes32"}],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "name": "getAttestation",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "scoreHash", "type": "bytes32"}],
+        "outputs": [
+            {
+                "name": "",
+                "type": "tuple",
+                "components": [
+                    {"name": "scoreHash", "type": "bytes32"},
+                    {"name": "ticker", "type": "string"},
+                    {"name": "attestedAt", "type": "uint256"},
+                    {"name": "attester", "type": "address"},
+                    {"name": "claimedAt", "type": "uint256"},
+                ],
+            }
+        ],
+    },
+    {
+        "name": "hashesForTicker",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "ticker", "type": "string"}],
+        "outputs": [{"name": "", "type": "bytes32[]"}],
+    },
+    {
+        "name": "ScoreAttested",
+        "type": "event",
+        "anonymous": False,
+        "inputs": [
+            {"name": "ticker", "type": "string", "indexed": False},
+            {"name": "scoreHash", "type": "bytes32", "indexed": False},
+            {"name": "attestedAt", "type": "uint256", "indexed": False},
+            {"name": "claimedAt", "type": "uint256", "indexed": False},
+            {"name": "attester", "type": "address", "indexed": False},
+        ],
     },
 ]
 
@@ -319,6 +369,7 @@ class AttesterSettings:
         "attest_enabled",
         "refuse_reason",
         "broadcast_deadline_seconds",
+        "wait_seconds",
     )
 
     def __init__(
@@ -340,6 +391,7 @@ class AttesterSettings:
         min_balance_wei: int = 0,
         attest_enabled: bool = True,
         broadcast_deadline_seconds: int = DEFAULT_BROADCAST_DEADLINE_SECONDS,
+        wait_seconds: float = DEFAULT_WAIT_SECONDS,
     ) -> None:
         key = (private_key or "").strip()
         self._get_key = (lambda captured: (lambda: captured))(key)
@@ -371,6 +423,10 @@ class AttesterSettings:
         if deadline < 0:
             deadline = DEFAULT_BROADCAST_DEADLINE_SECONDS
         self.broadcast_deadline_seconds = deadline
+        wait = float(wait_seconds)
+        if wait < 0:
+            wait = 0.0
+        self.wait_seconds = wait
         if key or self.rpc_url:
             _VAULT.add(key, self.rpc_url)
             _install_redact_filter()
@@ -440,6 +496,7 @@ class AttesterSettings:
                 "RWA_ATTEST_BROADCAST_DEADLINE_SECONDS",
                 DEFAULT_BROADCAST_DEADLINE_SECONDS,
             ),
+            wait_seconds=_env_float("RWA_ATTEST_WAIT_SECONDS", DEFAULT_WAIT_SECONDS),
         )
 
 
@@ -476,6 +533,18 @@ class SendOutcome:
     already: bool
 
 
+@dataclass(frozen=True)
+class SubmitResult:
+    """Outcome of one live attest. ``error`` is redacted and must not be returned on HTTP."""
+
+    status: str
+    tx_hash: str | None = None
+    attested_at: int | None = None
+    reason: str | None = None
+    message: str | None = None
+    error: str | None = None
+
+
 def _hash_bytes(score_hash: str) -> bytes:
     raw = score_hash.strip().lower()
     if raw.startswith("0x"):
@@ -507,20 +576,28 @@ def _assert_dedicated_attester(*, signer: str, owner: str, is_attester: bool) ->
         raise TerminalAttestError("signer is not an attester on this contract")
 
 
-def _require_stored(store: Any, job: dict[str, Any]) -> None:
-    """Only hashes this process stored from the scorer may be sent."""
-    row = store.get_attested_payload(job["score_hash"])
-    if row is None:
-        raise TerminalAttestError("refusing hash that was not stored by the scorer")
-    raw = row["canonical"]
-    if hash_canonical(raw) != row["score_hash"] or row["score_hash"] != job["score_hash"]:
-        raise TerminalAttestError("stored payload does not match its hash")
-    payload = json.loads(raw.decode("utf-8"))
-    if str(payload.get("ticker")) != str(job["ticker"]):
-        raise TerminalAttestError("ticker does not match stored payload")
-    if int(payload.get("as_of")) != int(job["claimed_at"]):
-        raise TerminalAttestError("as_of does not match stored payload")
-    _validate_subject(job["score_hash"], str(job["ticker"]), int(job["claimed_at"]))
+def _require_request_bytes(
+    canonical: bytes,
+    score_hash: str,
+    ticker: str,
+    claimed_at: int,
+) -> None:
+    """Only the hash of bytes from this request may be sent. No caller-supplied hash."""
+    raw = bytes(canonical)
+    digest = hash_canonical(raw)
+    if digest != score_hash:
+        raise TerminalAttestError("refusing hash that was not computed from this request")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise TerminalAttestError("canonical payload is not JSON") from exc
+    if not isinstance(payload, dict):
+        raise TerminalAttestError("canonical payload is not an object")
+    if str(payload.get("ticker")) != str(ticker):
+        raise TerminalAttestError("ticker does not match canonical payload")
+    if int(payload.get("as_of")) != int(claimed_at):
+        raise TerminalAttestError("as_of does not match canonical payload")
+    _validate_subject(score_hash, str(ticker), int(claimed_at))
 
 
 def _tx_hex(tx_hash: Any) -> str:
@@ -583,27 +660,25 @@ def _parse_iso(text: str) -> float:
     return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
 
 
-def admission_block(store: Any, settings: AttesterSettings, ticker: str) -> str | None:
-    """``min_interval``, ``hourly_cap``, or ``daily_cap`` when a new enqueue must not be sent."""
+def admission_block(
+    store: Any,
+    settings: AttesterSettings,
+    ticker: str,
+    *,
+    now: float | None = None,
+) -> str | None:
+    """``min_interval``, ``hourly_cap``, or ``daily_cap`` when a new send must not happen."""
+    clock = time.time() if now is None else float(now)
     interval = int(settings.min_interval_seconds)
     if interval > 0:
-        latest = store.latest_attest_job_for_ticker(ticker)
-        if latest is not None:
-            try:
-                age = time.time() - _parse_iso(str(latest["created_at"]))
-            except (TypeError, ValueError, OSError):
-                age = 0.0
-            if age < interval:
-                return "min_interval"
-    now = time.time()
+        latest = store.last_send_at(ticker)
+        if latest is not None and (clock - float(latest)) < interval:
+            return "min_interval"
     hourly = int(settings.hourly_tx_cap)
-    since_hour = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
-    if int(store.count_attest_jobs_since(since_hour)) >= hourly:
+    if int(store.count_sends_since(clock - 3600)) >= hourly:
         return "hourly_cap"
     cap = int(settings.daily_tx_cap)
-    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
-    count = int(store.count_attest_jobs_since(since))
-    if count >= cap:
+    if int(store.count_sends_since(clock - 86400)) >= cap:
         return "daily_cap"
     return None
 
@@ -612,9 +687,9 @@ def guard_live_attester(settings: AttesterSettings) -> None:
     """Refuse to send when scores are fixtures.
 
     Called on the production path (``from_env``). Tests that pass an
-    ``AttesterSettings`` instance are left alone. The queue is in memory
-    on purpose. ``isAttested`` before every send is what stops a restart
-    from posting the same digest twice.
+    ``AttesterSettings`` instance are left alone. Pending transactions are
+    in memory on purpose. ``attested`` before every send is what stops a
+    restart from posting the same digest twice.
     """
     from rwa_score.client import use_fixtures
 
@@ -634,7 +709,7 @@ class Web3Chain:
 
     A Render deploy can overlap two processes. Run one instance. Once a
     hash is stored, this sender does not broadcast another transaction for
-    that job. The reconciler polls the saved hash. ``isAttested`` is
+    that job. The reconciler polls the saved hash. ``attested`` is
     checked before every send so a restart cannot post the same digest twice.
     """
 
@@ -691,6 +766,58 @@ class Web3Chain:
         ok, ts, who = self._contract.functions.verify(_hash_bytes(score_hash), ticker).call()
         return bool(ok), int(ts), str(who)
 
+    def attested(self, score_hash: str) -> bool:
+        return bool(self._contract.functions.attested(_hash_bytes(score_hash)).call())
+
+    def get_attestation(self, score_hash: str) -> dict[str, Any]:
+        rec = self._contract.functions.getAttestation(_hash_bytes(score_hash)).call()
+        score = rec[0]
+        score_hex = score.hex() if hasattr(score, "hex") else str(score)
+        if not str(score_hex).startswith("0x"):
+            score_hex = "0x" + str(score_hex)
+        return {
+            "score_hash": score_hex,
+            "ticker": str(rec[1]),
+            "attested_at": int(rec[2]),
+            "attester": str(rec[3]),
+            "claimed_at": int(rec[4]),
+        }
+
+    def hashes_for_ticker(self, ticker: str) -> list[str]:
+        rows = self._contract.functions.hashesForTicker(ticker).call()
+        out: list[str] = []
+        for item in rows:
+            text = item.hex() if hasattr(item, "hex") else str(item)
+            if not text.startswith("0x"):
+                text = "0x" + text
+            out.append(text)
+        return out
+
+    def receipt_event(self, tx_hash: str) -> dict[str, Any] | None:
+        """Decode ``ScoreAttested`` from a receipt. None when the receipt is absent."""
+        receipt = self.get_receipt(tx_hash)
+        if receipt is None:
+            return None
+        try:
+            logs = self._contract.events.ScoreAttested().process_receipt(receipt)
+        except Exception:
+            return None
+        if not logs:
+            return None
+        args = logs[0]["args"]
+        score = args["scoreHash"]
+        score_hex = score.hex() if hasattr(score, "hex") else str(score)
+        if not str(score_hex).startswith("0x"):
+            score_hex = "0x" + str(score_hex)
+        return {
+            "ticker": str(args["ticker"]),
+            "score_hash": score_hex,
+            "attested_at": int(args["attestedAt"]),
+            "claimed_at": int(args["claimedAt"]),
+            "attester": str(args["attester"]),
+            "tx_hash": tx_hash,
+        }
+
     def attest(
         self,
         score_hash: str,
@@ -703,6 +830,7 @@ class Web3Chain:
         pending_tx: str | None = None,
         known_hashes: list[str] | None = None,
         on_submitted: Callable[[str, int], None] | None = None,
+        receipt_timeout: float | None = None,
     ) -> str:
         with self._lock:
             return self._send(
@@ -715,6 +843,7 @@ class Web3Chain:
                 pending_tx=pending_tx,
                 known_hashes=known_hashes,
                 on_submitted=on_submitted,
+                receipt_timeout=receipt_timeout,
             )
 
     def landed_hash(
@@ -748,6 +877,7 @@ class Web3Chain:
         pending_tx: str | None = None,
         known_hashes: list[str] | None = None,
         on_submitted: Callable[[str, int], None] | None = None,
+        receipt_timeout: float | None = None,
     ) -> str:
         chain_id = int(self._w3.eth.chain_id)
         if chain_id != BASE_SEPOLIA_CHAIN_ID:
@@ -792,6 +922,7 @@ class Web3Chain:
             known=known,
             on_submitted=on_submitted,
             bump=0,
+            receipt_timeout=receipt_timeout,
         )
 
     def _broadcast(
@@ -807,6 +938,7 @@ class Web3Chain:
         known: list[str],
         on_submitted: Callable[[str, int], None] | None,
         bump: int,
+        receipt_timeout: float | None = None,
     ) -> str:
         max_fee, priority = clamp_eip1559_fees(
             max_fee_gwei=self._settings.max_fee_gwei,
@@ -837,10 +969,17 @@ class Web3Chain:
             on_submitted(hex_hash, int(nonce))
         # Stay on this nonce until a receipt says it was consumed.
         self._nonce = int(nonce)
+        timeout = RECEIPT_TIMEOUT_SECONDS if receipt_timeout is None else float(receipt_timeout)
+        if timeout <= 0:
+            # Return immediately, but if the node already mined this hash
+            # (anvil automine), report that receipt instead of a stale pending.
+            landed = self._landed(known, score_hash, ticker)
+            if landed:
+                self._nonce = int(nonce) + 1
+                return landed
+            return hex_hash
         try:
-            receipt = self._w3.eth.wait_for_transaction_receipt(
-                sent, timeout=RECEIPT_TIMEOUT_SECONDS
-            )
+            receipt = self._w3.eth.wait_for_transaction_receipt(sent, timeout=timeout)
         except Exception as exc:
             if _is_already(exc):
                 raise AlreadyAttestedError("AlreadyAttested") from None
@@ -909,14 +1048,35 @@ def _revert_blob(w3: Any, tx: dict[str, Any]) -> str:
     return ""
 
 
+def _local_refusal(settings: AttesterSettings, score_hash: str, ticker: str, claimed_at: int) -> str:
+    """Config and subject checks that do not touch the network. Empty when they pass."""
+    if int(settings.chain_id) != BASE_SEPOLIA_CHAIN_ID:
+        return f"refusing configured chain id {settings.chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
+    if settings.enforce_contract_pin and settings.contract.lower() != PINNED_ATTESTATION_CONTRACT.lower():
+        return f"refusing contract; pinned to {PINNED_ATTESTATION_CONTRACT}"
+    if settings.gas_limit <= 0 or settings.gas_limit > HARD_GAS_CAP:
+        return f"gas cap must be 1..{HARD_GAS_CAP}"
+    try:
+        _validate_subject(score_hash, ticker, claimed_at)
+    except TerminalAttestError as exc:
+        return str(exc)
+    return ""
+
+
 def send_one(
     job: dict[str, Any],
     chain: Chain,
     settings: AttesterSettings,
     *,
     on_submitted: Callable[[str, int], None] | None = None,
+    receipt_timeout: float | None = None,
+    skip_initial_verify: bool = False,
 ) -> SendOutcome:
-    """Pre-check ``verify``, then send. ``AlreadyAttested`` is success."""
+    """Pre-check ``verify``, then send. ``AlreadyAttested`` is success.
+
+    ``skip_initial_verify`` is set when the caller already read ``eth_chainId``
+    and ``verify`` for this attempt. The post-send ``verify`` still runs.
+    """
     if int(settings.chain_id) != BASE_SEPOLIA_CHAIN_ID:
         raise TerminalAttestError(
             f"refusing configured chain id {settings.chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
@@ -928,18 +1088,19 @@ def send_one(
     if settings.gas_limit <= 0 or settings.gas_limit > HARD_GAS_CAP:
         raise TerminalAttestError(f"gas cap must be 1..{HARD_GAS_CAP}")
     _validate_subject(str(job["score_hash"]), str(job["ticker"]), int(job["claimed_at"]))
-    chain_id = int(chain.chain_id())
-    if chain_id != BASE_SEPOLIA_CHAIN_ID:
-        raise TerminalAttestError(
-            f"refusing eth_chainId {chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
-        )
-    ok, attested_at, _who = chain.verify(job["score_hash"], job["ticker"])
-    if ok:
-        return SendOutcome(
-            tx_hash=_receipt_hash(chain, job),
-            attested_at=int(attested_at),
-            already=True,
-        )
+    if not skip_initial_verify:
+        chain_id = int(chain.chain_id())
+        if chain_id != BASE_SEPOLIA_CHAIN_ID:
+            raise TerminalAttestError(
+                f"refusing eth_chainId {chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
+            )
+        ok, attested_at, _who = chain.verify(job["score_hash"], job["ticker"])
+        if ok:
+            return SendOutcome(
+                tx_hash=_receipt_hash(chain, job),
+                attested_at=int(attested_at),
+                already=True,
+            )
     fee = int(chain.fee_wei())
     if fee > settings.value_cap_wei:
         raise TerminalAttestError(
@@ -956,6 +1117,7 @@ def send_one(
             pending_tx=job.get("tx_hash"),
             known_hashes=list(job.get("known_tx_hashes") or []),
             on_submitted=on_submitted,
+            receipt_timeout=receipt_timeout,
         )
     except AlreadyAttestedError:
         ok2, ts2, _who2 = chain.verify(job["score_hash"], job["ticker"])
@@ -1001,59 +1163,144 @@ def _receipt_hash(chain: Chain, job: dict[str, Any]) -> str | None:
     return found
 
 
-def on_chain_view(
-    store: Any,
-    score_hash: str,
-    settings: AttesterSettings,
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
+
+def chain_status(
+    chain: Any,
     *,
-    admission: str | None = None,
+    ticker: str,
+    score_hash: str | None = None,
+    tx_hash: str | None = None,
 ) -> dict[str, Any]:
-    if not settings.enabled:
-        return {
-            "attested": False,
-            "tx": None,
-            "attestedAt": None,
-            "worker": "disabled",
-            "reason": settings.disabled_reason,
-        }
-    payload = store.get_attested_payload(score_hash)
-    job = store.latest_attest_job(score_hash)
-    tx = None if payload is None else payload.get("tx_hash")
-    attested_at = None if payload is None else payload.get("attested_at")
-    status = None if job is None else job["status"]
-    if tx is None and job is not None:
-        tx = job.get("tx_hash")
-    if attested_at is None and job is not None and job.get("status") == "confirmed":
-        attested_at = job.get("attested_at")
-    attested = status == "confirmed" or attested_at is not None
+    """Read ScoreAttestation. Never consults process memory.
+
+    By ``tx_hash``: receipt plus a decoded ``ScoreAttested`` log.
+    By ``score_hash``: ``attested``, ``getAttestation``, and ``verify``.
+    By ticker alone: ``hashesForTicker``, then the same getters.
+    A probe that throws becomes a generic error. The exception text is dropped.
+    """
+    symbol = ticker.strip().upper()
     body: dict[str, Any] = {
-        "attested": bool(attested),
-        "tx": tx,
-        "attestedAt": attested_at,
-        "worker": "enabled",
-        "status": status or "absent",
+        "ticker": symbol,
+        "attested": False,
+        "tx": None,
+        "attestedAt": None,
+        "claimedAt": None,
+        "attester": None,
+        "score_hash": score_hash,
+        "status": "absent",
+        "source": "chain",
     }
-    if admission in THROTTLE_MESSAGES:
-        body["status"] = "throttled"
-        body["reason"] = admission
-        body["message"] = THROTTLE_MESSAGES[admission]
+    event = None
+    if tx_hash:
+        reader = getattr(chain, "receipt_event", None)
+        if not callable(reader):
+            body["status"] = "unavailable"
+            body["reason"] = FAILED_REASON
+            body["message"] = FAILED_MESSAGE
+            return body
+        try:
+            event = reader(tx_hash)
+        except Exception:
+            event = None
+        if not isinstance(event, dict):
+            body["tx"] = tx_hash
+            body["status"] = "pending"
+            body["message"] = "Receipt is not on chain yet."
+            return body
+        body["tx"] = tx_hash
+        body["event"] = {
+            "ticker": event.get("ticker"),
+            "score_hash": event.get("score_hash"),
+            "attested_at": _as_int(event.get("attested_at")),
+            "claimed_at": _as_int(event.get("claimed_at")),
+            "attester": event.get("attester"),
+        }
+        score_hash = str(event.get("score_hash") or score_hash or "")
+        body["score_hash"] = score_hash or None
+        if str(event.get("ticker") or "").upper() != symbol:
+            body["status"] = "absent"
+            body["attested"] = False
+            body["message"] = "Receipt event ticker does not match."
+            return body
+    digest = (score_hash or "").strip()
+    if not digest:
+        listing = getattr(chain, "hashes_for_ticker", None)
+        if callable(listing):
+            try:
+                found = listing(symbol)
+            except Exception:
+                found = None
+            if isinstance(found, list) and found and isinstance(found[-1], str):
+                digest = found[-1]
+                body["score_hash"] = digest
+    if not digest:
+        if event is not None:
+            body["status"] = "confirmed"
+            body["attested"] = True
+            body["attestedAt"] = _as_int(event.get("attested_at"))
         return body
-    if status == "failed":
+    attested_fn = getattr(chain, "attested", None)
+    attested_flag: bool | None = None
+    if callable(attested_fn):
+        try:
+            attested_flag = _as_bool(attested_fn(digest))
+        except Exception:
+            attested_flag = None
+    if attested_flag is None and event is None:
+        body["status"] = "unavailable"
         body["reason"] = FAILED_REASON
         body["message"] = FAILED_MESSAGE
-    elif status == "pending" and job is not None and job.get("last_error") == LOW_BALANCE_REASON:
-        body["reason"] = LOW_BALANCE_REASON
-        body["message"] = LOW_BALANCE_MESSAGE
-    elif status == "pending" and job is not None and job.get("last_error") in THROTTLE_MESSAGES:
-        code = str(job["last_error"])
-        body["status"] = "throttled"
-        body["reason"] = code
-        body["message"] = THROTTLE_MESSAGES[code]
+        return body
+    record = None
+    getter = getattr(chain, "get_attestation", None)
+    if callable(getter):
+        try:
+            record = getter(digest)
+        except Exception:
+            record = None
+    verified = None
+    verifier = getattr(chain, "verify", None)
+    if callable(verifier):
+        try:
+            verified = verifier(digest, symbol)
+        except Exception:
+            verified = None
+    ok = attested_flag is True
+    if isinstance(verified, tuple) and verified:
+        ok = ok and verified[0] is True
+    elif attested_flag is not True:
+        ok = False
+    if isinstance(record, dict):
+        if str(record.get("ticker") or "").upper() not in {"", symbol}:
+            ok = False
+        body["attestedAt"] = _as_int(record.get("attested_at"))
+        body["claimedAt"] = _as_int(record.get("claimed_at"))
+        body["attester"] = record.get("attester")
+    elif isinstance(verified, tuple) and len(verified) >= 2:
+        body["attestedAt"] = _as_int(verified[1])
+        if len(verified) >= 3:
+            body["attester"] = verified[2]
+    body["attested"] = bool(ok)
+    body["status"] = "confirmed" if ok else "absent"
+    if event is not None and ok:
+        body["tx"] = tx_hash
+        body["status"] = "confirmed"
     return body
 
 
 class AttestWorker:
-    """Single thread. ``process_once`` is what tests call. ``kick`` is async."""
+    """Single thread. ``submit`` broadcasts. ``process_once`` only reconciles."""
 
     def __init__(
         self,
@@ -1078,7 +1325,7 @@ class AttestWorker:
         return self._chain
 
     def kick(self) -> None:
-        """Start the thread if this worker is enabled. Returns immediately."""
+        """Start the reconciler if this worker is enabled. Returns immediately."""
         if not self.settings.enabled or not self.autostart:
             return
         with self._start_lock:
@@ -1118,172 +1365,255 @@ class AttestWorker:
                 self._wake.wait(timeout=2.0)
                 self._wake.clear()
 
-    def _promote_if_landed(self, job: dict[str, Any]) -> bool:
-        """If the subject is already on chain, confirm it with the mined hash."""
-        if not job.get("tx_hash") and not (job.get("known_tx_hashes") or []):
-            return False
+    def submit(
+        self,
+        *,
+        canonical: bytes,
+        score_hash: str,
+        ticker: str,
+        claimed_at: int,
+        now: float | None = None,
+    ) -> SubmitResult:
+        """Hash must be of ``canonical`` from this request. Check attested, then broadcast once."""
+        clock = time.time() if now is None else float(now)
+        secret = self.settings.private_key
+        rpc_url = self.settings.rpc_url
+        if not self.settings.enabled:
+            return SubmitResult(
+                status="disabled",
+                reason="disabled",
+                message=self.settings.disabled_reason,
+            )
         try:
-            verified = self.chain().verify(job["score_hash"], job["ticker"])
-        except Exception:
-            return False
-        if not (isinstance(verified, tuple) and verified and verified[0] is True):
-            return False
-        landed = _receipt_hash(self.chain(), job)
-        attested_at = None
-        if len(verified) >= 2 and isinstance(verified[1], int):
-            attested_at = int(verified[1])
-        logger.info(
-            "attest job %s confirmed from chain hash=%s",
-            job["id"],
-            job["score_hash"],
+            _require_request_bytes(canonical, score_hash, ticker, claimed_at)
+        except TerminalAttestError as exc:
+            safe = redact(str(exc), secret, rpc_url)
+            logger.info("attest refused: %s", safe)
+            return SubmitResult(
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
+                error=safe,
+            )
+        existing = self.store.inflight_for_hash(score_hash)
+        if existing is not None:
+            return SubmitResult(
+                status="pending",
+                tx_hash=existing.get("tx_hash"),
+                reason="broadcast_pending",
+                message="Broadcast already in flight. No second transaction was sent.",
+            )
+        local = _local_refusal(
+            self.settings, score_hash, ticker, int(claimed_at)
         )
-        self.store.finish_attest_job(
-            job["id"],
-            status="confirmed",
-            tx_hash=landed,
-            attested_at=attested_at,
-            error=None,
+        if local:
+            logger.info("attest failed: %s", local)
+            return SubmitResult(
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
+                error=local,
+            )
+        # Chain id, then attested, before admission. A posted hash is not a new send.
+        gate, attested_at, gate_error = self._preflight(score_hash, ticker)
+        if gate == "failed":
+            logger.info("attest failed: %s", gate_error)
+            return SubmitResult(
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
+                error=gate_error,
+            )
+        if gate == "confirmed":
+            return SubmitResult(status="confirmed", attested_at=attested_at)
+        blocked = admission_block(self.store, self.settings, ticker, now=clock)
+        if blocked:
+            return SubmitResult(
+                status="throttled",
+                reason=blocked,
+                message=THROTTLE_MESSAGES[blocked],
+            )
+        if not self._balance_ok():
+            return SubmitResult(
+                status="low_balance",
+                reason=LOW_BALANCE_REASON,
+                message=LOW_BALANCE_MESSAGE,
+            )
+        job: dict[str, Any] = {
+            "score_hash": score_hash,
+            "ticker": ticker,
+            "claimed_at": int(claimed_at),
+            "tx_hash": None,
+            "nonce": None,
+            "known_tx_hashes": [],
+        }
+
+        def _on_submitted(tx_hash: str, nonce: int) -> None:
+            self.store.note_broadcast(
+                tx_hash=tx_hash,
+                nonce=nonce,
+                score_hash=score_hash,
+                ticker=ticker,
+                claimed_at=int(claimed_at),
+                now=clock,
+            )
+            job["tx_hash"] = tx_hash
+            job["nonce"] = nonce
+            job["known_tx_hashes"] = [tx_hash]
+
+        try:
+            outcome = send_one(
+                job,
+                self.chain(),
+                self.settings,
+                on_submitted=_on_submitted,
+                receipt_timeout=self.settings.wait_seconds,
+                skip_initial_verify=True,
+            )
+        except TerminalAttestError as exc:
+            safe = redact(str(exc), secret, rpc_url)
+            logger.info("attest failed: %s", safe)
+            if job.get("tx_hash"):
+                return SubmitResult(
+                    status="pending",
+                    tx_hash=job.get("tx_hash"),
+                    reason="broadcast_pending",
+                    message="Broadcast is in flight. No second transaction was sent.",
+                )
+            return SubmitResult(
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
+                error=safe,
+            )
+        except Exception as exc:  # noqa: BLE001 — redacted; a broadcast stays pending
+            safe = redact(str(exc), secret, rpc_url)
+            logger.info("attest error: %s", safe)
+            if job.get("tx_hash"):
+                return SubmitResult(
+                    status="pending",
+                    tx_hash=job.get("tx_hash"),
+                    reason="broadcast_pending",
+                    message="Broadcast is in flight. No second transaction was sent.",
+                    error=safe,
+                )
+            return SubmitResult(
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
+                error=safe,
+            )
+        if outcome.tx_hash and not job.get("tx_hash") and not outcome.already:
+            self.store.note_broadcast(
+                tx_hash=outcome.tx_hash,
+                nonce=0,
+                score_hash=score_hash,
+                ticker=ticker,
+                claimed_at=int(claimed_at),
+                now=clock,
+            )
+            job["tx_hash"] = outcome.tx_hash
+            job["known_tx_hashes"] = [outcome.tx_hash]
+        if outcome.already or (outcome.attested_at is not None and outcome.tx_hash):
+            if job.get("tx_hash") and outcome.tx_hash:
+                self.store.drop_inflight(str(job["tx_hash"]))
+            return SubmitResult(
+                status="confirmed",
+                tx_hash=outcome.tx_hash,
+                attested_at=outcome.attested_at,
+            )
+        if outcome.already:
+            return SubmitResult(
+                status="confirmed",
+                tx_hash=outcome.tx_hash,
+                attested_at=outcome.attested_at,
+            )
+        if job.get("tx_hash") or outcome.tx_hash:
+            return SubmitResult(
+                status="pending",
+                tx_hash=job.get("tx_hash") or outcome.tx_hash,
+                reason="broadcast_pending",
+                message="Broadcast is in flight.",
+            )
+        return SubmitResult(
+            status="failed",
+            reason=FAILED_REASON,
+            message=FAILED_MESSAGE,
         )
-        return True
+
+    def _preflight(self, score_hash: str, ticker: str) -> tuple[str, int | None, str]:
+        """Read the chain once before admission.
+
+        Returns ``failed`` (with a redacted message), ``confirmed`` (hash
+        already attested), or ``ready`` (safe to consider a send).
+        """
+        secret = self.settings.private_key
+        rpc_url = self.settings.rpc_url
+        chain = self.chain()
+        try:
+            chain_id = int(chain.chain_id())
+        except Exception as exc:
+            return "failed", None, redact(str(exc), secret, rpc_url)
+        if chain_id != BASE_SEPOLIA_CHAIN_ID:
+            return (
+                "failed",
+                None,
+                f"refusing eth_chainId {chain_id}; only {BASE_SEPOLIA_CHAIN_ID}",
+            )
+        try:
+            ok, attested_at, _who = chain.verify(score_hash, ticker)
+        except Exception as exc:
+            return "failed", None, redact(str(exc), secret, rpc_url)
+        if ok is True:
+            if isinstance(attested_at, int) and not isinstance(attested_at, bool):
+                return "confirmed", int(attested_at), ""
+            return "confirmed", 0, ""
+        return "ready", None, ""
 
     def recover_broadcasts(self, *, now: float | None = None) -> int:
-        """Poll every saved broadcast once. Used on startup after a crash."""
+        """Poll every in-flight broadcast once. Used on startup. Does not send."""
         if not self.settings.enabled:
             return 0
         clock = time.time() if now is None else float(now)
-        rows = self.store.list_inflight_broadcasts()
+        rows = self.store.list_inflight()
         for job in rows:
             self._reconcile(job, clock)
         return len(rows)
 
     def process_once(self, *, now: float | None = None) -> bool:
-        """Handle one due job. False when the queue has nothing due."""
+        """Reconcile one in-flight broadcast. False when nothing is in flight."""
         if not self.settings.enabled:
             return False
         clock = time.time() if now is None else float(now)
-        inflight = self.store.claim_broadcast_job(
-            now=clock, lease_seconds=BROADCAST_POLL_SECONDS
-        )
-        if inflight is not None:
-            self._reconcile(inflight, clock)
-            return True
-        job = self.store.claim_next_attest_job(now=clock)
+        job = self.store.next_inflight()
         if job is None:
             return False
-        if not self._balance_ok(job, clock):
-            return True
-        secret = self.settings.private_key
-        rpc_url = self.settings.rpc_url
-
-        def _on_submitted(tx_hash: str, nonce: int) -> None:
-            self.store.note_submitted_tx(job["id"], tx_hash=tx_hash, nonce=nonce)
-            job["tx_hash"] = tx_hash
-            job["nonce"] = nonce
-            known = list(job.get("known_tx_hashes") or [])
-            if tx_hash not in known:
-                known.append(tx_hash)
-            job["known_tx_hashes"] = known
-
-        try:
-            _require_stored(self.store, job)
-            outcome = send_one(job, self.chain(), self.settings, on_submitted=_on_submitted)
-        except TerminalAttestError as exc:
-            if job.get("tx_hash"):
-                self._hold_broadcast(job, clock)
-                return True
-            safe = redact(str(exc), secret, rpc_url)
-            if self._promote_if_landed(job):
-                return True
-            logger.info("attest job %s failed: %s", job["id"], safe)
-            self.store.finish_attest_job(job["id"], status="failed", error=safe)
-            return True
-        except Exception as exc:  # noqa: BLE001 — retry transient RPC / gas errors
-            if job.get("tx_hash"):
-                self._hold_broadcast(job, clock)
-                return True
-            safe = redact(str(exc), secret, rpc_url)
-            attempts = int(job["attempts"])
-            if attempts >= self.settings.max_attempts:
-                if self._promote_if_landed(job):
-                    return True
-                logger.info("attest job %s exhausted retries: %s", job["id"], safe)
-                self.store.finish_attest_job(job["id"], status="failed", error=safe)
-                return True
-            delay = self.settings.backoff_seconds * (2 ** (attempts - 1))
-            logger.info(
-                "attest job %s retry %s in %ss: %s",
-                job["id"],
-                attempts,
-                delay,
-                safe,
-            )
-            self.store.finish_attest_job(
-                job["id"],
-                status="pending",
-                error=safe,
-                next_attempt_at=clock + delay,
-            )
-            return True
-        logger.info(
-            "attest job %s confirmed hash=%s already=%s",
-            job["id"],
-            job["score_hash"],
-            outcome.already,
-        )
-        self.store.finish_attest_job(
-            job["id"],
-            status="confirmed",
-            tx_hash=outcome.tx_hash,
-            attested_at=outcome.attested_at,
-            error=None,
-        )
+        self._reconcile(job, clock)
         return True
 
-    def _balance_ok(self, job: dict[str, Any], clock: float) -> bool:
-        """False when the signer is under the floor. The job stays pending."""
+    def _balance_ok(self) -> bool:
         floor = int(self.settings.min_balance_wei)
         if floor <= 0:
             return True
         reader = getattr(self.chain(), "balance_wei", None)
-        bal: int | None
         if not callable(reader):
-            bal = None
-        else:
-            try:
-                bal = int(reader())
-            except Exception:
-                bal = None
-        if bal is not None and bal >= floor:
-            return True
-        logger.info("attest job %s waiting: attester balance below floor", job["id"])
-        self.store.finish_attest_job(
-            job["id"],
-            status="pending",
-            error=LOW_BALANCE_REASON,
-            next_attempt_at=clock + 60.0,
-        )
-        return False
-
-    def _hold_broadcast(self, job: dict[str, Any], clock: float) -> None:
-        """Receipt timed out. Keep the saved hash and let the reconciler poll it."""
-        logger.info("attest job %s broadcast pending hash=%s", job["id"], job.get("tx_hash"))
-        self.store.finish_attest_job(
-            job["id"],
-            status="broadcast_pending",
-            tx_hash=job.get("tx_hash"),
-            nonce=job.get("nonce"),
-            error=None,
-            next_attempt_at=clock + BROADCAST_POLL_SECONDS,
-        )
+            return False
+        try:
+            bal = int(reader())
+        except Exception:
+            return False
+        return bal >= floor
 
     def _reconcile(self, job: dict[str, Any], clock: float) -> None:
-        """Poll the saved hash. Confirm only with the receipt hash ``_landed`` found.
+        """Poll the saved hash. Drop it only when ``_landed`` returns the receipt hash.
 
-        Failed only when the deadline has passed, the receipt is missing,
-        ``isAttested`` is false, and the account nonce has moved past the
-        saved nonce on a different transaction.
+        A true ``verify`` with no receipt hash stays in flight. The saved
+        broadcast hash is not copied into a confirmed result. Failed only
+        when the deadline has passed, the receipt is missing, ``attested``
+        is false, and the account nonce has moved past the saved nonce.
         """
-        if not job.get("tx_hash"):
+        tx_hash = job.get("tx_hash")
+        if not tx_hash:
             return
         chain = self.chain()
         landed = _receipt_hash(chain, job)
@@ -1298,39 +1628,23 @@ class AttestWorker:
             if len(result) >= 2 and isinstance(result[1], int):
                 attested_at = int(result[1])
         if landed:
-            logger.info("attest job %s confirmed from receipt hash=%s", job["id"], landed)
-            self.store.finish_attest_job(
-                job["id"],
-                status="confirmed",
-                tx_hash=landed,
-                attested_at=attested_at,
-                error=None,
-            )
+            logger.info("attest broadcast confirmed from receipt hash=%s", landed)
+            if attested_at is not None:
+                job["attested_at"] = attested_at
+            self.store.drop_inflight(str(tx_hash))
+            try:
+                chain_obj = self.chain()
+                if hasattr(chain_obj, "_nonce") and job.get("nonce") is not None:
+                    chain_obj._nonce = int(job["nonce"]) + 1
+            except Exception:
+                pass
             return
         if verified:
-            # On chain, but the receipt scan did not return a hash. Do not
-            # copy the broadcast hash. The anvil test fails in this state.
-            self._reschedule_broadcast(job, clock)
             return
         if self._broadcast_dropped(job, chain, clock):
-            logger.info("attest job %s broadcast dropped", job["id"])
-            self.store.finish_attest_job(
-                job["id"],
-                status="failed",
-                error="broadcast_dropped",
-            )
+            logger.info("attest broadcast dropped hash=%s", tx_hash)
+            self.store.drop_inflight(str(tx_hash))
             return
-        self._reschedule_broadcast(job, clock)
-
-    def _reschedule_broadcast(self, job: dict[str, Any], clock: float) -> None:
-        self.store.finish_attest_job(
-            job["id"],
-            status="broadcast_pending",
-            tx_hash=job.get("tx_hash"),
-            nonce=job.get("nonce"),
-            error=None,
-            next_attempt_at=clock + BROADCAST_POLL_SECONDS,
-        )
 
     def _broadcast_dropped(self, job: dict[str, Any], chain: Chain, clock: float) -> bool:
         started = job.get("broadcast_at")
@@ -1369,7 +1683,7 @@ class AttestWorker:
 
 
 def main() -> None:
-    """Drain due jobs once, then exit. For a future worker process. No send if disabled."""
+    """Reconcile in-flight broadcasts once, then exit. No send if disabled."""
     from .store import open_store
 
     settings = AttesterSettings.from_env()

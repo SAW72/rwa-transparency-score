@@ -1,17 +1,17 @@
-# Score history and attestation bytes
+# No score store
 
-Payloads, scoring inputs, score history, and the attest job queue live in the API process memory. A restart or a free-plan spin-down drops them. That loss is accepted.
-
-`RWA_STORE_MAX_ENTRIES` caps how many history rows, payloads, jobs, usage events, and deliveries the process keeps. The default is 1000. The code hard-max is 10000. In-flight attest jobs are not evicted to make room.
-
-`GET /v1/attest/{ticker}` and `GET /v1/attest/{ticker}/status` return `canonical_payload`: the exact canonical bytes and scoring inputs as base64. Save that object and check it later with:
+There is no database, no disk, and no score, payload, or history cache. `POST /v1/attest/{ticker}` computes the score live, builds the canonical bytes once, hashes them, and posts that hash to `ScoreAttestation`. The response is the only copy of the payload. Save it. The contract stores the hash, not the bytes, so that file is what `verify` needs later:
 
 ```bash
 python -m rwa_score.api.verify NVDA --payload-file nvda.json --offline
 ```
 
-The digest is SHA-256 of those canonical bytes, the same `bytes32` the contract stores.
+The digest is SHA-256 of those canonical bytes, the same `bytes32` the contract stores. The contract does not keccak the payload.
 
-`/health` reports process status, whether the attester is enabled, the configured chain id, RPC reachability, attester balance against the floor, and queue depth. It does not probe a database.
+The only in-process attester state is a nonce lock, an in-flight map of `{tx_hash, nonce}` (plus the subject needed to poll `attested`) until the receipt lands, and the rate-limit / tx-cap counters. That is pending-transaction bookkeeping, not a score cache. A restart drops it. That is safe because every send checks `attested` before broadcasting and never resends after a broadcast.
+
+`GET /v1/attest/{ticker}/status` reads the chain only, by `tx_hash` (receipt plus the `ScoreAttested` log) or by `score_hash` (`attested`, `getAttestation`, `verify`). It does not read process memory.
+
+`/health` reports process status, whether the attester is enabled, the configured chain id, RPC reachability, attester balance against the floor, and queue depth (in-flight count). It does not probe a database.
 
 Future (out of scope): persistent DB only if we go mainnet or partner with a data provider like CoinMarketCap (API signups).

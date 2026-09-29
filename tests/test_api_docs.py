@@ -58,12 +58,12 @@ def test_webhook_poster_disables_redirects() -> None:
     assert "allow_redirects=False" in src
 
 
-def test_readme_documents_tenant_scoped_webhooks() -> None:
+def test_readme_documents_live_attest_and_saved_payload() -> None:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "per tenant" in text
-    assert "never fires key B" in text
-    assert "does not follow HTTP redirects" in text
+    assert "POST /v1/attest" in text
+    assert "--payload-file" in text
     assert "authorized attester" in text
+    assert "no score store" in text.lower() or "does not store the score" in text.lower() or "not stored" in text.lower()
 
 
 def test_deploy_script_holds_mainnet() -> None:
@@ -193,6 +193,6 @@ def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
         "RWA_API_BOOTSTRAP_KEY",
         "CMC_API_KEY",
         "RWA_USE_FIXTURES",
-        "RWA_STORE_MAX_ENTRIES",
+        "RWA_ATTEST_WAIT_SECONDS",
     ):
         assert required in keys

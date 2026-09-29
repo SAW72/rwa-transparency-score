@@ -5,16 +5,15 @@ Wraps ``TransparencyScorer`` / ``create_client`` so numbers match Streamlit.
 
 from __future__ import annotations
 
+import base64
 import logging
 import math
 import time
-import secrets
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl
 
 from rwa_score import __version__
 from rwa_score.client import create_client
@@ -31,15 +30,13 @@ from .attest import (
 from .auto_attest import (
     AttestWorker,
     AttesterSettings,
-    admission_block,
+    SubmitResult,
+    chain_status,
     guard_live_attester,
-    on_chain_view,
 )
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store, open_store
-from .verify import export_payload
-from .webhooks import apply_score_side_effects, assert_public_https_url
 
 logger = logging.getLogger(__name__)
 
@@ -67,17 +64,6 @@ BREAKDOWN_KEYS = (
 )
 
 
-class WatchlistBody(BaseModel):
-    tickers: list[str] = Field(default_factory=list)
-
-
-class WebhookBody(BaseModel):
-    url: HttpUrl
-    secret: str | None = None
-    ticker: str | None = None
-    trigger: str = "band_cross"
-
-
 def _http_error(status: int, error: str, message: str, **extra: Any) -> HTTPException:
     return HTTPException(status_code=status, detail={"error": error, "message": message, **extra})
 
@@ -86,9 +72,8 @@ class _SealedScore(dict):
     """Score dict plus the one canonical attestation built for this request.
 
     ``canonical`` and ``attestation_payload`` are attributes, not keys, so
-    they stay out of the JSON body. Later history, webhooks, and
-    ``GET /v1/attest`` must hash these bytes instead of calling
-    ``time.time()`` again.
+    they stay out of the JSON body. ``POST /v1/attest`` hashes these bytes
+    instead of calling ``time.time()`` again.
     """
 
     canonical: bytes
@@ -227,7 +212,7 @@ def create_app(
     if attester is None:
         guard_live_attester(attester_cfg)
     logger.info(
-        "store backend=%s attester=%s",
+        "pending-tx state only backend=%s attester=%s",
         db.backend,
         "enabled" if attester_cfg.enabled else "disabled",
     )
@@ -248,7 +233,7 @@ def create_app(
         title="RAT Score API",
         description=(
             "Paid output layer for RAT Score. Scoring logic stays MIT-open; "
-            "this surface is API access, history, webhooks, and attestation hashes."
+            "this surface is API access and live attestation. Scores are not stored."
         ),
         version=__version__,
         lifespan=lifespan,
@@ -298,7 +283,7 @@ def create_app(
             raise _http_error(
                 403,
                 "paid_required",
-                "This endpoint needs a paid key (history, webhooks, attestation).",
+                "This endpoint needs a paid key (attestation).",
             )
         return key
 
@@ -320,14 +305,6 @@ def create_app(
                 )
             report = _sanitize_non_finite(report)
         decorated = _decorate(report)
-        if _finite_score(decorated.get("score")):
-            apply_score_side_effects(
-                db,
-                decorated,
-                key_id=key.id,
-                poster=app.state.poster,
-                timeout=cfg.webhook_timeout_seconds,
-            )
         return decorated
 
     @app.get("/health", response_model=None)
@@ -385,198 +362,114 @@ def create_app(
                 rows.append({"ticker": symbol, "error": detail.get("message", "error")})
         return {"tickers": symbols, "scores": rows}
 
-    @app.get("/v1/watchlist")
-    def get_watchlist(key: ApiKey = Depends(require_key)) -> dict[str, Any]:
-        symbols = db.get_watchlist(key.id)
-        scores = []
-        for symbol in symbols:
-            try:
-                scores.append(score_ticker(symbol, key))
-            except HTTPException as exc:
-                detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
-                scores.append({"ticker": symbol, "error": detail.get("message", "error")})
-        return {"tickers": symbols, "scores": scores}
-
-    @app.put("/v1/watchlist")
-    def put_watchlist(body: WatchlistBody, key: ApiKey = Depends(require_key)) -> dict[str, Any]:
-        if len(body.tickers) > cfg.max_watchlist_tickers:
-            raise _http_error(
-                400,
-                "bad_request",
-                f"Watchlist cap is {cfg.max_watchlist_tickers} tickers.",
-            )
-        symbols = db.set_watchlist(key.id, body.tickers)
-        return {"tickers": symbols}
-
-    @app.post("/v1/watchlist")
-    def post_watchlist(body: WatchlistBody, key: ApiKey = Depends(require_key)) -> dict[str, Any]:
-        current = db.get_watchlist(key.id)
-        if len(set(current) | {t.strip().upper() for t in body.tickers if t.strip()}) > cfg.max_watchlist_tickers:
-            raise _http_error(
-                400,
-                "bad_request",
-                f"Watchlist cap is {cfg.max_watchlist_tickers} tickers.",
-            )
-        symbols = db.add_watchlist(key.id, body.tickers)
-        return {"tickers": symbols}
-
-    @app.delete("/v1/watchlist/{ticker}")
-    def delete_watchlist(ticker: str, key: ApiKey = Depends(require_key)) -> dict[str, Any]:
-        db.remove_watchlist(key.id, ticker)
-        return {"tickers": db.get_watchlist(key.id)}
-
-    @app.get("/v1/history/{ticker}")
-    def history(
-        ticker: str,
-        limit: int = Query(default=30, ge=1, le=200),
-        key: ApiKey = Depends(require_paid),
+    def _attest_body(
+        report: _SealedScore,
+        *,
+        result: SubmitResult | None,
     ) -> dict[str, Any]:
-        return {
-            "ticker": ticker.upper(),
-            "history": db.get_history(ticker, limit=limit, key_id=key.id),
-        }
-
-    @app.post("/v1/webhooks")
-    def create_webhook(body: WebhookBody, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        if body.trigger not in {"band_cross", "below_orange"}:
-            raise _http_error(400, "bad_request", "trigger must be band_cross or below_orange.")
-        try:
-            assert_public_https_url(str(body.url))
-        except ValueError as exc:
-            raise _http_error(400, "bad_request", str(exc)) from exc
-        secret = body.secret or secrets.token_urlsafe(24)
-        hook = db.add_webhook(
-            key.id,
-            url=str(body.url),
-            secret=secret,
-            ticker=body.ticker,
-            trigger=body.trigger,
-        )
-        return {
-            "id": hook.id,
-            "url": hook.url,
-            "ticker": hook.ticker,
-            "trigger": hook.trigger,
-            "secret": secret,
-            "created_at": hook.created_at,
-        }
-
-    @app.get("/v1/webhooks")
-    def list_webhooks(key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        hooks = [
-            {
-                "id": h.id,
-                "url": h.url,
-                "ticker": h.ticker,
-                "trigger": h.trigger,
-                "active": h.active,
-                "created_at": h.created_at,
-            }
-            for h in db.list_webhooks(key.id)
-        ]
-        return {"webhooks": hooks}
-
-    @app.delete("/v1/webhooks/{webhook_id}")
-    def delete_webhook(webhook_id: int, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        ok = db.deactivate_webhook(key.id, webhook_id)
-        if not ok:
-            raise _http_error(404, "not_found", "Webhook not found.")
-        return {"id": webhook_id, "active": False}
-
-    @app.get("/v1/attest/{ticker}")
-    def attest(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        report = score_ticker(ticker, key, for_attest=True)
-        # Same bytes history and webhooks just stored. Do not rebuild:
-        # a second as_of = time.time() would return a hash with no row.
-        payload, raw, digest = canonical_for(report)
-        db.save_attested_payload(
-            ticker=report["ticker"],
-            canonical=raw,
-            inputs=inputs_bytes(report),
-        )
-        admission = None
-        if attester_cfg.enabled:
-            admission = admission_block(db, attester_cfg, report["ticker"])
-            if admission is None:
-                db.enqueue_attest_job(
-                    score_hash=digest,
-                    ticker=report["ticker"],
-                    claimed_at=int(payload["as_of"]),
-                )
-                worker.kick()
-        chain_view = on_chain_view(db, digest, attester_cfg, admission=admission)
-        saved = db.get_attested_payload(digest)
-        canonical_payload = export_payload(
-            ticker=report["ticker"],
-            score_hash=digest,
-            canonical=raw if saved is None else saved["canonical"],
-            inputs=None if saved is None else saved.get("inputs"),
-        )
-        return {
+        payload = report.attestation_payload
+        raw = report.canonical
+        digest = str(report["attestation"]["score_hash"])
+        inputs = inputs_bytes(report)
+        status = "disabled" if result is None else result.status
+        tx_hash = None if result is None else result.tx_hash
+        body: dict[str, Any] = {
             "ticker": report["ticker"],
+            "score": None if not _finite_score(report.get("score")) else report.get("score"),
+            "as_of": payload.get("as_of"),
             "score_hash": digest,
             "algo": ATTESTATION_ALGO,
+            "canonical_b64": base64.b64encode(raw).decode("ascii"),
             "payload": payload,
-            "canonical_payload": canonical_payload,
+            "inputs_b64": base64.b64encode(inputs).decode("ascii"),
+            "tx_hash": tx_hash,
+            "status": status,
             "chain": cfg.attestation_chain,
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or None,
-            "stored": True,
-            "on_chain": chain_view,
             "note": (
-                "Call ScoreAttestation.attest(scoreHash, ticker, timestamp) "
-                "on Base Sepolia from an authorized attester (owner or "
-                "allowlisted relayer / API-held key). Attester is msg.sender "
-                "(not calldata). The timestamp argument is stored only as "
-                "claimedAt; the contract records block.timestamp as attestedAt. "
-                "Pass payload.as_of as that timestamp. as_of is attest time: "
-                "the Unix second when this payload was hashed, not when the "
-                "data was observed. Fixture scores use as_of 0, which is not "
-                "a calendar time. data_as_of is the latest provider observation "
-                "time already on the report, or null. When the attester worker "
-                "is enabled it enqueues that call off this response, using "
-                "these same canonical bytes. canonical_payload is the exact "
-                "bytes (base64) plus scoring inputs. Save it and pass "
-                "--payload-file to verify after a restart, because the "
-                "in-memory store is dropped. The contract stores this hash "
-                "only — never the raw score. Mainnet is held."
+                "Save this JSON and pass it to verify --payload-file. "
+                "The contract stores only the hash of these canonical bytes. "
+                "The hash is SHA-256 of those bytes, the bytes32 submitted to "
+                "attest. The contract does not hash the payload itself. "
+                "Save the payload; a restart drops in-flight transaction state "
+                "and does not keep a copy of this score. Mainnet is held."
             ),
         }
+        if result is not None and result.reason:
+            body["reason"] = result.reason
+        if result is not None and result.message:
+            body["message"] = result.message
+        return body
+
+    @app.post("/v1/attest/{ticker}")
+    def attest(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
+        """Score live, hash once, check attested, broadcast or return confirmed.
+
+        The request body is not a hash. Only bytes computed here are sent.
+        """
+        report = score_ticker(ticker, key, for_attest=True)
+        if not isinstance(report, _SealedScore):
+            raise _http_error(500, "error", "Score was not sealed.")
+        payload = report.attestation_payload
+        digest = str(report["attestation"]["score_hash"])
+        if not attester_cfg.enabled:
+            return _attest_body(report, result=SubmitResult(
+                status="disabled",
+                reason="disabled",
+                message=attester_cfg.disabled_reason,
+            ))
+        result = worker.submit(
+            canonical=report.canonical,
+            score_hash=digest,
+            ticker=str(report["ticker"]),
+            claimed_at=int(payload["as_of"]),
+        )
+        # Redacted detail stays in logs. The HTTP body gets the generic message.
+        return _attest_body(report, result=result)
 
     @app.get("/v1/attest/{ticker}/status")
-    def attest_status(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
-        """Latest stored payload and its on-chain job. Does not score or enqueue."""
+    def attest_status(
+        ticker: str,
+        tx_hash: str | None = Query(default=None),
+        score_hash: str | None = Query(default=None),
+        key: ApiKey = Depends(require_paid),
+    ) -> dict[str, Any]:
+        """Chain read only. Does not score and does not read process memory."""
         _ = key
         if _control_ticker(ticker):
             raise _http_error(400, "bad_ticker", "Ticker contains a control character.")
         symbol = ticker.strip().upper()
-        row = db.latest_attested_payload(symbol)
-        if row is None:
-            return {
-                "ticker": symbol,
-                "stored": False,
-                "score_hash": None,
-                "chain": cfg.attestation_chain,
-                "chain_id": cfg.attestation_chain_id,
-                "contract": cfg.attestation_contract or None,
-                "on_chain": on_chain_view(db, "0x" + "00" * 32, attester_cfg),
-            }
-        digest = row["score_hash"]
-        return {
-            "ticker": row["ticker"],
-            "stored": True,
-            "score_hash": digest,
-            "canonical_payload": export_payload(
-                ticker=row["ticker"],
-                score_hash=digest,
-                canonical=row["canonical"],
-                inputs=row.get("inputs"),
-            ),
+        chain = getattr(worker, "_chain", None)
+        if chain is None and attester_cfg.rpc_url and attester_cfg.contract and attester_cfg.enabled:
+            try:
+                chain = worker.chain()
+            except Exception:
+                chain = None
+        base = {
+            "ticker": symbol,
             "chain": cfg.attestation_chain,
             "chain_id": cfg.attestation_chain_id,
-            "contract": cfg.attestation_contract or None,
-            "on_chain": on_chain_view(db, digest, attester_cfg),
+            "contract": cfg.attestation_contract or attester_cfg.contract or None,
         }
+        if chain is None:
+            return {
+                **base,
+                "status": "unavailable",
+                "error": "chain_unset",
+                "message": "Status is read from the chain only. No RPC is configured.",
+                "on_chain": {
+                    "attested": False,
+                    "tx": None,
+                    "attestedAt": None,
+                    "status": "unavailable",
+                    "source": "chain",
+                    "reason": "chain_unset",
+                    "message": "Status is read from the chain only. No RPC is configured.",
+                },
+            }
+        view = chain_status(chain, ticker=symbol, score_hash=score_hash, tx_hash=tx_hash)
+        return {**base, "score_hash": view.get("score_hash"), "tx_hash": view.get("tx"), "status": view.get("status"), "on_chain": view}
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:

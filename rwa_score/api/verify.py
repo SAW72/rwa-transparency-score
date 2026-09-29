@@ -1,40 +1,35 @@
-"""Check saved canonical bytes against an optional on-chain record.
+"""Check a saved attest response against ScoreAttestation.
 
-Does not re-score. Does not send transactions. The API keeps those bytes
-in memory and drops them on restart. Save ``canonical_payload`` from
-``GET /v1/attest/{ticker}`` (or the status endpoint) and pass it as
-``--payload-file``. This command exits non-zero and does not invent a payload.
+Does not re-score. Does not send transactions. The API does not keep the
+payload. Save the JSON from ``POST /v1/attest/{ticker}`` and pass it as
+``--payload-file``.
 
-The digest is SHA-256 of the canonical bytes (the ``bytes32`` the contract
-stores). It is not a keccak of the raw JSON.
+The digest is SHA-256 of the canonical bytes. That is the ``bytes32``
+``attest`` stores. The contract does not keccak the payload. ``verify``
+on the contract keccak-hashes the ticker string only, to compare it.
+This command checks ``attested``, ``getAttestation``, ``verify``, and,
+when the file has ``tx_hash``, the ``ScoreAttested`` log on that receipt.
 
 Exit codes:
 
-- ``0`` saved bytes match their hash, saved inputs recompute
-  ``inputs_digest``, and the chain read matched. ``--offline`` is also
-  ``0`` when the local checks pass; that mode prints that nothing was
-  checked on-chain.
-- ``1`` ``--payload-file`` does not exist, or the file is not a payload bundle
-- ``2`` nothing saved. The note says ``no stored payload`` unless that
-  hash is attested on-chain, in which case it says the pre-fix payload
-  is unavailable
-- ``3`` saved bytes do not match the hash, the payload is malformed,
-  or saved inputs do not recompute ``inputs_digest``
-- ``4`` the payload ticker, or the ticker on a ``--hash`` file, does not
-  match the request; chain id is not 84532; verify() is false; or the
-  attester mismatches
+- ``0`` canonical bytes match their hash and the chain read matched.
+  ``--offline`` is also ``0`` when the local checks pass; that mode
+  prints that nothing was checked on-chain. Inputs are checked only
+  when the file includes them.
+- ``1`` ``--payload-file`` is missing, does not exist, or is not a bundle
+- ``3`` bytes do not match the hash, the payload is malformed, or inputs
+  in the file do not recompute ``inputs_digest``
+- ``4`` ticker mismatch, chain id is not 84532, ``attested`` / ``verify``
+  is false, the attester mismatches, or the receipt event does not match
 - ``5`` RPC / cast call failed
 - ``6`` a chain read was requested but ``cast`` is not on ``PATH``
 - ``7`` no ``--rpc-url`` and ``BASE_SEPOLIA_RPC_URL`` is unset, and
-  ``--offline`` was not passed. Nothing was checked on-chain.
-- ``8`` the bundle has no inputs, so ``inputs_digest`` cannot be
-  re-derived
+  ``--offline`` was not passed
 
-On-chain read uses ``cast chain-id`` and ``cast call`` when ``--rpc-url``
-(or ``BASE_SEPOLIA_RPC_URL``) is set. The contract defaults to the pinned
-Base Sepolia deployment. Without a URL, pass ``--offline`` to check
-saved bytes only.
-The digest passed to ``verify`` is recomputed from the saved bytes.
+Exit ``2`` (nothing stored / missing row) and exit ``8`` (inputs missing)
+are retired. There is no stored row, and a file without inputs is still
+checkable from the canonical bytes.
+
 ``--fixtures``, ``--api-url``, and ``--api-key`` are obsolete: they warn
 on stderr and do not re-score.
 """
@@ -51,6 +46,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from eth_abi import decode as abi_decode
+from eth_utils import keccak
+
 from .attest import (
     PINNED_ATTESTATION_CONTRACT,
     canonical_bytes,
@@ -61,42 +59,37 @@ from .settings import BASE_SEPOLIA_CHAIN_ID
 
 EXIT_OK = 0
 EXIT_DB = 1
+# Retired. Nothing is stored, so a missing file is exit 1, not a missing row.
 EXIT_NOT_STORED = 2
 EXIT_HASH_MISMATCH = 3
 EXIT_NO_MATCH = 4
 EXIT_RPC_ERROR = 5
 EXIT_CAST_MISSING = 6
 EXIT_CHAIN_UNCHECKED = 7
+# Retired. A payload file without inputs is still verified from canonical bytes.
 EXIT_INPUTS_MISSING = 8
 
 # Type signature is unchanged. The uint256 is the contract's trusted
 # attestedAt (block.timestamp at attest), not the attester's claimedAt.
+# None of the ScoreAttested fields are indexed. topic0 is the keccak of
+# the canonical signature; the hash in the log data is the bytes32 the
+# attester submitted (SHA-256 of the canonical payload), not a keccak of it.
+_SCORE_ATTESTED_TOPIC = "0x" + keccak(
+    text="ScoreAttested(string,bytes32,uint256,uint256,address)"
+).hex()
 # JSON `attested_at` is that int. cast 1.8.3 prints `1700000000 [1.7e9]`.
 VERIFY_SIG = "verify(bytes32,string)(bool,uint256,address)"
-
-NO_STORED_PAYLOAD = (
-    "no stored payload. "
-    "verify does not re-score and will not invent canonical bytes."
-)
-
-# Only when the requested hash is attested on-chain and the bytes are gone.
-NOTHING_STORED = (
-    "pre-fix attestation, stored payload unavailable. "
-    "The hash is on-chain and there is no stored payload for it. "
-    "verify does not re-score and will not rebuild a hash attested before "
-    "canonical bytes were stored. "
-    "GET /v1/attest/{ticker} stores a new payload; as_of is attest time, "
-    "so that new hash differs from the pre-fix hash. "
-    "A restart drops the in-memory bytes. Save canonical_payload from "
-    "GET /v1/attest/{ticker} and pass --payload-file."
-)
+ATTESTED_SIG = "attested(bytes32)(bool)"
+# A struct return needs the extra parentheses. Without them cast treats the
+# first word (the hash) as a string offset and the call fails.
+GET_ATTESTATION_SIG = "getAttestation(bytes32)((bytes32,string,uint256,address,uint256))"
 
 _LEGACY_FIELDS = ("as_of", "data_as_of", "scorer_version", "inputs_digest")
 
 _OBSOLETE_FLAGS = (
     "WARNING: --fixtures, --api-url, and --api-key are Ignored. They do not re-score and are obsolete. "
-    "verify only checks canonical bytes already stored by GET /v1/attest. "
-    "Older on-chain hashes with no stored row cannot be rebuilt from fixtures or the API."
+    "verify only checks the JSON from POST /v1/attest/{ticker}. "
+    "It does not re-score and it does not invent a payload."
 )
 
 
@@ -118,6 +111,41 @@ def _cast_output(cast: str, args: list[str], rpc_url: str) -> str:
         raise _RpcError(_redact_rpc(str(detail), rpc_url)) from None
 
 
+def _parse_bool(text: str) -> bool | None:
+    token = text.strip().split()[0].lower() if text.strip() else ""
+    if token in {"true", "1"}:
+        return True
+    if token in {"false", "0"}:
+        return False
+    return None
+
+
+def _parse_record(text: str) -> dict[str, Any] | None:
+    """cast prints getAttestation as a tuple, or one field per line.
+
+    Cast 1.8 adds a ``[1.7e9]`` annotation after each uint. Drop those.
+    """
+    fields: list[str] = []
+    for token in text.replace("(", " ").replace(")", " ").replace(",", " ").split():
+        if token.startswith("[") and token.endswith("]"):
+            continue
+        fields.append(token.strip().strip('"'))
+    if len(fields) < 5:
+        return None
+    try:
+        attested_at = int(fields[2])
+        claimed_at = int(fields[4])
+    except ValueError:
+        return None
+    return {
+        "score_hash": fields[0],
+        "ticker": fields[1],
+        "attested_at": attested_at,
+        "attester": fields[3],
+        "claimed_at": claimed_at,
+    }
+
+
 def on_chain_verify(
     *,
     contract: str,
@@ -125,6 +153,7 @@ def on_chain_verify(
     digest: str,
     ticker: str,
     expected_attester: str = "",
+    tx_hash: str = "",
 ) -> dict[str, Any]:
     """Read chain id and ``verify()``. Never returns success for a non-84532 chain.
 
@@ -148,6 +177,16 @@ def on_chain_verify(
             "attester_ok": False,
         }
     try:
+        attested_raw = _cast_output(
+            cast,
+            [cast, "call", contract, ATTESTED_SIG, digest, "--rpc-url", rpc_url],
+            rpc_url,
+        )
+        record_raw = _cast_output(
+            cast,
+            [cast, "call", contract, GET_ATTESTATION_SIG, digest, "--rpc-url", rpc_url],
+            rpc_url,
+        )
         out = _cast_output(
             cast,
             [cast, "call", contract, VERIFY_SIG, digest, ticker, "--rpc-url", rpc_url],
@@ -155,6 +194,15 @@ def on_chain_verify(
         )
     except _RpcError as exc:
         return {"ok": False, "chain_id": chain_id, "error": str(exc)}
+    attested_flag = _parse_bool(attested_raw)
+    record = _parse_record(record_raw)
+    if attested_flag is None or record is None:
+        return {
+            "ok": False,
+            "chain_id": chain_id,
+            "error": "unparsed attestation",
+            "raw": record_raw.strip(),
+        }
     parts = [p.strip() for p in out.replace("\n", " ").split() if p.strip()]
     # cast prints bool / uint / address, one per line or space-separated.
     lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
@@ -170,15 +218,90 @@ def on_chain_verify(
         return {"ok": False, "chain_id": chain_id, "error": "unparsed attested_at", "raw": out.strip()}
     expected = expected_attester.strip()
     attester_ok = bool(expected) and attester.lower() == expected.lower()
+    verify_ok = flag.lower() in {"true", "1"}
+    record_ticker = str(record.get("ticker") or "")
+    record_ok = (
+        attested_flag is True
+        and record_ticker == ticker
+        and str(record.get("attester") or "").lower() == attester.lower()
+    )
+    event = None
+    if tx_hash.strip():
+        try:
+            receipt_raw = _cast_output(
+                cast,
+                [cast, "receipt", tx_hash.strip(), "--json", "--rpc-url", rpc_url],
+                rpc_url,
+            )
+        except _RpcError as exc:
+            return {"ok": False, "chain_id": chain_id, "error": str(exc)}
+        event = {"tx_hash": tx_hash.strip()}
+        if _score_attested_in_receipt(receipt_raw, digest, ticker):
+            event["match"] = True
+        else:
+            record_ok = False
+            event["match"] = False
     return {
-        "ok": flag.lower() in {"true", "1"},
+        "ok": verify_ok and record_ok,
+        "attested": attested_flag,
         "chain_id": chain_id,
         "attested_at": attested_at,
         "attester": attester,
         "attester_ok": attester_ok,
         "expected_attester": expected or None,
+        "record": record,
+        "event": event,
         "raw": out.strip(),
     }
+
+
+def _score_attested_in_receipt(receipt_raw: str, digest: str, ticker: str) -> bool:
+    """True when a receipt log is ScoreAttested for this ticker and hash.
+
+    ``cast receipt --json`` ABI-encodes the hash inside ``logs[].data``.
+    A substring search misses it. Decode the event the contract actually emits.
+    """
+    try:
+        receipt = json.loads(receipt_raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    logs = receipt.get("logs")
+    if not isinstance(logs, list) and isinstance(receipt.get("transactionReceipt"), dict):
+        logs = receipt["transactionReceipt"].get("logs")
+    if not isinstance(logs, list):
+        return False
+    want = digest.lower()
+    if not want.startswith("0x"):
+        want = "0x" + want
+    for log in logs:
+        if not isinstance(log, dict):
+            continue
+        topics = log.get("topics") or []
+        if not topics or str(topics[0]).lower() != _SCORE_ATTESTED_TOPIC:
+            continue
+        decoded = _decode_score_attested(str(log.get("data") or ""))
+        if decoded is None:
+            continue
+        log_ticker, score_hash = decoded[0], decoded[1]
+        score_hex = score_hash.hex() if isinstance(score_hash, (bytes, bytearray)) else str(score_hash)
+        if not score_hex.startswith("0x"):
+            score_hex = "0x" + score_hex
+        if score_hex.lower() == want and str(log_ticker) == ticker:
+            return True
+    return False
+
+
+def _decode_score_attested(data: str) -> tuple[Any, ...] | None:
+    raw = data[2:] if data.startswith("0x") else data
+    if not raw:
+        return None
+    try:
+        blob = bytes.fromhex(raw)
+        return abi_decode(["string", "bytes32", "uint256", "uint256", "address"], blob)
+    except (ValueError, TypeError):
+        return None
 
 
 def _inputs_match(raw: bytes, claimed: Any) -> tuple[bool, dict[str, Any] | None]:
@@ -236,14 +359,19 @@ def load_payload_file(path: Path) -> dict[str, Any]:
         except (ValueError, TypeError) as exc:
             raise ValueError("payload file inputs are not base64") from exc
     claimed = str(data.get("score_hash") or "").strip()
+    nested = data.get("payload")
+    ticker = str(data.get("ticker") or "")
+    if not ticker and isinstance(nested, dict):
+        ticker = str(nested.get("ticker") or "")
     return {
         "score_hash": claimed or hash_canonical(canonical),
-        "ticker": str(data.get("ticker") or ""),
+        "ticker": ticker,
         "canonical": canonical,
         "inputs": inputs,
         "stored_at": None,
-        "tx_hash": None,
+        "tx_hash": data.get("tx_hash") or None,
         "attested_at": None,
+        "parsed_payload": nested if isinstance(nested, dict) else None,
     }
 
 
@@ -280,9 +408,9 @@ def main(argv: list[str] | None = None) -> int:
         "--payload-file",
         default="",
         help=(
-            "JSON bundle from GET /v1/attest canonical_payload "
-            "(ticker, score_hash, canonical_b64, inputs_b64). "
-            "Required to check bytes after the API process has restarted."
+            "JSON returned by POST /v1/attest/{ticker} "
+            "(score, as_of, score_hash, canonical_b64, payload, tx_hash, status). "
+            "Required. The API does not keep a copy."
         ),
     )
     parser.add_argument(
@@ -370,42 +498,45 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_DB
         requested = args.score_hash.strip()
         if requested and row["score_hash"] != requested:
-            row = None
-
-    if row is None:
-        on_chain = None
-        note = NO_STORED_PAYLOAD
-        requested = args.score_hash.strip()
-        if requested and args.rpc_url.strip():
-            on_chain = on_chain_verify(
-                contract=contract,
-                rpc_url=args.rpc_url.strip(),
-                digest=requested,
-                ticker=ticker,
-                expected_attester=args.attester,
-            )
-            if (
-                on_chain.get("ok") is True
-                and on_chain.get("chain_id") == BASE_SEPOLIA_CHAIN_ID
-                and not on_chain.get("error")
-            ):
-                note = NOTHING_STORED
-            else:
-                on_chain = None
-        result: dict[str, Any] = {
+            result = {
+                "ticker": ticker,
+                "stored": True,
+                "score_hash": row["score_hash"],
+                "payload": None,
+                "canonical": None,
+                "contract": contract,
+                "on_chain": None,
+                "match": False,
+                "hash_ok": False,
+                "note": (
+                    " --hash does not match the payload file. "
+                    "verify does not look up a different hash."
+                    + ignored_note
+                ),
+            }
+            _emit(result, as_json=args.json)
+            return EXIT_NO_MATCH
+    else:
+        result = {
             "ticker": ticker,
             "stored": False,
             "score_hash": None,
             "payload": None,
             "canonical": None,
             "contract": contract,
-            "on_chain": on_chain,
+            "on_chain": None,
             "match": False,
             "hash_ok": False,
-            "note": note + ignored_note,
+            "error": "payload_missing",
+            "note": (
+                "--payload-file is required. "
+                "Save the JSON from POST /v1/attest/{ticker} and pass that file. "
+                "verify does not re-score and does not invent canonical bytes."
+                + ignored_note
+            ),
         }
         _emit(result, as_json=args.json)
-        return EXIT_NOT_STORED
+        return EXIT_DB
 
     raw = row["canonical"]
     if not isinstance(raw, (bytes, bytearray)):
@@ -443,8 +574,8 @@ def main(argv: list[str] | None = None) -> int:
         "on_chain": None,
         "match": None,
         "note": (
-            "Hash recomputed from the stored canonical JSON. "
-            "No live re-score. "
+            "Hash recomputed from the canonical JSON in --payload-file. "
+            "No live re-score. The contract stores this SHA-256 digest, not a keccak of the JSON. "
             "inputs_digest covers every scoring input retained on the report, "
             "not raw provider bodies. "
             "as_of is attest time (Unix seconds when the payload was hashed), "
@@ -459,7 +590,7 @@ def main(argv: list[str] | None = None) -> int:
             result["error"] = "malformed_payload"
             result["note"] += " Malformed stored payload."
         else:
-            result["note"] += " Stored bytes do not match the hash key."
+            result["note"] += " Canonical bytes do not match the hash."
         result["match"] = False
         _emit(result, as_json=args.json)
         return EXIT_HASH_MISMATCH
@@ -503,10 +634,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         result["inputs_stored"] = False
         result["inputs_digest_ok"] = None
+        result["note"] += " Inputs were not in the file; inputs_digest was not re-derived."
+
+    parsed_payload = row.get("parsed_payload")
+    if isinstance(parsed_payload, dict) and payload is not None and parsed_payload != payload:
         result["match"] = False
-        result["note"] += " Scoring inputs were not stored; inputs_digest cannot be re-derived."
+        result["note"] += " Parsed payload does not match canonical bytes."
         _emit(result, as_json=args.json)
-        return EXIT_INPUTS_MISSING
+        return EXIT_HASH_MISMATCH
 
     if args.rpc_url.strip():
         chain = on_chain_verify(
@@ -515,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
             digest=recomputed,
             ticker=ticker,
             expected_attester=args.attester,
+            tx_hash=str(row.get("tx_hash") or ""),
         )
         result["on_chain"] = chain
         if chain.get("error") == "cast_missing":

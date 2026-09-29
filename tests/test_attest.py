@@ -23,7 +23,6 @@ from rwa_score.api.attest import (
     recompute_inputs_digest,
     score_hash,
 )
-from rwa_score.api.store import Store
 from rwa_score.api.verify import (
     EXIT_CAST_MISSING,
     EXIT_CHAIN_UNCHECKED,
@@ -239,17 +238,16 @@ def test_hash_changes_when_any_field_changes(field: str, new_value: object) -> N
     assert hash_canonical(canonical_bytes(mutated)) != hash_canonical(canonical_bytes(original))
 
 
-def test_stored_bytes_round_trip(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+def test_payload_file_round_trip(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
+    from rwa_score.api.verify import load_payload_file
+
     report = fixture_scorer.score("NVDA")
     raw = canonical_bytes(attestation_payload(report))
-    store = Store()
-    digest = store.save_attested_payload(ticker="NVDA", canonical=raw)
-    loaded = store.get_attested_payload(digest)
-    assert loaded is not None
+    path = _write_bundle(tmp_path / "nvda.payload.json", ticker="NVDA", canonical=raw, inputs=inputs_bytes(report))
+    loaded = load_payload_file(path)
     assert loaded["canonical"] == raw
-    assert hash_canonical(loaded["canonical"]) == digest
+    assert hash_canonical(loaded["canonical"]) == loaded["score_hash"]
     assert hash_canonical(loaded["canonical"]) == score_hash(report)
-    store.close()
 
 
 def _write_bundle(
@@ -292,8 +290,20 @@ def _cast_outputs(chain_id: str = "84532", verify: str = CAST_183_VERIFY):
         if cmd == "chain-id":
             return chain_id + "\n"
         if cmd == "call":
+            sig = args[3] if len(args) > 3 else ""
+            lines = [ln.strip() for ln in verify.splitlines() if ln.strip()]
+            ts = lines[1].split()[0] if len(lines) > 1 else "0"
+            who = lines[2] if len(lines) > 2 else "0x" + "00" * 20
+            if sig.startswith("attested("):
+                flag = lines[0].lower() if lines else "false"
+                return ("true\n" if flag.startswith("true") else "false\n")
+            if sig.startswith("getAttestation("):
+                digest = args[4] if len(args) > 4 else "0x" + "11" * 32
+                return f"{digest}\nNVDA\n{ts}\n{who}\n0\n"
             return verify
-        raise AssertionError(cmd)
+        if cmd == "receipt":
+            return "{}\n"
+        raise AssertionError(args)
 
     return run
 
@@ -362,16 +372,18 @@ def test_verify_does_not_call_the_scorer(monkeypatch, capsys, tmp_path: Path) ->
     assert "obsolete" in payload["note"].lower()
 
 
-def test_verify_clear_when_nothing_stored(capsys) -> None:
+def test_verify_requires_payload_file(capsys) -> None:
     code = main(["NVDA", "--json"])
-    assert code == EXIT_NOT_STORED
+    assert code == EXIT_DB
+    assert code != EXIT_NOT_STORED
     payload = json.loads(capsys.readouterr().out)
     assert payload["stored"] is False
     assert payload["score_hash"] is None
     assert payload["on_chain"] is None
     assert payload["match"] is False
     assert "does not re-score" in payload["note"]
-    assert "no stored payload" in payload["note"]
+    assert "payload-file is required" in payload["note"]
+    assert "no stored payload" not in payload["note"]
     assert "pre-fix" not in payload["note"]
 
 
@@ -441,11 +453,11 @@ def test_verify_rpc_error_and_missing_cast(monkeypatch, capsys, tmp_path: Path) 
 def test_verify_contract_defaults_to_pinned(monkeypatch, capsys) -> None:
     monkeypatch.delenv("RWA_ATTESTATION_CONTRACT", raising=False)
     code = main(["NVDA", "--json"])
-    assert code == EXIT_NOT_STORED
+    assert code == EXIT_DB
     body = json.loads(capsys.readouterr().out)
     assert body["contract"] == PINNED_ATTESTATION_CONTRACT
     assert body["contract"] == "0x2F073a3628D498d92956e7eFE2b26633eDa75b00"
-    assert "no stored payload" in body["note"]
+    assert "no stored payload" not in body["note"]
     assert "pre-fix" not in body["note"]
 
 
@@ -593,31 +605,32 @@ def test_verify_flags_legacy_payload_missing_new_fields(capsys, tmp_path: Path) 
         payload.pop(key)
     raw = canonical_bytes(payload)
     db = _write_bundle(tmp_path / "legacy.payload.json", ticker="NVDA", canonical=raw, inputs=None)
-    code = main(["NVDA", "--json", "--payload-file", str(db)])
-    assert code == EXIT_INPUTS_MISSING
+    code = main(["NVDA", "--offline", "--json", "--payload-file", str(db)])
+    assert code == EXIT_OK
+    assert code != EXIT_INPUTS_MISSING
     body = json.loads(capsys.readouterr().out)
     assert body["legacy"] is True
     assert body["hash_ok"] is True
     assert body["inputs_stored"] is False
-    assert body["match"] is False
     assert "Legacy payload is missing" in body["note"]
-    assert "inputs were not stored" in body["note"].lower()
 
 
 def test_verify_exit_codes_are_distinct() -> None:
-    codes = (
+    """2 and 8 are retired: no stored row, and missing inputs is not its own failure."""
+    live = (
         EXIT_OK,
         EXIT_DB,
-        EXIT_NOT_STORED,
         EXIT_HASH_MISMATCH,
         EXIT_NO_MATCH,
         EXIT_RPC_ERROR,
         EXIT_CAST_MISSING,
         EXIT_CHAIN_UNCHECKED,
-        EXIT_INPUTS_MISSING,
     )
-    assert codes == tuple(range(9))
-    assert len(set(codes)) == len(codes)
+    assert live == (0, 1, 3, 4, 5, 6, 7)
+    assert EXIT_NOT_STORED == 2
+    assert EXIT_INPUTS_MISSING == 8
+    assert EXIT_NOT_STORED not in live
+    assert EXIT_INPUTS_MISSING not in live
 
 
 def test_verify_without_rpc_fails_closed_unless_offline(
@@ -640,21 +653,21 @@ def test_verify_without_rpc_fails_closed_unless_offline(
     assert "nothing was checked on-chain" in body["note"].lower()
 
 
-def test_verify_missing_inputs_json_is_its_own_exit(capsys, tmp_path: Path) -> None:
+def test_verify_missing_inputs_still_checks_canonical_bytes(capsys, tmp_path: Path) -> None:
+    """Exit 8 is retired. Canonical bytes are enough when inputs are absent."""
     payload = _base_payload()
     raw = canonical_bytes(payload)
     db = _write_bundle(tmp_path / "no-inputs.payload.json", ticker="NVDA", canonical=raw, inputs=None)
     code = main(["NVDA", "--offline", "--json", "--payload-file", str(db)])
     body = json.loads(capsys.readouterr().out)
-    assert code == EXIT_INPUTS_MISSING
-    assert code not in (EXIT_OK, EXIT_HASH_MISMATCH, EXIT_NOT_STORED)
+    assert code == EXIT_OK
+    assert code != EXIT_INPUTS_MISSING
     assert body["inputs_stored"] is False
-    assert body["match"] is False
     assert body["hash_ok"] is True
-    assert "inputs were not stored" in body["note"].lower()
+    assert body["offline"] is True
 
 
-def test_verify_null_inputs_with_digest_exits_missing(capsys, tmp_path: Path) -> None:
+def test_verify_null_inputs_with_digest_is_not_a_missing_row(capsys, tmp_path: Path) -> None:
     payload = _base_payload()
     raw = canonical_bytes(payload)
     db = _write_bundle(
@@ -668,55 +681,21 @@ def test_verify_null_inputs_with_digest_exits_missing(capsys, tmp_path: Path) ->
     db.write_text(json.dumps(body), encoding="utf-8")
     code = main(["NVDA", "--offline", "--json", "--payload-file", str(db)])
     body = json.loads(capsys.readouterr().out)
-    assert code == EXIT_INPUTS_MISSING
+    assert code == EXIT_OK
+    assert code != EXIT_INPUTS_MISSING
     assert body["hash_ok"] is True
     assert body["payload"]["inputs_digest"]
     assert body["inputs_stored"] is False
-    assert body["match"] is False
-    assert "inputs were not stored" in body["note"].lower()
 
 
-def test_missing_row_says_no_stored_payload(capsys) -> None:
+def test_missing_payload_file_is_exit_1(capsys) -> None:
     code = main(["NVDA", "--hash", "0x" + "11" * 32, "--json"])
     body = json.loads(capsys.readouterr().out)
-    assert code == EXIT_NOT_STORED
-    assert "no stored payload" in body["note"]
+    assert code == EXIT_DB
+    assert code != EXIT_NOT_STORED
+    assert "payload-file is required" in body["note"]
+    assert "no stored payload" not in body["note"]
     assert "pre-fix" not in body["note"]
-
-
-def test_prefix_wording_only_when_hash_is_on_chain(monkeypatch, capsys) -> None:
-    digest = "0x" + "ab" * 32
-
-    def attested(**_kwargs):
-        return {
-            "ok": True,
-            "chain_id": 84532,
-            "attester_ok": True,
-            "attested_at": 1,
-            "attester": "0x" + "11" * 20,
-        }
-
-    monkeypatch.setattr("rwa_score.api.verify.on_chain_verify", attested)
-    code = main(
-        ["NVDA", "--hash", digest, "--json", "--rpc-url", "http://127.0.0.1:8545"]
-    )
-    body = json.loads(capsys.readouterr().out)
-    assert code == EXIT_NOT_STORED
-    assert "pre-fix attestation, stored payload unavailable" in body["note"]
-    assert body["on_chain"]["ok"] is True
-
-    def absent(**_kwargs):
-        return {"ok": False, "chain_id": 84532, "attester_ok": False}
-
-    monkeypatch.setattr("rwa_score.api.verify.on_chain_verify", absent)
-    code = main(
-        ["NVDA", "--hash", digest, "--json", "--rpc-url", "http://127.0.0.1:8545"]
-    )
-    body = json.loads(capsys.readouterr().out)
-    assert code == EXIT_NOT_STORED
-    assert "no stored payload" in body["note"]
-    assert "pre-fix" not in body["note"]
-    assert body["on_chain"] is None
 
 
 def test_inputs_allowlist_drops_headers_keys_tokens_and_urls(
