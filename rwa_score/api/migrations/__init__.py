@@ -260,6 +260,16 @@ ALTER TABLE attest_jobs ADD COLUMN IF NOT EXISTS nonce BIGINT;
 ALTER TABLE attest_jobs ADD COLUMN IF NOT EXISTS known_tx_hashes TEXT;
 """
 
+# When the broadcast was submitted. The reconciler fails the job only after
+# this instant plus the deadline, and only if the nonce was taken by another tx.
+SQLITE_007 = """
+ALTER TABLE attest_jobs ADD COLUMN broadcast_at REAL;
+"""
+
+POSTGRES_007 = """
+ALTER TABLE attest_jobs ADD COLUMN IF NOT EXISTS broadcast_at DOUBLE PRECISION;
+"""
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -275,6 +285,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration("004_attestation_inputs", SQLITE_004, POSTGRES_004),
     Migration("005_attest_jobs", SQLITE_005, POSTGRES_005),
     Migration("006_attest_job_nonce", SQLITE_006, POSTGRES_006),
+    Migration("007_attest_broadcast_at", SQLITE_007, POSTGRES_007),
 )
 
 

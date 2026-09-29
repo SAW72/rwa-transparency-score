@@ -108,8 +108,8 @@ checks `isAttested` before sending.
 
 Fees are EIP-1559. The worker sets `maxFeePerGas` and `maxPriorityFeePerGas`
 on every send. `RWA_ATTEST_MAX_FEE_GWEI` (default `20`) is clamped to a hard
-ceiling of `100` gwei in code. A retry that still has a pending transaction
-replaces it at the same nonce with a higher fee, still under that ceiling.
+ceiling of `100` gwei in code. A broadcast is not replaced. The saved hash
+is polled until it mines.
 
 Drain protection sits in front of the queue. `RWA_ATTEST_MIN_INTERVAL_SECONDS`
 (default `300`) is the minimum gap between enqueues for one ticker.
@@ -131,10 +131,11 @@ It includes `store` (`postgres` or `sqlite`) and `attester` (`enabled` or
 
 The attester does not start when `DATABASE_URL` is unset, when `RENDER` is
 set without that URL, or when `RWA_USE_FIXTURES=1` and the attester would
-otherwise be enabled. A claim sets `next_attempt_at` about 90 seconds ahead
-so a second process cannot send the same job while the first is still
-waiting on a receipt. The stored `tx_hash` and `nonce` are what the retry
-uses.
+otherwise be enabled. `RWA_ATTEST_ENABLED` is `false` in `render.yaml`.
+Nothing sends until that value is turned on. A claim sets `next_attempt_at`
+about 90 seconds ahead so a second process cannot send the same job while
+the first is still broadcasting. The moment `send` returns a hash, that
+hash and its nonce are committed before the receipt wait.
 
 ## One worker only
 
@@ -148,13 +149,16 @@ copes like this:
 - Postgres claims the job with `SELECT … FOR UPDATE SKIP LOCKED`, so only
   one process takes a given row. SQLite holds the process lock around the
   same claim. Keep the API service at **one instance**.
-- After broadcast, the job row stores `tx_hash`, `nonce`, and the list of
-  hashes already sent. A retry re-waits on that hash, or replaces it at the
-  **same nonce**. It does not take a new nonce while the earlier one is
-  still unresolved.
-- Before a job is marked failed, the worker reads `verify`. If the
-  transaction landed, the job is confirmed with the hash from the mined
-  receipt, not with a hash that never made it into a block.
+- After broadcast, the job row stores `tx_hash` and `nonce` before the
+  receipt wait. A receipt timeout moves the job to `broadcast_pending`.
+  The worker does not send another transaction for that job.
+- On startup, and in the worker loop, a reconciler polls that saved hash's
+  receipt and `isAttested` until it lands or
+  `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` (default `1800`) has passed.
+- The job is marked failed only when the receipt is still missing,
+  `isAttested` is false, and the account nonce has moved past the saved
+  nonce on a different transaction. A landed transaction is confirmed with
+  the hash from its receipt.
 
 Do not scale this service past one instance. Do not run
 `python -m rwa_score.api.auto_attest` beside the API process on the same key.
@@ -192,7 +196,8 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTEST_DAILY_CAP` | Max attest jobs created per 24 hours. Default `8`. Hard max `48` in code | `8` | no |
 | `RWA_ATTEST_HOURLY_CAP` | Max attest jobs created per hour. Default `4`. Hard max `24` in code | `4` | no |
 | `RWA_ATTEST_MIN_BALANCE_WEI` | Stop sending when the signer balance is below this. Default `50000000000000` | `50000000000000` | no |
-| `RWA_ATTEST_ENABLED` | Kill switch. Only `1`, `true`, `yes`, or `on` sends. Default off | `false` | no |
+| `RWA_ATTEST_ENABLED` | Kill switch. Only `1`, `true`, `yes`, or `on` sends. `render.yaml` sets `false`. Default off | `false` | no |
+| `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` | Seconds to poll a broadcast before the drop check. Default `1800` | `1800` | no |
 | `RWA_API_DB_PATH` | SQLite file used only when `DATABASE_URL` is unset. Default `data/rat_api.sqlite` | `data/rat_api.sqlite` | no |
 | `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot so `/v1/attest` works after spin-down wipes sqlite | `rat_` plus a long random token | yes |
 | `RWA_API_BOOTSTRAP_TIER` | Tier of that key. `/v1/attest` requires `paid` | `paid` | no |

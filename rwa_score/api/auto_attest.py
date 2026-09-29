@@ -17,9 +17,9 @@ does not send. A missing ``DATABASE_URL`` (or ``RWA_USE_FIXTURES=1``) also
 refuses to start the attester.
 
 One API instance only. During a Render deploy the old process and the new
-one overlap. Postgres claims with ``FOR UPDATE SKIP LOCKED``, and a
-broadcast transaction is retried at the same nonce. Do not run a second
-worker on this key.
+one overlap. Postgres claims with ``FOR UPDATE SKIP LOCKED``. A job that
+has already been broadcast is never sent again. The worker polls that
+saved hash until it lands. Do not run a second worker on this key.
 """
 
 from __future__ import annotations
@@ -61,6 +61,9 @@ HARD_HOURLY_TX_CAP = 24
 DEFAULT_HOURLY_TX_CAP = 4
 # 0.00005 ETH. from_env uses this. The constructor default is 0 so tests and anvil stay quiet.
 DEFAULT_MIN_BALANCE_WEI = 50_000_000_000_000
+# How long a broadcast may stay unresolved before the drop check is allowed.
+DEFAULT_BROADCAST_DEADLINE_SECONDS = 30 * 60
+BROADCAST_POLL_SECONDS = 15.0
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_SECONDS = 2.0
@@ -320,6 +323,7 @@ class AttesterSettings:
         "min_balance_wei",
         "attest_enabled",
         "refuse_reason",
+        "broadcast_deadline_seconds",
     )
 
     def __init__(
@@ -340,6 +344,7 @@ class AttesterSettings:
         hourly_tx_cap: int = DEFAULT_HOURLY_TX_CAP,
         min_balance_wei: int = 0,
         attest_enabled: bool = True,
+        broadcast_deadline_seconds: int = DEFAULT_BROADCAST_DEADLINE_SECONDS,
     ) -> None:
         key = (private_key or "").strip()
         self._get_key = (lambda captured: (lambda: captured))(key)
@@ -367,6 +372,10 @@ class AttesterSettings:
         self.min_balance_wei = max(0, int(min_balance_wei))
         self.attest_enabled = bool(attest_enabled)
         self.refuse_reason = ""
+        deadline = int(broadcast_deadline_seconds)
+        if deadline < 0:
+            deadline = DEFAULT_BROADCAST_DEADLINE_SECONDS
+        self.broadcast_deadline_seconds = deadline
         if key or self.rpc_url:
             _VAULT.add(key, self.rpc_url)
             _install_redact_filter()
@@ -432,6 +441,10 @@ class AttesterSettings:
             hourly_tx_cap=_env_int("RWA_ATTEST_HOURLY_CAP", DEFAULT_HOURLY_TX_CAP),
             min_balance_wei=_env_int("RWA_ATTEST_MIN_BALANCE_WEI", DEFAULT_MIN_BALANCE_WEI),
             attest_enabled=_env_on("RWA_ATTEST_ENABLED"),
+            broadcast_deadline_seconds=_env_int(
+                "RWA_ATTEST_BROADCAST_DEADLINE_SECONDS",
+                DEFAULT_BROADCAST_DEADLINE_SECONDS,
+            ),
         )
 
 
@@ -634,9 +647,9 @@ class Web3Chain:
     """One signer, one nonce stream. Do not run a second worker on this key.
 
     A Render deploy can overlap two processes. The database claim lock
-    (``FOR UPDATE SKIP LOCKED``) gives the job to one of them. If a hash and
-    nonce are already stored, this sender re-waits or replaces at that same
-    nonce. It does not allocate a new nonce while the old one is unresolved.
+    (``FOR UPDATE SKIP LOCKED``) gives a new send to one of them. Once a
+    hash is stored, this sender does not broadcast another transaction for
+    that job. The reconciler polls the saved hash.
     """
 
     def __init__(self, settings: AttesterSettings) -> None:
@@ -672,6 +685,21 @@ class Web3Chain:
 
     def balance_wei(self) -> int:
         return int(self._w3.eth.get_balance(self._account.address))
+
+    def transaction_count(self, block: str = "latest") -> int:
+        return int(self._w3.eth.get_transaction_count(self._account.address, block))
+
+    def get_tx(self, tx_hash: str) -> Any | None:
+        try:
+            return self._w3.eth.get_transaction(tx_hash)
+        except Exception:
+            return None
+
+    def get_receipt(self, tx_hash: str) -> Any | None:
+        try:
+            return self._w3.eth.get_transaction_receipt(tx_hash)
+        except Exception:
+            return None
 
     def verify(self, score_hash: str, ticker: str) -> tuple[bool, int, str]:
         ok, ts, who = self._contract.functions.verify(_hash_bytes(score_hash), ticker).call()
@@ -749,50 +777,20 @@ class Web3Chain:
                 known.append(item)
         if pending_tx and pending_tx not in known:
             known.append(pending_tx)
+        if pending_tx:
+            # Already broadcast. Never sign another transaction for this job.
+            landed = self._landed(known, score_hash, ticker)
+            if landed:
+                if pending_nonce is not None:
+                    self._nonce = int(pending_nonce) + 1
+                return landed
+            raise RuntimeError("broadcast still pending; not sending another transaction")
         if known:
             landed = self._landed(known, score_hash, ticker)
             if landed:
                 if pending_nonce is not None:
                     self._nonce = int(pending_nonce) + 1
                 return landed
-        unresolved = pending_nonce is not None and bool(pending_tx)
-        if unresolved:
-            try:
-                receipt = self._w3.eth.wait_for_transaction_receipt(
-                    pending_tx, timeout=RECEIPT_TIMEOUT_SECONDS
-                )
-            except Exception:
-                receipt = None
-            if receipt is not None and int(receipt["status"]) == 1:
-                self._nonce = int(pending_nonce) + 1
-                return _tx_hex(receipt["transactionHash"])
-            if receipt is not None and int(receipt["status"]) == 0:
-                landed = self._landed(known, score_hash, ticker)
-                if landed:
-                    self._nonce = int(pending_nonce) + 1
-                    return landed
-                # Revert consumed the nonce. A later send may take a new one.
-                self._nonce = None
-            else:
-                # Still pending. Replace at the same nonce. Never suggested+1.
-                nonce = choose_nonce(
-                    stored_nonce=int(pending_nonce),
-                    unresolved=True,
-                    suggested=int(pending_nonce) + 1,
-                )
-                self._nonce = nonce
-                return self._broadcast(
-                    score_hash,
-                    ticker,
-                    claimed_at,
-                    value_wei=value_wei,
-                    gas_limit=gas_limit,
-                    chain_id=chain_id,
-                    nonce=nonce,
-                    known=known,
-                    on_submitted=on_submitted,
-                    bump=1,
-                )
         if self._nonce is None:
             suggested = int(self._w3.eth.get_transaction_count(self._account.address, "pending"))
             self._nonce = choose_nonce(stored_nonce=None, unresolved=False, suggested=suggested)
@@ -1114,6 +1112,13 @@ class AttestWorker:
         self._wake.set()
 
     def _loop(self) -> None:
+        try:
+            self.recover_broadcasts()
+        except Exception as exc:  # noqa: BLE001 — keep the thread up
+            logger.info(
+                "attest recover error: %s",
+                redact(str(exc), self.settings.private_key, self.settings.rpc_url),
+            )
         while not self._stop.is_set():
             worked = False
             try:
@@ -1155,11 +1160,27 @@ class AttestWorker:
         )
         return True
 
+    def recover_broadcasts(self, *, now: float | None = None) -> int:
+        """Poll every saved broadcast once. Used on startup after a crash."""
+        if not self.settings.enabled:
+            return 0
+        clock = time.time() if now is None else float(now)
+        rows = self.store.list_inflight_broadcasts()
+        for job in rows:
+            self._reconcile(job, clock)
+        return len(rows)
+
     def process_once(self, *, now: float | None = None) -> bool:
         """Handle one due job. False when the queue has nothing due."""
         if not self.settings.enabled:
             return False
         clock = time.time() if now is None else float(now)
+        inflight = self.store.claim_broadcast_job(
+            now=clock, lease_seconds=BROADCAST_POLL_SECONDS
+        )
+        if inflight is not None:
+            self._reconcile(inflight, clock)
+            return True
         job = self.store.claim_next_attest_job(now=clock)
         if job is None:
             return False
@@ -1181,6 +1202,9 @@ class AttestWorker:
             _require_stored(self.store, job)
             outcome = send_one(job, self.chain(), self.settings, on_submitted=_on_submitted)
         except TerminalAttestError as exc:
+            if job.get("tx_hash"):
+                self._hold_broadcast(job, clock)
+                return True
             safe = redact(str(exc), secret, rpc_url)
             if self._promote_if_landed(job):
                 return True
@@ -1188,6 +1212,9 @@ class AttestWorker:
             self.store.finish_attest_job(job["id"], status="failed", error=safe)
             return True
         except Exception as exc:  # noqa: BLE001 — retry transient RPC / gas errors
+            if job.get("tx_hash"):
+                self._hold_broadcast(job, clock)
+                return True
             safe = redact(str(exc), secret, rpc_url)
             attempts = int(job["attempts"])
             if attempts >= self.settings.max_attempts:
@@ -1251,6 +1278,109 @@ class AttestWorker:
         )
         return False
 
+    def _hold_broadcast(self, job: dict[str, Any], clock: float) -> None:
+        """Receipt timed out. Keep the saved hash and let the reconciler poll it."""
+        logger.info("attest job %s broadcast pending hash=%s", job["id"], job.get("tx_hash"))
+        self.store.finish_attest_job(
+            job["id"],
+            status="broadcast_pending",
+            tx_hash=job.get("tx_hash"),
+            nonce=job.get("nonce"),
+            error=None,
+            next_attempt_at=clock + BROADCAST_POLL_SECONDS,
+        )
+
+    def _reconcile(self, job: dict[str, Any], clock: float) -> None:
+        """Poll the saved hash. Confirm only with the receipt hash ``_landed`` found.
+
+        Failed only when the deadline has passed, the receipt is missing,
+        ``isAttested`` is false, and the account nonce has moved past the
+        saved nonce on a different transaction.
+        """
+        if not job.get("tx_hash"):
+            return
+        chain = self.chain()
+        landed = _receipt_hash(chain, job)
+        attested_at = None
+        verified = False
+        try:
+            result = chain.verify(job["score_hash"], job["ticker"])
+        except Exception:
+            result = None
+        if isinstance(result, tuple) and result and result[0] is True:
+            verified = True
+            if len(result) >= 2 and isinstance(result[1], int):
+                attested_at = int(result[1])
+        if landed:
+            logger.info("attest job %s confirmed from receipt hash=%s", job["id"], landed)
+            self.store.finish_attest_job(
+                job["id"],
+                status="confirmed",
+                tx_hash=landed,
+                attested_at=attested_at,
+                error=None,
+            )
+            return
+        if verified:
+            # On chain, but the receipt scan did not return a hash. Do not
+            # copy the broadcast hash. The anvil test fails in this state.
+            self._reschedule_broadcast(job, clock)
+            return
+        if self._broadcast_dropped(job, chain, clock):
+            logger.info("attest job %s broadcast dropped", job["id"])
+            self.store.finish_attest_job(
+                job["id"],
+                status="failed",
+                error="broadcast_dropped",
+            )
+            return
+        self._reschedule_broadcast(job, clock)
+
+    def _reschedule_broadcast(self, job: dict[str, Any], clock: float) -> None:
+        self.store.finish_attest_job(
+            job["id"],
+            status="broadcast_pending",
+            tx_hash=job.get("tx_hash"),
+            nonce=job.get("nonce"),
+            error=None,
+            next_attempt_at=clock + BROADCAST_POLL_SECONDS,
+        )
+
+    def _broadcast_dropped(self, job: dict[str, Any], chain: Chain, clock: float) -> bool:
+        started = job.get("broadcast_at")
+        if started is None:
+            return False
+        deadline = float(started) + float(self.settings.broadcast_deadline_seconds)
+        if clock < deadline:
+            return False
+        receipt_of = getattr(chain, "get_receipt", None)
+        if not callable(receipt_of):
+            return False
+        try:
+            receipt = receipt_of(job["tx_hash"])
+        except Exception:
+            receipt = None
+        if receipt is not None:
+            return False
+        counter = getattr(chain, "transaction_count", None)
+        lookup = getattr(chain, "get_tx", None)
+        if not callable(counter) or not callable(lookup):
+            return False
+        saved = job.get("nonce")
+        if saved is None:
+            return False
+        try:
+            latest = int(counter("latest"))
+        except Exception:
+            return False
+        if latest <= int(saved):
+            return False
+        try:
+            other = lookup(job["tx_hash"])
+        except Exception:
+            other = None
+        return other is None
+
 
 def main() -> None:
     """Drain due jobs once, then exit. For a future worker process. No send if disabled."""
@@ -1266,6 +1396,7 @@ def main() -> None:
     store = open_store(path=cfg.db_path, database_url=cfg.database_url)
     worker = AttestWorker(store=store, settings=settings, autostart=False)
     try:
+        worker.recover_broadcasts()
         while worker.process_once():
             pass
     finally:

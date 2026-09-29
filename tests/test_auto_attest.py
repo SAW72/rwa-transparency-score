@@ -527,7 +527,7 @@ def test_runbook_single_worker_key_import_and_rotation_order() -> None:
     text = (ROOT / "contracts" / "ATTESTER_RUNBOOK.md").read_text(encoding="utf-8")
     assert "One worker only" in text
     assert "FOR UPDATE SKIP LOCKED" in text
-    assert "same nonce" in text
+    assert "broadcast_pending" in text
     new_at = text.index('"setAttester(address,bool)" "$NEW_ATTESTER" true')
     old_at = text.index('"setAttester(address,bool)" "$OLD_ATTESTER" false')
     assert new_at < old_at
@@ -811,16 +811,25 @@ def _allow_worker(rpc: str, contract: str) -> None:
 
 @pytest.mark.skipif(shutil.which("anvil") is None or shutil.which("forge") is None, reason="anvil missing")
 def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
-    """Receipt wait times out, the tx later mines, and the job stores that hash.
+    """Receipt wait times out, the tx later mines, and reconcile stores that hash.
 
-    Fails if ``_landed`` is disabled: the confirmed tx hash is the receipt hash
-    ``_landed`` returns, and a success that only noticed ``verify`` has no hash.
-    A second send while the first is pending must reuse nonce 0.
+    Mining is off (``anvil_setAutomine false``) until ``evm_mine``. Fails if
+    ``_landed`` is disabled: confirm records only the hash that scan returns.
+    A later ``process_once`` must not broadcast a second transaction.
     """
     port = _free_port()
     rpc = f"http://127.0.0.1:{port}"
     proc = subprocess.Popen(
-        ["anvil", "--host", "127.0.0.1", "--port", str(port), "--chain-id", "84532", "--silent"],
+        [
+            "anvil",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--chain-id",
+            "84532",
+            "--silent",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -867,36 +876,33 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
         assert worker.process_once() is True
         pending = store.latest_attest_job(digest)
         assert pending is not None
-        assert pending["status"] == "pending"
+        assert pending["status"] == "broadcast_pending"
         assert pending["nonce"] == 0
         assert pending["tx_hash"]
-        first_tx = chain._w3.eth.get_transaction(pending["tx_hash"])
+        assert pending["broadcast_at"] is not None
+        saved_hash = pending["tx_hash"]
+        first_tx = chain._w3.eth.get_transaction(saved_hash)
         assert int(first_tx["nonce"]) == 0
         assert int(first_tx["maxFeePerGas"]) <= HARD_MAX_FEE_GWEI * 1_000_000_000
         assert int(first_tx["maxPriorityFeePerGas"]) <= int(first_tx["maxFeePerGas"])
         assert int(first_tx["maxFeePerGas"]) > 0
         assert nonce_lookups == ["pending"]
-        assert worker.process_once() is True
-        replaced = store.latest_attest_job(digest)
-        assert replaced is not None
-        assert replaced["status"] == "pending"
-        assert replaced["nonce"] == 0
-        assert len(replaced["known_tx_hashes"]) == 2
-        assert replaced["tx_hash"] != pending["tx_hash"]
-        # Same-nonce replacement. The node may drop the first hash.
-        # A new nonce would have called get_transaction_count again.
+        # Still unmined. Reconcile must not sign a replacement.
+        assert worker.process_once(now=time.time() + 30) is True
+        waiting = store.latest_attest_job(digest)
+        assert waiting is not None
+        assert waiting["status"] == "broadcast_pending"
+        assert waiting["tx_hash"] == saved_hash
+        assert waiting["nonce"] == 0
+        assert waiting["known_tx_hashes"] == [saved_hash]
         assert nonce_lookups == ["pending"]
-        second_tx = chain._w3.eth.get_transaction(replaced["tx_hash"])
-        assert int(second_tx["nonce"]) == 0
-        assert int(second_tx["maxFeePerGas"]) >= int(first_tx["maxFeePerGas"])
-        assert int(second_tx["maxFeePerGas"]) <= HARD_MAX_FEE_GWEI * 1_000_000_000
-        assert int(second_tx["maxPriorityFeePerGas"]) <= int(second_tx["maxFeePerGas"])
         chain._w3.provider.make_request("evm_mine", [])
-        assert worker.process_once() is True
+        assert worker.process_once(now=time.time() + 60) is True
         job = store.latest_attest_job(digest)
         assert job is not None
         assert job["status"] == "confirmed"
         assert job["tx_hash"]
+        assert job["known_tx_hashes"] == [saved_hash]
         receipt = chain._w3.eth.get_transaction_receipt(job["tx_hash"])
         assert int(receipt["status"]) == 1
         mined = receipt["transactionHash"]
@@ -904,6 +910,7 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
         if not mined_hex.startswith("0x"):
             mined_hex = "0x" + mined_hex
         assert job["tx_hash"].lower() == mined_hex.lower()
+        assert nonce_lookups == ["pending"]
         assert chain._w3.eth.get_transaction_count(chain.address) == 1
         payload = store.get_attested_payload(digest)
         assert payload is not None
@@ -914,6 +921,66 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_crash_recovery_polls_saved_hash_and_does_not_resend(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.landed_hash.return_value = "0x" + "cd" * 32
+    chain.attest.side_effect = AssertionError("must not send again")
+    store = Store(tmp_path / "crash.sqlite")
+    digest, claimed = _seed(store, fixture_scorer)
+    job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    store.note_submitted_tx(job["id"], tx_hash="0x" + "cd" * 32, nonce=3)
+    worker = _worker(store, _settings("0x" + "61" * 32), chain)
+    assert worker.recover_broadcasts(now=time.time()) == 1
+    saved = store.latest_attest_job(digest)
+    assert saved is not None
+    assert saved["status"] == "confirmed"
+    assert saved["tx_hash"] == "0x" + "cd" * 32
+    assert saved["nonce"] == 3
+    chain.attest.assert_not_called()
+
+
+def test_broadcast_fails_only_after_deadline_when_nonce_is_taken(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.landed_hash.return_value = None
+    chain.get_receipt.return_value = None
+    chain.get_tx.return_value = None
+    chain.transaction_count.return_value = 0
+    chain.attest.side_effect = AssertionError("must not send again")
+    store = Store(tmp_path / "drop.sqlite")
+    digest, claimed = _seed(store, fixture_scorer)
+    job = store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    store.note_submitted_tx(job["id"], tx_hash="0x" + "ab" * 32, nonce=0)
+    store._execute(
+        "UPDATE attest_jobs SET broadcast_at = ? WHERE id = ?",
+        (time.time() - 120, job["id"]),
+    )
+    store._commit()
+    worker = _worker(
+        store,
+        _settings("0x" + "62" * 32, broadcast_deadline_seconds=30),
+        chain,
+    )
+    assert worker.process_once(now=time.time()) is True
+    waiting = store.latest_attest_job(digest)
+    assert waiting is not None
+    assert waiting["status"] == "broadcast_pending"
+    chain.transaction_count.return_value = 1
+    assert worker.process_once(now=time.time() + 30) is True
+    failed = store.latest_attest_job(digest)
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["tx_hash"] == "0x" + "ab" * 32
+    chain.attest.assert_not_called()
 
 
 def test_kill_switch_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -103,6 +103,8 @@ services:
       - key: RWA_ATTEST_MIN_BALANCE_WEI
         sync: false
       - key: RWA_ATTEST_ENABLED
+        value: "false"
+      - key: RWA_ATTEST_BROADCAST_DEADLINE_SECONDS
         sync: false
       - key: RWA_API_DB_PATH
         sync: false

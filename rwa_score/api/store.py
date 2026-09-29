@@ -29,8 +29,18 @@ _SCHEMA_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
 # Hold a claimed row past the receipt wait so a second process cannot send it too.
 CLAIM_LEASE_SECONDS = 90.0
 _CLAIM_SQL = (
-    "SELECT * FROM attest_jobs WHERE status = 'pending' AND next_attempt_at <= ? "
-    "ORDER BY id LIMIT 1"
+    "SELECT * FROM attest_jobs WHERE status = 'pending' AND tx_hash IS NULL "
+    "AND next_attempt_at <= ? ORDER BY id LIMIT 1"
+)
+_BROADCAST_SQL = (
+    "SELECT * FROM attest_jobs WHERE ("
+    "status = 'broadcast_pending' "
+    "OR (status = 'pending' AND tx_hash IS NOT NULL)"
+    ") AND next_attempt_at <= ? ORDER BY id LIMIT 1"
+)
+_BROADCAST_LIST_SQL = (
+    "SELECT * FROM attest_jobs WHERE status = 'broadcast_pending' "
+    "OR (status = 'pending' AND tx_hash IS NOT NULL) ORDER BY id"
 )
 # One worker. SKIP LOCKED is the overlap guard; isAttested makes a duplicate send a no-op.
 CLAIM_SQL_POSTGRES = _CLAIM_SQL + " FOR UPDATE SKIP LOCKED"
@@ -136,6 +146,11 @@ def _job_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "tx_hash": row["tx_hash"],
         "nonce": None if nonce is None else int(nonce),
         "known_tx_hashes": _job_known_hashes(row["known_tx_hashes"]) if "known_tx_hashes" in keys else [],
+        "broadcast_at": (
+            None
+            if "broadcast_at" not in keys or row["broadcast_at"] is None
+            else float(row["broadcast_at"])
+        ),
         "attested_at": row["attested_at"],
         "attempts": int(row["attempts"]),
         "next_attempt_at": float(row["next_attempt_at"] or 0),
@@ -812,7 +827,7 @@ class Store:
             if not force:
                 existing = self._execute(
                     "SELECT * FROM attest_jobs WHERE score_hash = ? "
-                    "AND status IN ('pending', 'confirmed') "
+                    "AND status IN ('pending', 'broadcast_pending', 'confirmed') "
                     "ORDER BY id DESC LIMIT 1",
                     (digest,),
                 ).fetchone()
@@ -878,8 +893,8 @@ class Store:
                 known.append(tx_hash)
             self._execute(
                 "UPDATE attest_jobs SET tx_hash = ?, nonce = ?, known_tx_hashes = ?, "
-                "updated_at = ? WHERE id = ?",
-                (tx_hash, int(nonce), json.dumps(known), stamped, job_id),
+                "broadcast_at = COALESCE(broadcast_at, ?), updated_at = ? WHERE id = ?",
+                (tx_hash, int(nonce), json.dumps(known), time.time(), stamped, job_id),
             )
             self._commit()
 
@@ -922,6 +937,44 @@ class Store:
             ).fetchone()
         return _job_from_row(fresh)
 
+    def claim_broadcast_job(self, *, now: float, lease_seconds: float = 15.0) -> dict[str, Any] | None:
+        """Take one due broadcast so the reconciler can poll it. Does not send."""
+        stamped = _iso()
+        lease_until = float(now) + float(lease_seconds)
+        sql = _BROADCAST_SQL + (
+            " FOR UPDATE SKIP LOCKED" if self.backend == "postgres" else ""
+        )
+        with self._lock:
+            if self.backend == "postgres":
+                with self._conn.transaction():
+                    row = self._execute(sql, (float(now),)).fetchone()
+                    if row is None:
+                        return None
+                    self._execute(
+                        "UPDATE attest_jobs SET next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                        (lease_until, stamped, row["id"]),
+                    )
+            else:
+                row = self._execute(sql, (float(now),)).fetchone()
+                if row is None:
+                    return None
+                self._execute(
+                    "UPDATE attest_jobs SET next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                    (lease_until, stamped, row["id"]),
+                )
+                self._commit()
+            fresh = self._execute(
+                "SELECT * FROM attest_jobs WHERE id = ?",
+                (row["id"],),
+            ).fetchone()
+        return _job_from_row(fresh)
+
+    def list_inflight_broadcasts(self) -> list[dict[str, Any]]:
+        """Jobs that already have a hash, including ones still inside a claim lease."""
+        with self._lock:
+            rows = self._execute(_BROADCAST_LIST_SQL).fetchall()
+        return [_job_from_row(row) for row in rows]
+
     def finish_attest_job(
         self,
         job_id: int,
@@ -933,7 +986,7 @@ class Store:
         next_attempt_at: float | None = None,
         nonce: int | None = None,
     ) -> None:
-        if status not in {"pending", "confirmed", "failed"}:
+        if status not in {"pending", "broadcast_pending", "confirmed", "failed"}:
             raise ValueError(f"unknown job status: {status}")
         stamped = _iso()
         with self._lock:

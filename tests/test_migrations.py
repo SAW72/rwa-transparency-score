@@ -105,6 +105,7 @@ def test_postgres_dump_is_dialect_ready_and_not_executed() -> None:
         "004_attestation_inputs",
         "005_attest_jobs",
         "006_attest_job_nonce",
+        "007_attest_broadcast_at",
     }
     assert "nonce" in sqlite_sql
     assert "known_tx_hashes" in sql
@@ -157,6 +158,7 @@ def test_apply_is_idempotent(tmp_path: Path) -> None:
         "004_attestation_inputs",
         "005_attest_jobs",
         "006_attest_job_nonce",
+        "007_attest_broadcast_at",
     ]
     assert second == []
     conn.close()
