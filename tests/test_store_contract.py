@@ -31,12 +31,9 @@ def test_keys_rate_counters_and_inflight_are_the_only_state() -> None:
     assert row["ticker"] == "NVDA"
     assert store.inflight_for_hash("0x" + "cd" * 32)["tx_hash"] == "0x" + "ab" * 32
     assert store.queue_depth() == 1
-    assert store.count_sends_since(0) == 1
-    assert store.last_send_at("NVDA") == 1_000.0
     store.drop_inflight("0x" + "ab" * 32)
     assert store.get_inflight("0x" + "ab" * 32) is None
     assert store.queue_depth() == 0
-    assert store.count_sends_since(0) == 1
     assert not hasattr(store, "save_attested_payload")
     assert not hasattr(store, "record_history")
     store.close()

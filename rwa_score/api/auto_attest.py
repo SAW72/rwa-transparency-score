@@ -13,16 +13,12 @@ It does not keep scores.
 Spencer sets the attester key on Render himself. This process reads
 ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
 
-If ``RWA_ATTEST_ENABLED`` is not true, or the key, contract, or RPC is unset,
-the worker stays disabled and the API says so. It does not crash and it
-does not send. ``RWA_USE_FIXTURES=1`` also refuses to start the attester.
-
-One API instance only. Do not run a second worker on this key.
+If the key, contract, or RPC is unset, the worker stays disabled and the
+API says so. It does not crash and it does not send.
 """
 
 from __future__ import annotations
 
-import calendar
 import json
 import logging
 import os
@@ -48,17 +44,7 @@ DISABLED_REASON = (
 DEFAULT_GAS_LIMIT = 300_000
 # Hard ceiling. Env may set a lower cap. Measured attest max is about 210495.
 HARD_GAS_CAP = 500_000
-# EIP-1559 ceiling in code. Env may set a lower cap, never a higher one.
-HARD_MAX_FEE_GWEI = 100
 DEFAULT_MAX_FEE_GWEI = 20
-# Drain protection. Env may lower these. The daily cap cannot exceed the hard max.
-DEFAULT_MIN_INTERVAL_SECONDS = 300
-HARD_DAILY_TX_CAP = 48
-DEFAULT_DAILY_TX_CAP = 8
-HARD_HOURLY_TX_CAP = 24
-DEFAULT_HOURLY_TX_CAP = 4
-# 0.00005 ETH. from_env uses this. The constructor default is 0 so tests and anvil stay quiet.
-DEFAULT_MIN_BALANCE_WEI = 50_000_000_000_000
 # How long a broadcast may stay unresolved before the drop check is allowed.
 DEFAULT_BROADCAST_DEADLINE_SECONDS = 30 * 60
 # POST returns as soon as the tx is broadcast unless this is raised.
@@ -70,18 +56,6 @@ DEFAULT_BACKOFF_SECONDS = 2.0
 _REDACTED = "[redacted]"
 FAILED_REASON = "attest_failed"
 FAILED_MESSAGE = "The attest job failed."
-THROTTLE_MESSAGES = {
-    "min_interval": (
-        "Attest for this ticker is inside the minimum interval. No transaction was sent."
-    ),
-    "hourly_cap": "Hourly attest transaction cap reached. No transaction was sent.",
-    "daily_cap": "Daily attest transaction cap reached. No transaction was sent.",
-}
-LOW_BALANCE_REASON = "low_balance"
-LOW_BALANCE_MESSAGE = "Attester balance is below the floor. No transaction was sent."
-KILL_SWITCH_REASON = (
-    "Attester worker disabled: RWA_ATTEST_ENABLED is not true. No transaction was sent."
-)
 RPC_TIMEOUT_SECONDS = 20
 RECEIPT_TIMEOUT_SECONDS = 60
 # Fixture scores use as_of 0. Anything past year 2100 is not a unix second.
@@ -344,10 +318,6 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
-def _env_on(name: str) -> bool:
-    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 class AttesterSettings:
     """Env-only attester config. The key lives in a closure, not on ``__dict__``."""
 
@@ -362,12 +332,6 @@ class AttesterSettings:
         "chain_id",
         "enforce_contract_pin",
         "max_fee_gwei",
-        "min_interval_seconds",
-        "daily_tx_cap",
-        "hourly_tx_cap",
-        "min_balance_wei",
-        "attest_enabled",
-        "refuse_reason",
         "broadcast_deadline_seconds",
         "wait_seconds",
     )
@@ -385,11 +349,6 @@ class AttesterSettings:
         chain_id: int = BASE_SEPOLIA_CHAIN_ID,
         enforce_contract_pin: bool = True,
         max_fee_gwei: float = DEFAULT_MAX_FEE_GWEI,
-        min_interval_seconds: int = DEFAULT_MIN_INTERVAL_SECONDS,
-        daily_tx_cap: int = DEFAULT_DAILY_TX_CAP,
-        hourly_tx_cap: int = DEFAULT_HOURLY_TX_CAP,
-        min_balance_wei: int = 0,
-        attest_enabled: bool = True,
         broadcast_deadline_seconds: int = DEFAULT_BROADCAST_DEADLINE_SECONDS,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
     ) -> None:
@@ -406,19 +365,7 @@ class AttesterSettings:
         fee = float(max_fee_gwei)
         if fee < 0:
             fee = float(DEFAULT_MAX_FEE_GWEI)
-        self.max_fee_gwei = min(fee, float(HARD_MAX_FEE_GWEI))
-        self.min_interval_seconds = max(0, int(min_interval_seconds))
-        cap = int(daily_tx_cap)
-        if cap < 0:
-            cap = DEFAULT_DAILY_TX_CAP
-        self.daily_tx_cap = min(cap, HARD_DAILY_TX_CAP)
-        hcap = int(hourly_tx_cap)
-        if hcap < 0:
-            hcap = DEFAULT_HOURLY_TX_CAP
-        self.hourly_tx_cap = min(hcap, HARD_HOURLY_TX_CAP)
-        self.min_balance_wei = max(0, int(min_balance_wei))
-        self.attest_enabled = bool(attest_enabled)
-        self.refuse_reason = ""
+        self.max_fee_gwei = fee
         deadline = int(broadcast_deadline_seconds)
         if deadline < 0:
             deadline = DEFAULT_BROADCAST_DEADLINE_SECONDS
@@ -437,26 +384,12 @@ class AttesterSettings:
 
     @property
     def enabled(self) -> bool:
-        return bool(
-            self.attest_enabled
-            and not self.refuse_reason
-            and self.private_key
-            and self.contract
-            and self.rpc_url
-        )
-
-    def refuse(self, reason: str) -> None:
-        """Stop the worker. ``reason`` is the status text. Nothing is sent."""
-        self.refuse_reason = (reason or "").strip()
+        return bool(self.private_key and self.contract and self.rpc_url)
 
     @property
     def disabled_reason(self) -> str:
         if self.enabled:
             return ""
-        if self.refuse_reason:
-            return self.refuse_reason
-        if not self.attest_enabled:
-            return KILL_SWITCH_REASON
         return DISABLED_REASON
 
     def __repr__(self) -> str:
@@ -485,13 +418,6 @@ class AttesterSettings:
             backoff_seconds=_env_float("RWA_ATTEST_BACKOFF_SECONDS", DEFAULT_BACKOFF_SECONDS),
             chain_id=_env_int("RWA_ATTESTATION_CHAIN_ID", BASE_SEPOLIA_CHAIN_ID),
             max_fee_gwei=_env_float("RWA_ATTEST_MAX_FEE_GWEI", DEFAULT_MAX_FEE_GWEI),
-            min_interval_seconds=_env_int(
-                "RWA_ATTEST_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL_SECONDS
-            ),
-            daily_tx_cap=_env_int("RWA_ATTEST_DAILY_CAP", DEFAULT_DAILY_TX_CAP),
-            hourly_tx_cap=_env_int("RWA_ATTEST_HOURLY_CAP", DEFAULT_HOURLY_TX_CAP),
-            min_balance_wei=_env_int("RWA_ATTEST_MIN_BALANCE_WEI", DEFAULT_MIN_BALANCE_WEI),
-            attest_enabled=_env_on("RWA_ATTEST_ENABLED"),
             broadcast_deadline_seconds=_env_int(
                 "RWA_ATTEST_BROADCAST_DEADLINE_SECONDS",
                 DEFAULT_BROADCAST_DEADLINE_SECONDS,
@@ -623,18 +549,15 @@ def clamp_eip1559_fees(
     base_fee_wei: int = 0,
     bump: int = 0,
 ) -> tuple[int, int]:
-    """``(maxFeePerGas, maxPriorityFeePerGas)``, both at or under the hard ceiling.
+    """``(maxFeePerGas, maxPriorityFeePerGas)`` at or under ``max_fee_gwei``.
 
-    ``bump`` raises the priority about 12.5% per step so a same-nonce replacement
-    is accepted, and still cannot pass the ceiling.
+    ``bump`` raises the priority about 12.5% per step and still cannot pass
+    the requested cap. The broadcaster calls this with ``bump=0``.
     """
-    cap = int(HARD_MAX_FEE_GWEI * 1_000_000_000)
     requested = float(max_fee_gwei)
     if requested < 0:
-        requested = 0.0
-    requested_wei = int(min(requested, float(HARD_MAX_FEE_GWEI)) * 1_000_000_000)
-    if requested_wei > cap:
-        requested_wei = cap
+        requested = float(DEFAULT_MAX_FEE_GWEI)
+    requested_wei = int(requested * 1_000_000_000)
     if requested_wei < 1:
         requested_wei = 1
     priority = min(1_000_000_000, requested_wei)
@@ -656,61 +579,12 @@ def clamp_eip1559_fees(
     return int(max_fee), int(priority)
 
 
-def _parse_iso(text: str) -> float:
-    return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
-
-
-def admission_block(
-    store: Any,
-    settings: AttesterSettings,
-    ticker: str,
-    *,
-    now: float | None = None,
-) -> str | None:
-    """``min_interval``, ``hourly_cap``, or ``daily_cap`` when a new send must not happen."""
-    clock = time.time() if now is None else float(now)
-    interval = int(settings.min_interval_seconds)
-    if interval > 0:
-        latest = store.last_send_at(ticker)
-        if latest is not None and (clock - float(latest)) < interval:
-            return "min_interval"
-    hourly = int(settings.hourly_tx_cap)
-    if int(store.count_sends_since(clock - 3600)) >= hourly:
-        return "hourly_cap"
-    cap = int(settings.daily_tx_cap)
-    if int(store.count_sends_since(clock - 86400)) >= cap:
-        return "daily_cap"
-    return None
-
-
-def guard_live_attester(settings: AttesterSettings) -> None:
-    """Refuse to send when scores are fixtures.
-
-    Called on the production path (``from_env``). Tests that pass an
-    ``AttesterSettings`` instance are left alone. Pending transactions are
-    in memory on purpose. ``attested`` before every send is what stops a
-    restart from posting the same digest twice.
-    """
-    from rwa_score.client import use_fixtures
-
-    would_send = bool(
-        settings.attest_enabled and settings.private_key and settings.contract and settings.rpc_url
-    )
-    if use_fixtures() and would_send:
-        settings.refuse(
-            "RWA_USE_FIXTURES is set while the attester is enabled. "
-            "The attester will not start. No transaction was sent."
-        )
-        logger.warning("attester refused: %s", settings.disabled_reason)
-
-
 class Web3Chain:
-    """One signer, one nonce stream. Do not run a second worker on this key.
+    """One signer, one nonce stream.
 
-    A Render deploy can overlap two processes. Run one instance. Once a
-    hash is stored, this sender does not broadcast another transaction for
-    that job. The reconciler polls the saved hash. ``attested`` is
-    checked before every send so a restart cannot post the same digest twice.
+    Once a hash is broadcast, this sender does not broadcast another
+    transaction for that job. The reconciler polls the saved hash.
+    ``attested`` is checked before every send.
     """
 
     def __init__(self, settings: AttesterSettings) -> None:
@@ -1414,7 +1288,7 @@ class AttestWorker:
                 message=FAILED_MESSAGE,
                 error=local,
             )
-        # Chain id, then attested, before admission. A posted hash is not a new send.
+        # Chain id, then attested. A posted hash is not a new send.
         gate, attested_at, gate_error = self._preflight(score_hash, ticker)
         if gate == "failed":
             logger.info("attest failed: %s", gate_error)
@@ -1426,19 +1300,6 @@ class AttestWorker:
             )
         if gate == "confirmed":
             return SubmitResult(status="confirmed", attested_at=attested_at)
-        blocked = admission_block(self.store, self.settings, ticker, now=clock)
-        if blocked:
-            return SubmitResult(
-                status="throttled",
-                reason=blocked,
-                message=THROTTLE_MESSAGES[blocked],
-            )
-        if not self._balance_ok():
-            return SubmitResult(
-                status="low_balance",
-                reason=LOW_BALANCE_REASON,
-                message=LOW_BALANCE_MESSAGE,
-            )
         job: dict[str, Any] = {
             "score_hash": score_hash,
             "ticker": ticker,
@@ -1542,7 +1403,7 @@ class AttestWorker:
         )
 
     def _preflight(self, score_hash: str, ticker: str) -> tuple[str, int | None, str]:
-        """Read the chain once before admission.
+        """Read the chain once before a send.
 
         Returns ``failed`` (with a redacted message), ``confirmed`` (hash
         already attested), or ``ready`` (safe to consider a send).
@@ -1590,19 +1451,6 @@ class AttestWorker:
             return False
         self._reconcile(job, clock)
         return True
-
-    def _balance_ok(self) -> bool:
-        floor = int(self.settings.min_balance_wei)
-        if floor <= 0:
-            return True
-        reader = getattr(self.chain(), "balance_wei", None)
-        if not callable(reader):
-            return False
-        try:
-            bal = int(reader())
-        except Exception:
-            return False
-        return bal >= floor
 
     def _reconcile(self, job: dict[str, Any], clock: float) -> None:
         """Poll the saved hash. Drop it only when ``_landed`` returns the receipt hash.
@@ -1687,7 +1535,6 @@ def main() -> None:
     from .store import open_store
 
     settings = AttesterSettings.from_env()
-    guard_live_attester(settings)
     if not settings.enabled:
         print(settings.disabled_reason)
         return

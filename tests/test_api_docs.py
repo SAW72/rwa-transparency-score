@@ -180,10 +180,7 @@ def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
             continue
         key = stripped.split(":", 1)[1].strip()
         nxt = lines[index + 1].strip()
-        if key == "RWA_ATTEST_ENABLED":
-            assert nxt == 'value: "false"'
-        else:
-            assert nxt == "sync: false"
+        assert nxt == "sync: false"
         keys.append(key)
     for required in (
         "RWA_ATTESTER_PRIVATE_KEY",

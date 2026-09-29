@@ -238,7 +238,6 @@ def test_nan_in_live_report_score_200_attest_422(
     assert body["error"] == "non_finite_value"
     assert body["field"] == "score"
     assert store.queue_depth() == 0
-    assert store.count_sends_since(0) == 0
 
     scored = client.get("/v1/score/NVDA", headers=_headers(raw))
     assert scored.status_code == 200

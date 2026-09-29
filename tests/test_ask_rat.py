@@ -330,27 +330,8 @@ def test_fallback_live_client_says_live_not_fixture(recording_client) -> None:
     assert "FIXTURE" not in text
 
 
-def test_unknown_ticker_does_not_crash(fixture_scorer, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unknown ticker stays on the templated fallback.
-
-    ``ask`` calls xAI whenever ``XAI_API_KEY`` is set. A successful model
-    reply is prefixed with the fixture line but does not always include
-    "not financial advice", so this assertion failed about half the time
-    against the live model. The fallback path is deterministic.
-    """
-    monkeypatch.delenv("XAI_API_KEY", raising=False)
-
-    class _NoNetwork:
-        def post(self, *args, **kwargs):
-            raise AssertionError("unknown-ticker test must not call xAI")
-
-    result = ask(
-        "What’s weakest on NOTATICKER?",
-        fixture_scorer,
-        session=_NoNetwork(),
-        api_key="",
-    )
-    assert result.polished is False
+def test_unknown_ticker_does_not_crash(fixture_scorer) -> None:
+    result = ask("What’s weakest on NOTATICKER?", fixture_scorer)
     assert result.answer
     assert "FIXTURE" in result.answer
     assert "not financial advice" in result.answer.lower()

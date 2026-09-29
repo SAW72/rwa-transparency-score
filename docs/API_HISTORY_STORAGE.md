@@ -8,7 +8,7 @@ python -m rwa_score.api.verify NVDA --payload-file nvda.json --offline
 
 The digest is SHA-256 of those canonical bytes, the same `bytes32` the contract stores. The contract does not keccak the payload.
 
-The only in-process attester state is a nonce lock, an in-flight map of `{tx_hash, nonce}` (plus the subject needed to poll `attested`) until the receipt lands, and the rate-limit / tx-cap counters. That is pending-transaction bookkeeping, not a score cache. A restart drops it. That is safe because every send checks `attested` before broadcasting and never resends after a broadcast.
+The only in-process attester state is a nonce lock, an in-flight map of `{tx_hash, nonce}` (plus the subject needed to poll `attested`) until the receipt lands, and the API rate-limit counters. That is pending-transaction bookkeeping, not a score cache. A restart drops it. That is safe because every send checks `attested` before broadcasting and never resends after a broadcast.
 
 `GET /v1/attest/{ticker}/status` reads the chain only, by `tx_hash` (receipt plus the `ScoreAttested` log) or by `score_hash` (`attested`, `getAttestation`, `verify`). It does not read process memory.
 

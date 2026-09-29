@@ -32,7 +32,6 @@ from .auto_attest import (
     AttesterSettings,
     SubmitResult,
     chain_status,
-    guard_live_attester,
 )
 from .confidence import compute_confidence
 from .settings import ApiSettings
@@ -165,19 +164,16 @@ def _rpc_status(worker: AttestWorker, settings: AttesterSettings) -> str:
     return "ok"
 
 
-def _attester_balance(worker: AttestWorker, settings: AttesterSettings) -> str:
-    """``ok``, ``low``, or ``unknown``. Does not open a new RPC client."""
-    floor = int(getattr(settings, "min_balance_wei", 0) or 0)
+def _attester_balance(worker: AttestWorker, _settings: AttesterSettings) -> str:
+    """``ok`` or ``unknown``. Does not open a new RPC client."""
     chain = getattr(worker, "_chain", None)
     reader = getattr(chain, "balance_wei", None) if chain is not None else None
     if not callable(reader):
         return "unknown"
     try:
-        bal = int(reader())
+        int(reader())
     except Exception:
         return "unknown"
-    if floor > 0 and bal < floor:
-        return "low"
     return "ok"
 
 
@@ -209,8 +205,6 @@ def create_app(
     if store is None and cfg.bootstrap_key:
         db.ensure_key(cfg.bootstrap_key, name="bootstrap", tier=cfg.bootstrap_tier)
     attester_cfg = attester if attester is not None else AttesterSettings.from_env()
-    if attester is None:
-        guard_live_attester(attester_cfg)
     logger.info(
         "pending-tx state only backend=%s attester=%s",
         db.backend,

@@ -54,8 +54,7 @@ uvicorn rwa_score.api.app:create_app --factory --host 0.0.0.0 --port $PORT
 | Start command | the uvicorn line above |
 | Health check path | `/health` |
 
-Env vars on this service are `sync: false`, except `RWA_ATTEST_ENABLED`,
-which `render.yaml` sets to `false`. You type the other values in the
+Env vars on this service are `sync: false`. You type the values in the
 dashboard after sync. A later sync will not overwrite them.
 
 Free plan: the service spins down after about 15 minutes idle. There is
@@ -103,63 +102,18 @@ capped by `RWA_ATTEST_GAS_LIMIT` (default `300000`). A Foundry gas report on
 this contract showed `attest` median **208274** and max **210495** (24 calls;
 the minimum includes reverts).
 
-There is no score store. Pending-tx state is in memory: `tx_hash` and
-nonce until the receipt lands. A restart drops it. One worker. A duplicate
-send is still success because the worker checks `attested` before sending.
-
-Fees are EIP-1559. The worker sets `maxFeePerGas` and `maxPriorityFeePerGas`
-on every send. `RWA_ATTEST_MAX_FEE_GWEI` (default `20`) is clamped to a hard
-ceiling of `100` gwei in code. A broadcast is not replaced. The saved hash
-is polled until it mines.
-
-Drain protection sits in front of the send. `RWA_ATTEST_MIN_INTERVAL_SECONDS`
-(default `300`) is the minimum gap between broadcasts for one ticker.
-`RWA_ATTEST_HOURLY_CAP` (default `4`, hard max `24`) and
-`RWA_ATTEST_DAILY_CAP` (default `8`, hard max `48`) cap how many transactions
-are broadcast. When a limit hits, the API does not send. The response
-`reason` is `min_interval`, `hourly_cap`, or `daily_cap`, and `message`
-says no transaction was sent. A failed send's `reason` is the code
-`attest_failed`. The raw exception, including the RPC URL, is not returned.
-
-`RWA_ATTEST_ENABLED` defaults off. Nothing is signed or broadcast until it
-is `true` (also `1`, `yes`, or `on`). `RWA_ATTEST_MIN_BALANCE_WEI` (default
-`50000000000000`, about 0.00005 ETH) stops sends while the signer is below
-that floor. Status and `/health` report `low_balance` / `attester_balance`.
-`/health` reports process status, attester enabled or disabled, chain id,
-RPC reachability, attester balance against the floor, and queue depth. It
-does not probe a database.
-
-The attester does not start when `RWA_USE_FIXTURES=1` and it would otherwise
-be enabled. `RWA_ATTEST_ENABLED` is `false` in `render.yaml`. Nothing sends
-until that value is turned on. The moment `send` returns a hash, that hash
-and its nonce are recorded before the receipt wait. `attested` is checked
-on-chain before any send, so a restart cannot double-post.
-
-## One worker only
-
-Run a single API instance. The attester thread and the signer share one
-nonce stream. A second instance on the same key will race.
-
-Render deploys overlap: the old process stays up until the new one passes
-its health check, so two processes can hold the key at once. The design
-copes like this:
-
-- Keep the API service at **one instance**. Pending-tx state is in memory,
-  so a second process does not see the first process's broadcasts.
-  `attested` before every send is what stops a restart from posting twice.
-- After broadcast, the process stores `tx_hash` and `nonce` before the
-  receipt wait. A receipt timeout leaves that entry `broadcast_pending`.
-  The worker does not send another transaction for that hash.
-- On startup, and in the worker loop, a reconciler polls that saved hash's
-  receipt and `attested` until it lands or
-  `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` (default `1800`) has passed.
-- The job is marked failed only when the receipt is still missing,
-  `attested` is false, and the account nonce has moved past the saved
-  nonce on a different transaction. A landed transaction is confirmed with
-  the hash from its receipt.
-
-Do not scale this service past one instance. Do not run
-`python -m rwa_score.api.auto_attest` beside the API process on the same key.
+There is no score store. The moment `send` returns a hash, that hash and
+its nonce are recorded before the receipt wait. A receipt timeout leaves
+the entry pending. The worker does not send another transaction for that
+hash. On startup, and in the worker loop, a reconciler polls that saved
+hash's receipt and `attested` until it lands or
+`RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` (default `1800`) has passed. The
+entry is dropped only when the deadline has passed, the receipt is still
+missing, `attested` is false, and the account nonce has moved past the
+saved nonce on a different transaction. A landed transaction is confirmed
+with the hash from its receipt. `attested` is checked before every send.
+A failed send's `reason` is the code `attest_failed`. The raw exception,
+including the RPC URL, is not returned.
 
 If `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, or
 `BASE_SEPOLIA_RPC_URL` is unset, the worker is disabled and `/v1/attest`
@@ -191,12 +145,6 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTEST_GAS_LIMIT` | Gas cap. Default `300000` | `300000` | no |
 | `RWA_ATTEST_MAX_ATTEMPTS` | Retries before the job is failed. Default `5` | `5` | no |
 | `RWA_ATTEST_BACKOFF_SECONDS` | Base delay between retries. Default `2.0` | `2.0` | no |
-| `RWA_ATTEST_MAX_FEE_GWEI` | EIP-1559 cap for `maxFeePerGas` and `maxPriorityFeePerGas`. Default `20`. Hard ceiling `100` in code | `20` | no |
-| `RWA_ATTEST_MIN_INTERVAL_SECONDS` | Minimum seconds between enqueues for one ticker. Default `300`. `0` turns the gap off | `300` | no |
-| `RWA_ATTEST_DAILY_CAP` | Max attest jobs created per 24 hours. Default `8`. Hard max `48` in code | `8` | no |
-| `RWA_ATTEST_HOURLY_CAP` | Max attest jobs created per hour. Default `4`. Hard max `24` in code | `4` | no |
-| `RWA_ATTEST_MIN_BALANCE_WEI` | Stop sending when the signer balance is below this. Default `50000000000000` | `50000000000000` | no |
-| `RWA_ATTEST_ENABLED` | Kill switch. Only `1`, `true`, `yes`, or `on` sends. `render.yaml` sets `false`. Default off | `false` | no |
 | `RWA_ATTEST_BROADCAST_DEADLINE_SECONDS` | Seconds to poll a broadcast before the drop check. Default `1800` | `1800` | no |
 | `RWA_ATTEST_WAIT_SECONDS` | How long POST waits for a receipt before returning `pending`. Default `0` (return as soon as the tx is broadcast) | `0` | no |
 | `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot. The key list is in memory and is lost on restart | `rat_` plus a long random token | yes |
@@ -225,8 +173,8 @@ score, payload, or history cache. The caller saves the JSON
 `verify --payload-file` later. The on-chain record is the hash only.
 
 The only in-memory attester state is pending-tx state (`tx_hash` and
-nonce) until the receipt lands, plus rate-limit and transaction-cap
-counters. It is in memory and is lost on restart and on free-plan
+nonce) until the receipt lands, plus rate-limit counters. It is in memory
+and is lost on restart and on free-plan
 spin-down. That is safe because every send checks `attested` first and a
 broadcast is never resent. There is no Render Postgres, no `DATABASE_URL`,
 and no dump or restore step.
@@ -238,31 +186,20 @@ Future (out of scope): persistent DB only if we go mainnet or partner with a dat
 Do this on your own computer. Do not paste the key into git, a PR, chat, or
 an agent.
 
-Import or create a keystore so `cast` `--account` can see it:
-
 ```bash
-cast wallet import <name> --interactive
+cast wallet new
+cast wallet address --account "<new-keystore-name>"
 ```
 
-Or create a new keystore in a directory you choose:
+Export the address only:
 
 ```bash
-cast wallet new <dir> <name>
+export ATTESTER_ADDRESS="<address from the new keystore>"
+export ATTESTER_ACCOUNT="<new-keystore-name>"
 ```
 
-Then read the address only:
-
-```bash
-cast wallet address --account "<name>"
-export ATTESTER_ADDRESS="<address from that keystore>"
-export ATTESTER_ACCOUNT="<name>"
-```
-
-Move the key onto Render by pasting it into the dashboard secret
-`RWA_ATTESTER_PRIVATE_KEY` on `rwa-transparency-score-api` (Environment →
-the secret field → Save). Do not put the key in a file in this repo, do not
-pass it as a command argument, and do not paste it into chat. Names and
-shapes for the other variables are in the next section.
+Then set the API service env in the Render dashboard yourself. Names and
+shapes are in the next section. Never paste a real key into git, a PR, or chat.
 
 ## 2. Owner calls (Spencer only)
 
@@ -356,58 +293,6 @@ remove the owner.
 The worker refuses to sign if its address is `owner()`. Use a dedicated
 attester. Keep that address's balance small (section 4): `setFee(0)` means
 the only spend is gas.
-
-## 5b. Rotate the attester (Spencer only)
-
-Order is fixed:
-
-1. Allow the new key (`setAttester` true).
-2. Switch `RWA_ATTESTER_PRIVATE_KEY` on `rwa-transparency-score-api` to the new key and wait until that service is running it.
-3. Revoke the old key (`setAttester` false).
-
-Do not revoke the old key first. That leaves a window with no working attester. Do not leave both keys allowlisted after the new one is live unless you mean to. The new key is another keystore you created off any agent machine (section 1). Paste it into the dashboard secret only.
-
-```bash
-export OLD_ATTESTER="<address currently allowlisted>"
-export NEW_ATTESTER="<address of the new keystore>"
-```
-
-**Spencer only. Agents never broadcast.**
-
-Step 1. Allow the new attester:
-
-```bash
-if [ "$(cast chain-id --rpc-url "$BASE_SEPOLIA_RPC_URL")" = "84532" ]; then
-  cast send "$SCORE_ATTESTATION" "setAttester(address,bool)" "$NEW_ATTESTER" true \
-    --rpc-url "$BASE_SEPOLIA_RPC_URL" \
-    --account "$OWNER_ACCOUNT" \
-    --sender "$OWNER"
-else
-  echo "skip send: chain is not Base Sepolia 84532"
-fi
-```
-
-Step 2. On the Render dashboard, set `RWA_ATTESTER_PRIVATE_KEY` on
-`rwa-transparency-score-api` to the new key. Save. Wait until the deploy is
-live. Do not put the key in this shell.
-
-Step 3. Revoke the old attester:
-
-```bash
-if [ "$(cast chain-id --rpc-url "$BASE_SEPOLIA_RPC_URL")" = "84532" ]; then
-  cast send "$SCORE_ATTESTATION" "setAttester(address,bool)" "$OLD_ATTESTER" false \
-    --rpc-url "$BASE_SEPOLIA_RPC_URL" \
-    --account "$OWNER_ACCOUNT" \
-    --sender "$OWNER"
-else
-  echo "skip send: chain is not Base Sepolia 84532"
-fi
-```
-
-Read-only: `isAttester` is true for `NEW_ATTESTER` before you revoke, and
-false for `OLD_ATTESTER` after step 3. `owner()` is still
-`0x714b8546E5F006E0E74ec23FbafcF8e7F33a081f`. Top up `NEW_ATTESTER` with the
-section 4 value (`0.002ether`) after it is allowlisted, not more.
 
 ## 6. Live end-to-end check (Spencer only, Base Sepolia)
 

@@ -3,7 +3,7 @@
 There is no score store, payload cache, history, watchlist, or webhook
 table, and nothing is written to disk. A restart drops the key ring
 (recreate the paid key from ``RWA_API_BOOTSTRAP_KEY``), the rate-limit
-and transaction-cap counters, and the in-flight map.
+counters, and the in-flight map.
 
 The in-flight map is pending-transaction state: ``tx_hash`` and ``nonce``,
 plus the subject needed to poll ``attested`` for that broadcast. It is not
@@ -71,8 +71,6 @@ class Store:
         self._keys_by_hash: dict[str, ApiKey] = {}
         self._keys_by_id: dict[int, ApiKey] = {}
         self._usage: list[tuple[int, float, str]] = []
-        # (ticker, unix time) for the L2 interval and the hourly/daily caps.
-        self._sends: list[tuple[str, float]] = []
         # tx_hash -> pending broadcast. Dropped when the receipt lands or the
         # deadline says the broadcast is gone. Not a score cache.
         self._inflight: dict[str, dict[str, Any]] = {}
@@ -197,18 +195,6 @@ class Store:
             self._usage = [row for row in self._usage if row[1] >= cutoff]
             return True, used + 1
 
-    def last_send_at(self, ticker: str) -> float | None:
-        symbol = ticker.upper()
-        with self._lock:
-            times = [ts for name, ts in self._sends if name == symbol]
-        if not times:
-            return None
-        return max(times)
-
-    def count_sends_since(self, since: float) -> int:
-        with self._lock:
-            return sum(1 for _name, ts in self._sends if ts >= since)
-
     def note_broadcast(
         self,
         *,
@@ -233,9 +219,6 @@ class Store:
         }
         with self._lock:
             self._inflight[tx_hash] = row
-            self._sends.append((symbol, clock))
-            cutoff = clock - (86_400.0 * 2)
-            self._sends = [item for item in self._sends if item[1] >= cutoff]
 
     def get_inflight(self, tx_hash: str) -> dict[str, Any] | None:
         with self._lock:
