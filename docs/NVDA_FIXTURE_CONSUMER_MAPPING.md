@@ -127,5 +127,19 @@ jq '{
 }' docs/examples/v1_score_NVDA.fixture.json
 ```
 
-No adapter is included in this first note. A later runnable adapter should be
-explicitly labeled as a simulation and should preserve the same scope boundaries.
+The companion [simulation-only adapter](../scripts/nvda_consumer_conformance.py)
+now checks the accepted fixture SHA-256 pin before reading it and emits the
+[deterministic golden output](examples/nvda_consumer_conformance.simulation.json):
+
+```bash
+python3 scripts/nvda_consumer_conformance.py > /tmp/nvda-consumer-simulation.json
+diff -u docs/examples/nvda_consumer_conformance.simulation.json /tmp/nvda-consumer-simulation.json
+python3 -m pytest tests/test_nvda_consumer_conformance.py
+```
+
+The adapter uses only the local fixture. It preserves RAT's score and evidence
+labels, leaves exact instrument and source observation time unbound, counts no
+cross-issuer wrappers as independent same-instrument quotes, and reports
+`mayAuthorizeExecution: false`. It produces no action verdict or signed Insight
+assessment. The output is a consumer conformance simulation, not a RAT scoring
+change or permission to execute.
