@@ -534,6 +534,56 @@ def test_settings_mapping_does_not_expose_private_key() -> None:
     assert "SecretKey12345678" not in repr(settings)
 
 
+def test_b3_secret_rpc_key_absent_from_db_logs_and_status(
+    tmp_path: Path,
+    fixture_scorer: TransparencyScorer,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BASE_SEPOLIA_RPC_URL's embedded key must not reach the DB, logs, or status."""
+    rpc = "https://base-sepolia.example/v2/SECRETRPCKEY123"
+    monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", rpc)
+    monkeypatch.setenv("RWA_ATTESTER_PRIVATE_KEY", "0x" + "44" * 32)
+    monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
+    monkeypatch.setenv("RWA_ATTEST_MIN_INTERVAL_SECONDS", "0")
+    settings = AttesterSettings.from_env()
+    assert settings.enabled is True
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.fee_wei.return_value = 0
+    chain.attest.side_effect = RuntimeError(f"rpc down {rpc}")
+    api = ApiSettings(db_path=tmp_path / "b3.sqlite")
+    store = Store(api.db_path)
+    digest, claimed = _seed(store, fixture_scorer)
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    worker = _worker(store, settings, chain)
+    settings.max_attempts = 1
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("web3").error("provider %s", rpc)
+        logging.getLogger("rwa_score.api").error("status leaked %s", rpc)
+        assert worker.process_once(now=1_000.0) is True
+    job = store.latest_attest_job(digest)
+    assert job is not None
+    assert "SECRETRPCKEY123" not in (job["last_error"] or "")
+    assert "SECRETRPCKEY123" not in caplog.text
+    assert rpc not in caplog.text
+    app = create_app(
+        settings=api,
+        store=store,
+        scorer=fixture_scorer,
+        attester=settings,
+        chain=chain,
+        start_worker=False,
+    )
+    raw = store.create_key(name="paid", tier="paid")
+    resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
+    assert resp.status_code == 200
+    assert "SECRETRPCKEY123" not in resp.text
+    assert rpc not in resp.text
+    assert resp.json()["on_chain"]["reason"] == "attest_failed"
+
+
 def test_rpc_url_never_in_last_error_status_or_any_logger(
     tmp_path: Path,
     fixture_scorer: TransparencyScorer,
