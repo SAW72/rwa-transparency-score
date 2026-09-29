@@ -11,8 +11,10 @@ or a paid plan with a persistent disk is the way to keep the queue across
 spin-down. Spencer sets the attester key on Render himself. This process
 reads ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
 
-If the key, contract, or RPC is unset, the worker stays disabled and the
-API says so. It does not crash and it does not send.
+If ``RWA_ATTEST_ENABLED`` is not true, or the key, contract, or RPC is unset,
+the worker stays disabled and the API says so. It does not crash and it
+does not send. A missing ``DATABASE_URL`` (or ``RWA_USE_FIXTURES=1``) also
+refuses to start the attester.
 
 One API instance only. During a Render deploy the old process and the new
 one overlap. Postgres claims with ``FOR UPDATE SKIP LOCKED``, and a
@@ -55,6 +57,10 @@ DEFAULT_MAX_FEE_GWEI = 20
 DEFAULT_MIN_INTERVAL_SECONDS = 300
 HARD_DAILY_TX_CAP = 48
 DEFAULT_DAILY_TX_CAP = 8
+HARD_HOURLY_TX_CAP = 24
+DEFAULT_HOURLY_TX_CAP = 4
+# 0.00005 ETH. from_env uses this. The constructor default is 0 so tests and anvil stay quiet.
+DEFAULT_MIN_BALANCE_WEI = 50_000_000_000_000
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_SECONDS = 2.0
@@ -65,8 +71,14 @@ THROTTLE_MESSAGES = {
     "min_interval": (
         "Attest for this ticker is inside the minimum interval. No transaction was sent."
     ),
+    "hourly_cap": "Hourly attest transaction cap reached. No transaction was sent.",
     "daily_cap": "Daily attest transaction cap reached. No transaction was sent.",
 }
+LOW_BALANCE_REASON = "low_balance"
+LOW_BALANCE_MESSAGE = "Attester balance is below the floor. No transaction was sent."
+KILL_SWITCH_REASON = (
+    "Attester worker disabled: RWA_ATTEST_ENABLED is not true. No transaction was sent."
+)
 RPC_TIMEOUT_SECONDS = 20
 RECEIPT_TIMEOUT_SECONDS = 60
 # Fixture scores use as_of 0. Anything past year 2100 is not a unix second.
@@ -284,6 +296,10 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_on(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class AttesterSettings:
     """Env-only attester config. The key lives in a closure, not on ``__dict__``."""
 
@@ -300,6 +316,10 @@ class AttesterSettings:
         "max_fee_gwei",
         "min_interval_seconds",
         "daily_tx_cap",
+        "hourly_tx_cap",
+        "min_balance_wei",
+        "attest_enabled",
+        "refuse_reason",
     )
 
     def __init__(
@@ -317,6 +337,9 @@ class AttesterSettings:
         max_fee_gwei: float = DEFAULT_MAX_FEE_GWEI,
         min_interval_seconds: int = DEFAULT_MIN_INTERVAL_SECONDS,
         daily_tx_cap: int = DEFAULT_DAILY_TX_CAP,
+        hourly_tx_cap: int = DEFAULT_HOURLY_TX_CAP,
+        min_balance_wei: int = 0,
+        attest_enabled: bool = True,
     ) -> None:
         key = (private_key or "").strip()
         self._get_key = (lambda captured: (lambda: captured))(key)
@@ -337,6 +360,13 @@ class AttesterSettings:
         if cap < 0:
             cap = DEFAULT_DAILY_TX_CAP
         self.daily_tx_cap = min(cap, HARD_DAILY_TX_CAP)
+        hcap = int(hourly_tx_cap)
+        if hcap < 0:
+            hcap = DEFAULT_HOURLY_TX_CAP
+        self.hourly_tx_cap = min(hcap, HARD_HOURLY_TX_CAP)
+        self.min_balance_wei = max(0, int(min_balance_wei))
+        self.attest_enabled = bool(attest_enabled)
+        self.refuse_reason = ""
         if key or self.rpc_url:
             _VAULT.add(key, self.rpc_url)
             _install_redact_filter()
@@ -347,12 +377,26 @@ class AttesterSettings:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.private_key and self.contract and self.rpc_url)
+        return bool(
+            self.attest_enabled
+            and not self.refuse_reason
+            and self.private_key
+            and self.contract
+            and self.rpc_url
+        )
+
+    def refuse(self, reason: str) -> None:
+        """Stop the worker. ``reason`` is the status text. Nothing is sent."""
+        self.refuse_reason = (reason or "").strip()
 
     @property
     def disabled_reason(self) -> str:
         if self.enabled:
             return ""
+        if self.refuse_reason:
+            return self.refuse_reason
+        if not self.attest_enabled:
+            return KILL_SWITCH_REASON
         return DISABLED_REASON
 
     def __repr__(self) -> str:
@@ -385,6 +429,9 @@ class AttesterSettings:
                 "RWA_ATTEST_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL_SECONDS
             ),
             daily_tx_cap=_env_int("RWA_ATTEST_DAILY_CAP", DEFAULT_DAILY_TX_CAP),
+            hourly_tx_cap=_env_int("RWA_ATTEST_HOURLY_CAP", DEFAULT_HOURLY_TX_CAP),
+            min_balance_wei=_env_int("RWA_ATTEST_MIN_BALANCE_WEI", DEFAULT_MIN_BALANCE_WEI),
+            attest_enabled=_env_on("RWA_ATTEST_ENABLED"),
         )
 
 
@@ -529,7 +576,7 @@ def _parse_iso(text: str) -> float:
 
 
 def admission_block(store: Any, settings: AttesterSettings, ticker: str) -> str | None:
-    """``min_interval`` or ``daily_cap`` when a new enqueue must not be sent."""
+    """``min_interval``, ``hourly_cap``, or ``daily_cap`` when a new enqueue must not be sent."""
     interval = int(settings.min_interval_seconds)
     if interval > 0:
         latest = store.latest_attest_job_for_ticker(ticker)
@@ -540,12 +587,47 @@ def admission_block(store: Any, settings: AttesterSettings, ticker: str) -> str 
                 age = 0.0
             if age < interval:
                 return "min_interval"
+    now = time.time()
+    hourly = int(settings.hourly_tx_cap)
+    since_hour = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+    if int(store.count_attest_jobs_since(since_hour)) >= hourly:
+        return "hourly_cap"
     cap = int(settings.daily_tx_cap)
-    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 86400))
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
     count = int(store.count_attest_jobs_since(since))
     if count >= cap:
         return "daily_cap"
     return None
+
+
+def guard_live_attester(settings: AttesterSettings, *, database_url: str) -> None:
+    """Refuse to send when the queue is ephemeral or scores are fixtures.
+
+    Called on the production path (``from_env``). Tests that pass an
+    ``AttesterSettings`` instance are left alone.
+    """
+    from rwa_score.api.settings import is_postgres_url
+    from rwa_score.client import use_fixtures
+
+    postgres = is_postgres_url(database_url)
+    render = bool((os.getenv("RENDER") or "").strip() or (os.getenv("RENDER_SERVICE_ID") or "").strip())
+    would_send = bool(
+        settings.attest_enabled and settings.private_key and settings.contract and settings.rpc_url
+    )
+    reasons: list[str] = []
+    if not postgres and (render or would_send):
+        reasons.append(
+            "DATABASE_URL is unset, so the attester will not start on ephemeral SQLite. "
+            "No transaction was sent."
+        )
+    if use_fixtures() and would_send:
+        reasons.append(
+            "RWA_USE_FIXTURES is set while the attester is enabled. "
+            "The attester will not start. No transaction was sent."
+        )
+    if reasons:
+        settings.refuse(" ".join(reasons))
+        logger.warning("attester refused: %s", settings.disabled_reason)
 
 
 class Web3Chain:
@@ -587,6 +669,9 @@ class Web3Chain:
 
     def fee_wei(self) -> int:
         return int(self._contract.functions.attestationFee().call())
+
+    def balance_wei(self) -> int:
+        return int(self._w3.eth.get_balance(self._account.address))
 
     def verify(self, score_hash: str, ticker: str) -> tuple[bool, int, str]:
         ok, ts, who = self._contract.functions.verify(_hash_bytes(score_hash), ticker).call()
@@ -972,6 +1057,9 @@ def on_chain_view(
     if status == "failed":
         body["reason"] = FAILED_REASON
         body["message"] = FAILED_MESSAGE
+    elif status == "pending" and job is not None and job.get("last_error") == LOW_BALANCE_REASON:
+        body["reason"] = LOW_BALANCE_REASON
+        body["message"] = LOW_BALANCE_MESSAGE
     elif status == "pending" and job is not None and job.get("last_error") in THROTTLE_MESSAGES:
         code = str(job["last_error"])
         body["status"] = "throttled"
@@ -1075,6 +1163,8 @@ class AttestWorker:
         job = self.store.claim_next_attest_job(now=clock)
         if job is None:
             return False
+        if not self._balance_ok(job, clock):
+            return True
         secret = self.settings.private_key
         rpc_url = self.settings.rpc_url
 
@@ -1136,6 +1226,31 @@ class AttestWorker:
         )
         return True
 
+    def _balance_ok(self, job: dict[str, Any], clock: float) -> bool:
+        """False when the signer is under the floor. The job stays pending."""
+        floor = int(self.settings.min_balance_wei)
+        if floor <= 0:
+            return True
+        reader = getattr(self.chain(), "balance_wei", None)
+        bal: int | None
+        if not callable(reader):
+            bal = None
+        else:
+            try:
+                bal = int(reader())
+            except Exception:
+                bal = None
+        if bal is not None and bal >= floor:
+            return True
+        logger.info("attest job %s waiting: attester balance below floor", job["id"])
+        self.store.finish_attest_job(
+            job["id"],
+            status="pending",
+            error=LOW_BALANCE_REASON,
+            next_attempt_at=clock + 60.0,
+        )
+        return False
+
 
 def main() -> None:
     """Drain due jobs once, then exit. For a future worker process. No send if disabled."""
@@ -1143,10 +1258,11 @@ def main() -> None:
     from .store import open_store
 
     settings = AttesterSettings.from_env()
+    cfg = ApiSettings.from_env()
+    guard_live_attester(settings, database_url=cfg.database_url)
     if not settings.enabled:
         print(settings.disabled_reason)
         return
-    cfg = ApiSettings.from_env()
     store = open_store(path=cfg.db_path, database_url=cfg.database_url)
     worker = AttestWorker(store=store, settings=settings, autostart=False)
     try:

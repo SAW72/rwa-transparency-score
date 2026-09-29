@@ -5,6 +5,7 @@ Wraps ``TransparencyScorer`` / ``create_client`` so numbers match Streamlit.
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 import secrets
@@ -27,11 +28,19 @@ from .attest import (
     inputs_bytes,
     resolve_scorer_version,
 )
-from .auto_attest import AttestWorker, AttesterSettings, admission_block, on_chain_view
+from .auto_attest import (
+    AttestWorker,
+    AttesterSettings,
+    admission_block,
+    guard_live_attester,
+    on_chain_view,
+)
 from .confidence import compute_confidence
 from .settings import ApiSettings
 from .store import ApiKey, Store, open_store
 from .webhooks import apply_score_side_effects, assert_public_https_url
+
+logger = logging.getLogger(__name__)
 
 BREAKDOWN_KEYS = (
     "ticker",
@@ -146,6 +155,27 @@ def _decorate(report: dict[str, Any]) -> _SealedScore:
     return out
 
 
+def _control_ticker(symbol: str) -> bool:
+    """NUL and other control characters must be a 4xx, never a database error."""
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in symbol)
+
+
+def _attester_balance(worker: AttestWorker, settings: AttesterSettings) -> str:
+    """``ok``, ``low``, or ``unknown``. Does not open a new RPC client."""
+    floor = int(getattr(settings, "min_balance_wei", 0) or 0)
+    chain = getattr(worker, "_chain", None)
+    reader = getattr(chain, "balance_wei", None) if chain is not None else None
+    if not callable(reader):
+        return "unknown"
+    try:
+        bal = int(reader())
+    except Exception:
+        return "unknown"
+    if floor > 0 and bal < floor:
+        return "low"
+    return "ok"
+
+
 def _extract_key(
     x_api_key: str | None,
     authorization: str | None,
@@ -174,6 +204,13 @@ def create_app(
     if store is None and cfg.bootstrap_key:
         db.ensure_key(cfg.bootstrap_key, name="bootstrap", tier=cfg.bootstrap_tier)
     attester_cfg = attester if attester is not None else AttesterSettings.from_env()
+    if attester is None:
+        guard_live_attester(attester_cfg, database_url=cfg.database_url)
+    logger.info(
+        "store backend=%s attester=%s",
+        db.backend,
+        "enabled" if attester_cfg.enabled else "disabled",
+    )
     worker = AttestWorker(
         store=db,
         settings=attester_cfg,
@@ -246,6 +283,8 @@ def create_app(
         return key
 
     def score_ticker(symbol: str, key: ApiKey, *, for_attest: bool = False) -> dict[str, Any]:
+        if _control_ticker(symbol):
+            raise _http_error(400, "bad_ticker", "Ticker contains a control character.")
         try:
             report = get_scorer().score(symbol)
         except ScoreError as exc:
@@ -271,11 +310,18 @@ def create_app(
             )
         return decorated
 
-    @app.get("/health")
-    def health() -> dict[str, Any]:
+    @app.get("/health", response_model=None)
+    def health():
         payload = build_health_payload()
         payload["api"] = True
         payload["version"] = __version__
+        payload["store"] = db.backend
+        payload["attester"] = "enabled" if attester_cfg.enabled else "disabled"
+        payload["attester_balance"] = _attester_balance(worker, attester_cfg)
+        db_ok = db.ping()
+        payload["database"] = "ok" if db_ok else "down"
+        if not db_ok:
+            return JSONResponse(status_code=503, content=payload)
         return payload
 
     @app.get("/v1/me")
@@ -473,6 +519,8 @@ def create_app(
     def attest_status(ticker: str, key: ApiKey = Depends(require_paid)) -> dict[str, Any]:
         """Latest stored payload and its on-chain job. Does not score or enqueue."""
         _ = key
+        if _control_ticker(ticker):
+            raise _http_error(400, "bad_ticker", "Ticker contains a control character.")
         symbol = ticker.strip().upper()
         row = db.latest_attested_payload(symbol)
         if row is None:

@@ -107,6 +107,22 @@ def test_health_does_not_need_a_key(tmp_path: Path, fixture_scorer: Transparency
     body = resp.json()
     assert body["api"] is True
     assert "fixtures" in body
+    assert body["database"] == "ok"
+    assert body["store"] == "sqlite"
+    assert body["attester"] in {"enabled", "disabled"}
+
+
+def test_control_character_ticker_is_400(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    client, store = _client(tmp_path, fixture_scorer)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = _headers(raw)
+    for path in ("/v1/score/NVDA%00", "/v1/attest/NV%0ADA", "/v1/attest/NV%00DA/status"):
+        resp = client.get(path, headers=headers)
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "bad_ticker"
+        assert resp.status_code < 500
 
 
 def test_missing_and_invalid_key(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:

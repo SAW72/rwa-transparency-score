@@ -1,7 +1,7 @@
 """Auto-attest worker. Mocks by default. Anvil dev accounts only when anvil exists.
 
-The Anvil private keys below are the public Foundry development accounts
-(account 0 and account 1). They are not secrets and are not used on a real network.
+Anvil account keys are derived at runtime from Foundry's published test mnemonic.
+The hex keys are not stored in this file. They are not used on a real network.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from rwa_score.api.attest import attestation_payload, canonical_bytes
 from rwa_score.api.auto_attest import (
     HARD_DAILY_TX_CAP,
     HARD_GAS_CAP,
+    HARD_HOURLY_TX_CAP,
     HARD_MAX_FEE_GWEI,
     PINNED_ATTESTATION_CONTRACT,
     RECEIPT_TIMEOUT_SECONDS,
@@ -41,10 +42,25 @@ from rwa_score.api.settings import ApiSettings
 from rwa_score.api.store import Store
 from rwa_score.scorer import TransparencyScorer
 
-# Public Anvil defaults. See https://book.getfoundry.sh/anvil/ (Development accounts).
-ANVIL_ACCOUNT_0 = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-ANVIL_ACCOUNT_1 = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _anvil_account(index: int):
+    """Foundry's default test account. The mnemonic is public; the key is not a literal."""
+    from eth_account import Account
+
+    Account.enable_unaudited_hdwallet_features()
+    phrase = " ".join(["test"] * 11 + ["junk"])
+    return Account.from_mnemonic(phrase, account_path=f"m/44'/60'/0'/0/{index}")
+
+
+def _anvil_key(index: int) -> str:
+    raw = _anvil_account(index).key.hex()
+    return raw if str(raw).startswith("0x") else "0x" + str(raw)
+
+
+def _anvil_address(index: int) -> str:
+    return _anvil_account(index).address
 CONTRACTS = ROOT / "contracts"
 
 
@@ -59,6 +75,7 @@ def _settings(key: str = "", **overrides: object) -> AttesterSettings:
         backoff_seconds=0.0,
         min_interval_seconds=0,
         daily_tx_cap=48,
+        hourly_tx_cap=HARD_HOURLY_TX_CAP,
     )
     data.update(overrides)
     return AttesterSettings(**data)  # type: ignore[arg-type]
@@ -293,7 +310,7 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
                 rpc,
                 "--unlocked",
                 "--from",
-                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                _anvil_address(0),
                 "--broadcast",
                 "src/ScoreAttestation.sol:ScoreAttestation",
                 "--constructor-args",
@@ -308,9 +325,7 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
             if "Deployed to:" in line:
                 address = line.split("Deployed to:", 1)[1].strip()
         assert address.startswith("0x")
-        from eth_account import Account
-
-        worker_addr = Account.from_key(ANVIL_ACCOUNT_1).address
+        worker_addr = _anvil_address(1)
         subprocess.check_call(
             [
                 "cast",
@@ -323,7 +338,7 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
                 rpc,
                 "--unlocked",
                 "--from",
-                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                _anvil_address(0),
             ],
             stdout=subprocess.DEVNULL,
         )
@@ -338,12 +353,12 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
                 rpc,
                 "--unlocked",
                 "--from",
-                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                _anvil_address(0),
             ],
             stdout=subprocess.DEVNULL,
         )
         settings = AttesterSettings(
-            private_key=ANVIL_ACCOUNT_1,
+            private_key=_anvil_key(1),
             contract=address,
             rpc_url=rpc,
             value_cap_wei=0,
@@ -546,6 +561,8 @@ def test_b3_secret_rpc_key_absent_from_db_logs_and_status(
     monkeypatch.setenv("RWA_ATTESTER_PRIVATE_KEY", "0x" + "44" * 32)
     monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
     monkeypatch.setenv("RWA_ATTEST_MIN_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("RWA_ATTEST_MIN_BALANCE_WEI", "0")
+    monkeypatch.setenv("RWA_ATTEST_ENABLED", "true")
     settings = AttesterSettings.from_env()
     assert settings.enabled is True
     chain = Mock()
@@ -689,6 +706,11 @@ def test_min_interval_does_not_enqueue_or_send(
     assert "minimum interval" in throttled["message"]
     assert "No transaction was sent" in throttled["message"]
     assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+    for _ in range(2):
+        extra = client.get("/v1/attest/NVDA", headers=headers)
+        assert extra.status_code == 200
+        assert extra.json()["on_chain"]["reason"] == "min_interval"
+    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
     worker = _worker(store, settings, chain)
     assert worker.process_once(now=time.time()) is True
     chain.attest.assert_called_once()
@@ -733,7 +755,7 @@ def _forge_deploy(rpc: str) -> str:
             rpc,
             "--unlocked",
             "--from",
-            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            _anvil_address(0),
             "--broadcast",
             "src/ScoreAttestation.sol:ScoreAttestation",
             "--constructor-args",
@@ -753,9 +775,7 @@ def _forge_deploy(rpc: str) -> str:
 
 
 def _allow_worker(rpc: str, contract: str) -> None:
-    from eth_account import Account
-
-    worker_addr = Account.from_key(ANVIL_ACCOUNT_1).address
+    worker_addr = _anvil_address(1)
     subprocess.check_call(
         [
             "cast",
@@ -768,7 +788,7 @@ def _allow_worker(rpc: str, contract: str) -> None:
             rpc,
             "--unlocked",
             "--from",
-            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            _anvil_address(0),
         ],
         stdout=subprocess.DEVNULL,
     )
@@ -783,7 +803,7 @@ def _allow_worker(rpc: str, contract: str) -> None:
             rpc,
             "--unlocked",
             "--from",
-            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+            _anvil_address(0),
         ],
         stdout=subprocess.DEVNULL,
     )
@@ -814,7 +834,7 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
         address = _forge_deploy(rpc)
         _allow_worker(rpc, address)
         settings = AttesterSettings(
-            private_key=ANVIL_ACCOUNT_1,
+            private_key=_anvil_key(1),
             contract=address,
             rpc_url=rpc,
             value_cap_wei=0,
@@ -894,3 +914,117 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_kill_switch_defaults_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RWA_ATTEST_ENABLED", raising=False)
+    monkeypatch.setenv("RWA_ATTESTER_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
+    monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", "http://127.0.0.1:9")
+    off = AttesterSettings.from_env()
+    assert off.attest_enabled is False
+    assert off.enabled is False
+    assert "RWA_ATTEST_ENABLED" in off.disabled_reason
+    assert "No transaction was sent" in off.disabled_reason
+    monkeypatch.setenv("RWA_ATTEST_ENABLED", "true")
+    on = AttesterSettings.from_env()
+    assert on.enabled is True
+
+
+def test_low_balance_does_not_send(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    settings = _settings("0x" + "57" * 32, min_balance_wei=10**18)
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.balance_wei.return_value = 1
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.fee_wei.return_value = 0
+    chain.attest.return_value = "0x" + "ab" * 32
+    api = ApiSettings(db_path=tmp_path / "bal.sqlite")
+    store = Store(api.db_path)
+    digest, claimed = _seed(store, fixture_scorer)
+    store.enqueue_attest_job(score_hash=digest, ticker="NVDA", claimed_at=claimed)
+    worker = _worker(store, settings, chain)
+    assert worker.process_once(now=1_000.0) is True
+    chain.attest.assert_not_called()
+    job = store.latest_attest_job(digest)
+    assert job is not None
+    assert job["status"] == "pending"
+    assert job["last_error"] == "low_balance"
+    app = create_app(
+        settings=api,
+        store=store,
+        scorer=fixture_scorer,
+        attester=settings,
+        chain=chain,
+        start_worker=False,
+    )
+    raw = store.create_key(name="paid", tier="paid")
+    resp = TestClient(app).get("/v1/attest/NVDA/status", headers={"X-API-Key": raw})
+    assert resp.status_code == 200
+    assert resp.json()["on_chain"]["reason"] == "low_balance"
+    assert "No transaction was sent" in resp.json()["on_chain"]["message"]
+    health = TestClient(app).get("/health")
+    assert health.status_code == 200
+    assert health.json()["attester_balance"] == "low"
+    assert health.json()["attester"] == "enabled"
+    assert health.json()["store"] == "sqlite"
+    assert health.json()["database"] == "ok"
+
+
+def test_hourly_cap_does_not_enqueue(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    settings = _settings(
+        "0x" + "58" * 32,
+        min_interval_seconds=0,
+        hourly_tx_cap=1,
+        daily_tx_cap=48,
+    )
+    api = ApiSettings(db_path=tmp_path / "hour.sqlite")
+    store = Store(api.db_path)
+    app = create_app(
+        settings=api,
+        store=store,
+        scorer=fixture_scorer,
+        attester=settings,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = {"X-API-Key": raw}
+    first = client.get("/v1/attest/NVDA", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["on_chain"].get("reason") != "hourly_cap"
+    second = client.get("/v1/attest/AAPL", headers=headers)
+    assert second.status_code == 200
+    body = second.json()["on_chain"]
+    assert body["reason"] == "hourly_cap"
+    assert "No transaction was sent" in body["message"]
+    assert store.count_attest_jobs_since("1970-01-01T00:00:00Z") == 1
+
+
+def test_sqlite_and_fixtures_refuse_a_live_attester(
+    tmp_path: Path,
+    fixture_scorer: TransparencyScorer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RWA_ATTEST_ENABLED", "true")
+    monkeypatch.setenv("RWA_ATTESTER_PRIVATE_KEY", "0x" + "59" * 32)
+    monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
+    monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("RWA_USE_FIXTURES", "1")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("RENDER", raising=False)
+    api = ApiSettings(db_path=tmp_path / "refuse.sqlite")
+    app = create_app(settings=api, scorer=fixture_scorer, start_worker=False)
+    reason = app.state.attester.disabled_reason
+    assert app.state.attester.enabled is False
+    assert "DATABASE_URL" in reason
+    assert "RWA_USE_FIXTURES" in reason
+    assert "No transaction was sent" in reason
+    health = TestClient(app).get("/health")
+    assert health.status_code == 200
+    assert health.json()["attester"] == "disabled"
+    assert health.json()["store"] == "sqlite"

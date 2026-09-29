@@ -98,6 +98,12 @@ services:
         sync: false
       - key: RWA_ATTEST_DAILY_CAP
         sync: false
+      - key: RWA_ATTEST_HOURLY_CAP
+        sync: false
+      - key: RWA_ATTEST_MIN_BALANCE_WEI
+        sync: false
+      - key: RWA_ATTEST_ENABLED
+        sync: false
       - key: RWA_API_DB_PATH
         sync: false
       - key: RWA_API_BOOTSTRAP_KEY

@@ -113,12 +113,28 @@ replaces it at the same nonce with a higher fee, still under that ceiling.
 
 Drain protection sits in front of the queue. `RWA_ATTEST_MIN_INTERVAL_SECONDS`
 (default `300`) is the minimum gap between enqueues for one ticker.
-`RWA_ATTEST_DAILY_CAP` (default `8`) is the maximum number of attest jobs
-created in 24 hours, and the code refuses anything above `48`. When either
-limit hits, the API does not enqueue and does not send. `on_chain.reason` is
-`min_interval` or `daily_cap`, and `on_chain.message` says no transaction
-was sent. A failed job's status reason is the code `attest_failed`. The raw
-exception, including the RPC URL, is not returned.
+`RWA_ATTEST_HOURLY_CAP` (default `4`, hard max `24`) and
+`RWA_ATTEST_DAILY_CAP` (default `8`, hard max `48`) cap how many jobs are
+created. When a limit hits, the API does not enqueue and does not send.
+`on_chain.reason` is `min_interval`, `hourly_cap`, or `daily_cap`, and
+`on_chain.message` says no transaction was sent. A failed job's status
+reason is the code `attest_failed`. The raw exception, including the RPC
+URL, is not returned.
+
+`RWA_ATTEST_ENABLED` defaults off. Nothing is signed or broadcast until it
+is `true` (also `1`, `yes`, or `on`). `RWA_ATTEST_MIN_BALANCE_WEI` (default
+`50000000000000`, about 0.00005 ETH) stops sends while the signer is below
+that floor. Status and `/health` report `low_balance` / `attester_balance`.
+`/health` also runs `SELECT 1` and returns 503 when the database is down.
+It includes `store` (`postgres` or `sqlite`) and `attester` (`enabled` or
+`disabled`).
+
+The attester does not start when `DATABASE_URL` is unset, when `RENDER` is
+set without that URL, or when `RWA_USE_FIXTURES=1` and the attester would
+otherwise be enabled. A claim sets `next_attempt_at` about 90 seconds ahead
+so a second process cannot send the same job while the first is still
+waiting on a receipt. The stored `tx_hash` and `nonce` are what the retry
+uses.
 
 ## One worker only
 
@@ -174,6 +190,9 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTEST_MAX_FEE_GWEI` | EIP-1559 cap for `maxFeePerGas` and `maxPriorityFeePerGas`. Default `20`. Hard ceiling `100` in code | `20` | no |
 | `RWA_ATTEST_MIN_INTERVAL_SECONDS` | Minimum seconds between enqueues for one ticker. Default `300`. `0` turns the gap off | `300` | no |
 | `RWA_ATTEST_DAILY_CAP` | Max attest jobs created per 24 hours. Default `8`. Hard max `48` in code | `8` | no |
+| `RWA_ATTEST_HOURLY_CAP` | Max attest jobs created per hour. Default `4`. Hard max `24` in code | `4` | no |
+| `RWA_ATTEST_MIN_BALANCE_WEI` | Stop sending when the signer balance is below this. Default `50000000000000` | `50000000000000` | no |
+| `RWA_ATTEST_ENABLED` | Kill switch. Only `1`, `true`, `yes`, or `on` sends. Default off | `false` | no |
 | `RWA_API_DB_PATH` | SQLite file used only when `DATABASE_URL` is unset. Default `data/rat_api.sqlite` | `data/rat_api.sqlite` | no |
 | `RWA_API_BOOTSTRAP_KEY` | Paid key recreated on boot so `/v1/attest` works after spin-down wipes sqlite | `rat_` plus a long random token | yes |
 | `RWA_API_BOOTSTRAP_TIER` | Tier of that key. `/v1/attest` requires `paid` | `paid` | no |
