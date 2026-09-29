@@ -6,9 +6,11 @@ handler returns immediately, or after ``RWA_ATTEST_WAIT_SECONDS``.
 
 The only pending-transaction state is an in-flight map of ``tx_hash`` and
 ``nonce`` (plus the subject needed to poll ``attested``). A restart drops
-it. That is safe because every send checks ``attested`` first and a
-broadcast is never resent. The background thread only reconciles receipts.
-It does not keep scores.
+it. A startup hold waits while the pending nonce is ahead of the latest
+nonce, and every send checks ``attested`` first. That reduces the chance
+of a duplicate. A restart in the middle of a broadcast can still cost one
+duplicate transaction that reverts or no-ops. The background thread only
+reconciles receipts. It does not keep scores.
 
 Spencer sets the attester key on Render himself. This process reads
 ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
@@ -50,6 +52,9 @@ DEFAULT_BROADCAST_DEADLINE_SECONDS = 30 * 60
 # POST returns as soon as the tx is broadcast unless this is raised.
 DEFAULT_WAIT_SECONDS = 0.0
 BROADCAST_POLL_SECONDS = 15.0
+# On startup, wait this long for a leftover mempool tx to mine before sending.
+STARTUP_HOLD_SECONDS = 15.0
+STARTUP_HOLD_POLL_SECONDS = 0.25
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_SECONDS = 2.0
@@ -536,6 +541,12 @@ def _is_already(exc: BaseException) -> bool:
     return ALREADY_ATTESTED_SELECTOR in blob or "alreadyattested" in blob
 
 
+def _nonce_rejected(exc: BaseException) -> bool:
+    """True when the node refused the nonce and the cache must be dropped."""
+    blob = str(exc).lower()
+    return "nonce too low" in blob or "replacement underpriced" in blob
+
+
 def choose_nonce(*, stored_nonce: int | None, unresolved: bool, suggested: int) -> int:
     """Keep the in-flight nonce. A new nonce is only legal once that one is resolved."""
     if unresolved and stored_nonce is not None:
@@ -584,7 +595,9 @@ class Web3Chain:
 
     Once a hash is broadcast, this sender does not broadcast another
     transaction for that job. The reconciler polls the saved hash.
-    ``attested`` is checked before every send.
+    The startup hold plus the ``attested`` pre-check reduce the risk of a
+    duplicate after a restart. A restart mid-broadcast can still cost one
+    duplicate transaction that reverts or no-ops.
     """
 
     def __init__(self, settings: AttesterSettings) -> None:
@@ -607,6 +620,26 @@ class Web3Chain:
         )
         self._lock = threading.Lock()
         self._nonce: int | None = None
+        self._startup_hold()
+
+    def _startup_hold(self) -> None:
+        """No sends while a restart still has a transaction in the mempool.
+
+        Poll until the pending nonce count equals the latest nonce count,
+        or until the deadline, then proceed.
+        """
+        deadline = time.monotonic() + STARTUP_HOLD_SECONDS
+        while True:
+            try:
+                pending = int(self.transaction_count("pending"))
+                latest = int(self.transaction_count("latest"))
+            except Exception:
+                return
+            if pending <= latest:
+                return
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(STARTUP_HOLD_POLL_SECONDS)
 
     @property
     def address(self) -> str:
@@ -781,10 +814,15 @@ class Web3Chain:
                 if pending_nonce is not None:
                     self._nonce = int(pending_nonce) + 1
                 return landed
+        # The cache stays on the nonce we last used. The pending count is the
+        # next legal nonce once that transaction is in the mempool, so a later
+        # job must not reuse it.
+        pending_count = int(self._w3.eth.get_transaction_count(self._account.address, "pending"))
         if self._nonce is None:
-            suggested = int(self._w3.eth.get_transaction_count(self._account.address, "pending"))
-            self._nonce = choose_nonce(stored_nonce=None, unresolved=False, suggested=suggested)
-        nonce = int(self._nonce)
+            nonce = pending_count
+        else:
+            nonce = max(int(self._nonce), pending_count)
+        self._nonce = int(nonce)
         return self._broadcast(
             score_hash,
             ticker,
@@ -835,14 +873,24 @@ class Web3Chain:
         raw = getattr(signed, "raw_transaction", None)
         if raw is None:
             raw = signed.rawTransaction
-        sent = self._w3.eth.send_raw_transaction(raw)
-        hex_hash = _tx_hex(sent)
+        # The hash is known before the node accepts the bytes. Record it
+        # first so a crash between sign and send is still in flight.
+        hex_hash = _tx_hex(signed.hash)
         if hex_hash not in known:
             known.append(hex_hash)
         if on_submitted is not None:
             on_submitted(hex_hash, int(nonce))
         # Stay on this nonce until a receipt says it was consumed.
         self._nonce = int(nonce)
+        try:
+            sent = self._w3.eth.send_raw_transaction(raw)
+        except Exception as exc:
+            if _nonce_rejected(exc):
+                self._nonce = None
+            raise
+        sent_hash = _tx_hex(sent)
+        if sent_hash not in known:
+            known.append(sent_hash)
         timeout = RECEIPT_TIMEOUT_SECONDS if receipt_timeout is None else float(receipt_timeout)
         if timeout <= 0:
             # Return immediately, but if the node already mined this hash
@@ -1490,8 +1538,8 @@ class AttestWorker:
         if verified:
             return
         if self._broadcast_dropped(job, chain, clock):
-            logger.info("attest broadcast dropped hash=%s", tx_hash)
-            self.store.drop_inflight(str(tx_hash))
+            logger.info("attest broadcast dropped hash=%s reason=broadcast_dropped", tx_hash)
+            self.store.drop_inflight(str(tx_hash), reason="broadcast_dropped")
             return
 
     def _broadcast_dropped(self, job: dict[str, Any], chain: Chain, clock: float) -> bool:

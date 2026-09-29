@@ -62,8 +62,11 @@ no score store, no disk, and no database. `POST /v1/attest/{ticker}`
 computes the score live and returns the payload. Save that JSON. The only
 in-memory attester state is a pending transaction (`tx_hash` and nonce)
 until the receipt lands, plus rate-limit counters. That pending-tx state
-is lost on restart. That is safe because every send checks `attested`
-first. A background worker is not in `render.yaml`.
+is lost on restart. A startup hold waits while the pending nonce is
+ahead of the latest nonce, and every send checks `attested` first. That
+reduces the chance of a duplicate. A restart in the middle of a broadcast
+can still cost one duplicate transaction that reverts or no-ops. A
+background worker is not in `render.yaml`.
 
 ### Blueprint sync (Spencer)
 
@@ -175,8 +178,10 @@ score, payload, or history cache. The caller saves the JSON
 The only in-memory attester state is pending-tx state (`tx_hash` and
 nonce) until the receipt lands, plus rate-limit counters. It is in memory
 and is lost on restart and on free-plan
-spin-down. That is safe because every send checks `attested` first and a
-broadcast is never resent. There is no Render Postgres, no `DATABASE_URL`,
+spin-down. The startup hold plus the `attested` pre-check reduce the
+chance of a duplicate. A restart in the middle of a broadcast can still
+cost one duplicate transaction that reverts or no-ops. There is no Render
+Postgres, no `DATABASE_URL`,
 and no dump or restore step.
 
 Future (out of scope): persistent DB only if we go mainnet or partner with a data provider like CoinMarketCap (API signups).

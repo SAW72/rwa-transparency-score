@@ -7,9 +7,10 @@ counters, and the in-flight map.
 
 The in-flight map is pending-transaction state: ``tx_hash`` and ``nonce``,
 plus the subject needed to poll ``attested`` for that broadcast. It is not
-a copy of the score. It is lost on restart. That is safe because every
-send checks ``attested`` first and never resends a hash that is already
-on chain.
+a copy of the score. It is lost on restart. The startup hold plus the
+``attested`` pre-check reduce the chance of a duplicate. A restart
+mid-broadcast can still cost one duplicate transaction that reverts or
+no-ops.
 """
 
 from __future__ import annotations
@@ -74,6 +75,7 @@ class Store:
         # tx_hash -> pending broadcast. Dropped when the receipt lands or the
         # deadline says the broadcast is gone. Not a score cache.
         self._inflight: dict[str, dict[str, Any]] = {}
+        self._dropped: dict[str, str] = {}
 
     def close(self) -> None:
         return None
@@ -243,9 +245,15 @@ class Store:
             first = next(iter(self._inflight.values()))
             return dict(first)
 
-    def drop_inflight(self, tx_hash: str) -> None:
+    def drop_inflight(self, tx_hash: str, *, reason: str | None = None) -> None:
         with self._lock:
             self._inflight.pop(tx_hash, None)
+            if reason:
+                self._dropped[tx_hash] = reason
+
+    def dropped_reason(self, tx_hash: str) -> str | None:
+        with self._lock:
+            return self._dropped.get(tx_hash)
 
 
 def open_store() -> Store:

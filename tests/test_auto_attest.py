@@ -851,6 +851,101 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
             proc.kill()
 
 
+def test_anvil_timeout_then_next_job_confirms(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    """Job A times out with automine off. Job B uses the next nonce and confirms.
+
+    The cached nonce stays on A's nonce. The next send must take
+    ``max(cached, pending count)`` so B is not stuck on that nonce.
+    """
+    port = _free_port()
+    rpc = f"http://127.0.0.1:{port}"
+    proc = subprocess.Popen(
+        [
+            "anvil",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--chain-id",
+            "84532",
+            "--silent",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not _anvil_ready(rpc):
+            if proc.poll() is not None:
+                pytest.fail("anvil exited before it was ready")
+            time.sleep(0.1)
+        assert _anvil_ready(rpc)
+        address = _forge_deploy(rpc)
+        _allow_worker(rpc, address)
+        settings = AttesterSettings(
+            private_key=_anvil_key(1),
+            contract=address,
+            rpc_url=rpc,
+            value_cap_wei=0,
+            gas_limit=300_000,
+            max_attempts=5,
+            backoff_seconds=0.0,
+            enforce_contract_pin=False,
+            max_fee_gwei=20,
+            wait_seconds=30,
+        )
+        chain = Web3Chain(settings)
+        chain._w3.provider.make_request("anvil_setAutomine", [False])
+        real_wait = chain._w3.eth.wait_for_transaction_receipt
+        waits = {"n": 0}
+
+        def _wait(tx_hash: object, timeout: float = 120, poll_latency: float = 0.1) -> object:
+            waits["n"] += 1
+            if waits["n"] == 1:
+                raise TimeoutError("receipt timeout")
+            chain._w3.provider.make_request("evm_mine", [])
+            return real_wait(tx_hash, timeout=timeout, poll_latency=poll_latency)
+
+        chain._w3.eth.wait_for_transaction_receipt = _wait  # type: ignore[method-assign]
+        store = Store()
+        digest_a, claimed_a, raw_a = _seed(fixture_scorer)
+        second = attestation_payload(fixture_scorer.score("NVDA"))
+        second["ticker"] = "AAPL"
+        second["as_of"] = 1
+        raw_b = canonical_bytes(second)
+        digest_b = hash_canonical(raw_b)
+        worker = AttestWorker(store=store, settings=settings, chain=chain, autostart=False)
+        first = worker.submit(
+            canonical=raw_a, score_hash=digest_a, ticker="NVDA", claimed_at=claimed_a
+        )
+        assert first.status == "pending"
+        assert first.tx_hash
+        assert store.get_inflight(first.tx_hash)["nonce"] == 0
+        second_result = worker.submit(
+            canonical=raw_b, score_hash=digest_b, ticker="AAPL", claimed_at=1
+        )
+        assert waits["n"] == 2
+        assert second_result.status == "confirmed"
+        assert second_result.tx_hash
+        assert second_result.tx_hash.lower() != first.tx_hash.lower()
+        first_tx = chain._w3.eth.get_transaction(first.tx_hash)
+        second_tx = chain._w3.eth.get_transaction(second_result.tx_hash)
+        assert int(first_tx["nonce"]) == 0
+        assert int(second_tx["nonce"]) == 1
+        assert int(chain._w3.eth.get_transaction_receipt(second_result.tx_hash)["status"]) == 1
+        assert worker.process_once(now=time.time() + 60) is True
+        assert store.get_inflight(first.tx_hash) is None
+        assert int(chain._w3.eth.get_transaction_receipt(first.tx_hash)["status"]) == 1
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def test_crash_recovery_polls_saved_hash_and_does_not_resend(
     tmp_path: Path, fixture_scorer: TransparencyScorer
 ) -> None:
@@ -908,4 +1003,5 @@ def test_broadcast_fails_only_after_deadline_when_nonce_is_taken(
     chain.transaction_count.return_value = 1
     assert worker.process_once(now=time.time() + 30) is True
     assert store.get_inflight("0x" + "ab" * 32) is None
+    assert store.dropped_reason("0x" + "ab" * 32) == "broadcast_dropped"
     chain.attest.assert_not_called()
