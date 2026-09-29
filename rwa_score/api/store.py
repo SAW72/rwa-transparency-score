@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 import sqlite3
@@ -22,7 +23,11 @@ from typing import Any, Iterable
 from .migrations import SQLITE_001 as SCHEMA, apply_postgres_migrations, apply_sqlite_migrations
 from .settings import DEFAULT_DB_PATH, is_postgres_url, normalize_postgres_url
 
+logger = logging.getLogger(__name__)
+
 _SCHEMA_NAME = re.compile(r"[a-z][a-z0-9_]{0,30}")
+# Hold a claimed row past the receipt wait so a second process cannot send it too.
+CLAIM_LEASE_SECONDS = 90.0
 _CLAIM_SQL = (
     "SELECT * FROM attest_jobs WHERE status = 'pending' AND next_attempt_at <= ? "
     "ORDER BY id LIMIT 1"
@@ -177,7 +182,11 @@ class Store:
             from psycopg.rows import dict_row
 
             try:
-                self._conn = psycopg.connect(normalize_postgres_url(url), row_factory=dict_row)
+                self._conn = psycopg.connect(
+                    normalize_postgres_url(url),
+                    autocommit=True,
+                    row_factory=dict_row,
+                )
             except Exception:
                 # The driver message includes the URL. Do not chain it.
                 raise RuntimeError("could not open DATABASE_URL") from None
@@ -186,7 +195,6 @@ class Store:
                     raise ValueError("schema name is not a safe identifier")
                 self._execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
                 self._execute(f"SET search_path TO {schema}")
-                self._conn.commit()
         else:
             if path is None:
                 raise ValueError("sqlite path is required when DATABASE_URL is unset")
@@ -203,7 +211,108 @@ class Store:
     def _execute(self, sql: str, params: tuple | list = ()):
         if self.backend == "postgres":
             sql = sql.replace("?", "%s")
-        return self._conn.execute(sql, params)
+        try:
+            return self._conn.execute(sql, params)
+        except Exception as exc:
+            if self.backend != "postgres":
+                raise
+            if self._connection_dead(exc) and not self._postgres_tx_open():
+                self._reconnect()
+                return self._conn.execute(sql, params)
+            self._rollback_failed()
+            raise
+
+    def _connection_dead(self, exc: BaseException) -> bool:
+        import psycopg
+
+        return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError))
+
+    def _postgres_tx_open(self) -> bool:
+        """True only while a real transaction is open. A dead connection is not one."""
+        import psycopg
+
+        try:
+            status = self._conn.info.transaction_status
+        except Exception:
+            return False
+        return status in (
+            psycopg.pq.TransactionStatus.ACTIVE,
+            psycopg.pq.TransactionStatus.INTRANS,
+            psycopg.pq.TransactionStatus.INERROR,
+        )
+
+    def _rollback_failed(self) -> None:
+        if self.backend != "postgres":
+            return
+        try:
+            import psycopg
+
+            if self._conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
+                self._conn.rollback()
+        except Exception:
+            return
+
+    def _reconnect(self) -> None:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        try:
+            self._conn = psycopg.connect(
+                normalize_postgres_url(self.database_url),
+                autocommit=True,
+                row_factory=dict_row,
+            )
+        except Exception:
+            raise RuntimeError("could not open DATABASE_URL") from None
+        if self._schema:
+            self._conn.execute(f"SET search_path TO {self._schema}")
+
+    def _commit(self) -> None:
+        """SQLite commits the write. Postgres is in autocommit, so this is a no-op."""
+        if self.backend == "postgres":
+            return
+        self._conn.commit()
+
+    def _unique_violation(self, exc: BaseException) -> bool:
+        if isinstance(exc, sqlite3.IntegrityError):
+            return "unique" in str(exc).lower()
+        try:
+            import psycopg
+
+            return isinstance(exc, psycopg.errors.UniqueViolation)
+        except Exception:
+            return False
+
+    def ping(self) -> bool:
+        """``SELECT 1``. Reconnects once when the Postgres connection is dead."""
+        try:
+            with self._lock:
+                row = self._execute("SELECT 1 AS ok").fetchone()
+        except Exception:
+            return False
+        if row is None:
+            return False
+        try:
+            return int(row["ok"]) == 1
+        except (KeyError, IndexError, TypeError, ValueError):
+            try:
+                return int(row[0]) == 1
+            except (IndexError, TypeError, ValueError):
+                return False
+
+    def backend_pid(self) -> int | None:
+        """Postgres backend pid, for tests that terminate the connection."""
+        if self.backend != "postgres":
+            return None
+        with self._lock:
+            row = self._execute("SELECT pg_backend_pid() AS pid").fetchone()
+        if row is None:
+            return None
+        return int(row["pid"])
 
     def _init(self) -> None:
         with self._lock:
@@ -212,7 +321,7 @@ class Store:
                 return
             apply_sqlite_migrations(self._conn)
             self._migrate_last_bands()
-            self._conn.commit()
+            self._commit()
 
     def _migrate_last_bands(self) -> None:
         """Scope band-crossing state per API key. Drop unattributable legacy rows."""
@@ -262,7 +371,7 @@ class Store:
                     "UPDATE api_keys SET name = ?, tier = ?, revoked_at = NULL WHERE id = ?",
                     (name, tier, row["id"]),
                 )
-                self._conn.commit()
+                self._commit()
                 return _key_from_row(
                     self._execute(
                         "SELECT * FROM api_keys WHERE id = ?", (row["id"],)
@@ -273,7 +382,7 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?)",
                 (digest, prefix, name, tier, now),
             )
-            self._conn.commit()
+            self._commit()
             return _key_from_row(
                 self._execute(
                     "SELECT * FROM api_keys WHERE key_hash = ?", (digest,)
@@ -287,7 +396,7 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?)",
                 (hash_key(raw), raw[:12], name, tier, _iso()),
             )
-            self._conn.commit()
+            self._commit()
 
     def lookup_key(self, raw: str) -> ApiKey | None:
         digest = hash_key(raw)
@@ -313,7 +422,7 @@ class Store:
                 "WHERE key_prefix = ? AND revoked_at IS NULL",
                 (_iso(), prefix),
             )
-            self._conn.commit()
+            self._commit()
             return int(cur.rowcount)
 
     def count_usage(self, key_id: int, *, since: float) -> int:
@@ -349,7 +458,7 @@ class Store:
                 (key_id, now, path),
             )
             self._execute("DELETE FROM usage_events WHERE ts < ?", (cutoff,))
-            self._conn.commit()
+            self._commit()
             return True, used + 1
 
     def record_usage(self, key_id: int, path: str, *, ts: float | None = None) -> None:
@@ -361,7 +470,7 @@ class Store:
                 (key_id, stamped, path),
             )
             self._execute("DELETE FROM usage_events WHERE ts < ?", (cutoff,))
-            self._conn.commit()
+            self._commit()
 
     def record_history(
         self,
@@ -382,7 +491,7 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (ticker.upper(), stamped, score, band, payload_json, payload_hash, key_id),
             )
-            self._conn.commit()
+            self._commit()
 
     def get_history(
         self,
@@ -438,7 +547,7 @@ class Store:
                 "score = excluded.score, updated_at = excluded.updated_at",
                 (key_id, ticker.upper(), band, score, time.time()),
             )
-            self._conn.commit()
+            self._commit()
 
     def add_watchlist(self, key_id: int, tickers: Iterable[str]) -> list[str]:
         symbols = [t.strip().upper() for t in tickers if t and t.strip()]
@@ -449,7 +558,7 @@ class Store:
                     "ON CONFLICT (key_id, ticker) DO NOTHING",
                     (key_id, symbol),
                 )
-            self._conn.commit()
+            self._commit()
         return self.get_watchlist(key_id)
 
     def set_watchlist(self, key_id: int, tickers: Iterable[str]) -> list[str]:
@@ -461,7 +570,7 @@ class Store:
                     "INSERT INTO watchlist_items (key_id, ticker) VALUES (?, ?)",
                     (key_id, symbol),
                 )
-            self._conn.commit()
+            self._commit()
         return list(symbols)
 
     def remove_watchlist(self, key_id: int, ticker: str) -> None:
@@ -470,7 +579,7 @@ class Store:
                 "DELETE FROM watchlist_items WHERE key_id = ? AND ticker = ?",
                 (key_id, ticker.upper()),
             )
-            self._conn.commit()
+            self._commit()
 
     def get_watchlist(self, key_id: int) -> list[str]:
         with self._lock:
@@ -513,7 +622,7 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
                 (key_id, url, secret, symbol, trigger, _iso()),
             ).fetchone()
-            self._conn.commit()
+            self._commit()
         return _hook_from_row(row)
 
     def list_webhooks(self, key_id: int) -> list[Webhook]:
@@ -536,7 +645,7 @@ class Store:
                 "UPDATE webhooks SET active = 0 WHERE id = ? AND key_id = ?",
                 (webhook_id, key_id),
             )
-            self._conn.commit()
+            self._commit()
             return cur.rowcount > 0
 
     def active_webhooks(self, key_id: int) -> list[Webhook]:
@@ -563,7 +672,7 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (webhook_id, ticker.upper(), event, status_code, time.time(), int(ok)),
             )
-            self._conn.commit()
+            self._commit()
 
     def save_attested_payload(
         self,
@@ -597,34 +706,63 @@ class Store:
                 (digest,),
             ).fetchone()
             if existing is not None:
-                stored = existing["canonical_json"]
-                if isinstance(stored, str):
-                    stored = stored.encode("utf-8")
-                if bytes(stored) != raw:
-                    raise ValueError("refusing to replace attested payload bytes for an existing hash")
-                if inputs_raw is not None:
-                    prior = existing["inputs_json"]
-                    if prior is None:
-                        self._execute(
-                            "UPDATE attested_payloads SET inputs_json = ? WHERE score_hash = ?",
-                            (inputs_raw, digest),
-                        )
-                        self._conn.commit()
+                return self._keep_existing_payload(existing, raw, inputs_raw, digest)
+            try:
+                self._execute(
+                    "INSERT INTO attested_payloads "
+                    "(score_hash, ticker, canonical_json, stored_at, inputs_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (digest, symbol, raw, _iso(), inputs_raw),
+                )
+                self._commit()
+            except Exception as exc:
+                if not self._unique_violation(exc):
+                    if self.backend == "sqlite":
+                        self._conn.rollback()
                     else:
-                        if isinstance(prior, str):
-                            prior = prior.encode("utf-8")
-                        if bytes(prior) != inputs_raw:
-                            raise ValueError(
-                                "refusing to replace attested inputs for an existing hash"
-                            )
-                return digest
-            self._execute(
-                "INSERT INTO attested_payloads "
-                "(score_hash, ticker, canonical_json, stored_at, inputs_json) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (digest, symbol, raw, _iso(), inputs_raw),
-            )
-            self._conn.commit()
+                        self._rollback_failed()
+                    raise
+                if self.backend == "sqlite":
+                    self._conn.rollback()
+                else:
+                    self._rollback_failed()
+                raced = self._execute(
+                    "SELECT canonical_json, inputs_json FROM attested_payloads WHERE score_hash = ?",
+                    (digest,),
+                ).fetchone()
+                if raced is None:
+                    raise
+                return self._keep_existing_payload(raced, raw, inputs_raw, digest)
+        return digest
+
+    def _as_payload_bytes(self, value: Any) -> bytes:
+        if isinstance(value, memoryview):
+            return value.tobytes()
+        if isinstance(value, str):
+            return value.encode("utf-8")
+        return bytes(value)
+
+    def _keep_existing_payload(
+        self,
+        existing: Any,
+        raw: bytes,
+        inputs_raw: bytes | None,
+        digest: str,
+    ) -> str:
+        stored = self._as_payload_bytes(existing["canonical_json"])
+        if stored != raw:
+            raise ValueError("refusing to replace attested payload bytes for an existing hash")
+        if inputs_raw is not None:
+            prior = existing["inputs_json"]
+            if prior is None:
+                self._execute(
+                    "UPDATE attested_payloads SET inputs_json = ? WHERE score_hash = ?",
+                    (inputs_raw, digest),
+                )
+                self._commit()
+            else:
+                if self._as_payload_bytes(prior) != inputs_raw:
+                    raise ValueError("refusing to replace attested inputs for an existing hash")
         return digest
 
     def get_attested_payload(self, score_hash: str) -> dict[str, Any] | None:
@@ -687,7 +825,7 @@ class Store:
                 ") VALUES (?, ?, ?, 'pending', 0, 0, ?, ?)",
                 (digest, symbol, int(claimed_at), now, now),
             )
-            self._conn.commit()
+            self._commit()
             row = self._execute(
                 "SELECT * FROM attest_jobs WHERE score_hash = ? ORDER BY id DESC LIMIT 1",
                 (digest,),
@@ -743,26 +881,41 @@ class Store:
                 "updated_at = ? WHERE id = ?",
                 (tx_hash, int(nonce), json.dumps(known), stamped, job_id),
             )
-            self._conn.commit()
+            self._commit()
 
     def claim_next_attest_job(self, *, now: float) -> dict[str, Any] | None:
         """Take the oldest due pending job and count one attempt. Single worker.
 
-        Postgres locks the row with ``FOR UPDATE SKIP LOCKED``. SQLite uses
-        this process lock around the same select-then-update. A landed
-        duplicate is still success because the worker checks ``isAttested``.
+        The claim sets ``next_attempt_at`` a lease ahead so a second process
+        cannot take the same row while this one is still sending. Postgres
+        locks the row with ``FOR UPDATE SKIP LOCKED`` inside one transaction.
+        SQLite uses this process lock around the same select-then-update.
+        A landed duplicate is still success because the worker checks ``isAttested``.
         """
         stamped = _iso()
+        lease_until = float(now) + CLAIM_LEASE_SECONDS
         claim_sql = CLAIM_SQL_POSTGRES if self.backend == "postgres" else _CLAIM_SQL
         with self._lock:
-            row = self._execute(claim_sql, (float(now),)).fetchone()
-            if row is None:
-                return None
-            self._execute(
-                "UPDATE attest_jobs SET attempts = attempts + 1, updated_at = ? WHERE id = ?",
-                (stamped, row["id"]),
-            )
-            self._conn.commit()
+            if self.backend == "postgres":
+                with self._conn.transaction():
+                    row = self._execute(claim_sql, (float(now),)).fetchone()
+                    if row is None:
+                        return None
+                    self._execute(
+                        "UPDATE attest_jobs SET attempts = attempts + 1, "
+                        "next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                        (lease_until, stamped, row["id"]),
+                    )
+            else:
+                row = self._execute(claim_sql, (float(now),)).fetchone()
+                if row is None:
+                    return None
+                self._execute(
+                    "UPDATE attest_jobs SET attempts = attempts + 1, "
+                    "next_attempt_at = ?, updated_at = ? WHERE id = ?",
+                    (lease_until, stamped, row["id"]),
+                )
+                self._commit()
             fresh = self._execute(
                 "SELECT * FROM attest_jobs WHERE id = ?",
                 (row["id"],),
@@ -822,7 +975,7 @@ class Store:
                         "UPDATE attested_payloads SET attested_at = ? WHERE score_hash = ?",
                         (int(attested_at), row["score_hash"]),
                     )
-            self._conn.commit()
+            self._commit()
 
     def recent_deliveries(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
@@ -835,7 +988,23 @@ class Store:
 
 
 def open_store(*, path: str | Path | None = None, database_url: str = "") -> Store:
-    """Postgres when ``database_url`` is a postgres URL. Otherwise the SQLite file."""
+    """Postgres when ``database_url`` is a postgres URL. Otherwise the SQLite file.
+
+    The SQLite fallback is logged. On Render, missing ``DATABASE_URL`` is also
+    a warning: that file disappears on spin-down. The attester refuses to
+    start in that case; this function still opens the file for local reads.
+    """
+    import os
+
     if is_postgres_url(database_url):
-        return Store(database_url=database_url)
-    return Store(path or DEFAULT_DB_PATH)
+        store = Store(database_url=database_url)
+        logger.info("store backend=postgres")
+        return store
+    store = Store(path or DEFAULT_DB_PATH)
+    logger.info("store backend=sqlite")
+    if (os.getenv("RENDER") or "").strip() or (os.getenv("RENDER_SERVICE_ID") or "").strip():
+        logger.warning(
+            "RENDER is set and DATABASE_URL is not Postgres. "
+            "The queue is ephemeral SQLite and does not survive spin-down."
+        )
+    return store
