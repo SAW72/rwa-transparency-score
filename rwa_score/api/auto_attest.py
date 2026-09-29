@@ -547,6 +547,58 @@ def _nonce_rejected(exc: BaseException) -> bool:
     return "nonce too low" in blob or "replacement underpriced" in blob
 
 
+def _unambiguous_rejection(exc: BaseException) -> bool:
+    """True when the node refused the raw transaction and did not accept it.
+
+    A timeout or a dropped connection stays ambiguous: the hash recorded
+    before ``send_raw_transaction`` might still be in the mempool.
+    """
+    blob = str(exc).lower()
+    needles = (
+        "insufficient funds",
+        "insufficient balance",
+        "nonce too low",
+        "replacement transaction underpriced",
+        "replacement underpriced",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "gas required exceeds allowance",
+        "max fee per gas less than block base fee",
+    )
+    return any(needle in blob for needle in needles)
+
+
+def _status_of(receipt: Any) -> int | None:
+    """Receipt status, or None when this object is not a mined receipt."""
+    if receipt is None or isinstance(receipt, bool):
+        return None
+    raw: Any
+    if isinstance(receipt, dict):
+        raw = receipt.get("status")
+    else:
+        raw = getattr(receipt, "status", None)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return int(raw)
+
+
+def _raw_receipt(chain: Any, tx_hash: str | None) -> Any:
+    if not tx_hash:
+        return None
+    getter = getattr(chain, "get_receipt", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(tx_hash)
+    except Exception:
+        return None
+
+
+def _receipt_succeeded(chain: Any, tx_hash: str | None) -> bool:
+    """True when a receipt for ``tx_hash`` is already mined with status 1."""
+    return _status_of(_raw_receipt(chain, tx_hash)) == 1
+
+
 def choose_nonce(*, stored_nonce: int | None, unresolved: bool, suggested: int) -> int:
     """Keep the in-flight nonce. A new nonce is only legal once that one is resolved."""
     if unresolved and stored_nonce is not None:
@@ -1060,11 +1112,12 @@ def send_one(
             )
         raise
     ok3, ts3, _who3 = chain.verify(job["score_hash"], job["ticker"])
-    return SendOutcome(
-        tx_hash=tx_hash,
-        attested_at=int(ts3) if ok3 else None,
-        already=False,
-    )
+    if ok3 is True:
+        attested_at = int(ts3) if isinstance(ts3, int) and not isinstance(ts3, bool) else 0
+        return SendOutcome(tx_hash=tx_hash, attested_at=attested_at, already=False)
+    if _receipt_succeeded(chain, tx_hash):
+        return SendOutcome(tx_hash=tx_hash, attested_at=0, already=False)
+    return SendOutcome(tx_hash=tx_hash, attested_at=None, already=False)
 
 
 def _receipt_hash(chain: Chain, job: dict[str, Any]) -> str | None:
@@ -1238,6 +1291,7 @@ class AttestWorker:
         self.autostart = autostart
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
+        self._submit_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
 
@@ -1317,14 +1371,6 @@ class AttestWorker:
                 message=FAILED_MESSAGE,
                 error=safe,
             )
-        existing = self.store.inflight_for_hash(score_hash)
-        if existing is not None:
-            return SubmitResult(
-                status="pending",
-                tx_hash=existing.get("tx_hash"),
-                reason="broadcast_pending",
-                message="Broadcast already in flight. No second transaction was sent.",
-            )
         local = _local_refusal(
             self.settings, score_hash, ticker, int(claimed_at)
         )
@@ -1336,18 +1382,6 @@ class AttestWorker:
                 message=FAILED_MESSAGE,
                 error=local,
             )
-        # Chain id, then attested. A posted hash is not a new send.
-        gate, attested_at, gate_error = self._preflight(score_hash, ticker)
-        if gate == "failed":
-            logger.info("attest failed: %s", gate_error)
-            return SubmitResult(
-                status="failed",
-                reason=FAILED_REASON,
-                message=FAILED_MESSAGE,
-                error=gate_error,
-            )
-        if gate == "confirmed":
-            return SubmitResult(status="confirmed", attested_at=attested_at)
         job: dict[str, Any] = {
             "score_hash": score_hash,
             "ticker": ticker,
@@ -1356,6 +1390,7 @@ class AttestWorker:
             "nonce": None,
             "known_tx_hashes": [],
         }
+        claimed = False
 
         def _on_submitted(tx_hash: str, nonce: int) -> None:
             self.store.note_broadcast(
@@ -1370,6 +1405,49 @@ class AttestWorker:
             job["nonce"] = nonce
             job["known_tx_hashes"] = [tx_hash]
 
+        def _rejected(exc: BaseException) -> SubmitResult | None:
+            """Drop the hash when the node refused the raw transaction outright."""
+            if not (job.get("tx_hash") and _unambiguous_rejection(exc)):
+                return None
+            self.store.drop_inflight(str(job["tx_hash"]))
+            safe = redact(str(exc), secret, rpc_url)
+            logger.info("attest rejected: %s", safe)
+            return SubmitResult(
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
+                error=safe,
+            )
+
+        # Check attested and claim the payload hash under one lock, before send.
+        # A second identical POST sees the claim and does not broadcast.
+        with self._submit_lock:
+            existing = self.store.inflight_for_hash(score_hash)
+            if existing is not None:
+                return SubmitResult(
+                    status="pending",
+                    tx_hash=existing.get("tx_hash"),
+                    reason="broadcast_pending",
+                    message="Broadcast already in flight. No second transaction was sent.",
+                )
+            gate, attested_at, gate_error = self._preflight(score_hash, ticker)
+            if gate == "failed":
+                logger.info("attest failed: %s", gate_error)
+                return SubmitResult(
+                    status="failed",
+                    reason=FAILED_REASON,
+                    message=FAILED_MESSAGE,
+                    error=gate_error,
+                )
+            if gate == "confirmed":
+                return SubmitResult(status="confirmed", attested_at=attested_at)
+            self.store.reserve_inflight(
+                score_hash=score_hash,
+                ticker=ticker,
+                claimed_at=int(claimed_at),
+                now=clock,
+            )
+            claimed = True
         try:
             outcome = send_one(
                 job,
@@ -1379,7 +1457,21 @@ class AttestWorker:
                 receipt_timeout=self.settings.wait_seconds,
                 skip_initial_verify=True,
             )
+            if outcome.tx_hash and not job.get("tx_hash") and not outcome.already:
+                self.store.note_broadcast(
+                    tx_hash=outcome.tx_hash,
+                    nonce=int(job["nonce"]) if job.get("nonce") is not None else 0,
+                    score_hash=score_hash,
+                    ticker=ticker,
+                    claimed_at=int(claimed_at),
+                    now=clock,
+                )
+                job["tx_hash"] = outcome.tx_hash
+                job["known_tx_hashes"] = [outcome.tx_hash]
         except TerminalAttestError as exc:
+            rejected = _rejected(exc)
+            if rejected is not None:
+                return rejected
             safe = redact(str(exc), secret, rpc_url)
             logger.info("attest failed: %s", safe)
             if job.get("tx_hash"):
@@ -1395,7 +1487,10 @@ class AttestWorker:
                 message=FAILED_MESSAGE,
                 error=safe,
             )
-        except Exception as exc:  # noqa: BLE001 — redacted; a broadcast stays pending
+        except Exception as exc:  # noqa: BLE001 — redacted; an accepted broadcast stays pending
+            rejected = _rejected(exc)
+            if rejected is not None:
+                return rejected
             safe = redact(str(exc), secret, rpc_url)
             logger.info("attest error: %s", safe)
             if job.get("tx_hash"):
@@ -1412,30 +1507,23 @@ class AttestWorker:
                 message=FAILED_MESSAGE,
                 error=safe,
             )
-        if outcome.tx_hash and not job.get("tx_hash") and not outcome.already:
-            self.store.note_broadcast(
-                tx_hash=outcome.tx_hash,
-                nonce=0,
-                score_hash=score_hash,
-                ticker=ticker,
-                claimed_at=int(claimed_at),
-                now=clock,
-            )
-            job["tx_hash"] = outcome.tx_hash
-            job["known_tx_hashes"] = [outcome.tx_hash]
+        finally:
+            if claimed and not job.get("tx_hash"):
+                self.store.release_reserve(score_hash)
         if outcome.already or (outcome.attested_at is not None and outcome.tx_hash):
-            if job.get("tx_hash") and outcome.tx_hash:
+            if job.get("tx_hash"):
                 self.store.drop_inflight(str(job["tx_hash"]))
             return SubmitResult(
                 status="confirmed",
                 tx_hash=outcome.tx_hash,
                 attested_at=outcome.attested_at,
             )
-        if outcome.already:
+        if job.get("tx_hash") and _status_of(_raw_receipt(self.chain(), str(job["tx_hash"]))) == 0:
+            self.store.drop_inflight(str(job["tx_hash"]))
             return SubmitResult(
-                status="confirmed",
-                tx_hash=outcome.tx_hash,
-                attested_at=outcome.attested_at,
+                status="failed",
+                reason=FAILED_REASON,
+                message=FAILED_MESSAGE,
             )
         if job.get("tx_hash") or outcome.tx_hash:
             return SubmitResult(
@@ -1490,29 +1578,40 @@ class AttestWorker:
         return len(rows)
 
     def process_once(self, *, now: float | None = None) -> bool:
-        """Reconcile one in-flight broadcast. False when nothing is in flight."""
+        """Reconcile every in-flight broadcast once.
+
+        True only when a row was removed. A pass that changes nothing returns
+        False so the loop sleeps instead of spinning on a stuck head.
+        """
         if not self.settings.enabled:
             return False
         clock = time.time() if now is None else float(now)
-        job = self.store.next_inflight()
-        if job is None:
+        jobs = [row for row in self.store.list_inflight() if row.get("tx_hash")]
+        if not jobs:
             return False
-        self._reconcile(job, clock)
-        return True
+        progressed = False
+        for job in jobs:
+            tx_hash = str(job["tx_hash"])
+            self._reconcile(job, clock)
+            if self.store.get_inflight(tx_hash) is None:
+                progressed = True
+        return progressed
 
     def _reconcile(self, job: dict[str, Any], clock: float) -> None:
-        """Poll the saved hash. Drop it only when ``_landed`` returns the receipt hash.
+        """Poll one saved hash. Remove it once any receipt exists or verify is true.
 
-        A true ``verify`` with no receipt hash stays in flight. The saved
-        broadcast hash is not copied into a confirmed result. Failed only
-        when the deadline has passed, the receipt is missing, ``attested``
-        is false, and the account nonce has moved past the saved nonce.
+        A success receipt and a revert both leave the queue. A true ``verify``
+        removes the row even when this hash has no receipt, so a duplicate that
+        already landed cannot pin the loop. The saved broadcast hash is still
+        not copied into a confirmed result. ``broadcast_dropped`` is only for
+        a missing receipt past the deadline, with the nonce already consumed.
         """
         tx_hash = job.get("tx_hash")
         if not tx_hash:
             return
         chain = self.chain()
         landed = _receipt_hash(chain, job)
+        status = _status_of(_raw_receipt(chain, str(tx_hash)))
         attested_at = None
         verified = False
         try:
@@ -1521,25 +1620,31 @@ class AttestWorker:
             result = None
         if isinstance(result, tuple) and result and result[0] is True:
             verified = True
-            if len(result) >= 2 and isinstance(result[1], int):
+            if len(result) >= 2 and isinstance(result[1], int) and not isinstance(result[1], bool):
                 attested_at = int(result[1])
-        if landed:
-            logger.info("attest broadcast confirmed from receipt hash=%s", landed)
-            if attested_at is not None:
-                job["attested_at"] = attested_at
+        if landed or verified or status is not None:
+            if landed or status == 1:
+                logger.info("attest broadcast confirmed from receipt hash=%s", landed or tx_hash)
+                if attested_at is not None:
+                    job["attested_at"] = attested_at
+                self._bump_nonce(chain, job)
+            elif status is not None:
+                logger.info("attest broadcast receipt status=%s hash=%s", status, tx_hash)
+                self._bump_nonce(chain, job)
+            else:
+                logger.info("attest broadcast already verified hash=%s", tx_hash)
             self.store.drop_inflight(str(tx_hash))
-            try:
-                chain_obj = self.chain()
-                if hasattr(chain_obj, "_nonce") and job.get("nonce") is not None:
-                    chain_obj._nonce = int(job["nonce"]) + 1
-            except Exception:
-                pass
-            return
-        if verified:
             return
         if self._broadcast_dropped(job, chain, clock):
             logger.info("attest broadcast dropped hash=%s reason=broadcast_dropped", tx_hash)
             self.store.drop_inflight(str(tx_hash), reason="broadcast_dropped")
+            return
+
+    def _bump_nonce(self, chain: Chain, job: dict[str, Any]) -> None:
+        try:
+            if hasattr(chain, "_nonce") and job.get("nonce") is not None:
+                chain._nonce = int(job["nonce"]) + 1
+        except Exception:
             return
 
     def _broadcast_dropped(self, job: dict[str, Any], chain: Chain, clock: float) -> bool:

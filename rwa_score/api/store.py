@@ -25,6 +25,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Reasons for broadcasts we already gave up on. Bounded so a long-lived
+# process does not keep every dropped hash forever.
+_DROPPED_MAX = 256
+
 
 def hash_key(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -220,7 +224,46 @@ class Store:
             "known_tx_hashes": [tx_hash],
         }
         with self._lock:
+            self._inflight.pop("reserved:" + score_hash, None)
             self._inflight[tx_hash] = row
+
+    def reserve_inflight(
+        self,
+        *,
+        score_hash: str,
+        ticker: str,
+        claimed_at: int,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Claim ``score_hash`` or return the row that already owns it.
+
+        The claim and the lookup share this lock, so two callers cannot both
+        decide the hash is free.
+        """
+        clock = time.time() if now is None else float(now)
+        with self._lock:
+            for row in self._inflight.values():
+                if row["score_hash"] == score_hash:
+                    return dict(row)
+            self._inflight["reserved:" + score_hash] = {
+                "tx_hash": None,
+                "nonce": None,
+                "score_hash": score_hash,
+                "ticker": ticker.upper(),
+                "claimed_at": int(claimed_at),
+                "broadcast_at": clock,
+                "known_tx_hashes": [],
+                "reserved": True,
+            }
+        return None
+
+    def release_reserve(self, score_hash: str) -> None:
+        """Drop a claim that never received a transaction hash."""
+        with self._lock:
+            key = "reserved:" + score_hash
+            row = self._inflight.get(key)
+            if row is not None and not row.get("tx_hash"):
+                self._inflight.pop(key, None)
 
     def get_inflight(self, tx_hash: str) -> dict[str, Any] | None:
         with self._lock:
@@ -250,6 +293,8 @@ class Store:
             self._inflight.pop(tx_hash, None)
             if reason:
                 self._dropped[tx_hash] = reason
+                while len(self._dropped) > _DROPPED_MAX:
+                    self._dropped.pop(next(iter(self._dropped)))
 
     def dropped_reason(self, tx_hash: str) -> str | None:
         with self._lock:

@@ -192,7 +192,7 @@ Do this on your own computer. Do not paste the key into git, a PR, chat, or
 an agent.
 
 ```bash
-cast wallet new
+cast wallet new "$HOME/.foundry/keystores" "<new-keystore-name>"
 cast wallet address --account "<new-keystore-name>"
 ```
 

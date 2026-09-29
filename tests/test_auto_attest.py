@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from unittest.mock import Mock
@@ -822,8 +823,8 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
         assert int(first_tx["maxPriorityFeePerGas"]) <= int(first_tx["maxFeePerGas"])
         assert int(first_tx["maxFeePerGas"]) > 0
         assert nonce_lookups == ["pending"]
-        # Still unmined. Reconcile must not sign a replacement.
-        assert worker.process_once(now=time.time() + 30) is True
+        # Still unmined. Reconcile must not sign a replacement, and must not spin.
+        assert worker.process_once(now=time.time() + 30) is False
         waiting = store.get_inflight(saved_hash)
         assert waiting is not None
         assert waiting["tx_hash"] == saved_hash
@@ -996,7 +997,7 @@ def test_broadcast_fails_only_after_deadline_when_nonce_is_taken(
         _settings("0x" + "62" * 32, broadcast_deadline_seconds=30),
         chain,
     )
-    assert worker.process_once(now=time.time()) is True
+    assert worker.process_once(now=time.time()) is False
     waiting = store.get_inflight("0x" + "ab" * 32)
     assert waiting is not None
     assert waiting["nonce"] == 0
@@ -1005,3 +1006,279 @@ def test_broadcast_fails_only_after_deadline_when_nonce_is_taken(
     assert store.get_inflight("0x" + "ab" * 32) is None
     assert store.dropped_reason("0x" + "ab" * 32) == "broadcast_dropped"
     chain.attest.assert_not_called()
+
+
+def test_concurrent_identical_submits_broadcast_once(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.get_receipt.return_value = None
+    tx_hash = "0x" + "ab" * 32
+
+    def _attest(*_args: object, **kwargs: object) -> str:
+        time.sleep(0.05)
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted(tx_hash, 4)
+        return tx_hash
+
+    chain.attest.side_effect = _attest
+    store = Store()
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
+    worker = _worker(store, _settings("0x" + "71" * 32), chain)
+    barrier = threading.Barrier(4)
+    results: list[object] = []
+
+    def _go() -> None:
+        barrier.wait()
+        results.append(
+            worker.submit(
+                canonical=raw_bytes,
+                score_hash=digest,
+                ticker="NVDA",
+                claimed_at=claimed,
+            )
+        )
+
+    threads = [threading.Thread(target=_go) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert chain.attest.call_count == 1
+    assert store.queue_depth() == 1
+    assert all(getattr(item, "status") == "pending" for item in results)
+
+
+def test_reverted_duplicate_is_removed_from_inflight(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    chain = Mock()
+    chain.verify.return_value = (True, 5, "0x" + "11" * 20)
+    chain.landed_hash.return_value = None
+    chain.get_receipt.return_value = {"status": 0}
+    chain.attest.side_effect = AssertionError("must not send again")
+    store = Store()
+    digest, claimed, _raw = _seed(fixture_scorer)
+    tx_hash = "0x" + "cd" * 32
+    store.note_broadcast(
+        tx_hash=tx_hash,
+        nonce=1,
+        score_hash=digest,
+        ticker="NVDA",
+        claimed_at=claimed,
+        now=time.time(),
+    )
+    worker = _worker(store, _settings("0x" + "72" * 32), chain)
+    assert worker.process_once() is True
+    assert store.get_inflight(tx_hash) is None
+    assert store.queue_depth() == 0
+    chain.attest.assert_not_called()
+
+
+def test_confirmed_receipt_leaves_inflight(fixture_scorer: TransparencyScorer) -> None:
+    chain = Mock()
+    chain.verify.return_value = (True, 9, "0x" + "22" * 20)
+    tx_hash = "0x" + "ef" * 32
+    chain.landed_hash.return_value = tx_hash
+    chain.get_receipt.return_value = {"status": 1}
+    store = Store()
+    digest, claimed, _raw = _seed(fixture_scorer)
+    store.note_broadcast(
+        tx_hash=tx_hash,
+        nonce=2,
+        score_hash=digest,
+        ticker="NVDA",
+        claimed_at=claimed,
+        now=time.time(),
+    )
+    worker = _worker(store, _settings("0x" + "73" * 32), chain)
+    assert worker.process_once() is True
+    assert store.get_inflight(tx_hash) is None
+
+
+def test_stuck_head_does_not_block_a_confirmed_sibling(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    chain = Mock()
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.landed_hash.return_value = None
+    stuck = "0x" + "11" * 32
+    done = "0x" + "22" * 32
+
+    def _receipt(tx_hash: str) -> dict[str, int] | None:
+        if tx_hash == done:
+            return {"status": 1}
+        return None
+
+    chain.get_receipt.side_effect = _receipt
+    chain.get_tx.return_value = {"hash": stuck}
+    chain.transaction_count.return_value = 0
+    store = Store()
+    digest, claimed, _raw = _seed(fixture_scorer)
+    now = time.time()
+    store.note_broadcast(
+        tx_hash=stuck,
+        nonce=0,
+        score_hash="0x" + "33" * 32,
+        ticker="NVDA",
+        claimed_at=claimed,
+        now=now,
+    )
+    store.note_broadcast(
+        tx_hash=done,
+        nonce=1,
+        score_hash=digest,
+        ticker="AAPL",
+        claimed_at=claimed,
+        now=now,
+    )
+    worker = _worker(store, _settings("0x" + "74" * 32), chain)
+    assert worker.process_once(now=now) is True
+    assert store.get_inflight(stuck) is not None
+    assert store.get_inflight(done) is None
+
+
+def test_reconcile_loop_sleeps_when_nothing_progresses(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    chain = Mock()
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.landed_hash.return_value = None
+    chain.get_receipt.return_value = None
+    chain.get_tx.return_value = {"hash": "0x" + "ab" * 32}
+    chain.transaction_count.return_value = 0
+    store = Store()
+    digest, claimed, _raw = _seed(fixture_scorer)
+    tx_hash = "0x" + "ab" * 32
+    store.note_broadcast(
+        tx_hash=tx_hash,
+        nonce=0,
+        score_hash=digest,
+        ticker="NVDA",
+        claimed_at=claimed,
+        now=time.time(),
+    )
+    worker = AttestWorker(
+        store=store,
+        settings=_settings("0x" + "75" * 32),
+        chain=chain,
+        autostart=True,
+    )
+    worker.kick()
+    try:
+        deadline = time.time() + 2.0
+        while chain.verify.call_count < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        seen = chain.verify.call_count
+        assert seen >= 1
+        time.sleep(0.6)
+        assert chain.verify.call_count < 8
+        assert chain.verify.call_count - seen <= 1
+        assert store.get_inflight(tx_hash) is not None
+    finally:
+        worker.stop()
+
+
+def test_insufficient_funds_returns_failed_and_drops_inflight(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    tx_hash = "0x" + "cd" * 32
+
+    def _attest(*_args: object, **kwargs: object) -> str:
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted(tx_hash, 2)
+        raise ValueError("insufficient funds for gas * price + value")
+
+    chain.attest.side_effect = _attest
+    store = Store()
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
+    worker = _worker(store, _settings("0x" + "76" * 32), chain)
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
+    )
+    assert result.status == "failed"
+    assert store.get_inflight(tx_hash) is None
+    assert store.inflight_for_hash(digest) is None
+    assert store.queue_depth() == 0
+
+
+def test_timeout_after_broadcast_stays_pending(fixture_scorer: TransparencyScorer) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    tx_hash = "0x" + "ef" * 32
+
+    def _attest(*_args: object, **kwargs: object) -> str:
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted(tx_hash, 3)
+        raise TimeoutError("timed out")
+
+    chain.attest.side_effect = _attest
+    store = Store()
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
+    worker = _worker(store, _settings("0x" + "77" * 32), chain)
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
+    )
+    assert result.status == "pending"
+    assert result.tx_hash == tx_hash
+    assert store.get_inflight(tx_hash) is not None
+
+
+def test_mined_receipt_at_response_time_is_confirmed(
+    fixture_scorer: TransparencyScorer,
+) -> None:
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    tx_hash = "0x" + "ee" * 32
+    chain.get_receipt.return_value = {"status": 1}
+
+    def _attest(*_args: object, **kwargs: object) -> str:
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted(tx_hash, 1)
+        return tx_hash
+
+    chain.attest.side_effect = _attest
+    store = Store()
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
+    worker = _worker(store, _settings("0x" + "78" * 32, wait_seconds=0), chain)
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
+    )
+    assert result.status == "confirmed"
+    assert result.tx_hash == tx_hash
+    assert store.get_inflight(tx_hash) is None
+
+
+def test_dropped_reasons_stay_bounded() -> None:
+    store = Store()
+    for index in range(300):
+        tx_hash = "0x" + f"{index:064x}"
+        store.note_broadcast(
+            tx_hash=tx_hash,
+            nonce=index,
+            score_hash="0x" + "ab" * 32,
+            ticker="NVDA",
+            claimed_at=1,
+            now=float(index),
+        )
+        store.drop_inflight(tx_hash, reason="broadcast_dropped")
+    assert len(store._dropped) == 256
+    assert store.dropped_reason("0x" + f"{299:064x}") == "broadcast_dropped"
+    assert store.dropped_reason("0x" + f"{0:064x}") is None
+    assert store.dropped_reason("0x" + f"{43:064x}") is None
+    assert store.dropped_reason("0x" + f"{44:064x}") == "broadcast_dropped"

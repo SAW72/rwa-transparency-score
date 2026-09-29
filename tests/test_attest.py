@@ -787,3 +787,21 @@ def test_verify_hash_for_another_ticker_exits_4(capsys, tmp_path: Path) -> None:
     assert body["ticker_ok"] is False
     assert body["payload_ticker"] == "TSLA"
     assert body["match"] is False
+
+
+def test_verify_hash_mismatch_without_json_exits_4(capsys, tmp_path: Path) -> None:
+    payload = _base_payload()
+    raw = canonical_bytes(payload)
+    digest = hash_canonical(raw)
+    db = _write_bundle(
+        tmp_path / "mismatch.payload.json",
+        ticker="NVDA",
+        canonical=raw,
+        inputs=None,
+        score_hash=digest,
+    )
+    other = "0x" + "22" * 32
+    code = main(["NVDA", "--hash", other, "--payload-file", str(db)])
+    out = capsys.readouterr().out
+    assert code == EXIT_NO_MATCH
+    assert "does not match" in out

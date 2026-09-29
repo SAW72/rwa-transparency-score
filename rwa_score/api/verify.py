@@ -709,8 +709,8 @@ def _emit(result: dict[str, Any], *, as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, indent=2))
         return
-    if not result.get("stored"):
-        print(result["note"])
+    if not result.get("stored") or "score" not in result:
+        print(result.get("note") or "")
         return
     print(f"{result['ticker']} score={result['score']} [{result['band']}]")
     print(f"score_hash {result['score_hash']}")
