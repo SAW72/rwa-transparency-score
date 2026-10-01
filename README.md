@@ -320,7 +320,20 @@ python scripts/verify_attestation.py NVDA --payload-file nvda.json --rpc-url "$B
 
 Exit `2` (nothing stored / missing row) and exit `8` (inputs missing) are retired. There is no stored row, and a file without inputs is still checked from the canonical bytes.
 
-When `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, and `BASE_SEPOLIA_RPC_URL` are set, `POST /v1/attest/{ticker}` checks `attested` and broadcasts `attest(scoreHash, ticker, as_of)` for the hash computed in that request. It returns `pending` or `confirmed` immediately, or after `RWA_ATTEST_WAIT_SECONDS` (default `0`). Only that request's bytes are hashed. There is no arbitrary-hash input. If the attester is disabled, the response still returns the score and payload with status `disabled` and sends nothing. The key is env-only. Sends are Spencer-only: [`contracts/ATTESTER_RUNBOOK.md`](contracts/ATTESTER_RUNBOOK.md).
+`POST /v1/attest/{ticker}` broadcasts only when `RWA_ATTESTER_PRIVATE_KEY`, `RWA_ATTESTATION_CONTRACT`, and `BASE_SEPOLIA_RPC_URL` are set, `RWA_ATTEST_ENABLED=1`, and `RWA_USE_FIXTURES` is off. It checks `attested` and broadcasts `attest(scoreHash, ticker, as_of)` for the hash computed in that request. It returns `pending` or `confirmed` immediately, or after `RWA_ATTEST_WAIT_SECONDS` (default `0`). Only that request's bytes are hashed. There is no arbitrary-hash input. If the key, contract, or RPC is unset, the response still returns the score and payload with status `disabled` and sends nothing. If those three are set and `RWA_ATTEST_ENABLED` is off (the default), the response is HTTP 503 `attester_disabled` and sends nothing. The live Base Sepolia `attestationFee()` is `0.001 ETH` until the owner calls `setFee(0)`; the default `RWA_ATTEST_VALUE_CAP_WEI` of `0` refuses that fee. The key is env-only. Sends are Spencer-only: [`contracts/ATTESTER_RUNBOOK.md`](contracts/ATTESTER_RUNBOOK.md).
+
+`GET /health` reports `attester_low_balance` (boolean), `attester_balance_wei`, and `attester_min_balance_wei` so a monitor can alert when the attester is under the floor. Caps below are in-process: a restart clears them, and a second API instance does not share them.
+
+| Name | Default | Meaning |
+|---|---|---|
+| `RWA_ATTEST_ENABLED` | off | Kill switch. `1` arms sends. |
+| `RWA_ATTEST_MIN_BALANCE_WEI` | `1000000000000000` | Refuse when the attester balance is below this many wei. `0` disables the floor. |
+| `RWA_ATTEST_MAX_PER_HOUR` | `6` | Global broadcasts per hour. `0` refuses every send. |
+| `RWA_ATTEST_MAX_PER_DAY` | `24` | Global broadcasts per day. `0` refuses every send. |
+| `RWA_ATTEST_MIN_INTERVAL_SECONDS` | `600` | Minimum gap between broadcasts of one ticker. `0` disables the interval. |
+| `RWA_ATTEST_MAX_PER_KEY_PER_DAY` | `8` | Broadcasts per paid API key per day. `0` refuses every keyed send. |
+| `RWA_ATTEST_VALUE_CAP_WEI` | `0` | Max wei paid to `attest`. Above this, refuse. |
+| `RWA_ATTEST_MAX_FEE_GWEI` | `20` | EIP-1559 ceiling. Must be in `(0, 100]`. |
 
 There is no score store. The caller saves the POST body and passes `--payload-file`. In-flight transaction state (tx hash and nonce) is in memory and is lost on restart. Notes: [`docs/API_HISTORY_STORAGE.md`](docs/API_HISTORY_STORAGE.md).
 

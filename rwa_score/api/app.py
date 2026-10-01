@@ -28,10 +28,14 @@ from .attest import (
     resolve_scorer_version,
 )
 from .auto_attest import (
+    FIXTURES_BLOCK_MESSAGE,
+    KILL_SWITCH_MESSAGE,
+    SAFETY_HTTP,
     AttestWorker,
     AttesterSettings,
     SubmitResult,
     chain_status,
+    safety_status,
 )
 from .confidence import compute_confidence
 from .settings import ApiSettings
@@ -180,19 +184,6 @@ def _rpc_status(worker: AttestWorker, settings: AttesterSettings) -> str:
     return "ok"
 
 
-def _attester_balance(worker: AttestWorker, _settings: AttesterSettings) -> str:
-    """``ok`` or ``unknown``. Does not open a new RPC client."""
-    chain = getattr(worker, "_chain", None)
-    reader = getattr(chain, "balance_wei", None) if chain is not None else None
-    if not callable(reader):
-        return "unknown"
-    try:
-        int(reader())
-    except Exception:
-        return "unknown"
-    return "ok"
-
-
 def _extract_key(
     x_api_key: str | None,
     authorization: str | None,
@@ -326,10 +317,9 @@ def create_app(
         payload["api"] = True
         payload["version"] = __version__
         payload["process"] = "ok"
-        payload["attester"] = "enabled" if attester_cfg.enabled else "disabled"
         payload["chain_id"] = cfg.attestation_chain_id
         payload["rpc"] = _rpc_status(worker, attester_cfg)
-        payload["attester_balance"] = _attester_balance(worker, attester_cfg)
+        payload.update(safety_status(worker, attester_cfg))
         payload["queue_depth"] = db.queue_depth()
         return payload
 
@@ -421,6 +411,10 @@ def create_app(
 
         The request body is not a hash. Only bytes computed here are sent.
         """
+        if attester_cfg.fixtures_blocked:
+            raise _http_error(503, "fixtures_with_attester", FIXTURES_BLOCK_MESSAGE)
+        if attester_cfg.configured and not attester_cfg.attest_enabled:
+            raise _http_error(503, "attester_disabled", KILL_SWITCH_MESSAGE)
         report = score_ticker(ticker, key, for_attest=True)
         if not isinstance(report, _SealedScore):
             raise _http_error(500, "error", "Score was not sealed.")
@@ -437,9 +431,14 @@ def create_app(
             score_hash=digest,
             ticker=str(report["ticker"]),
             claimed_at=int(payload["as_of"]),
+            api_key_id=key.id,
         )
-        # Redacted detail stays in logs. The HTTP body gets the generic message.
-        return _attest_body(report, result=result)
+        body = _attest_body(report, result=result)
+        http_status = SAFETY_HTTP.get(result.reason or "")
+        if http_status is not None:
+            body["error"] = result.reason
+            return JSONResponse(status_code=http_status, content=body)
+        return body
 
     @app.get("/v1/attest/{ticker}/status")
     def attest_status(
@@ -464,6 +463,7 @@ def create_app(
             "chain": cfg.attestation_chain,
             "chain_id": cfg.attestation_chain_id,
             "contract": cfg.attestation_contract or attester_cfg.contract or None,
+            **safety_status(worker, attester_cfg),
         }
         if chain is None:
             return {

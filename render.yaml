@@ -84,7 +84,21 @@ services:
         sync: false
       - key: RWA_ATTESTATION_CHAIN
         sync: false
+      - key: RWA_ATTEST_ENABLED
+        sync: false
       - key: RWA_ATTEST_VALUE_CAP_WEI
+        sync: false
+      - key: RWA_ATTEST_MIN_BALANCE_WEI
+        sync: false
+      - key: RWA_ATTEST_MAX_PER_HOUR
+        sync: false
+      - key: RWA_ATTEST_MAX_PER_DAY
+        sync: false
+      - key: RWA_ATTEST_MIN_INTERVAL_SECONDS
+        sync: false
+      - key: RWA_ATTEST_MAX_PER_KEY_PER_DAY
+        sync: false
+      - key: RWA_ATTEST_MAX_FEE_GWEI
         sync: false
       - key: RWA_ATTEST_GAS_LIMIT
         sync: false

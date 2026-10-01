@@ -71,6 +71,14 @@ def _settings(key: str = "", **overrides: object) -> AttesterSettings:
         gas_limit=300_000,
         max_attempts=5,
         backoff_seconds=0.0,
+        # Legacy cases opt out of the production floors. Safety tests set them.
+        min_balance_wei=0,
+        max_per_hour=10_000,
+        max_per_day=10_000,
+        min_interval_seconds=0,
+        max_per_key_per_day=10_000,
+        attest_enabled=True,
+        use_fixtures=False,
     )
     data.update(overrides)
     return AttesterSettings(**data)  # type: ignore[arg-type]
@@ -572,6 +580,10 @@ def test_b3_secret_rpc_key_absent_from_db_logs_and_status(
     monkeypatch.setenv("BASE_SEPOLIA_RPC_URL", rpc)
     monkeypatch.setenv("RWA_ATTESTER_PRIVATE_KEY", "0x" + "44" * 32)
     monkeypatch.setenv("RWA_ATTESTATION_CONTRACT", PINNED_ATTESTATION_CONTRACT)
+    monkeypatch.setenv("RWA_ATTEST_ENABLED", "1")
+    monkeypatch.setenv("RWA_USE_FIXTURES", "0")
+    monkeypatch.setenv("RWA_ATTEST_MIN_BALANCE_WEI", "0")
+    monkeypatch.setenv("RWA_ATTEST_MIN_INTERVAL_SECONDS", "0")
     settings = AttesterSettings.from_env()
     assert settings.enabled is True
     chain = Mock()
