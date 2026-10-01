@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -69,6 +70,8 @@ DEFAULT_MAX_PER_DAY = 24
 # Paid-key POST /v1/attest for one ticker. 0 disables the interval.
 DEFAULT_MIN_INTERVAL_SECONDS = 600
 DEFAULT_MAX_PER_KEY_PER_DAY = 8
+# GET /health reuses one balance read for this long. A send always reads again.
+BALANCE_HEALTH_CACHE_SECONDS = 5.0
 HOUR_SECONDS = 3600.0
 DAY_SECONDS = 86_400.0
 _REDACTED = "[redacted]"
@@ -82,11 +85,15 @@ FIXTURES_BLOCK_MESSAGE = (
 LOW_BALANCE_MESSAGE = (
     "Attester balance is below RWA_ATTEST_MIN_BALANCE_WEI. No transaction was sent."
 )
+UNAVAILABLE_BALANCE_MESSAGE = (
+    "Attester balance could not be read. No transaction was sent."
+)
 # Stable machine-readable codes returned on POST /v1/attest. No send on any of these.
 SAFETY_HTTP = {
     "attester_disabled": 503,
     "fixtures_with_attester": 503,
     "attester_low_balance": 503,
+    "attester_balance_unavailable": 503,
     "attest_fee_cap": 503,
     "attest_gas_fee_cap": 503,
     "attest_hourly_cap": 429,
@@ -435,7 +442,7 @@ class AttesterSettings:
         max_fee_gwei: float = DEFAULT_MAX_FEE_GWEI,
         broadcast_deadline_seconds: int = DEFAULT_BROADCAST_DEADLINE_SECONDS,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
-        attest_enabled: bool = True,
+        attest_enabled: bool = False,
         use_fixtures: bool = False,
         min_balance_wei: int = DEFAULT_MIN_BALANCE_WEI,
         max_per_hour: int = DEFAULT_MAX_PER_HOUR,
@@ -454,9 +461,12 @@ class AttesterSettings:
         self.backoff_seconds = float(backoff_seconds)
         self.chain_id = int(chain_id)
         self.enforce_contract_pin = bool(enforce_contract_pin)
-        fee = float(max_fee_gwei)
-        if fee < 0:
-            fee = float(DEFAULT_MAX_FEE_GWEI)
+        try:
+            fee = float(max_fee_gwei)
+        except (TypeError, ValueError):
+            fee = float("nan")
+        # Keep NaN, infinity, and non-positive values. submit refuses them.
+        # Do not rewrite a bad ceiling to the 20 gwei default.
         self.max_fee_gwei = fee
         deadline = int(broadcast_deadline_seconds)
         if deadline < 0:
@@ -777,27 +787,39 @@ def clamp_eip1559_fees(
     return int(max_fee), int(priority)
 
 
-def eip1559_fees_or_refuse(*, max_fee_gwei: float, base_fee_wei: int) -> tuple[int, int]:
-    """``(maxFeePerGas, maxPriorityFeePerGas)`` or a refusal. Never clamps past the ceiling.
+def gas_ceiling_message() -> str:
+    return (
+        f"RWA_ATTEST_MAX_FEE_GWEI must be a finite value within (0, {HARD_MAX_FEE_GWEI:g}]. "
+        "No transaction was sent."
+    )
 
-    ``RWA_ATTEST_MAX_FEE_GWEI`` must sit in ``(0, HARD_MAX_FEE_GWEI]``. If the
-    network base fee plus the priority fee would need more than that ceiling,
-    the caller must not sign.
+
+def gas_ceiling_refusal(max_fee_gwei: float) -> str | None:
+    """Error text when the configured ceiling cannot be used. ``None`` when it can.
+
+    NaN, infinity, and values ``<= 0`` are refusals. They are not replaced
+    with the 20 gwei default.
     """
     try:
         requested = float(max_fee_gwei)
-    except (TypeError, ValueError) as exc:
-        raise SafetyRefusal(
-            "attest_gas_fee_cap",
-            f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
-            "No transaction was sent.",
-        ) from exc
-    if requested <= 0 or requested > HARD_MAX_FEE_GWEI:
-        raise SafetyRefusal(
-            "attest_gas_fee_cap",
-            f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
-            "No transaction was sent.",
-        )
+    except (TypeError, ValueError):
+        return gas_ceiling_message()
+    if not math.isfinite(requested) or requested <= 0 or requested > HARD_MAX_FEE_GWEI:
+        return gas_ceiling_message()
+    return None
+
+
+def eip1559_fees_or_refuse(*, max_fee_gwei: float, base_fee_wei: int) -> tuple[int, int]:
+    """``(maxFeePerGas, maxPriorityFeePerGas)`` or a refusal. Never clamps past the ceiling.
+
+    ``RWA_ATTEST_MAX_FEE_GWEI`` must sit in ``(0, HARD_MAX_FEE_GWEI]`` and be
+    finite. If the network base fee plus the priority fee would need more
+    than that ceiling, the caller must not sign.
+    """
+    refused = gas_ceiling_refusal(max_fee_gwei)
+    if refused:
+        raise SafetyRefusal("attest_gas_fee_cap", refused)
+    requested = float(max_fee_gwei)
     ceiling = int(requested * 1_000_000_000)
     hard_ceiling = int(HARD_MAX_FEE_GWEI * 1_000_000_000)
     if ceiling > hard_ceiling:
@@ -852,37 +874,68 @@ def _mock_int(chain: Any, name: str) -> int | None:
     return int(value)
 
 
+def _unavailable_balance(exc: BaseException | None = None) -> SafetyRefusal:
+    refusal = SafetyRefusal("attester_balance_unavailable", UNAVAILABLE_BALANCE_MESSAGE)
+    if exc is not None:
+        raise refusal from exc
+    return refusal
+
+
 def read_balance_wei(chain: Any) -> int:
-    """Attester balance. A failed read refuses the send."""
+    """Attester balance. A failed read refuses the send.
+
+    The code is ``attester_balance_unavailable``, not ``attester_low_balance``.
+    A low balance is a separate check against the floor.
+    """
     if _is_mock(chain):
-        found = _mock_int(chain, "balance_wei")
-        if found is None:
-            raise SafetyRefusal(
-                "attester_low_balance",
-                "Attester balance is unavailable. No transaction was sent.",
-            )
-        return found
+        child = getattr(chain, "_mock_children", {}).get("balance_wei")
+        if child is None:
+            raise _unavailable_balance()
+        try:
+            value = chain.balance_wei()
+        except SafetyRefusal:
+            raise
+        except Exception as exc:
+            raise _unavailable_balance(exc)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _unavailable_balance()
+        return int(value)
     reader = getattr(chain, "balance_wei", None)
     if not callable(reader):
-        raise SafetyRefusal(
-            "attester_low_balance",
-            "Attester balance is unavailable. No transaction was sent.",
-        )
+        raise _unavailable_balance()
     try:
         value = reader()
     except SafetyRefusal:
         raise
     except Exception as exc:
-        raise SafetyRefusal(
-            "attester_low_balance",
-            "Attester balance is unavailable. No transaction was sent.",
-        ) from exc
+        raise _unavailable_balance(exc)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise SafetyRefusal(
-            "attester_low_balance",
-            "Attester balance is unavailable. No transaction was sent.",
-        )
+        raise _unavailable_balance()
     return int(value)
+
+
+def probe_balance(chain: Any) -> tuple[int | None, str]:
+    """``(wei, "ok" | "unavailable" | "unknown")`` for ``/health``.
+
+    An unstubbed mock is ``unknown`` so tests do not look like an RPC outage.
+    A real chain that fails the read is ``unavailable``.
+    """
+    if _is_mock(chain):
+        child = getattr(chain, "_mock_children", {}).get("balance_wei")
+        if child is None:
+            return None, "unknown"
+        if getattr(child, "side_effect", None) in (None,):
+            found = _mock_int(chain, "balance_wei")
+            if found is None:
+                return None, "unknown"
+            chain.balance_wei()
+            return found, "ok"
+    try:
+        return read_balance_wei(chain), "ok"
+    except SafetyRefusal as exc:
+        if exc.code == "attester_balance_unavailable":
+            return None, "unavailable"
+        raise
 
 
 def read_base_fee_wei(chain: Any) -> int | None:
@@ -961,7 +1014,7 @@ class AttestLimiter:
                         last = item.ts if last is None else max(last, item.ts)
                 if last is not None and (now - last) < self._settings.min_interval_seconds:
                     return "attest_ticker_interval"
-            if key_id is not None and self._settings.max_per_key_per_day >= 0:
+            if key_id is not None:
                 used = sum(
                     1
                     for item in self._events
@@ -998,31 +1051,60 @@ def _cap_result(code: str) -> SubmitResult:
     return SubmitResult(status="failed", reason=code, message=message, error=message)
 
 
-def safety_status(worker: Any, settings: AttesterSettings) -> dict[str, Any]:
+def _balance_cache_fresh(worker: Any, now: float) -> bool:
+    if not getattr(worker, "balance_checked", False):
+        return False
+    ts = getattr(worker, "balance_read_at", None)
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False
+    age = float(now) - float(ts)
+    return 0 <= age < BALANCE_HEALTH_CACHE_SECONDS
+
+
+def _remember_balance(worker: Any, wei: int | None, *, unavailable: bool, now: float) -> None:
+    try:
+        worker.last_balance_wei = wei
+        worker.balance_unavailable = unavailable
+        worker.balance_checked = True
+        worker.balance_read_at = float(now)
+    except Exception:
+        return None
+
+
+def safety_status(
+    worker: Any,
+    settings: AttesterSettings,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
     """Enabled flag plus balance floor for ``/health`` and attest status.
 
-    Balance is read only when a chain client already exists. A missing read
-    leaves ``attester_balance_wei`` null and ``attester_low_balance`` false.
+    A chain read is cached for ``BALANCE_HEALTH_CACHE_SECONDS``. A failed read
+    is ``unavailable``, not ``low`` and not ``unknown``. No chain yet is
+    ``unknown``.
     """
+    clock = time.time() if now is None else float(now)
     balance = getattr(worker, "last_balance_wei", None)
     if isinstance(balance, bool) or not isinstance(balance, int):
         balance = None
+    unavailable = bool(getattr(worker, "balance_unavailable", False))
     chain = getattr(worker, "_chain", None)
-    if chain is not None:
-        try:
-            live = read_balance_wei(chain) if not _is_mock(chain) else _mock_int(chain, "balance_wei")
-        except SafetyRefusal:
-            live = None
-        if isinstance(live, int) and not isinstance(live, bool):
-            balance = int(live)
-            try:
-                worker.last_balance_wei = balance
-            except Exception:
-                pass
+    if chain is not None and not _balance_cache_fresh(worker, clock):
+        wei, kind = probe_balance(chain)
+        if kind == "unavailable":
+            balance = None
+            unavailable = True
+            _remember_balance(worker, None, unavailable=True, now=clock)
+        elif kind == "ok" and isinstance(wei, int):
+            balance = int(wei)
+            unavailable = False
+            _remember_balance(worker, balance, unavailable=False, now=clock)
     floor = int(settings.min_balance_wei)
-    known = isinstance(balance, int) and not isinstance(balance, bool)
+    known = isinstance(balance, int) and not isinstance(balance, bool) and not unavailable
     low = bool(known and floor > 0 and int(balance) < floor)
-    if known and floor > 0 and int(balance) < floor:
+    if unavailable:
+        balance_state = "unavailable"
+    elif low:
         balance_state = "low"
     elif known:
         balance_state = "ok"
@@ -1032,6 +1114,7 @@ def safety_status(worker: Any, settings: AttesterSettings) -> dict[str, Any]:
         "attester": "enabled" if settings.enabled else "disabled",
         "attester_enabled": bool(settings.enabled),
         "attester_low_balance": low,
+        "attester_balance_unavailable": balance_state == "unavailable",
         "attester_balance_wei": int(balance) if known else None,
         "attester_min_balance_wei": floor,
         "attester_balance": balance_state,
@@ -1507,12 +1590,10 @@ def send_one(
             max_fee_gwei=settings.max_fee_gwei,
             base_fee_wei=0 if base_fee is None else base_fee,
         )
-    elif float(settings.max_fee_gwei) <= 0 or float(settings.max_fee_gwei) > HARD_MAX_FEE_GWEI:
-        raise SafetyRefusal(
-            "attest_gas_fee_cap",
-            f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
-            "No transaction was sent.",
-        )
+    else:
+        gas_message = gas_ceiling_refusal(settings.max_fee_gwei)
+        if gas_message:
+            raise SafetyRefusal("attest_gas_fee_cap", gas_message)
     try:
         tx_hash = chain.attest(
             job["score_hash"],
@@ -1729,16 +1810,48 @@ class AttestWorker:
         self._wake = threading.Event()
         self._limiter = AttestLimiter(settings)
         self.last_balance_wei: int | None = None
+        self.balance_unavailable = False
+        self.balance_checked = False
+        self.balance_read_at: float | None = None
 
     def chain(self) -> Chain:
         if self._chain is None:
             self._chain = Web3Chain(self.settings)
         return self._chain
 
+    def prime_balance(self) -> None:
+        """Read the attester balance once at startup. Never raises.
+
+        Runs only when the attester is enabled. A failed read is stored as
+        unavailable so ``/health`` is not ``unknown`` and the process stays up.
+        """
+        if not self.settings.enabled:
+            return
+        try:
+            if self._chain is None:
+                if not self.autostart:
+                    return
+                chain = self.chain()
+            else:
+                chain = self._chain
+        except Exception:
+            _remember_balance(self, None, unavailable=True, now=time.time())
+            return
+        try:
+            wei, kind = probe_balance(chain)
+        except Exception:
+            _remember_balance(self, None, unavailable=True, now=time.time())
+            return
+        if kind == "unavailable":
+            _remember_balance(self, None, unavailable=True, now=time.time())
+        elif kind == "ok" and isinstance(wei, int):
+            _remember_balance(self, int(wei), unavailable=False, now=time.time())
+
     def kick(self) -> None:
         """Start the reconciler if this worker is enabled. Returns immediately."""
         if not self.settings.enabled or not self.autostart:
             return
+        self.prime_balance()
         with self._start_lock:
             if self._thread is not None and self._thread.is_alive():
                 self._wake.set()
@@ -1820,11 +1933,8 @@ class AttestWorker:
                 reason="disabled",
                 message=self.settings.disabled_reason,
             )
-        if float(self.settings.max_fee_gwei) <= 0 or float(self.settings.max_fee_gwei) > HARD_MAX_FEE_GWEI:
-            gas_message = (
-                f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
-                "No transaction was sent."
-            )
+        gas_message = gas_ceiling_refusal(self.settings.max_fee_gwei)
+        if gas_message:
             return SubmitResult(
                 status="failed",
                 reason="attest_gas_fee_cap",
@@ -1909,6 +2019,8 @@ class AttestWorker:
                 try:
                     balance = read_balance_wei(self.chain())
                 except SafetyRefusal as exc:
+                    if exc.code == "attester_balance_unavailable":
+                        _remember_balance(self, None, unavailable=True, now=clock)
                     logger.info("attest refused: %s", exc)
                     return SubmitResult(
                         status="failed",
@@ -1916,7 +2028,7 @@ class AttestWorker:
                         message=str(exc),
                         error=str(exc),
                     )
-                self.last_balance_wei = balance
+                _remember_balance(self, balance, unavailable=False, now=clock)
                 if balance < self.settings.min_balance_wei:
                     logger.info("attest refused: %s", LOW_BALANCE_MESSAGE)
                     return SubmitResult(

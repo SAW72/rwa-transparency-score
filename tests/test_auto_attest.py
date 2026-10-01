@@ -366,6 +366,7 @@ def test_anvil_attest_then_rerun_is_success(tmp_path: Path, fixture_scorer: Tran
             backoff_seconds=0.0,
             enforce_contract_pin=False,
             wait_seconds=10,
+            attest_enabled=True,
         )
         chain = Web3Chain(settings)
         assert chain.chain_id() == 84532
@@ -801,6 +802,7 @@ def test_anvil_receipt_timeout_then_it_lands(tmp_path: Path, fixture_scorer: Tra
             enforce_contract_pin=False,
             max_fee_gwei=20,
             wait_seconds=30,
+            attest_enabled=True,
         )
         chain = Web3Chain(settings)
         chain._w3.provider.make_request("anvil_setAutomine", [False])
@@ -908,6 +910,7 @@ def test_anvil_timeout_then_next_job_confirms(
             enforce_contract_pin=False,
             max_fee_gwei=20,
             wait_seconds=30,
+            attest_enabled=True,
         )
         chain = Web3Chain(settings)
         chain._w3.provider.make_request("anvil_setAutomine", [False])

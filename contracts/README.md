@@ -10,7 +10,9 @@ Anyone who cited a RAT Score can re-hash the payload and call `verify(scoreHash,
 
 `attest` is **not permissionless**. Only the contract **owner** or an **allowlisted attester** (a relayer or API-held key added via `setAttester`) can lock a hash. A stranger who pays `attestationFee` cannot occupy a digest or front-run an official payload. `AlreadyAttested` still prevents a second official lock of the same hash; it does not let random payers brick official hashes.
 
-`withdraw` pays with `call`, not the 2300-gas `transfer` stipend. A redeploy is required before Base Sepolia runs this bytecode.
+`withdraw` pays with `call`, not the 2300-gas `transfer` stipend.
+
+Live deployment: `0x2F073a3628D498d92956e7eFE2b26633eDa75b00` on Base Sepolia (84532). `attestationFee()` is `0` after [`setFee(0)`](https://sepolia.basescan.org/tx/0x2ea70e2b3fd004bf7165f2cbf13d764f7418b1869a570bb92c5f2fc967471eae) at block 47546350 (the fee moved from 0.001 ETH to 0). Sourcify reports an exact match for creation and runtime bytecode (verified 2026-09-28T21:28:46Z). Basescan verification was not re-checked from this environment (HTTP 403); the contract is not Basescan-verified. `RWA_ATTEST_VALUE_CAP_WEI=0` matches the current fee and refuses again if the fee is raised.
 
 ## Networks
 
@@ -48,16 +50,16 @@ Paste-and-sign steps are in [`DEPLOY_BASE_SEPOLIA.md`](DEPLOY_BASE_SEPOLIA.md). 
 `script/DeployScoreAttestation.s.sol` reverts unless `block.chainid == 84532` (`mainnet held: deploy Base Sepolia only`). On `forge script` it also requires `vm.rpc("eth_chainId") == 0x14a34` and reverts if `FOUNDRY_CHAIN_ID` is set, so a spoofed `--chain-id` cannot pass. Constructor fee defaults to `0.001 ether` and cannot exceed `MAX_FEE` (0.1 ether). Extra attesters default to the zero address (none are committed in this repo). If `FINAL_OWNER` differs from the deployer, the script calls `transferOwnership` and that owner must `acceptOwnership`.
 
 ```bash
-# optional defaults — leave the address placeholders; do not invent a contract address
+# optional defaults — the live contract is already deployed; do not redeploy it from an agent
 # ATTESTATION_FEE_WEI=1000000000000000
 # ATTESTER_ADDRESS=0x...
 # FINAL_OWNER=0x...
 ```
 
-After deploy, set the address in the API host environment (not in git):
+The live contract is already set:
 
 ```bash
-export RWA_ATTESTATION_CONTRACT=0x...
+export RWA_ATTESTATION_CONTRACT=0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 export RWA_ATTESTATION_CHAIN=base-sepolia
 export RWA_ATTESTATION_CHAIN_ID=84532
 ```
@@ -79,7 +81,7 @@ RWA_USE_FIXTURES=1 python scripts/verify_attestation.py NVDA --fixtures --json
 
 ```bash
 cd contracts
-export ATTESTATION_CONTRACT=0x...
+export ATTESTATION_CONTRACT=0x2F073a3628D498d92956e7eFE2b26633eDa75b00
 export SCORE_HASH=0x...          # 32-byte hex from the client
 export TICKER=NVDA
 # optional: ATTEST_TIMESTAMP   # claimedAt only; attestedAt is block.timestamp
@@ -93,7 +95,7 @@ forge script script/Attest.s.sol:Attest \
   --sender "$DEPLOYER"
 ```
 
-Default fee is **0.001 ETH** per attestation (covers gas + a small revenue line). Owner can `setFee` / `withdraw`.
+The constructor default is **0.001 ETH**. On the live contract the owner has set the fee to **0**. `RWA_ATTEST_VALUE_CAP_WEI=0` allows that fee and refuses `attest` again if `setFee` raises it. Owner can `setFee` / `withdraw`.
 
 3. Re-verify:
 
