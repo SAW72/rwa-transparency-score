@@ -10,6 +10,10 @@ Live contract (Base Sepolia, chain id **84532** only):
 
 `RWA_ATTESTATION_CONTRACT=0x2F073a3628D498d92956e7eFE2b26633eDa75b00`
 
+`attestationFee()` is `0`. The owner set it in
+[tx `0x2ea70e2b3fd004bf7165f2cbf13d764f7418b1869a570bb92c5f2fc967471eae`](https://sepolia.basescan.org/tx/0x2ea70e2b3fd004bf7165f2cbf13d764f7418b1869a570bb92c5f2fc967471eae)
+(block `47546350`). Sourcify: exact match. Not Basescan-verified.
+
 Owner that calls `setAttester` and `setFee`:
 
 `0x714b8546E5F006E0E74ec23FbafcF8e7F33a081f`
@@ -104,10 +108,10 @@ reads `eth_chainId` and refuses anything other than 84532. It calls
 `attestationFee()` and will not send if that fee is above
 `RWA_ATTEST_VALUE_CAP_WEI` (default `0`). `ScoreAttestation`'s constructor
 treats a fee argument of `0` as `DEFAULT_FEE`, which is `0.001 ether`
-(`1000000000000000` wei). The live Base Sepolia contract was deployed that
-way, so `attestationFee()` is `0.001 ETH` until the owner calls `setFee(0)`.
-With the default value cap the worker refuses `attest_fee_cap` and sends
-nothing until that call. Gas is capped by `RWA_ATTEST_GAS_LIMIT` (default
+(`1000000000000000` wei). The live contract was deployed that way, then the
+owner called `setFee(0)`. `attestationFee()` is now `0`. The default value
+cap matches that fee. If the owner raises the fee above the cap, the worker
+refuses `attest_fee_cap` and sends nothing. Gas is capped by `RWA_ATTEST_GAS_LIMIT` (default
 `300000`). A Foundry gas report on this contract showed `attest` median
 **208274** and max **210495** (24 calls; the minimum includes reverts).
 
@@ -138,7 +142,7 @@ cast send "$C" "setFee(uint256)" 0 --unlocked --from "$ADDR" --rpc-url "$RPC"
 cast send "$C" "attest(bytes32,string,uint256)" "$H2" NVDA 1700000000 --value 0 --unlocked --from "$ADDR" --rpc-url "$RPC" --json
 ```
 
-The worker path under the default value cap is the second call (`gasUsed` `191198`), because that cap refuses any positive `attestationFee`.
+The worker path under the default value cap is the second call (`gasUsed` `191198`). The live contract is now in that state: `attestationFee()` is `0`. The first number is only the local measurement taken while the fee was still `0.001 ETH`.
 
 There is no score store. The moment `send` returns a hash, that hash and
 its nonce are recorded before the receipt wait. A receipt timeout leaves
@@ -188,16 +192,16 @@ Checks run cheapest first. A refusal does not sign and does not broadcast.
 | `attester_min_balance_wei` | The configured floor, in wei. |
 | `attester_balance` | `low`, `ok`, or `unknown`. |
 
-An unread balance is `unknown` and `attester_low_balance` is `false`. A failed balance read refuses the send.
+An unread balance is `unknown` and `attester_low_balance` is `false`. A failed balance read is `attester_balance` `unavailable` and `attester_balance_unavailable` `true`. It is not `attester_low_balance`. The send is still refused, with error `attester_balance_unavailable`, and no transaction is sent. When the attester is enabled, process startup reads the balance once so `/health` is not `unknown` on the first poll. A failed startup read is `unavailable` and does not crash the process. `/health` reuses a balance read for 5 seconds (`BALANCE_HEALTH_CACHE_SECONDS` in `rwa_score/api/auto_attest.py`). The check before a send always reads again.
 
-The hourly, daily, per-ticker, and per-API-key counters live in this process. They are lost on restart and on free-plan spin-down. They are not shared across processes. Two API instances each allow the configured cap, so the real ceiling is the cap times the number of instances. Run one API instance. An in-flight identical hash is the existing dedup: the second POST sees the pending hash and does not spend another cap slot and does not send a second transaction. A cap of `0` refuses every send of that kind. Setting `RWA_ATTEST_MIN_BALANCE_WEI=0` turns the floor off. A negative gas ceiling is stored as the default `20` gwei. A value above `100` is refused.
+The hourly, daily, per-ticker, and per-API-key counters live in this process. They are lost on restart and on free-plan spin-down. They are not shared across processes. Two API instances each allow the configured cap, so the real ceiling is the cap times the number of instances. Run one API instance. An in-flight identical hash is the existing dedup: the second POST sees the pending hash and does not spend another cap slot and does not send a second transaction. A cap of `0` refuses every send of that kind. Setting `RWA_ATTEST_MIN_BALANCE_WEI=0` turns the floor off. `RWA_ATTEST_MAX_FEE_GWEI` must be a finite number in `(0, 100]`. NaN, infinity, and values `<= 0` are refused with `attest_gas_fee_cap`. They are not rewritten to the default `20` gwei. A value above `100` is refused the same way. The counters stay in this process. A shared store is held until mainnet.
 
 ### Enable on Base Sepolia
 
 Leave `RWA_ATTEST_ENABLED` unset until all of these are true:
 
 1. `RWA_USE_FIXTURES=0`. Fixtures plus an armed attester refuse every send.
-2. Owner has called `setFee(0)` and `attestationFee()` reads `0`. Until then the default value cap refuses.
+2. `attestationFee()` reads `0` (it does, after `setFee(0)`). If that fee is raised above `RWA_ATTEST_VALUE_CAP_WEI`, the worker refuses again.
 3. `cast balance` for the attester is at least `RWA_ATTEST_MIN_BALANCE_WEI`. Watch `attester_low_balance` on `GET /health`.
 4. One API process. Caps reset when that process restarts.
 5. Then set `RWA_ATTEST_ENABLED=1` in the dashboard. The key stays in the dashboard. Do not put it in git.
@@ -225,13 +229,13 @@ The worker does not trust `RWA_ATTESTATION_CHAIN_ID` when it sends. It calls
 | `RWA_ATTESTATION_CHAIN_ID` | `chain_id` in the API JSON. Send gate is still the RPC. | `84532` | no |
 | `RWA_ATTESTATION_CHAIN` | `chain` label in the API JSON | `base-sepolia` | no |
 | `RWA_ATTEST_ENABLED` | Kill switch. Default off. `1` allows sends when the key, contract, and RPC are set and fixtures are off | `0` | no |
-| `RWA_ATTEST_VALUE_CAP_WEI` | Max wei attached to `attest`. Default `0`. Live fee is `0.001 ETH` until `setFee(0)` | `0` | no |
+| `RWA_ATTEST_VALUE_CAP_WEI` | Max wei attached to `attest`. Default `0`. Live fee is `0`. A higher fee is refused | `0` | no |
 | `RWA_ATTEST_MIN_BALANCE_WEI` | Refuse when the attester balance is below this. Default `1000000000000000` (0.001 ETH). `0` disables the floor | `1000000000000000` | no |
 | `RWA_ATTEST_MAX_PER_HOUR` | In-process broadcasts per hour. Default `6`. `0` refuses every send | `6` | no |
 | `RWA_ATTEST_MAX_PER_DAY` | In-process broadcasts per day. Default `24`. `0` refuses every send | `24` | no |
 | `RWA_ATTEST_MIN_INTERVAL_SECONDS` | Minimum seconds between broadcasts for one ticker. Default `600`. `0` disables the interval | `600` | no |
 | `RWA_ATTEST_MAX_PER_KEY_PER_DAY` | Broadcasts per paid API key per day. Default `8`. `0` refuses every keyed send | `8` | no |
-| `RWA_ATTEST_MAX_FEE_GWEI` | EIP-1559 ceiling in gwei. Default `20`. Must be in `(0, 100]`. Above `100` is refused | `20` | no |
+| `RWA_ATTEST_MAX_FEE_GWEI` | EIP-1559 ceiling in gwei. Default `20`. Must be a finite value in `(0, 100]`. NaN, infinity, `<= 0`, and above `100` are refused. No fallback to 20 | `20` | no |
 | `RWA_ATTEST_GAS_LIMIT` | Gas cap. Default `300000` | `300000` | no |
 | `RWA_ATTEST_MAX_ATTEMPTS` | Retries before the job is failed. Default `5` | `5` | no |
 | `RWA_ATTEST_BACKOFF_SECONDS` | Base delay between retries. Default `2.0` | `2.0` | no |
@@ -346,11 +350,20 @@ cast balance "$ATTESTER_ADDRESS" --rpc-url "$BASE_SEPOLIA_RPC_URL"
 ```
 
 Expect owner `0x714b8546E5F006E0E74ec23FbafcF8e7F33a081f` and `isAttester`
-true. Expect fee `0` only after `setFee(0)`. Before that call the live
-contract returns `1000000000000000` wei (`0.001 ETH`), because the
-constructor maps a `0` fee argument to `DEFAULT_FEE`. The worker's default
-value cap is `0`, so it refuses `attest_fee_cap` and sends nothing until
-the fee reads `0`.
+true. Expect fee `0`. The owner called `setFee(0)` in
+[tx `0x2ea70e2b3fd004bf7165f2cbf13d764f7418b1869a570bb92c5f2fc967471eae`](https://sepolia.basescan.org/tx/0x2ea70e2b3fd004bf7165f2cbf13d764f7418b1869a570bb92c5f2fc967471eae)
+at block `47546350`. That transaction succeeded. The event changed the fee
+from `0.001 ETH` (`1000000000000000` wei, the constructor `DEFAULT_FEE`) to
+`0`. `attestationFee()` now returns `0`. The default value cap is `0`, so
+it allows this fee. If `setFee` raises the fee above the cap, the worker
+refuses `attest_fee_cap` and sends nothing.
+
+Sourcify reports `exact_match` for both creation and runtime bytecode
+(`https://sourcify.dev/server/v2/contract/84532/0x2F073a3628D498d92956e7eFE2b26633eDa75b00`,
+`verifiedAt` `2026-09-28T21:28:46Z`, solc `0.8.24`). A check of
+sepolia.basescan.org from this environment returned HTTP 403, so the
+Basescan verification flag was not re-read. Treat the source as
+Sourcify-verified and not Basescan-verified.
 
 ## 4. Keep the attester balance small
 

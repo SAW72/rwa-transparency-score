@@ -5,6 +5,8 @@ Anvil account keys are derived at runtime from Foundry's published test mnemonic
 
 from __future__ import annotations
 
+import math
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -13,6 +15,7 @@ from fastapi.testclient import TestClient
 from rwa_score.api.app import create_app
 from rwa_score.api.attest import canonical_bytes, hash_canonical
 from rwa_score.api.auto_attest import (
+    BALANCE_HEALTH_CACHE_SECONDS,
     DEFAULT_MAX_FEE_GWEI,
     DEFAULT_MAX_PER_DAY,
     DEFAULT_MAX_PER_HOUR,
@@ -498,3 +501,135 @@ def test_derived_key_never_leaks(
     blob = client.get("/health").text + repr(settings) + str(result.error)
     assert key not in blob
     assert key[2:] not in blob
+
+
+def test_constructor_defaults_attest_enabled_off() -> None:
+    key = _anvil_key(4)
+    settings = AttesterSettings(
+        private_key=key,
+        contract="0x2F073a3628D498d92956e7eFE2b26633eDa75b00",
+        rpc_url="http://127.0.0.1:9",
+    )
+    assert settings.attest_enabled is False
+    assert settings.configured is True
+    assert settings.enabled is False
+
+
+def test_bad_gas_ceiling_refuses_without_defaulting() -> None:
+    key = _anvil_key(5)
+    for bad in (float("nan"), float("inf"), float("-inf"), 0, -1):
+        chain = _ready_chain()
+        settings = _settings(key, max_fee_gwei=bad, min_balance_wei=0)
+        assert settings.max_fee_gwei != DEFAULT_MAX_FEE_GWEI
+        if bad == 0 or bad == -1:
+            assert settings.max_fee_gwei == float(bad)
+        result = _submit(_worker(Store(), settings, chain), "NVDA", 1_700_000_090, now=90_000.0)
+        assert result.reason == "attest_gas_fee_cap"
+        assert result.tx_hash is None
+        chain.chain_id.assert_not_called()
+        chain.attest.assert_not_called()
+    with pytest.raises(SafetyRefusal) as exc:
+        eip1559_fees_or_refuse(max_fee_gwei=float("nan"), base_fee_wei=1)
+    assert exc.value.code == "attest_gas_fee_cap"
+
+
+def test_from_env_keeps_non_finite_gas_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RWA_ATTESTER_PRIVATE_KEY", raising=False)
+    monkeypatch.setenv("RWA_ATTEST_MAX_FEE_GWEI", "nan")
+    assert math.isnan(AttesterSettings.from_env().max_fee_gwei)
+    monkeypatch.setenv("RWA_ATTEST_MAX_FEE_GWEI", "-3")
+    assert AttesterSettings.from_env().max_fee_gwei == -3.0
+
+
+def test_balance_read_failure_is_not_low_balance(
+    fixture_scorer: TransparencyScorer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_por(monkeypatch)
+    chain = _ready_chain()
+    chain.balance_wei.side_effect = RuntimeError("rpc down")
+    settings = _settings(_anvil_key(6), min_balance_wei=10**15)
+    worker = _worker(Store(), settings, chain)
+    result = _submit(worker, "NVDA", 1_700_000_091, now=91_000.0)
+    assert result.reason == "attester_balance_unavailable"
+    assert result.reason != "attester_low_balance"
+    assert result.tx_hash is None
+    chain.attest.assert_not_called()
+    chain.verify.assert_not_called()
+    body = safety_status(worker, settings)
+    assert body["attester_balance"] == "unavailable"
+    assert body["attester_balance_unavailable"] is True
+    assert body["attester_low_balance"] is False
+    assert body["attester_balance_wei"] is None
+
+    client, _store = _client(settings, chain, fixture_scorer)
+    health = client.get("/health").json()
+    assert health["attester_balance"] == "unavailable"
+    assert health["attester_balance_unavailable"] is True
+    assert health["attester_low_balance"] is False
+    assert health["attester_balance_wei"] is None
+
+
+def test_startup_balance_read_is_cached_and_send_is_fresh() -> None:
+    chain = _ready_chain()
+    chain.balance_wei.return_value = 10**18
+    settings = _settings(_anvil_key(7), min_balance_wei=10**15)
+    worker = AttestWorker(store=Store(), settings=settings, chain=chain, autostart=True)
+    worker.kick()
+    try:
+        assert worker._thread is not None
+        first = safety_status(worker, settings)
+        assert first["attester_balance"] == "ok"
+        assert first["attester_balance_wei"] == 10**18
+        assert first["attester_low_balance"] is False
+        cached_calls = chain.balance_wei.call_count
+        assert cached_calls >= 1
+        again = safety_status(worker, settings)
+        assert again["attester_balance_wei"] == 10**18
+        assert chain.balance_wei.call_count == cached_calls
+        worker.balance_read_at = time.time() - BALANCE_HEALTH_CACHE_SECONDS - 1
+        safety_status(worker, settings)
+        assert chain.balance_wei.call_count == cached_calls + 1
+        before_send = chain.balance_wei.call_count
+        result = _submit(worker, "NVDA", 1_700_000_092, now=92_000.0)
+        assert result.status == "confirmed"
+        assert chain.balance_wei.call_count > before_send
+    finally:
+        worker.stop()
+        if worker._thread is not None:
+            worker._thread.join(timeout=2)
+
+
+def test_startup_balance_failure_does_not_crash() -> None:
+    chain = _ready_chain()
+    chain.balance_wei.side_effect = RuntimeError("boot rpc down")
+    settings = _settings(_anvil_key(8), min_balance_wei=10**15)
+    worker = AttestWorker(store=Store(), settings=settings, chain=chain, autostart=True)
+    worker.kick()
+    try:
+        body = safety_status(worker, settings)
+        assert body["attester_balance"] == "unavailable"
+        assert body["attester_balance_unavailable"] is True
+        assert body["attester_low_balance"] is False
+    finally:
+        worker.stop()
+        if worker._thread is not None:
+            worker._thread.join(timeout=2)
+
+
+def test_zero_per_key_cap_still_refuses() -> None:
+    chain = _ready_chain()
+    settings = _settings(
+        _anvil_key(9),
+        max_per_hour=100,
+        max_per_day=100,
+        min_interval_seconds=0,
+        max_per_key_per_day=0,
+        min_balance_wei=0,
+    )
+    worker = _worker(Store(), settings, chain)
+    blocked = _submit(worker, "NVDA", 1_700_000_093, now=93_000.0, api_key_id=3)
+    assert blocked.reason == "attest_key_daily_cap"
+    assert blocked.tx_hash is None
+    chain.attest.assert_not_called()
+    chain.chain_id.assert_not_called()

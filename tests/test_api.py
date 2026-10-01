@@ -222,6 +222,7 @@ def test_nan_in_live_report_score_200_attest_422(
         private_key="0x" + "11" * 32,
         contract="0x" + "ab" * 20,
         rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
     )
     app = create_app(
         settings=settings,
@@ -277,6 +278,7 @@ def test_blank_price_and_volume_score_200_attest_422(
         private_key="0x" + "22" * 32,
         contract="0x" + "ab" * 20,
         rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
     )
     app = create_app(
         settings=settings,
@@ -324,6 +326,7 @@ def test_attest_status_does_not_score(
         private_key="0x" + "11" * 32,
         contract="0x" + "ab" * 20,
         rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
     )
     digest = "0x" + "cd" * 32
     chain = Mock()
