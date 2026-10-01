@@ -15,8 +15,10 @@ reconciles receipts. It does not keep scores.
 Spencer sets the attester key on Render himself. This process reads
 ``RWA_ATTESTER_PRIVATE_KEY`` from the environment and never logs it.
 
-If the key, contract, or RPC is unset, the worker stays disabled and the
-API says so. It does not crash and it does not send.
+If the key, contract, or RPC is unset, or ``RWA_ATTEST_ENABLED`` is off,
+the worker stays disabled and the API says so. It does not crash and it
+does not send. Hourly, daily, per-ticker, and per-key caps live in this
+process only. A restart clears them. A second instance does not share them.
 """
 
 from __future__ import annotations
@@ -58,7 +60,40 @@ STARTUP_HOLD_POLL_SECONDS = 0.25
 DEFAULT_VALUE_CAP_WEI = 0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BACKOFF_SECONDS = 2.0
+# Config cannot set a gas ceiling above this. 100 gwei.
+HARD_MAX_FEE_GWEI = 100.0
+# 0.001 ETH. Enough for a few Base Sepolia attests at the default gas ceiling.
+DEFAULT_MIN_BALANCE_WEI = 1_000_000_000_000_000
+DEFAULT_MAX_PER_HOUR = 6
+DEFAULT_MAX_PER_DAY = 24
+# Paid-key POST /v1/attest for one ticker. 0 disables the interval.
+DEFAULT_MIN_INTERVAL_SECONDS = 600
+DEFAULT_MAX_PER_KEY_PER_DAY = 8
+HOUR_SECONDS = 3600.0
+DAY_SECONDS = 86_400.0
 _REDACTED = "[redacted]"
+KILL_SWITCH_MESSAGE = (
+    "Attester disabled. RWA_ATTEST_ENABLED is off. No transaction was sent."
+)
+FIXTURES_BLOCK_MESSAGE = (
+    "Refusing to attest while RWA_USE_FIXTURES is on and the attester is enabled. "
+    "No transaction was sent."
+)
+LOW_BALANCE_MESSAGE = (
+    "Attester balance is below RWA_ATTEST_MIN_BALANCE_WEI. No transaction was sent."
+)
+# Stable machine-readable codes returned on POST /v1/attest. No send on any of these.
+SAFETY_HTTP = {
+    "attester_disabled": 503,
+    "fixtures_with_attester": 503,
+    "attester_low_balance": 503,
+    "attest_fee_cap": 503,
+    "attest_gas_fee_cap": 503,
+    "attest_hourly_cap": 429,
+    "attest_daily_cap": 429,
+    "attest_ticker_interval": 429,
+    "attest_key_daily_cap": 429,
+}
 FAILED_REASON = "attest_failed"
 FAILED_MESSAGE = "The attest job failed."
 RPC_TIMEOUT_SECONDS = 20
@@ -323,6 +358,43 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_flag(name: str) -> bool:
+    """True only for 1/true/yes/on. Unset and everything else is off."""
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int_default(name: str, default: int) -> int:
+    """Missing or non-integer env keeps ``default``. A negative value becomes 0."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < 0:
+        return 0
+    return value
+
+
+class _Secret:
+    """Private key wrapper. ``repr`` and ``str`` are redacted."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "_Secret('[redacted]')"
+
+    def __str__(self) -> str:
+        return "[redacted]"
+
+
 class AttesterSettings:
     """Env-only attester config. The key lives in a closure, not on ``__dict__``."""
 
@@ -339,6 +411,13 @@ class AttesterSettings:
         "max_fee_gwei",
         "broadcast_deadline_seconds",
         "wait_seconds",
+        "attest_enabled",
+        "use_fixtures",
+        "min_balance_wei",
+        "max_per_hour",
+        "max_per_day",
+        "min_interval_seconds",
+        "max_per_key_per_day",
     )
 
     def __init__(
@@ -356,9 +435,17 @@ class AttesterSettings:
         max_fee_gwei: float = DEFAULT_MAX_FEE_GWEI,
         broadcast_deadline_seconds: int = DEFAULT_BROADCAST_DEADLINE_SECONDS,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
+        attest_enabled: bool = True,
+        use_fixtures: bool = False,
+        min_balance_wei: int = DEFAULT_MIN_BALANCE_WEI,
+        max_per_hour: int = DEFAULT_MAX_PER_HOUR,
+        max_per_day: int = DEFAULT_MAX_PER_DAY,
+        min_interval_seconds: int = 0,
+        max_per_key_per_day: int = DEFAULT_MAX_PER_KEY_PER_DAY,
     ) -> None:
         key = (private_key or "").strip()
-        self._get_key = (lambda captured: (lambda: captured))(key)
+        secret = _Secret(key)
+        self._get_key = (lambda captured: (lambda: captured.reveal()))(secret)
         self.contract = (contract or "").strip()
         self.rpc_url = (rpc_url or "").strip()
         self.value_cap_wei = int(value_cap_wei)
@@ -379,6 +466,15 @@ class AttesterSettings:
         if wait < 0:
             wait = 0.0
         self.wait_seconds = wait
+        self.attest_enabled = bool(attest_enabled)
+        self.use_fixtures = bool(use_fixtures)
+        floor = int(min_balance_wei)
+        self.min_balance_wei = floor if floor > 0 else 0
+        self.max_per_hour = max(0, int(max_per_hour))
+        self.max_per_day = max(0, int(max_per_day))
+        interval = int(min_interval_seconds)
+        self.min_interval_seconds = interval if interval > 0 else 0
+        self.max_per_key_per_day = max(0, int(max_per_key_per_day))
         if key or self.rpc_url:
             _VAULT.add(key, self.rpc_url)
             _install_redact_filter()
@@ -388,11 +484,25 @@ class AttesterSettings:
         return self._get_key()
 
     @property
-    def enabled(self) -> bool:
+    def configured(self) -> bool:
+        """Key, contract, and RPC are all set. The kill switch is separate."""
         return bool(self.private_key and self.contract and self.rpc_url)
 
     @property
+    def fixtures_blocked(self) -> bool:
+        """Fixtures plus an armed attester. Startup and send both refuse."""
+        return bool(self.use_fixtures and self.attest_enabled and self.configured)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.attest_enabled and self.configured and not self.use_fixtures)
+
+    @property
     def disabled_reason(self) -> str:
+        if self.fixtures_blocked:
+            return FIXTURES_BLOCK_MESSAGE
+        if self.configured and not self.attest_enabled:
+            return KILL_SWITCH_MESSAGE
         if self.enabled:
             return ""
         return DISABLED_REASON
@@ -401,10 +511,14 @@ class AttesterSettings:
         return (
             "AttesterSettings("
             f"enabled={self.enabled}, "
+            f"attest_enabled={self.attest_enabled}, "
+            f"use_fixtures={self.use_fixtures}, "
             f"contract={self.contract!r}, "
             f"rpc_set={bool(self.rpc_url)}, "
             f"value_cap_wei={self.value_cap_wei}, "
             f"gas_limit={self.gas_limit}, "
+            f"min_balance_wei={self.min_balance_wei}, "
+            f"max_fee_gwei={self.max_fee_gwei}, "
             "private_key='[redacted]')"
         )
 
@@ -428,11 +542,32 @@ class AttesterSettings:
                 DEFAULT_BROADCAST_DEADLINE_SECONDS,
             ),
             wait_seconds=_env_float("RWA_ATTEST_WAIT_SECONDS", DEFAULT_WAIT_SECONDS),
+            attest_enabled=_env_flag("RWA_ATTEST_ENABLED"),
+            use_fixtures=_env_flag("RWA_USE_FIXTURES"),
+            min_balance_wei=_env_int_default(
+                "RWA_ATTEST_MIN_BALANCE_WEI", DEFAULT_MIN_BALANCE_WEI
+            ),
+            max_per_hour=_env_int_default("RWA_ATTEST_MAX_PER_HOUR", DEFAULT_MAX_PER_HOUR),
+            max_per_day=_env_int_default("RWA_ATTEST_MAX_PER_DAY", DEFAULT_MAX_PER_DAY),
+            min_interval_seconds=_env_int_default(
+                "RWA_ATTEST_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL_SECONDS
+            ),
+            max_per_key_per_day=_env_int_default(
+                "RWA_ATTEST_MAX_PER_KEY_PER_DAY", DEFAULT_MAX_PER_KEY_PER_DAY
+            ),
         )
 
 
 class TerminalAttestError(Exception):
     """Do not retry. Wrong chain and a fee above the cap land here."""
+
+
+class SafetyRefusal(TerminalAttestError):
+    """A safety limit refused the send. ``code`` is stable and machine-readable."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class AlreadyAttestedError(Exception):
@@ -642,6 +777,268 @@ def clamp_eip1559_fees(
     return int(max_fee), int(priority)
 
 
+def eip1559_fees_or_refuse(*, max_fee_gwei: float, base_fee_wei: int) -> tuple[int, int]:
+    """``(maxFeePerGas, maxPriorityFeePerGas)`` or a refusal. Never clamps past the ceiling.
+
+    ``RWA_ATTEST_MAX_FEE_GWEI`` must sit in ``(0, HARD_MAX_FEE_GWEI]``. If the
+    network base fee plus the priority fee would need more than that ceiling,
+    the caller must not sign.
+    """
+    try:
+        requested = float(max_fee_gwei)
+    except (TypeError, ValueError) as exc:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
+            "No transaction was sent.",
+        ) from exc
+    if requested <= 0 or requested > HARD_MAX_FEE_GWEI:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
+            "No transaction was sent.",
+        )
+    ceiling = int(requested * 1_000_000_000)
+    hard_ceiling = int(HARD_MAX_FEE_GWEI * 1_000_000_000)
+    if ceiling > hard_ceiling:
+        ceiling = hard_ceiling
+    if ceiling < 1:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "RWA_ATTEST_MAX_FEE_GWEI ceiling is empty. No transaction was sent.",
+        )
+    priority = min(1_000_000_000, ceiling)
+    try:
+        base = int(base_fee_wei)
+    except (TypeError, ValueError) as exc:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        ) from exc
+    if isinstance(base_fee_wei, bool) or base < 0:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        )
+    required = base + priority
+    if required > ceiling:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            f"base fee {base} plus priority {priority} exceeds "
+            f"RWA_ATTEST_MAX_FEE_GWEI ceiling {ceiling}. No transaction was sent.",
+        )
+    max_fee = base * 2 + priority
+    if max_fee > ceiling:
+        max_fee = ceiling
+    if max_fee < required:
+        max_fee = required
+    if priority > max_fee:
+        priority = max_fee
+    return int(max_fee), int(priority)
+
+
+def _is_mock(chain: Any) -> bool:
+    return type(chain).__module__.split(".")[0] == "unittest"
+
+
+def _mock_int(chain: Any, name: str) -> int | None:
+    """Explicit ``Mock.return_value`` when it is an int. Missing stubs are ``None``."""
+    child = getattr(chain, "_mock_children", {}).get(name)
+    if child is None:
+        return None
+    value = child.return_value
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
+
+def read_balance_wei(chain: Any) -> int:
+    """Attester balance. A failed read refuses the send."""
+    if _is_mock(chain):
+        found = _mock_int(chain, "balance_wei")
+        if found is None:
+            raise SafetyRefusal(
+                "attester_low_balance",
+                "Attester balance is unavailable. No transaction was sent.",
+            )
+        return found
+    reader = getattr(chain, "balance_wei", None)
+    if not callable(reader):
+        raise SafetyRefusal(
+            "attester_low_balance",
+            "Attester balance is unavailable. No transaction was sent.",
+        )
+    try:
+        value = reader()
+    except SafetyRefusal:
+        raise
+    except Exception as exc:
+        raise SafetyRefusal(
+            "attester_low_balance",
+            "Attester balance is unavailable. No transaction was sent.",
+        ) from exc
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SafetyRefusal(
+            "attester_low_balance",
+            "Attester balance is unavailable. No transaction was sent.",
+        )
+    return int(value)
+
+
+def read_base_fee_wei(chain: Any) -> int | None:
+    """Network base fee, or ``None`` when a mock did not stub it.
+
+    A real chain that fails the read raises ``SafetyRefusal`` so nothing is signed.
+    """
+    if _is_mock(chain):
+        return _mock_int(chain, "base_fee_wei")
+    reader = getattr(chain, "base_fee_wei", None)
+    if not callable(reader):
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        )
+    try:
+        value = reader()
+    except SafetyRefusal:
+        raise
+    except Exception as exc:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        ) from exc
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        )
+    if int(value) < 0:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        )
+    return int(value)
+
+
+@dataclass
+class _CapSpend:
+    ts: float
+    ticker: str
+    key_id: int | None
+
+
+class AttestLimiter:
+    """In-process broadcast counters.
+
+    Lost on restart. Not shared across processes. ``commit`` runs only when
+    a send is about to be attempted; ``release`` undoes it if nothing was broadcast.
+    """
+
+    def __init__(self, settings: AttesterSettings) -> None:
+        self._settings = settings
+        self._lock = threading.Lock()
+        self._events: list[_CapSpend] = []
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - DAY_SECONDS
+        self._events = [item for item in self._events if item.ts > cutoff]
+
+    def refusal(self, *, ticker: str, key_id: int | None, now: float) -> str | None:
+        """Stable error code when a cap blocks the send. ``None`` when it may proceed."""
+        symbol = str(ticker or "").upper()
+        with self._lock:
+            self._prune(now)
+            hour = now - HOUR_SECONDS
+            day = now - DAY_SECONDS
+            if sum(1 for item in self._events if item.ts > hour) >= self._settings.max_per_hour:
+                return "attest_hourly_cap"
+            if sum(1 for item in self._events if item.ts > day) >= self._settings.max_per_day:
+                return "attest_daily_cap"
+            if self._settings.min_interval_seconds > 0:
+                last = None
+                for item in self._events:
+                    if item.ticker == symbol:
+                        last = item.ts if last is None else max(last, item.ts)
+                if last is not None and (now - last) < self._settings.min_interval_seconds:
+                    return "attest_ticker_interval"
+            if key_id is not None and self._settings.max_per_key_per_day >= 0:
+                used = sum(
+                    1
+                    for item in self._events
+                    if item.key_id == key_id and item.ts > day
+                )
+                if used >= self._settings.max_per_key_per_day:
+                    return "attest_key_daily_cap"
+        return None
+
+    def commit(self, *, ticker: str, key_id: int | None, now: float) -> None:
+        with self._lock:
+            self._events.append(_CapSpend(float(now), str(ticker or "").upper(), key_id))
+
+    def release(self, *, ticker: str, key_id: int | None, now: float) -> None:
+        symbol = str(ticker or "").upper()
+        with self._lock:
+            for index in range(len(self._events) - 1, -1, -1):
+                item = self._events[index]
+                if item.ticker == symbol and item.key_id == key_id and item.ts == float(now):
+                    del self._events[index]
+                    return
+
+
+_CAP_MESSAGES = {
+    "attest_hourly_cap": "Attest hourly cap reached. No transaction was sent.",
+    "attest_daily_cap": "Attest daily cap reached. No transaction was sent.",
+    "attest_ticker_interval": "Ticker attest interval has not elapsed. No transaction was sent.",
+    "attest_key_daily_cap": "API key daily attest cap reached. No transaction was sent.",
+}
+
+
+def _cap_result(code: str) -> SubmitResult:
+    message = _CAP_MESSAGES.get(code, "Attest cap reached. No transaction was sent.")
+    return SubmitResult(status="failed", reason=code, message=message, error=message)
+
+
+def safety_status(worker: Any, settings: AttesterSettings) -> dict[str, Any]:
+    """Enabled flag plus balance floor for ``/health`` and attest status.
+
+    Balance is read only when a chain client already exists. A missing read
+    leaves ``attester_balance_wei`` null and ``attester_low_balance`` false.
+    """
+    balance = getattr(worker, "last_balance_wei", None)
+    if isinstance(balance, bool) or not isinstance(balance, int):
+        balance = None
+    chain = getattr(worker, "_chain", None)
+    if chain is not None:
+        try:
+            live = read_balance_wei(chain) if not _is_mock(chain) else _mock_int(chain, "balance_wei")
+        except SafetyRefusal:
+            live = None
+        if isinstance(live, int) and not isinstance(live, bool):
+            balance = int(live)
+            try:
+                worker.last_balance_wei = balance
+            except Exception:
+                pass
+    floor = int(settings.min_balance_wei)
+    known = isinstance(balance, int) and not isinstance(balance, bool)
+    low = bool(known and floor > 0 and int(balance) < floor)
+    if known and floor > 0 and int(balance) < floor:
+        balance_state = "low"
+    elif known:
+        balance_state = "ok"
+    else:
+        balance_state = "unknown"
+    return {
+        "attester": "enabled" if settings.enabled else "disabled",
+        "attester_enabled": bool(settings.enabled),
+        "attester_low_balance": low,
+        "attester_balance_wei": int(balance) if known else None,
+        "attester_min_balance_wei": floor,
+        "attester_balance": balance_state,
+        "fixtures_blocked": bool(settings.fixtures_blocked),
+    }
+
+
 class Web3Chain:
     """One signer, one nonce stream.
 
@@ -814,15 +1211,27 @@ class Web3Chain:
         hashes = [item for item in (known or []) if item]
         return self._landed(hashes, score_hash, ticker)
 
-    def _base_fee_wei(self) -> int:
+    def base_fee_wei(self) -> int:
+        """Latest base fee. A failed read refuses the send."""
         try:
             block = self._w3.eth.get_block("latest")
-        except Exception:
-            return 0
+        except Exception as exc:
+            raise SafetyRefusal(
+                "attest_gas_fee_cap",
+                "Base fee is unavailable. No transaction was sent.",
+            ) from exc
         raw = block.get("baseFeePerGas") if hasattr(block, "get") else None
         if raw is None:
-            raw = getattr(block, "baseFeePerGas", 0)
-        return int(raw or 0)
+            raw = getattr(block, "baseFeePerGas", None)
+        if raw is None:
+            raise SafetyRefusal(
+                "attest_gas_fee_cap",
+                "Base fee is unavailable. No transaction was sent.",
+            )
+        return int(raw)
+
+    def _base_fee_wei(self) -> int:
+        return self.base_fee_wei()
 
     def _send(
         self,
@@ -904,10 +1313,12 @@ class Web3Chain:
         bump: int,
         receipt_timeout: float | None = None,
     ) -> str:
-        max_fee, priority = clamp_eip1559_fees(
+        # Refuse before sign when the base fee cannot fit under the ceiling.
+        # bump is unused: this sender does not replace a stuck transaction.
+        _ = bump
+        max_fee, priority = eip1559_fees_or_refuse(
             max_fee_gwei=self._settings.max_fee_gwei,
-            base_fee_wei=self._base_fee_wei(),
-            bump=bump,
+            base_fee_wei=self.base_fee_wei(),
         )
         fn = self._contract.functions.attest(_hash_bytes(score_hash), ticker, int(claimed_at))
         tx = fn.build_transaction(
@@ -1075,10 +1486,32 @@ def send_one(
                 attested_at=int(attested_at),
                 already=True,
             )
+    if settings.min_balance_wei > 0:
+        balance = read_balance_wei(chain)
+        if balance < settings.min_balance_wei:
+            raise SafetyRefusal("attester_low_balance", LOW_BALANCE_MESSAGE)
     fee = int(chain.fee_wei())
     if fee > settings.value_cap_wei:
-        raise TerminalAttestError(
-            f"attestationFee {fee} exceeds RWA_ATTEST_VALUE_CAP_WEI {settings.value_cap_wei}"
+        raise SafetyRefusal(
+            "attest_fee_cap",
+            f"attestationFee {fee} exceeds RWA_ATTEST_VALUE_CAP_WEI {settings.value_cap_wei}",
+        )
+    base_fee = read_base_fee_wei(chain)
+    if base_fee is None and not _is_mock(chain):
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            "Base fee is unavailable. No transaction was sent.",
+        )
+    if base_fee is not None or not _is_mock(chain):
+        eip1559_fees_or_refuse(
+            max_fee_gwei=settings.max_fee_gwei,
+            base_fee_wei=0 if base_fee is None else base_fee,
+        )
+    elif float(settings.max_fee_gwei) <= 0 or float(settings.max_fee_gwei) > HARD_MAX_FEE_GWEI:
+        raise SafetyRefusal(
+            "attest_gas_fee_cap",
+            f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
+            "No transaction was sent.",
         )
     try:
         tx_hash = chain.attest(
@@ -1294,6 +1727,8 @@ class AttestWorker:
         self._submit_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._limiter = AttestLimiter(settings)
+        self.last_balance_wei: int | None = None
 
     def chain(self) -> Chain:
         if self._chain is None:
@@ -1349,16 +1784,52 @@ class AttestWorker:
         ticker: str,
         claimed_at: int,
         now: float | None = None,
+        api_key_id: int | None = None,
     ) -> SubmitResult:
-        """Hash must be of ``canonical`` from this request. Check attested, then broadcast once."""
+        """Hash must be of ``canonical`` from this request. Check attested, then broadcast once.
+
+        Cheap refusals (kill switch, fixtures, gas-config, caps) run before any
+        chain read. A refusal does not sign and does not broadcast.
+        """
         clock = time.time() if now is None else float(now)
         secret = self.settings.private_key
         rpc_url = self.settings.rpc_url
+        if self.settings.fixtures_blocked:
+            return SubmitResult(
+                status="disabled",
+                reason="fixtures_with_attester",
+                message=FIXTURES_BLOCK_MESSAGE,
+                error=FIXTURES_BLOCK_MESSAGE,
+            )
+        if not self.settings.attest_enabled:
+            if self.settings.configured:
+                return SubmitResult(
+                    status="disabled",
+                    reason="attester_disabled",
+                    message=KILL_SWITCH_MESSAGE,
+                    error=KILL_SWITCH_MESSAGE,
+                )
+            return SubmitResult(
+                status="disabled",
+                reason="disabled",
+                message=self.settings.disabled_reason,
+            )
         if not self.settings.enabled:
             return SubmitResult(
                 status="disabled",
                 reason="disabled",
                 message=self.settings.disabled_reason,
+            )
+        if float(self.settings.max_fee_gwei) <= 0 or float(self.settings.max_fee_gwei) > HARD_MAX_FEE_GWEI:
+            gas_message = (
+                f"RWA_ATTEST_MAX_FEE_GWEI must be within (0, {HARD_MAX_FEE_GWEI:g}]. "
+                "No transaction was sent."
+            )
+            return SubmitResult(
+                status="failed",
+                reason="attest_gas_fee_cap",
+                message=gas_message,
+                error=gas_message,
             )
         try:
             _require_request_bytes(canonical, score_hash, ticker, claimed_at)
@@ -1391,6 +1862,7 @@ class AttestWorker:
             "known_tx_hashes": [],
         }
         claimed = False
+        cap_held = False
 
         def _on_submitted(tx_hash: str, nonce: int) -> None:
             self.store.note_broadcast(
@@ -1430,6 +1902,29 @@ class AttestWorker:
                     reason="broadcast_pending",
                     message="Broadcast already in flight. No second transaction was sent.",
                 )
+            cap_code = self._limiter.refusal(ticker=ticker, key_id=api_key_id, now=clock)
+            if cap_code:
+                return _cap_result(cap_code)
+            if self.settings.min_balance_wei > 0:
+                try:
+                    balance = read_balance_wei(self.chain())
+                except SafetyRefusal as exc:
+                    logger.info("attest refused: %s", exc)
+                    return SubmitResult(
+                        status="failed",
+                        reason=exc.code,
+                        message=str(exc),
+                        error=str(exc),
+                    )
+                self.last_balance_wei = balance
+                if balance < self.settings.min_balance_wei:
+                    logger.info("attest refused: %s", LOW_BALANCE_MESSAGE)
+                    return SubmitResult(
+                        status="failed",
+                        reason="attester_low_balance",
+                        message=LOW_BALANCE_MESSAGE,
+                        error=LOW_BALANCE_MESSAGE,
+                    )
             gate, attested_at, gate_error = self._preflight(score_hash, ticker)
             if gate == "failed":
                 logger.info("attest failed: %s", gate_error)
@@ -1441,6 +1936,8 @@ class AttestWorker:
                 )
             if gate == "confirmed":
                 return SubmitResult(status="confirmed", attested_at=attested_at)
+            self._limiter.commit(ticker=ticker, key_id=api_key_id, now=clock)
+            cap_held = True
             self.store.reserve_inflight(
                 score_hash=score_hash,
                 ticker=ticker,
@@ -1468,6 +1965,21 @@ class AttestWorker:
                 )
                 job["tx_hash"] = outcome.tx_hash
                 job["known_tx_hashes"] = [outcome.tx_hash]
+        except SafetyRefusal as exc:
+            logger.info("attest refused: %s", exc)
+            if job.get("tx_hash"):
+                return SubmitResult(
+                    status="pending",
+                    tx_hash=job.get("tx_hash"),
+                    reason="broadcast_pending",
+                    message="Broadcast is in flight. No second transaction was sent.",
+                )
+            return SubmitResult(
+                status="failed",
+                reason=exc.code,
+                message=str(exc),
+                error=str(exc),
+            )
         except TerminalAttestError as exc:
             rejected = _rejected(exc)
             if rejected is not None:
@@ -1508,6 +2020,8 @@ class AttestWorker:
                 error=safe,
             )
         finally:
+            if cap_held and not job.get("tx_hash"):
+                self._limiter.release(ticker=ticker, key_id=api_key_id, now=clock)
             if claimed and not job.get("tx_hash"):
                 self.store.release_reserve(score_hash)
         if outcome.already or (outcome.attested_at is not None and outcome.tx_hash):
