@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,7 +16,7 @@ from rwa_score.points.rubric import (
     DAILY_CAPS,
     PER_ROW_CAP,
     known_issuers,
-    normalize_verified_tx_hash,
+    tx_hash_format_ok,
     points_for,
     record,
 )
@@ -135,20 +134,31 @@ def test_oversized_award_does_not_write(tmp_path: Path, monkeypatch: pytest.Monk
     ],
 )
 def test_non_hex_tx_hashes_are_rejected(raw: object) -> None:
-    with pytest.raises(ValueError, match="0x plus 64 hex"):
-        normalize_verified_tx_hash(raw)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"\^0x\[0-9a-f\]\{64\}"):
+        tx_hash_format_ok(raw)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    "raw",
     [
-        ("0x" + "ab" * 32, "0x" + "ab" * 32),
-        ("0x" + "AB" * 32, "0x" + "ab" * 32),
-        ("  0X" + "aB" * 32 + "\t", "0x" + "ab" * 32),
+        "0x" + "AB" * 32,
+        "0X" + "ab" * 32,
+        "0X" + "AB" * 32,
+        "  0x" + "ab" * 32,
+        "0x" + "ab" * 32 + " ",
+        "\t0x" + "ab" * 32,
+        "0x" + "ab" * 32 + "\n",
+        "  0X" + "aB" * 32 + "\t",
     ],
 )
-def test_verified_hashes_are_lowercased(raw: str, expected: str) -> None:
-    assert normalize_verified_tx_hash(raw) == expected
+def test_hashes_with_prefix_case_or_padding_are_rejected(raw: str) -> None:
+    with pytest.raises(ValueError, match=r"\^0x\[0-9a-f\]\{64\}"):
+        tx_hash_format_ok(raw)
+
+
+def test_exact_lowercase_hash_is_accepted() -> None:
+    raw = "0x" + "ab" * 32
+    assert tx_hash_format_ok(raw) == raw
 
 
 def test_known_issuers_come_from_the_registry() -> None:
@@ -203,12 +213,20 @@ def test_unknown_issuers_are_rejected(tmp_path: Path, issuer: str) -> None:
         {"TX-HASH": CHAIN},
         {"transaction_hash": CHAIN},
         {"verified_tx_hash": CHAIN},
+        {"amount": 1},
+        {"created_at": "2002-04-04T00:00:00Z"},
+        {"key": "rat-points-v1|once"},
+        {"utc_date": "2001-03-03"},
+        {"date": "1999-01-01"},
+        {"metadata": {"points": 9}},
+        {"metadata.points": 9},
+        {"note": "ignore me"},
     ],
 )
-def test_client_cannot_pass_points_or_tx_hash(tmp_path: Path, client: dict[str, object]) -> None:
+def test_unknown_client_fields_are_rejected(tmp_path: Path, client: dict[str, object]) -> None:
     ledger = _open(tmp_path)
     try:
-        with pytest.raises(ValueError, match="points|tx_hash"):
+        with pytest.raises(ValueError, match="unknown client field"):
             record(
                 ledger,
                 wallet=WALLET,
@@ -222,7 +240,7 @@ def test_client_cannot_pass_points_or_tx_hash(tmp_path: Path, client: dict[str, 
         ledger.close()
 
 
-def test_client_date_is_ignored(tmp_path: Path) -> None:
+def test_server_clock_sets_the_utc_day(tmp_path: Path) -> None:
     eastern = timezone(timedelta(hours=-4))
     # 21:00 in a -4 zone is 01:00 the next UTC day.
     server = datetime(2026, 10, 12, 21, 0, tzinfo=eastern)
@@ -234,16 +252,19 @@ def test_client_date_is_ignored(tmp_path: Path) -> None:
             action="score",
             issuer="  Backed-Finance  ",
             server_now=server,
-            client={
-                "date": "1999-01-01",
-                "on": "2000-02-02",
-                "utc_date": "2001-03-03",
-                "created_at": "2002-04-04T00:00:00Z",
-                "note": "ignore me",
-            },
+            client=None,
+        )
+        empty = record(
+            ledger,
+            wallet=WALLET,
+            action="share",
+            issuer="Backed Finance",
+            server_now=server,
+            client={},
         )
         assert result.status == "inserted"
         assert result.entry is not None
+        assert result.entry.utc_day == "2026-10-13"
         assert result.entry.metadata == {
             "issuer": "backed finance",
             "utc_date": "2026-10-13",
@@ -252,9 +273,9 @@ def test_client_date_is_ignored(tmp_path: Path) -> None:
             WALLET, "score", "backed finance", on="2026-10-13"
         )
         assert result.entry.tx_hash.startswith("rat-points-v1|")
-        stored = json.dumps(result.entry.metadata)
-        assert "1999" not in stored
-        assert "note" not in result.entry.metadata
+        assert empty.status == "inserted"
+        assert empty.entry is not None
+        assert empty.entry.utc_day == "2026-10-13"
     finally:
         ledger.close()
 
@@ -281,9 +302,11 @@ def test_same_issuer_does_not_multiply_and_score_cap_is_one(tmp_path: Path) -> N
         ledger.close()
 
 
-def test_same_issuer_stays_one_row_when_the_daily_cap_is_higher(
+def test_database_unique_day_caps_even_if_the_memory_cap_is_higher(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Same-issuer repeats are moot under the per-day cap: the second issuer
+    # has a different synthetic key and still gets no row.
     monkeypatch.setitem(DAILY_CAPS, "score", 5)
     ledger = _open(tmp_path)
     try:
@@ -291,9 +314,9 @@ def test_same_issuer_stays_one_row_when_the_daily_cap_is_higher(
         second = record(ledger, wallet=WALLET, action="score", issuer="ONDO", server_now=DAY)
         third = record(ledger, wallet=WALLET, action="score", issuer="Dinari", server_now=DAY)
         assert second.status == "duplicate"
-        assert third.status == "inserted"
-        assert third.awarded == 5
-        assert ledger.totals()[0].points == 10
+        assert third.status == "capped"
+        assert third.awarded == 0
+        assert ledger.totals()[0].points == 5
     finally:
         ledger.close()
 
@@ -344,7 +367,7 @@ def test_each_action_is_capped_per_wallet_per_day(
             action=action,
             issuer="Securitize",
             server_now=DAY,
-            verified_tx_hash=chain if action == "attest" else None,
+            tx_hash_format_ok=chain if action == "attest" else None,
             **kwargs,  # type: ignore[arg-type]
         )
         second = record(
@@ -353,7 +376,7 @@ def test_each_action_is_capped_per_wallet_per_day(
             action=action,
             issuer="Robinhood",
             server_now=DAY,
-            verified_tx_hash=("0x" + "22" * 32) if action == "attest" else None,
+            tx_hash_format_ok=("0x" + "22" * 32) if action == "attest" else None,
             **kwargs,  # type: ignore[arg-type]
         )
         assert first.status == "inserted"
@@ -367,28 +390,38 @@ def test_each_action_is_capped_per_wallet_per_day(
         ledger.close()
 
 
-def test_attest_stores_the_lowercased_verified_hash_only(tmp_path: Path) -> None:
+def test_attest_stores_only_an_exact_lowercase_hash(tmp_path: Path) -> None:
     ledger = _open(tmp_path)
-    mixed = "0x" + "AB" * 32
+    exact = "0x" + "ab" * 32
     try:
         with pytest.raises(ValueError, match="verified on-chain"):
             record(ledger, wallet=WALLET, action="attest", issuer="Ondo", server_now=DAY)
-        with pytest.raises(ValueError, match="0x plus 64 hex"):
+        with pytest.raises(ValueError, match=r"\^0x\[0-9a-f\]\{64\}"):
             record(
                 ledger,
                 wallet=WALLET,
                 action="attest",
                 issuer="Ondo",
-                verified_tx_hash="not-a-hash",
+                tx_hash_format_ok="not-a-hash",
                 server_now=DAY,
             )
+        for raw in ("0x" + "AB" * 32, "0X" + "ab" * 32, " " + exact, exact + "\n"):
+            with pytest.raises(ValueError, match=r"\^0x\[0-9a-f\]\{64\}"):
+                record(
+                    ledger,
+                    wallet=WALLET,
+                    action="attest",
+                    issuer="Ondo",
+                    tx_hash_format_ok=raw,
+                    server_now=DAY,
+                )
         with pytest.raises(ValueError, match="not accepted"):
             record(
                 ledger,
                 wallet=WALLET,
                 action="score",
                 issuer="Ondo",
-                verified_tx_hash=mixed,
+                tx_hash_format_ok=exact,
                 server_now=DAY,
             )
         inserted = record(
@@ -396,22 +429,22 @@ def test_attest_stores_the_lowercased_verified_hash_only(tmp_path: Path) -> None
             wallet=WALLET,
             action="attest",
             issuer="xStocks",
-            verified_tx_hash=mixed,
+            tx_hash_format_ok=exact,
             server_now=DAY,
-            client={"date": "1999-01-01"},
         )
         replay = record(
             ledger,
             wallet=WALLET,
             action="attest",
             issuer="Ondo",
-            verified_tx_hash=mixed.lower(),
+            tx_hash_format_ok=exact,
             server_now=DAY,
         )
         assert inserted.status == "inserted"
         assert inserted.awarded == 25
         assert inserted.entry is not None
-        assert inserted.entry.tx_hash == mixed.lower()
+        assert inserted.entry.tx_hash == exact
+        assert inserted.entry.utc_day == "2026-10-12"
         assert inserted.entry.points == 25
         assert not inserted.entry.tx_hash.startswith("rat-points-v1|")
         assert replay.status == "duplicate"
@@ -464,3 +497,121 @@ def test_rubric_is_not_wired_into_api_share_or_streamlit() -> None:
         text = path.read_text(encoding="utf-8")
         assert "points.rubric" not in text
         assert "points import record" not in text
+
+
+_RACE_ISSUERS = (
+    "Ondo",
+    "Paxos",
+    "Securitize",
+    "xStocks",
+    "Dinari",
+    "Robinhood",
+    "Backed Finance",
+    "Ondo",
+)
+
+
+def _race_record(path: str, wallet: str, issuer: str, stamp: str, queue: object) -> None:
+    """One process in the daily-cap race. Top-level so spawn can import it."""
+    from datetime import datetime
+
+    from rwa_score.points import PointsLedger
+    from rwa_score.points.rubric import record as record_row
+
+    ledger = PointsLedger(path)
+    try:
+        result = record_row(
+            ledger,
+            wallet=wallet,
+            action="score",
+            issuer=issuer,
+            server_now=datetime.fromisoformat(stamp),
+        )
+        queue.put(result.status)  # type: ignore[attr-defined]
+    except Exception as exc:
+        queue.put(f"error:{type(exc).__name__}:{exc}")  # type: ignore[attr-defined]
+    finally:
+        ledger.close()
+
+
+def test_daily_cap_is_one_row_across_processes(tmp_path: Path) -> None:
+    import multiprocessing
+
+    path = tmp_path / "race.sqlite"
+    prepared = PointsLedger(path)
+    prepared.close()
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_race_record,
+            args=(str(path), WALLET, issuer, DAY.isoformat(), queue),
+        )
+        for issuer in _RACE_ISSUERS
+    ]
+    for proc in processes:
+        proc.start()
+    statuses: list[object] = []
+    for proc in processes:
+        proc.join(60)
+        assert proc.exitcode == 0
+    for _ in processes:
+        statuses.append(queue.get(timeout=10))
+    assert statuses.count("inserted") == 1
+    assert set(statuses) <= {"inserted", "capped", "duplicate"}
+    reopened = PointsLedger(path)
+    try:
+        rows = reopened.by_wallet(WALLET)
+        assert len(rows) == 1
+        assert rows[0].action == "score"
+        assert rows[0].points == 5
+        assert rows[0].utc_day == "2026-10-12"
+        assert reopened.totals()[0].points == 5
+    finally:
+        reopened.close()
+
+
+def test_attest_hash_is_single_use_across_wallets(tmp_path: Path) -> None:
+    """One attest hash can be stored once, across every wallet.
+
+    Comparing that hash to an on-chain receipt is R3, before routes.
+    """
+    ledger = _open(tmp_path)
+    chain = "0x" + "ab" * 32
+    other_chain = "0x" + "cd" * 32
+    try:
+        first = record(
+            ledger,
+            wallet=WALLET,
+            action="attest",
+            issuer="Ondo",
+            tx_hash_format_ok=chain,
+            server_now=DAY,
+        )
+        reused = record(
+            ledger,
+            wallet=OTHER,
+            action="attest",
+            issuer="Paxos",
+            tx_hash_format_ok=chain,
+            server_now=NEXT_DAY,
+        )
+        fresh = record(
+            ledger,
+            wallet=OTHER,
+            action="attest",
+            issuer="Paxos",
+            tx_hash_format_ok=other_chain,
+            server_now=NEXT_DAY,
+        )
+        assert first.status == "inserted"
+        assert first.awarded == 25
+        assert reused.status == "rejected"
+        assert reused.awarded == 0
+        assert reused.entry is None
+        assert fresh.status == "inserted"
+        assert fresh.awarded == 25
+        assert [row.tx_hash for row in ledger.by_wallet(WALLET)] == [chain]
+        assert [row.tx_hash for row in ledger.by_wallet(OTHER)] == [other_chain]
+    finally:
+        ledger.close()

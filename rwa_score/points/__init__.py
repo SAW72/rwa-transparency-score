@@ -19,9 +19,9 @@ from .rubric import (
     PER_ROW_CAP,
     RecordResult,
     known_issuers,
-    normalize_verified_tx_hash,
     points_for,
     record,
+    tx_hash_format_ok,
 )
 
 __all__ = [
@@ -39,9 +39,9 @@ __all__ = [
     "init_db",
     "known_issuers",
     "normalize_tx_hash",
-    "normalize_verified_tx_hash",
     "normalize_wallet",
     "points_for",
     "record",
     "synthetic_tx_key",
+    "tx_hash_format_ok",
 ]

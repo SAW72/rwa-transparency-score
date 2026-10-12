@@ -5,7 +5,8 @@ later payment. The caller names an action. This module sets the points.
 A caller-supplied points value is refused. A caller-supplied ``tx_hash``
 is refused. The UTC day is the server clock.
 
-Not wired into the API, the share flow, or Streamlit.
+Not wired into the API, the share flow, or Streamlit. The on-chain receipt
+check for an attest hash is R3, before routes. This module checks format only.
 """
 
 from __future__ import annotations
@@ -27,7 +28,8 @@ from .ledger import (
     synthetic_tx_key,
 )
 
-# Fixed awards. Bug is not in this map: its amount comes from severity.
+# Placeholder amounts pending Spencer. The published band is what this
+# table currently uses; the numbers are not final.
 ACTION_POINTS: dict[str, int] = {
     "score": 5,
     "attest": 25,
@@ -35,7 +37,8 @@ ACTION_POINTS: dict[str, int] = {
     "integration": 100,
 }
 
-# Server scale inside the published 100–500 band. The caller passes a label.
+# Placeholder severity scale pending Spencer, inside the 100–500 band.
+# The caller passes a label. The amount comes from this table.
 BUG_SEVERITY_POINTS: dict[str, int] = {
     "low": 100,
     "medium": 250,
@@ -43,11 +46,12 @@ BUG_SEVERITY_POINTS: dict[str, int] = {
     "critical": 500,
 }
 
-# No single row can store more than this. Bug critical sits on the cap.
+# Placeholder per-row cap pending Spencer. The database CHECK matches it.
 PER_ROW_CAP = 500
 
-# New rows for one wallet and one action on one UTC day.
-# Score is one: a second score that day does not count, whatever the issuer.
+# Documents one row per wallet, action, and UTC day. Enforcement is
+# UNIQUE(wallet, action, utc_day). Raising these numbers in memory does
+# not admit a second row, and ``PointsLedger._append`` cannot either.
 DAILY_CAPS: dict[str, int] = {
     "score": 1,
     "attest": 1,
@@ -56,21 +60,25 @@ DAILY_CAPS: dict[str, int] = {
     "bug": 1,
 }
 
+# Empty on purpose. A client payload has no accepted fields.
+CLIENT_PAYLOAD_FIELDS: frozenset[str] = frozenset()
+
 _ONCHAIN_TX = re.compile(r"^0x[0-9a-f]{64}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ISSUER_FOLD = re.compile(r"[\s_\-]+")
-_CLIENT_KEY_FOLD = re.compile(r"[\s_\-]+")
 
-RecordStatus = Literal["inserted", "duplicate", "capped"]
+RecordStatus = Literal["inserted", "duplicate", "capped", "rejected"]
 
 
 @dataclass(frozen=True)
 class RecordResult:
     """``awarded`` is 0 unless ``status`` is ``inserted``.
 
-    ``capped`` means the wallet already used its rows for that action on
-    the server's UTC day. ``duplicate`` is an existing row (same issuer, or
-    the same verified hash) and does not add points.
+    ``capped`` means this wallet already has a row for that action on the
+    server's UTC day. ``duplicate`` is the same issuer or the same hash for
+    this wallet. ``rejected`` means the attest hash was already stored for
+    another wallet. Same-issuer repeats are moot under the per-day cap: the
+    day already allows one row, so a second issuer also gets no slot.
     """
 
     status: RecordStatus
@@ -84,19 +92,20 @@ def known_issuers() -> frozenset[str]:
     return frozenset(_fold_issuer(name) for name in raw)
 
 
-def normalize_verified_tx_hash(value: str) -> str:
-    """Return a verified on-chain hash in lowercase, or raise ``ValueError``.
+def tx_hash_format_ok(value: str) -> str:
+    """Return ``value`` when it matches ``^0x[0-9a-f]{64}$`` exactly.
 
-    The only accepted form is ``0x`` plus 64 hex characters. Mixed case is
-    folded to lowercase. A bare digest, a non-hex string, and a synthetic
-    key are rejected.
+    This is a format check. A ``0X`` prefix, uppercase hex, and surrounding
+    whitespace are rejected and are not rewritten. Comparing the hash to an
+    on-chain receipt is R3, before routes.
     """
-    if not isinstance(value, str):
-        raise ValueError("on-chain tx hash must be 0x plus 64 hex characters")
-    text = value.strip().lower()
-    if not _ONCHAIN_TX.fullmatch(text):
-        raise ValueError("on-chain tx hash must be 0x plus 64 hex characters")
-    return text
+    return _accept_tx_hash_format(value)
+
+
+def _accept_tx_hash_format(value: str) -> str:
+    if not isinstance(value, str) or not _ONCHAIN_TX.fullmatch(value):
+        raise ValueError("on-chain tx hash must match ^0x[0-9a-f]{64}$")
+    return value
 
 
 def points_for(action: str, severity: str | None = None) -> int:
@@ -129,63 +138,61 @@ def record(
     wallet: str,
     action: str,
     issuer: str,
-    verified_tx_hash: str | None = None,
+    tx_hash_format_ok: str | None = None,
     severity: str | None = None,
     client: Mapping[str, Any] | None = None,
     server_now: datetime | None = None,
 ) -> RecordResult:
-    """Append one rubric row, or return duplicate / capped without adding.
+    """Append one rubric row, or return duplicate, capped, or rejected.
 
-    ``server_now`` is the process clock (tests inject it). A date inside
-    ``client`` is ignored. ``client`` cannot carry points or a tx hash.
-    ``verified_tx_hash`` is accepted only for ``attest``, and only when it
-    is ``0x`` plus 64 hex characters. Every other action uses
+    ``server_now`` is the process clock (tests inject it). It stays a
+    public hook. ``client`` may only contain ``CLIENT_PAYLOAD_FIELDS``,
+    which is empty, so any client field is rejected. The parameter
+    ``tx_hash_format_ok`` is accepted only for ``attest``, and only when
+    the string matches ``^0x[0-9a-f]{64}$``. That is format only. The
+    on-chain receipt check is R3, before routes. One attest hash can be
+    stored once, across every wallet. Every other action uses
     ``synthetic_tx_key``.
+
+    The check and the insert share one ``BEGIN IMMEDIATE``.
+    ``UNIQUE(wallet, action, utc_day)`` is the daily cap.
     """
-    _refuse_client_points_and_tx_hash(client)
+    _reject_unknown_client_fields(client)
     name = _require_action(action)
     amount = points_for(name, severity)
     canonical_issuer = _require_known_issuer(issuer)
     day = _server_utc_day(server_now)
     normalized = normalize_wallet(wallet)
-    on_chain = name == "attest"
-    if on_chain:
-        if verified_tx_hash is None:
+    supplied_hash = tx_hash_format_ok
+    if name == "attest":
+        if supplied_hash is None:
             raise ValueError("attest requires a verified on-chain tx hash")
-        key = normalize_verified_tx_hash(verified_tx_hash)
+        key = _accept_tx_hash_format(supplied_hash)
     else:
-        if verified_tx_hash is not None:
+        if supplied_hash is not None:
             raise ValueError("tx hash is not accepted for this action")
         key = synthetic_tx_key(normalized, name, canonical_issuer, on=day)
         _require_server_key(key)
     metadata: dict[str, Any] = {"issuer": canonical_issuer, "utc_date": day}
     if name == "bug" and isinstance(severity, str):
         metadata["severity"] = severity.strip().lower()
-    # Hold the ledger lock across the cap check and the insert. append takes
-    # the same lock, which is an RLock.
-    with ledger._lock:
-        rows = ledger.by_wallet(normalized)
-        existing = _row_for_key(rows, name, key)
-        if existing is not None:
-            return RecordResult(status="duplicate", entry=existing, awarded=0)
-        if _rows_on_day(rows, name, day) >= DAILY_CAPS[name]:
-            return RecordResult(status="capped", entry=None, awarded=0)
-        appended = ledger.append(
-            wallet=normalized,
-            action=name,
-            points=amount,
-            tx_hash=key,
-            metadata=metadata,
-        )
-    if appended.status == "duplicate":
-        return RecordResult(status="duplicate", entry=appended.entry, awarded=0)
-    if appended.entry.points != amount or appended.entry.points > PER_ROW_CAP:
-        raise RuntimeError("stored points did not match the rubric")
-    return RecordResult(
-        status="inserted",
-        entry=appended.entry,
-        awarded=appended.entry.points,
+    # Same-issuer repeats are moot under the per-day cap. A repeated issuer
+    # matches (wallet, action, tx_hash) and comes back duplicate. A second
+    # issuer has a different synthetic key, and UNIQUE(wallet, action, utc_day)
+    # still allows only one row, so that issuer gets no slot either.
+    stored = ledger._insert_activity(
+        wallet=normalized,
+        action=name,
+        points=amount,
+        tx_hash=key,
+        metadata=metadata,
+        utc_day=day,
     )
+    if stored.status == "inserted":
+        if stored.entry is None or stored.entry.points != amount or stored.entry.points > PER_ROW_CAP:
+            raise RuntimeError("stored points did not match the rubric")
+        return RecordResult(status="inserted", entry=stored.entry, awarded=stored.entry.points)
+    return RecordResult(status=stored.status, entry=stored.entry, awarded=0)
 
 
 def _require_action(action: str) -> str:
@@ -227,41 +234,27 @@ def _server_utc_day(server_now: datetime | None) -> str:
     return moment.astimezone(timezone.utc).date().isoformat()
 
 
-def _refuse_client_points_and_tx_hash(client: Mapping[str, Any] | None) -> None:
-    """Dates in ``client`` are not read. Points and tx hashes are refused."""
+def _reject_unknown_client_fields(client: Mapping[str, Any] | None) -> None:
+    """Reject every client key. ``CLIENT_PAYLOAD_FIELDS`` is empty."""
     if client is None:
         return
     if not isinstance(client, Mapping) or isinstance(client, (str, bytes)):
         raise ValueError("client fields must be an object")
-    for key in client:
+    _reject_client_mapping(client, "")
+
+
+def _reject_client_mapping(mapping: Mapping[Any, Any], prefix: str) -> None:
+    for key, value in mapping.items():
         if not isinstance(key, str):
-            raise ValueError("client fields must be an object")
-        folded = _CLIENT_KEY_FOLD.sub("", key.strip().lower())
-        if folded == "points":
-            raise ValueError("points are set by the server")
-        if folded in {"txhash", "transactionhash", "verifiedtxhash"}:
-            raise ValueError("tx_hash is not accepted from the client")
+            raise ValueError("unknown client field")
+        path = f"{prefix}.{key}" if prefix else key
+        if path not in CLIENT_PAYLOAD_FIELDS:
+            raise ValueError(f"unknown client field: {path}")
+        if isinstance(value, Mapping) and not isinstance(value, (str, bytes)):
+            _reject_client_mapping(value, path)
 
 
 def _require_server_key(key: str) -> None:
     digest = key[len(SYNTHETIC_KEY_PREFIX) :]
     if not key.startswith(SYNTHETIC_KEY_PREFIX) or not _HEX64.fullmatch(digest):
         raise ValueError("synthetic key was not built by the server")
-
-
-def _row_for_key(rows: list[LedgerEntry], action: str, key: str) -> LedgerEntry | None:
-    for row in rows:
-        if row.action == action and row.tx_hash == key:
-            return row
-    return None
-
-
-def _rows_on_day(rows: list[LedgerEntry], action: str, day: str) -> int:
-    count = 0
-    for row in rows:
-        if row.action != action:
-            continue
-        meta = row.metadata or {}
-        if meta.get("utc_date") == day:
-            count += 1
-    return count
