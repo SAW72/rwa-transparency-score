@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -185,12 +186,37 @@ def test_synthetic_key_is_deterministic() -> None:
     second = synthetic_tx_key(wallet.lower(), "SCORE", "NVDA", on=date(2026, 10, 12))
     assert first == second
     material = f"{wallet.lower()}|score|NVDA|{day}"
-    assert first == hashlib.sha256(material.encode("utf-8")).hexdigest()
-    assert len(first) == 64
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    assert first == "rat-points-v1|" + digest
+    assert first.startswith("rat-points-v1|")
+    assert len(first) == len("rat-points-v1|") + 64
     assert synthetic_tx_key(wallet, "score", "aapl", on=day) != first
     assert synthetic_tx_key(wallet, "attest", "nvda", on=day) != first
     assert synthetic_tx_key(wallet, "score", "nvda", on="2026-10-13") != first
     assert synthetic_tx_key(OTHER, "score", "nvda", on=day) != first
+
+
+def test_db_file_is_owner_read_write_where_supported(tmp_path: Path) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX file modes are not available")
+    previous = os.umask(0)
+    path = tmp_path / "nested" / "points.sqlite"
+    ledger = None
+    try:
+        ledger = PointsLedger(path)
+        ledger.append(wallet=WALLET, action="score", points=5, tx_hash="once")
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o600
+    finally:
+        os.umask(previous)
+        if ledger is not None:
+            ledger.close()
+    reopened = PointsLedger(path)
+    try:
+        assert (path.stat().st_mode & 0o777) == 0o600
+        assert reopened.totals()[0].points == 5
+    finally:
+        reopened.close()
 
 
 def test_two_wallets_rank_by_total(tmp_path: Path) -> None:

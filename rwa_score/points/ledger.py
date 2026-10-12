@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -36,6 +37,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 ACTIONS: tuple[str, ...] = ("score", "attest", "share", "integration", "bug")
+
+# Off-chain rows use this prefix plus a SHA-256 hex digest. The rubric builds
+# that string. A client-supplied tx hash is not a synthetic key.
+SYNTHETIC_KEY_PREFIX = "rat-points-v1|"
 
 _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -63,10 +68,12 @@ def normalize_wallet(wallet: str) -> str:
 
 
 def normalize_tx_hash(tx_hash: str) -> str:
-    """Strip ``tx_hash``. Fold EVM hashes and 64-hex digests to lowercase.
+    """Strip ``tx_hash``. Fold recognized keys to lowercase.
 
-    Other keys are kept as written after stripping, so a caller-supplied
-    label stays stable. Empty text is rejected.
+    EVM hashes (``0x`` plus 64 hex), bare 64-hex digests, and server keys
+    (``rat-points-v1|`` plus 64 hex) are lowercased. Other labels are kept
+    as written after stripping, so a caller-supplied label stays stable.
+    Empty text is rejected.
     """
     if not isinstance(tx_hash, str):
         raise ValueError("tx_hash must be non-empty text")
@@ -74,6 +81,10 @@ def normalize_tx_hash(tx_hash: str) -> str:
     if not text or len(text) > 128:
         raise ValueError("tx_hash must be non-empty text of at most 128 characters")
     lowered = text.lower()
+    if lowered.startswith(SYNTHETIC_KEY_PREFIX):
+        digest = lowered[len(SYNTHETIC_KEY_PREFIX) :]
+        if _HEX64.fullmatch(digest):
+            return SYNTHETIC_KEY_PREFIX + digest
     if _EVM_TX.fullmatch(lowered) or _HEX64.fullmatch(lowered):
         return lowered
     return text
@@ -128,9 +139,9 @@ def synthetic_tx_key(
     *,
     on: date | datetime | str | None = None,
 ) -> str:
-    """Deterministic stand-in for ``tx_hash`` on off-chain actions.
+    """Server-built stand-in for ``tx_hash`` on off-chain actions.
 
-    The digest is lowercase SHA-256 hex of::
+    The key is ``rat-points-v1|`` plus the lowercase SHA-256 hex of::
 
         wallet|action|issuer|YYYY-MM-DD
 
@@ -138,7 +149,8 @@ def synthetic_tx_key(
     ``ACTIONS``, ``issuer`` is stripped and uppercased, and the date is a
     UTC calendar day (``on`` defaults to today in UTC). The same inputs on
     the same UTC day always return the same key, so a repeated insert for
-    that issuer does not add a second row.
+    that issuer does not add a second row. This function does not read a
+    client ``tx_hash``.
     """
     day = _utc_day(on)
     material = "|".join(
@@ -149,7 +161,8 @@ def synthetic_tx_key(
             day,
         )
     )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"{SYNTHETIC_KEY_PREFIX}{digest}"
 
 
 def _metadata_json(metadata: Mapping[str, Any] | None) -> str | None:
@@ -168,6 +181,30 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
 
 
+def _restrict_db_permissions(path: Path) -> None:
+    """Owner read/write only, on platforms that store a Unix mode.
+
+    SQLite would otherwise create the file with the process umask, which is
+    often world-readable. A failure to set the mode is ignored: some
+    filesystems do not implement it.
+    """
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(os.fspath(path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            os.chmod(path, 0o600)
+    except OSError:
+        return
+    finally:
+        os.close(fd)
+
+
 def _connect(path: str | Path) -> sqlite3.Connection:
     if str(path) == ":memory:":
         target = ":memory:"
@@ -175,12 +212,15 @@ def _connect(path: str | Path) -> sqlite3.Connection:
         file_path = Path(path)
         if file_path.parent != Path("."):
             file_path.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_db_permissions(file_path)
         target = str(file_path)
     conn = sqlite3.connect(target, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.isolation_level = None
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA recursive_triggers = ON")
+    if str(path) != ":memory:":
+        _restrict_db_permissions(Path(path))
     return conn
 
 
@@ -234,7 +274,8 @@ class PointsLedger:
 
     def __init__(self, path: str | Path) -> None:
         self.path: Path | None = None if str(path) == ":memory:" else Path(path)
-        self._lock = threading.Lock()
+        # RLock so the rubric can hold the lock across its cap check and append.
+        self._lock = threading.RLock()
         self._conn = _connect(path)
         with self._lock:
             init_db(self._conn)

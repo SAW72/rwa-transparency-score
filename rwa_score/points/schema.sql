@@ -1,9 +1,9 @@
 -- Append-only off-chain points. Unpaid activity counters.
 -- There is no token. Rows are insert-only: UPDATE and DELETE abort.
 --
--- tx_hash is caller-supplied text. On-chain rows store the transaction hash.
+-- tx_hash is the row key. On-chain rows store a verified 0x + 64 hex hash.
 -- Off-chain rows store synthetic_tx_key() from rwa_score/points/ledger.py:
--- SHA-256 hex of wallet|action|issuer|YYYY-MM-DD (UTC).
+-- 'rat-points-v1|' plus SHA-256 hex of wallet|action|issuer|YYYY-MM-DD (UTC).
 
 CREATE TABLE IF NOT EXISTS points_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
