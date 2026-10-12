@@ -30,6 +30,11 @@ CHAIN = "0x" + "ab" * 32
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _receipt_ok(tx_hash: str, wallet: str) -> bool:
+    """Test-only verifier. Library code has no stub that returns True."""
+    return True
+
+
 def _open(tmp_path: Path) -> PointsLedger:
     return PointsLedger(tmp_path / "points.sqlite")
 
@@ -360,6 +365,8 @@ def test_each_action_is_capped_per_wallet_per_day(
     if severity is not None:
         kwargs["severity"] = severity
     chain = "0x" + "11" * 32
+    if action == "attest":
+        kwargs["receipt_verifier"] = _receipt_ok
     try:
         first = record(
             ledger,
@@ -431,6 +438,7 @@ def test_attest_stores_only_an_exact_lowercase_hash(tmp_path: Path) -> None:
             issuer="xStocks",
             tx_hash_format_ok=exact,
             server_now=DAY,
+            receipt_verifier=_receipt_ok,
         )
         replay = record(
             ledger,
@@ -439,6 +447,7 @@ def test_attest_stores_only_an_exact_lowercase_hash(tmp_path: Path) -> None:
             issuer="Ondo",
             tx_hash_format_ok=exact,
             server_now=DAY,
+            receipt_verifier=_receipt_ok,
         )
         assert inserted.status == "inserted"
         assert inserted.awarded == 25
@@ -574,7 +583,8 @@ def test_daily_cap_is_one_row_across_processes(tmp_path: Path) -> None:
 def test_attest_hash_is_single_use_across_wallets(tmp_path: Path) -> None:
     """One attest hash can be stored once, across every wallet.
 
-    Comparing that hash to an on-chain receipt is R3, before routes.
+    The Base Sepolia receipt check itself is still R3, before routes.
+    These rows pass only because the test injects a verifier that returns True.
     """
     ledger = _open(tmp_path)
     chain = "0x" + "ab" * 32
@@ -587,6 +597,7 @@ def test_attest_hash_is_single_use_across_wallets(tmp_path: Path) -> None:
             issuer="Ondo",
             tx_hash_format_ok=chain,
             server_now=DAY,
+            receipt_verifier=_receipt_ok,
         )
         reused = record(
             ledger,
@@ -595,6 +606,7 @@ def test_attest_hash_is_single_use_across_wallets(tmp_path: Path) -> None:
             issuer="Paxos",
             tx_hash_format_ok=chain,
             server_now=NEXT_DAY,
+            receipt_verifier=_receipt_ok,
         )
         fresh = record(
             ledger,
@@ -603,6 +615,7 @@ def test_attest_hash_is_single_use_across_wallets(tmp_path: Path) -> None:
             issuer="Paxos",
             tx_hash_format_ok=other_chain,
             server_now=NEXT_DAY,
+            receipt_verifier=_receipt_ok,
         )
         assert first.status == "inserted"
         assert first.awarded == 25
@@ -613,5 +626,79 @@ def test_attest_hash_is_single_use_across_wallets(tmp_path: Path) -> None:
         assert fresh.awarded == 25
         assert [row.tx_hash for row in ledger.by_wallet(WALLET)] == [chain]
         assert [row.tx_hash for row in ledger.by_wallet(OTHER)] == [other_chain]
+    finally:
+        ledger.close()
+
+
+def test_attest_without_a_receipt_verifier_earns_nothing(tmp_path: Path) -> None:
+    made_up = "0x" + "11" * 32
+    ledger = _open(tmp_path)
+    try:
+        result = record(
+            ledger,
+            wallet=WALLET,
+            action="attest",
+            issuer="Ondo",
+            tx_hash_format_ok=made_up,
+            server_now=DAY,
+        )
+        assert result.status == "refused"
+        assert result.awarded == 0
+        assert result.entry is None
+        assert ledger.by_wallet(WALLET) == []
+        assert ledger.totals() == []
+    finally:
+        ledger.close()
+
+
+def test_attest_receipt_verifier_false_earns_nothing(tmp_path: Path) -> None:
+    made_up = "0x" + "11" * 32
+    seen: list[tuple[str, str]] = []
+
+    def deny(tx_hash: str, wallet: str) -> bool:
+        seen.append((tx_hash, wallet))
+        return False
+
+    ledger = _open(tmp_path)
+    try:
+        result = record(
+            ledger,
+            wallet=WALLET.upper(),
+            action="attest",
+            issuer="Paxos",
+            tx_hash_format_ok=made_up,
+            server_now=DAY,
+            receipt_verifier=deny,
+        )
+        assert result.status == "refused"
+        assert result.awarded == 0
+        assert result.entry is None
+        assert seen == [(made_up, WALLET)]
+        assert ledger.by_wallet(WALLET) == []
+        assert ledger.totals() == []
+    finally:
+        ledger.close()
+
+
+def test_attest_receipt_verifier_true_writes_one_row(tmp_path: Path) -> None:
+    made_up = "0x" + "11" * 32
+    ledger = _open(tmp_path)
+    try:
+        result = record(
+            ledger,
+            wallet=WALLET,
+            action="attest",
+            issuer="Securitize",
+            tx_hash_format_ok=made_up,
+            server_now=DAY,
+            receipt_verifier=_receipt_ok,
+        )
+        assert result.status == "inserted"
+        assert result.awarded == 25
+        rows = ledger.by_wallet(WALLET)
+        assert len(rows) == 1
+        assert rows[0].tx_hash == made_up
+        assert rows[0].points == 25
+        assert ledger.totals()[0].points == 25
     finally:
         ledger.close()

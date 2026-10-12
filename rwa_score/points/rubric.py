@@ -5,14 +5,15 @@ later payment. The caller names an action. This module sets the points.
 A caller-supplied points value is refused. A caller-supplied ``tx_hash``
 is refused. The UTC day is the server clock.
 
-Not wired into the API, the share flow, or Streamlit. The on-chain receipt
-check for an attest hash is R3, before routes. This module checks format only.
+Not wired into the API, the share flow, or Streamlit. An attest row is
+written only when an injected receipt verifier returns True. This module
+does not read a chain, and it has no verifier of its own.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -67,7 +68,7 @@ _ONCHAIN_TX = re.compile(r"^0x[0-9a-f]{64}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ISSUER_FOLD = re.compile(r"[\s_\-]+")
 
-RecordStatus = Literal["inserted", "duplicate", "capped", "rejected"]
+RecordStatus = Literal["inserted", "duplicate", "capped", "rejected", "refused"]
 
 
 @dataclass(frozen=True)
@@ -77,8 +78,10 @@ class RecordResult:
     ``capped`` means this wallet already has a row for that action on the
     server's UTC day. ``duplicate`` is the same issuer or the same hash for
     this wallet. ``rejected`` means the attest hash was already stored for
-    another wallet. Same-issuer repeats are moot under the per-day cap: the
-    day already allows one row, so a second issuer also gets no slot.
+    another wallet. ``refused`` means attest had no receipt verifier, or the
+    verifier did not return True, so nothing was written. Same-issuer repeats
+    are moot under the per-day cap: the day already allows one row, so a
+    second issuer also gets no slot.
     """
 
     status: RecordStatus
@@ -96,8 +99,8 @@ def tx_hash_format_ok(value: str) -> str:
     """Return ``value`` when it matches ``^0x[0-9a-f]{64}$`` exactly.
 
     This is a format check. A ``0X`` prefix, uppercase hex, and surrounding
-    whitespace are rejected and are not rewritten. Comparing the hash to an
-    on-chain receipt is R3, before routes.
+    whitespace are rejected and are not rewritten. A True receipt is a
+    separate, injected check. This function does not perform it.
     """
     return _accept_tx_hash_format(value)
 
@@ -142,17 +145,22 @@ def record(
     severity: str | None = None,
     client: Mapping[str, Any] | None = None,
     server_now: datetime | None = None,
+    receipt_verifier: Callable[[str, str], bool] | None = None,
 ) -> RecordResult:
-    """Append one rubric row, or return duplicate, capped, or rejected.
+    """Append one rubric row, or return duplicate, capped, rejected, or refused.
 
     ``server_now`` is the process clock (tests inject it). It stays a
     public hook. ``client`` may only contain ``CLIENT_PAYLOAD_FIELDS``,
     which is empty, so any client field is rejected. The parameter
     ``tx_hash_format_ok`` is accepted only for ``attest``, and only when
-    the string matches ``^0x[0-9a-f]{64}$``. That is format only. The
-    on-chain receipt check is R3, before routes. One attest hash can be
-    stored once, across every wallet. Every other action uses
+    the string matches ``^0x[0-9a-f]{64}$``. That is format only. One attest
+    hash can be stored once, across every wallet. Every other action uses
     ``synthetic_tx_key``.
+
+    Attest fail-closed: ``receipt_verifier(tx_hash, wallet)`` must return
+    True or the row is not written and ``awarded`` is 0. There is no default
+    verifier. ``None`` refuses. This module does not supply a stub that
+    returns True, and it does not read a chain.
 
     The check and the insert share one ``BEGIN IMMEDIATE``.
     ``UNIQUE(wallet, action, utc_day)`` is the daily cap.
@@ -168,6 +176,11 @@ def record(
         if supplied_hash is None:
             raise ValueError("attest requires a verified on-chain tx hash")
         key = _accept_tx_hash_format(supplied_hash)
+        # TODO(R3): the real Base Sepolia receipt check (success, the right
+        # chain and ScoreAttestation contract, the wallet as sender or subject)
+        # is a hard gate before any route calls record().
+        if receipt_verifier is None or receipt_verifier(key, normalized) is not True:
+            return RecordResult(status="refused", entry=None, awarded=0)
     else:
         if supplied_hash is not None:
             raise ValueError("tx hash is not accepted for this action")
