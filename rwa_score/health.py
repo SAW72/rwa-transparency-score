@@ -226,8 +226,10 @@ def _attach_custom_routes(app: Any) -> None:
 
 def _custom_route_specs() -> list[tuple[str, type]]:
     from .legal import _legal_handler_class
+    from .seo import seo_route_specs
 
     return [
+        *seo_route_specs(),
         (r"/health/?", _health_handler_class()),
         (r"/privacy/?", _legal_handler_class("privacy")),
         (r"/terms/?", _legal_handler_class("terms")),

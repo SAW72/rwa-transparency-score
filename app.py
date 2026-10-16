@@ -31,6 +31,7 @@ from rwa_score.ask_rat import (
 from rwa_score.client import create_client, env_flag, summarize_call_log
 from rwa_score.explainer import AI_FOOTNOTE, explain_score, fallback_explanation
 from rwa_score.health import install_health_route, serve_health_if_requested
+from rwa_score.seo import SEO_TITLE
 from rwa_score.score_card import (
     PNG_BUILD_FAILED_PREFIX,
     attach_x_share,
@@ -98,7 +99,7 @@ _catalog_shard_memo: dict[str, list[TickerOption]] = {}
 
 install_health_route()
 
-PAGE_TITLE = "RAT Score | RWA Transparency Score"
+PAGE_TITLE = SEO_TITLE
 BRAND_H1 = "RAT Score"
 BRAND_SUB = "RWA Transparency Score"
 TAGLINE = "Risk radar for tokenized stocks · CoinMarketCap Build-a-thon"
