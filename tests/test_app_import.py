@@ -31,7 +31,7 @@ EXPECTED_DISCLAIMER = (
 def test_brand_copy_replaces_old_page_title() -> None:
     import app as demo_app
 
-    assert demo_app.PAGE_TITLE == "RAT Score | RWA Transparency Score"
+    assert demo_app.PAGE_TITLE == "RAT Score | RWA Transparency Score for Tokenized Stocks"
     assert demo_app.BRAND_H1 == "RAT Score"
     assert demo_app.BRAND_SUB == "RWA Transparency Score"
     assert demo_app.TAGLINE == (
