@@ -15,8 +15,9 @@ Optional env var (name only; set the value in Render, never commit it): `COINGEC
 | Quote TTL | 10 minutes |
 | Directory TTL | 30 minutes (allowlist file; memory cache) |
 | Refresh | At least every 24 hours (these TTLs are shorter) |
-| HTTP 429 | Honor `Retry-After` only for digits or an HTTP-date. Otherwise 1s / 2s / 4s. At most 3 retries. Total sleep per request capped at 10 seconds |
+| HTTP 429 | Honor `Retry-After` only for ASCII digits or an HTTP-date. Otherwise 1s / 2s / 4s. At most 3 retries. Total sleep per request capped at 10 seconds |
 | After failure | Serve the last cached payload with `as of <timestamp>`. Do not crash the page |
+| Cool-down | After CoinGecko and the CMC fallback both fail, make no network call and no sleep for 45 seconds (`COOLDOWN_SECONDS`) and serve the stale or empty result. A success from either host clears it. One failed cycle costs at most 20 seconds |
 | Disk | Not required. Render's free disk is ephemeral |
 
 `app.py` also keeps the search directory in `st.cache_data` (30 minutes) and one scorer in `st.cache_resource`.

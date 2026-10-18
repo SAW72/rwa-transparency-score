@@ -13,6 +13,7 @@ import pytest
 from rwa_score.coingecko_client import (
     CMC_KEYLESS_QUOTES_URL,
     COINGECKO_BASE,
+    COOLDOWN_SECONDS,
     DEMO_KEY_HEADER,
     KEYLESS_NOTE,
     MARKETS_PATH,
@@ -518,3 +519,221 @@ def test_render_and_env_example_have_no_cmc_key_name() -> None:
     assert "COINGECKO_DEMO_API_KEY" in render
     assert "COINGECKO_DEMO_API_KEY" in example
     assert "plan: free" in render
+
+
+# --- Fix 1: Retry-After accepts ASCII digits only ---------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["²", "٣", "１２", "³", "", " ", "3.5", "5, 10", "+5", "-1"],
+)
+def test_retry_after_rejects_non_ascii_digits_and_junk_without_raising(raw: str) -> None:
+    assert parse_retry_after(raw) is None
+
+
+def test_retry_after_still_accepts_ascii_digits_and_http_date() -> None:
+    now = datetime(2026, 10, 18, 3, 0, tzinfo=timezone.utc)
+    assert parse_retry_after("5") == 5.0
+    assert parse_retry_after(" 7 ") == 7.0
+    assert parse_retry_after("0") == 0.0
+    when = format_datetime(now + timedelta(seconds=4), usegmt=True)
+    assert parse_retry_after(when, now=now) == 4.0
+
+
+def test_429_with_superscript_retry_after_does_not_raise_out_of_client(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    session = _HostSession(
+        lambda host: FakeResponse(429, {}, headers={"Retry-After": "²"})
+        if host == "coingecko"
+        else FakeResponse(200, _cmc_quote("PAXG", price=10.0, market_cap=1000.0, volume=5.0))
+    )
+    client = _client(tmp_path, session, sleeper=clock.sleep, clock=clock)
+    quotes = client.rwa_quotes(symbol="PAXG")
+    assert quotes["market_source"] == "cmc_keyless"
+    assert quotes["average_tokenized_price"] == 10.0
+    # The bad header falls to the 1s / 2s / 4s schedule, not to zero or a crash.
+    assert clock.slept and clock.slept[0] == 1.0
+
+
+# --- Fix 2: cool-down after total failure -----------------------------------
+
+
+class _FakeClock:
+    """Injectable monotonic clock. Sleeping advances it, like real time."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _HostSession:
+    """Fake transport. ``respond(host)`` returns a FakeResponse and may be swapped."""
+
+    def __init__(self, respond) -> None:
+        self.respond = respond
+        self.calls: list[str] = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        host = "cmc" if "coinmarketcap" in url else "coingecko"
+        self.calls.append(host)
+        return self.respond(host)
+
+
+def _both_429(secret: str = ""):
+    def respond(_host: str) -> FakeResponse:
+        return FakeResponse(429, {"echo": secret}, headers={"Retry-After": "9999"}, text=secret)
+
+    return respond
+
+
+def test_cooldown_constant_is_45_seconds() -> None:
+    assert COOLDOWN_SECONDS == 45
+
+
+def test_outage_burst_makes_zero_calls_and_zero_sleep_inside_cooldown(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    session = _HostSession(_both_429())
+    client = _client(tmp_path, session, sleeper=clock.sleep, clock=clock)
+    rows = client._allowlist_rows()
+    first = client._quote_for(rows[0])
+    assert first["unverified"] is True
+    first_calls = len(session.calls)
+    first_sleep = sum(clock.slept)
+    assert 0 < first_calls
+    assert first_sleep <= 20.0
+    for i in range(10):
+        row = rows[i % len(rows)]
+        if i % 3 == 0:
+            client._quote_for(row)
+        elif i % 3 == 1:
+            client.crypto_quote(row["rwa_id"])
+        else:
+            client.rwa_quotes(symbol=row["symbol"])
+    assert len(session.calls) == first_calls
+    assert sum(clock.slept) == first_sleep
+    assert sum(clock.slept) <= 20.0
+
+
+def test_cooldown_expires_after_45_seconds_and_retries(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    session = _HostSession(_both_429())
+    client = _client(tmp_path, session, sleeper=clock.sleep, clock=clock)
+    row = client._allowlist_rows()[0]
+    client._quote_for(row)
+    after_first = len(session.calls)
+    clock.advance(COOLDOWN_SECONDS - 1)
+    client._quote_for(row)
+    assert len(session.calls) == after_first
+    clock.advance(1)
+    client._quote_for(row)
+    assert len(session.calls) > after_first
+
+
+def test_success_from_either_host_clears_cooldown(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    markets = [_market("pax-gold", "paxg"), _market("figure-heloc", "figr_heloc")]
+    mode = {"cg": "fail"}
+
+    def respond(host: str) -> FakeResponse:
+        if host == "coingecko":
+            if mode["cg"] == "ok":
+                return FakeResponse(200, markets)
+            return FakeResponse(429, {}, headers={"Retry-After": "9999"})
+        return FakeResponse(429, {}, headers={"Retry-After": "9999"})
+
+    session = _HostSession(respond)
+    client = _client(tmp_path, session, sleeper=clock.sleep, clock=clock)
+    row = client._allowlist_rows()[0]
+    client._quote_for(row)
+    assert client._total_failure_at is not None
+    clock.advance(COOLDOWN_SECONDS)
+    mode["cg"] = "ok"
+    found = client._quote_for(row)
+    assert found["market_source"] == "coingecko" and found["stale"] is False
+    assert client._total_failure_at is None
+
+    # Same for the CMC fallback host.
+    clock2 = _FakeClock()
+    cmc_ok = {"on": False}
+
+    def respond2(host: str) -> FakeResponse:
+        if host == "cmc" and cmc_ok["on"]:
+            return FakeResponse(
+                200,
+                {
+                    "data": [
+                        {
+                            "symbol": "PAXG",
+                            "quote": [{"symbol": "USD", "price": 10.0, "market_cap": 1000.0, "volume_24h": 5.0}],
+                        }
+                    ]
+                },
+            )
+        return FakeResponse(429, {}, headers={"Retry-After": "9999"})
+
+    client2 = _client(tmp_path, _HostSession(respond2), sleeper=clock2.sleep, clock=clock2)
+    client2._quote_for(client2._allowlist_rows()[0])
+    assert client2._total_failure_at is not None
+    clock2.advance(COOLDOWN_SECONDS)
+    cmc_ok["on"] = True
+    assert client2._quote_for(client2._allowlist_rows()[0])["market_source"] == "cmc_keyless"
+    assert client2._total_failure_at is None
+
+
+def test_stale_data_still_served_with_stale_flag_during_cooldown(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    markets = [_market("pax-gold", "paxg", price=10.0, market_cap=1000.0, supply=100.0), _market("figure-heloc", "figr_heloc", price=1.0, market_cap=10.0, supply=10.0)]
+    state = {"up": True}
+
+    def respond(_host: str) -> FakeResponse:
+        if state["up"]:
+            return FakeResponse(200, markets)
+        return FakeResponse(429, {}, headers={"Retry-After": "9999"})
+
+    session = _HostSession(respond)
+    client = _client(tmp_path, session, sleeper=clock.sleep, clock=clock, now_iso=lambda: "2026-10-18T03:00:00Z")
+    row = client._allowlist_rows()[0]
+    assert client._quote_for(row)["stale"] is False
+    state["up"] = False
+    clock.advance(client.quote_ttl + 1)
+    during = client._quote_for(row)  # total failure, stale cache, starts cool-down
+    assert during["stale"] is True and during["price"] == 10.0
+    calls = len(session.calls)
+    slept = sum(clock.slept)
+    for _ in range(5):
+        again = client.crypto_quote(row["rwa_id"])
+        assert again["stale"] is True
+        assert again["quote"]["USD"]["price"] == 10.0
+        assert again["as_of"] == "2026-10-18T03:00:00Z"
+    assert len(session.calls) == calls
+    assert sum(clock.slept) == slept
+    assert "as of 2026-10-18T03:00:00Z" in client.provider_notice()
+
+
+def test_key_never_in_errors_or_repr_during_cooldown(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    session = _HostSession(_both_429(SENTINEL))
+    client = _client(tmp_path, session, sleeper=clock.sleep, clock=clock, api_key=SENTINEL)
+    rows = client._allowlist_rows()
+    client._quote_for(rows[0])
+    calls = len(session.calls)
+    blobs = []
+    for row in rows:
+        blobs.append(repr(client._quote_for(row)))
+        blobs.append(repr(client.crypto_quote(row["rwa_id"])))
+    blobs += [client.last_error, repr(client), client.provider_notice()]
+    assert len(session.calls) == calls
+    assert SENTINEL not in " ".join(blobs)
+    for call in session.calls:
+        assert call in {"cmc", "coingecko"}

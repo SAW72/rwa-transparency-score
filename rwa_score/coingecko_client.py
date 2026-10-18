@@ -52,6 +52,11 @@ CALLS_PER_DAY = 300
 MAX_RETRIES = 3
 MAX_WAIT_SECONDS = 10.0
 BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+# After CoinGecko and the CMC fallback both fail, skip every network call and
+# sleep for this many seconds and serve the stale or empty result. One failed
+# cycle costs at most 2 x MAX_WAIT_SECONDS; without this, each page call in an
+# outage pays that cost again. Any success clears it.
+COOLDOWN_SECONDS = 45.0
 # Quotes refresh inside the 5–10 minute ceiling. Directory identity is local
 # and may be reused for 30 minutes. Both are inside the 24h terms window.
 QUOTE_TTL_SECONDS = 600.0
@@ -91,9 +96,10 @@ def _redact(text: str, secret: str) -> str:
 
 
 def parse_retry_after(raw: Any, *, now: datetime | None = None) -> float | None:
-    """Seconds to wait. Digits or a clear HTTP-date only.
+    """Seconds to wait. ASCII digits or a clear HTTP-date only.
 
-    Negatives, decimals, lists, and other garbage return ``None`` so the
+    Negatives, decimals, lists, non-ASCII digits (``²``, Arabic-Indic, full
+    width), and other garbage return ``None`` so the
     caller uses 1s/2s/4s backoff instead of trusting the header.
     """
     if raw is None or isinstance(raw, (list, tuple, dict, bool)):
@@ -107,7 +113,7 @@ def parse_retry_after(raw: Any, *, now: datetime | None = None) -> float | None:
     text = str(raw).strip()
     if not text:
         return None
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         return float(int(text))
     try:
         parsed = parsedate_to_datetime(text)
@@ -265,6 +271,7 @@ class CoinGeckoClient:
         self._quotes_at: float | None = None
         self._quotes_as_of: str | None = None
         self._quotes_stale = False
+        self._total_failure_at: float | None = None
         self._journal = _CallJournal(self.source)
         self.last_error = ""
         self.class_coverage_note = ""
@@ -487,6 +494,11 @@ class CoinGeckoClient:
         ):
             self._record(MARKETS_PATH, via="cache", cached=True)
             return self._quotes
+        if (
+            self._total_failure_at is not None
+            and 0.0 <= (now - self._total_failure_at) < COOLDOWN_SECONDS
+        ):
+            return self._serve_stale_or_empty()
         allowlist = self._allowlist_rows()
         ids = [row["coingecko_id"] for row in allowlist]
         symbols = [row["symbol"] for row in allowlist]
@@ -498,6 +510,7 @@ class CoinGeckoClient:
             self._quotes_at = now
             self._quotes_as_of = self._now_iso()
             self._quotes_stale = False
+            self._total_failure_at = None
             self.last_error = ""
             for row in annotated.values():
                 row["as_of"] = self._quotes_as_of
@@ -533,12 +546,18 @@ class CoinGeckoClient:
             self._quotes_at = now
             self._quotes_as_of = self._now_iso()
             self._quotes_stale = False
+            self._total_failure_at = None
             for row in annotated.values():
                 row["as_of"] = self._quotes_as_of
             self._record(CMC_KEYLESS_QUOTES_URL, via="network")
             return annotated
         except CoinGeckoError as exc:
             self.last_error = str(exc)
+        self._total_failure_at = self._clock()
+        return self._serve_stale_or_empty()
+
+    def _serve_stale_or_empty(self) -> dict[str, dict[str, Any]]:
+        """Last cached book marked stale, or empty. No network, no sleep."""
         if self._quotes is not None:
             self._quotes_stale = True
             for row in self._quotes.values():
