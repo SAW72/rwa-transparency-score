@@ -19,8 +19,8 @@ from rwa_score.scorer import (
     wrappers_from_rwa_tokens,
 )
 from rwa_score.ticker_search import load_search_catalog, search_tickers
+from rwa_score.coingecko_client import NOT_AVAILABLE, CoinGeckoClient
 from tests.conftest import RecordingClient
-from tests.test_client import FakeSession, cmc_ok, _live
 
 
 def test_parse_rwa_quotes_payload_keeps_missing_numeric_none() -> None:
@@ -67,85 +67,58 @@ def test_parse_assets_list_payload_normalizes_rows() -> None:
     assert parsed["has_more"] is True
 
 
+class _QuietSession:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls += 1
+        raise AssertionError(f"unexpected network {url}")
+
+
 def test_live_rwa_quotes_fetches_and_caches() -> None:
+    """Second quote read is a cache hit. Venue names are not invented."""
+    from tests.test_coingecko_client import FakeResponse, FakeSession, _market
+
     session = FakeSession(
         [
-            cmc_ok(
-                {
-                    "rwa_assets": [
-                        {
-                            "rwa_id": 2,
-                            "symbol": "NVDA",
-                            "average_tokenized_price": 211.04,
-                            "tokenized_market_cap": 3726091.28,
-                            "tokenized_volume_24h": 7654132.31,
-                            "tokens": [
-                                {
-                                    "symbol": "NVDAX",
-                                    "price": 211.32,
-                                    "crypto_id": 36992,
-                                    "issuer_name": "xStocks",
-                                }
-                            ],
-                            "tradfi_markets": [
-                                {
-                                    "exchange": {"name": "Binance", "slug": "binance"},
-                                    "ticker": "NVDA",
-                                }
-                            ],
-                        }
-                    ]
-                }
+            FakeResponse(
+                200,
+                [_market(row["coingecko_id"], row["symbol"], price=100.0, market_cap=1_000.0, supply=10.0)
+                 for row in __import__("rwa_score.coingecko_client", fromlist=["load_allowlist"]).load_allowlist()],
             )
         ]
     )
-    client = _live(session)
-    first = client.rwa_quotes(rwa_id=2)
-    second = client.rwa_quotes(rwa_id=2)
-    assert first == second
-    assert first["average_tokenized_price"] == 211.04
-    assert first["tokens"][0]["issuer_name"] == "xStocks"
-    assert session.paths() == [ENDPOINT_QUOTES]
+    client = CoinGeckoClient(session=session, sleeper=lambda _s: None, api_key="")
+    first = client.rwa_quotes(symbol="PAXG")
+    second = client.rwa_quotes(symbol="PAXG")
+    assert first["symbol"] == second["symbol"] == "PAXG"
+    assert first["average_tokenized_price"] == 100.0
+    assert first["tokens"] == []
+    assert first["tradfi_markets_status"] == NOT_AVAILABLE
+    assert len(session.calls) == 1
     log = client.call_log()
     assert log[0]["source"] == "live" and log[0]["via"] == "network"
-    assert log[1]["via"] == "cache" and log[1]["cached"] is True
+    assert any(row["via"] == "cache" and row["cached"] is True for row in log)
 
 
 def test_live_assets_list_rejects_unknown_type() -> None:
-    client = _live(FakeSession([]))
+    client = CoinGeckoClient(session=_QuietSession(), sleeper=lambda _s: None, api_key="")
     try:
         client.assets_list(asset_type="spaceship")
     except Exception as exc:
         assert "asset_type" in str(exc)
     else:
-        raise AssertionError("expected CMCError")
+        raise AssertionError("expected an asset_type error")
 
 
-def test_live_assets_list_fetches_ranked_page() -> None:
-    session = FakeSession(
-        [
-            cmc_ok(
-                {
-                    "total_size": 1,
-                    "has_more": False,
-                    "rwa_assets": [
-                        {
-                            "symbol": "NVDA",
-                            "rwa_id": 2,
-                            "asset_type": "stock",
-                            "rwa_rank": 2,
-                        }
-                    ],
-                }
-            )
-        ]
-    )
-    client = _live(session)
-    page = client.assets_list(asset_type="stock")
-    assert page["rwa_assets"][0]["symbol"] == "NVDA"
-    assert session.paths() == [ENDPOINT_ASSETS_LIST]
-    assert session.calls[0][1]["asset_type"] == "stock"
-    assert session.calls[0][1]["sort"] == "rwa_rank"
+def test_live_assets_list_class_is_not_available() -> None:
+    client = CoinGeckoClient(session=_QuietSession(), sleeper=lambda _s: None, api_key="")
+    # Class filter is answered from the allowlist before a market call.
+    # Every allowlist class is unknown, so stock is not covered.
+    mapped = client.rwa_map(asset_type="stock")
+    assert mapped == []
+    assert client.class_coverage_note == NOT_AVAILABLE
 
 
 def test_price_prefers_rwa_quotes_over_crypto() -> None:

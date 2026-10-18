@@ -95,11 +95,11 @@ def test_judge_friction_covers_rate_limits_and_fixtures() -> None:
     text = FRICTION_DOC.read_text(encoding="utf-8")
     assert FRICTION_DOC.is_file()
     assert "429" in text
-    assert "1008" in text
+    assert "Retry-After" in text
     assert "RWA_USE_FIXTURES=1" in text
     assert "rwa-transparency-score.onrender.com" in text
     assert "/health" in text
-    assert "DoraHacks Startup" in text
+    assert "CoinGecko" in text
     assert "cold start" in text.lower()
     assert "X-API-Key: <REDACTED>" in text
 
@@ -188,7 +188,7 @@ def test_render_blueprint_keeps_scorecard_and_documents_api_service() -> None:
         "BASE_SEPOLIA_RPC_URL",
         "RWA_ATTESTATION_CHAIN_ID",
         "RWA_API_BOOTSTRAP_KEY",
-        "CMC_API_KEY",
+        "COINGECKO_DEMO_API_KEY",
         "RWA_USE_FIXTURES",
         "RWA_ATTEST_WAIT_SECONDS",
     ):

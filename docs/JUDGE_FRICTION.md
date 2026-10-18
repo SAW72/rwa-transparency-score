@@ -1,12 +1,12 @@
-# Judge friction (CMC DoraHacks)
+# Judge friction (CoinGecko)
 
-Short path so judging does not stall on CoinMarketCap rate limits or a Free Render cold start. **No Submit.** The hosted paid API is **not** deployed (spend hold).
+Short path so judging does not stall on CoinGecko rate limits or a Free Render cold start. **No Submit.** The hosted paid API is **not** deployed (spend hold).
 
 ## External contribution credit
 
 **YuTao Peng** ([@imokokok](https://github.com/imokokok)) contributed the offline NVDA fixture consumer-mapping note (PR [#52](https://github.com/SAW72/rwa-transparency-score/pull/52)): [`NVDA_FIXTURE_CONSUMER_MAPPING.md`](NVDA_FIXTURE_CONSUMER_MAPPING.md), linked from [`API_EVIDENCE.md`](API_EVIDENCE.md). Docs-only — how a downstream policy tool preserves RAT provenance labels. Credit / label only; not a GitHub collaborator invite.
 
-## Fastest path: offline fixtures (no CMC key)
+## Fastest path: offline fixtures (no market-data key)
 
 ```bash
 pip install -r requirements.txt
@@ -25,22 +25,18 @@ curl -sS -H "X-API-Key: <REDACTED>" http://127.0.0.1:8000/v1/score/NVDA
 
 Captured fixture-backed request + response: [`API_EVIDENCE.md`](API_EVIDENCE.md) / [`examples/v1_score_NVDA.fixture.json`](examples/v1_score_NVDA.fixture.json). That sample is **fixture-backed**, not live CMC (`data_source: "fixture"`).
 
-## CMC Basic rate limits
+## CoinGecko rate limits
 
-CMC **Basic** keys allow only a few HTTP requests per minute.
+Demo keys are published at 100 calls per minute and 10,000 calls per month. This app stays under that with a 30/minute cap and a 300/day process budget. Keyless access is stricter and shared. Prefer fixtures for judging.
 
 | Signal | Meaning |
 |---|---|
-| `HTTP 429` | HTTP request rate limit |
-| `error_code` **1008** | Same cap, sometimes on HTTP 200 |
-| Message | *You've exceeded your API Key's HTTP request rate limit. Rate limits reset every minute.* |
-| `error_code` **1006** / related `HTTP 403` | Current CMC plan does not include `/v5/real-world-assets/market-pairs/list` |
+| `HTTP 429` | Rate limit. `Retry-After` is used only when it is digits or an HTTP-date |
+| Other `Retry-After` values | Ignored. Backoff is 1s, then 2s, then 4s |
+| Wait cap | At most 10 seconds of sleep, then cached data with an `as of` time |
+| HTTP 5xx or network error | Same bounded retries, then keyless CMC quotes for price, market cap, and volume, then cache |
 
-**Market-pairs plan-block:** a live 1006 / related 403 on market-pairs does **not** crash the score card or Ask RAT. Cross-issuer basis is labeled **plan-blocked / unavailable** (not live market-pairs data). Other pillars keep scoring. Upgrade the CMC plan to restore pairs; until then the degrade is honest.
-
-**What to do:** wait about **one minute** and retry. The live client already retries 429 / 1008 with exponential backoff and jitter (honors `Retry-After`, waits ~60s total), then raises a clear error.
-
-[DoraHacks Startup](https://coinmarketcap.com/api/) unlocks a higher request rate (and more credits) than Basic. Prefer fixtures for judging so you never hit the cap.
+The page stays up. No key is printed. Venue names are **not available** (there is no market-pairs feed on this source).
 
 ## Live Streamlit demo (not the paid API)
 
@@ -78,10 +74,10 @@ Render hosts the **Streamlit** UI + `/health` (and `/privacy`, `/terms`). It doe
 |---|---|
 | Env | `RWA_USE_FIXTURES=1` |
 | Data | Bundled `rwa_score/fixtures/demo_cmc.json` |
-| Credits | None — no `CMC_API_KEY`, no live CMC |
+| Credits | None — fixtures only, no live CoinGecko |
 | Label | UI / CLI / API set `data_source` to `fixture` |
 
-`RWA_USE_FIXTURES=0` is live CMC + Chainlink PoR verifiers (needs a key). **Do not flip Render to fixtures** — `render.yaml` keeps the hosted demo on `0`.
+`RWA_USE_FIXTURES=0` is live CoinGecko + Chainlink PoR verifiers. **Do not flip Render to fixtures** — `render.yaml` keeps the hosted demo on `0`.
 
 ## Do not expect
 

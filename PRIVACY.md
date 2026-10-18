@@ -22,7 +22,8 @@ This Privacy Policy explains how we handle information when you use RAT, includi
 - Basic analytics if enabled later (we will update this policy if we add analytics cookies beyond essential hosting)
 
 **D. Third-party data displayed in scores**
-- CoinMarketCap (or similar) RWA/market fields when live mode is on
+- CoinGecko market fields when live mode is on. Data provided by CoinGecko (https://www.coingecko.com/en/api).
+- If CoinGecko is unavailable, price, market cap, and volume may come from CoinMarketCap's keyless public quotes. Commercial terms for that keyless path are not confirmed here.
 - Bundled **demo fixtures** when fixture mode is on (not live API data)
 
 We do **not** ask for seed phrases, private keys, government IDs, or payment card numbers for the demo.

@@ -3,9 +3,9 @@
 #
 # Render must stay at RWA_USE_FIXTURES=0 so live Chainlink PoR
 # checks run. Blueprint sync re-applies this file and will overwrite a
-# dashboard-only toggle. CMC_API_KEY must be set in the Render dashboard
-# (sync: false) for live CMC. Never commit the key. Local demos can still
-# set RWA_USE_FIXTURES=1.
+# dashboard-only toggle. COINGECKO_DEMO_API_KEY may be set in the Render
+# dashboard (sync: false). Leave it unset to use keyless CoinGecko. Never
+# commit the key. Local demos can still set RWA_USE_FIXTURES=1.
 # Optional: POLYGON_RPC_URL / BASE_RPC_URL / ETH_RPC_URL in the dashboard
 # (public no-key fallbacks are used when unset).
 #
@@ -35,7 +35,7 @@ services:
         value: "0"
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: CMC_API_KEY
+      - key: COINGECKO_DEMO_API_KEY
         sync: false
       - key: XAI_API_KEY
         sync: false
@@ -72,7 +72,7 @@ services:
         sync: false
       - key: PYTHONUNBUFFERED
         sync: false
-      - key: CMC_API_KEY
+      - key: COINGECKO_DEMO_API_KEY
         sync: false
       - key: RWA_ATTESTER_PRIVATE_KEY
         sync: false

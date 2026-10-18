@@ -597,7 +597,17 @@ class TransparencyScorer:
         except Exception as exc:  # noqa: BLE001 — record, do not hide
             flags.append(f"RWA quotes lookup failed: {exc}")
             return empty, flags
-        return parse_rwa_quotes_payload(raw), flags
+        parsed = parse_rwa_quotes_payload(raw)
+        if isinstance(raw, dict):
+            # Sanity flags are not part of the CMC quotes shape. Keep them
+            # when a live client set them. Fixture payloads omit the keys.
+            if "unverified" in raw:
+                parsed["unverified"] = bool(raw.get("unverified"))
+                parsed["unverified_reasons"] = list(raw.get("unverified_reasons") or [])
+            for key in ("market_source", "as_of", "stale", "tradfi_markets_status"):
+                if key in raw:
+                    parsed[key] = raw[key]
+        return parsed, flags
 
     def _crypto_quote_price(
         self, crypto_id: Any
@@ -694,8 +704,42 @@ class TransparencyScorer:
         *,
         quote_flags: list[str] | None = None,
     ) -> tuple[float, dict[str, Any], list[str], str]:
-        """Prefer RWA ``quotes/latest``; fall back to crypto 24hΔ. Never invent fields."""
+        """Prefer RWA quotes; fall back to crypto 24hΔ. Never invent fields."""
         flags = list(quote_flags or [])
+        if rwa_quotes.get("unverified"):
+            reasons = rwa_quotes.get("unverified_reasons") or []
+            detail = "; ".join(str(item) for item in reasons)
+            flags.append(
+                "Market row is unverified"
+                + (f" ({detail})" if detail else "")
+                + " — excluded from the price score."
+            )
+            meta = {
+                "available": False,
+                "unverified": True,
+                "unverified_reasons": list(reasons),
+                "source": rwa_quotes.get("market_source") or SOURCE_RWA_QUOTES,
+                "market_source": rwa_quotes.get("market_source"),
+                "as_of": rwa_quotes.get("as_of"),
+                "stale": bool(rwa_quotes.get("stale")),
+                "fallback": False,
+                "crypto_id": int(crypto_id) if crypto_id else None,
+                "percent_change_24h": None,
+                "price": rwa_quotes.get("average_tokenized_price"),
+                "average_tokenized_price": rwa_quotes.get("average_tokenized_price"),
+                "tokenized_market_cap": rwa_quotes.get("tokenized_market_cap"),
+                "tokenized_volume_24h": rwa_quotes.get("tokenized_volume_24h"),
+                "tokens": [],
+                "tradfi_markets": [],
+                "tradfi_venue_count": None,
+            }
+            return (
+                DEFAULT_PRICE_SCORE,
+                meta,
+                flags,
+                "Unverified market data is excluded from the price score. "
+                f"Assigned the missing-field default ({DEFAULT_PRICE_SCORE:.0f}), not a pass.",
+            )
         tokens = wrappers_from_rwa_tokens(rwa_quotes.get("tokens") or [])
         avg = rwa_quotes.get("average_tokenized_price")
         try:
@@ -779,12 +823,27 @@ class TransparencyScorer:
                 "tokens": [],
                 "tradfi_markets": rwa_quotes.get("tradfi_markets") or [],
             }
+            if rwa_quotes.get("market_source"):
+                meta["market_source"] = rwa_quotes.get("market_source")
+                meta["as_of"] = rwa_quotes.get("as_of")
+                meta["stale"] = bool(rwa_quotes.get("stale"))
+            if rwa_quotes.get("tradfi_markets_status") == "not available":
+                flags.append("TradFi venue names are not available.")
+            if rwa_quotes.get("market_source"):
+                why = (
+                    "Price is present but an issuer-token comparison is not available. "
+                    f"Assigned the missing-field default ({DEFAULT_PRICE_SCORE:.0f}), not a pass."
+                )
+            else:
+                why = (
+                    f"RWA quotes have an average ({avg_f:.4f}) but no priced tokens[]; "
+                    f"assigned the unverified default ({DEFAULT_PRICE_SCORE:.0f})."
+                )
             return (
                 DEFAULT_PRICE_SCORE,
                 meta,
                 flags,
-                f"RWA quotes have an average ({avg_f:.4f}) but no priced tokens[]; "
-                f"assigned the unverified default ({DEFAULT_PRICE_SCORE:.0f}).",
+                why,
             )
 
         return self._crypto_quote_price(crypto_id)
@@ -1251,27 +1310,28 @@ class TransparencyScorer:
         price_why = _append_verification_notes(price_why, price_v)
 
         cik = info.get("cik")
+        cik_missing = info.get("cik_status") == "not available"
         disclosure = 80.0 if cik else 20.0
+        if cik:
+            disclosure_evidence = f"SEC CIK {cik} on CMC RWA info record."
+            disclosure_lead = f"SEC CIK {cik} present on the RWA info record."
+        elif cik_missing:
+            disclosure_evidence = "SEC CIK is not available from this source."
+            disclosure_lead = "SEC CIK is not available from this source."
+        else:
+            disclosure_evidence = "No SEC CIK on the RWA info record."
+            disclosure_lead = (
+                "No SEC CIK on the RWA info record — issuer identity not matchable to filings."
+            )
         disclosure_v = VerificationResult(
             score=disclosure,
             level=VerificationLevel.SELF_REPORTED,
-            evidence=(
-                f"SEC CIK {cik} on CMC RWA info record."
-                if cik
-                else "No SEC CIK on the RWA info record."
-            ),
+            evidence=disclosure_evidence,
             source="cmc_rwa_info",
             notes=[f"verification={VerificationLevel.SELF_REPORTED.value}"],
             ok=bool(cik),
         )
-        disclosure_why = _append_verification_notes(
-            (
-                f"SEC CIK {cik} present on the RWA info record."
-                if cik
-                else "No SEC CIK on the RWA info record — issuer identity not matchable to filings."
-            ),
-            disclosure_v,
-        )
+        disclosure_why = _append_verification_notes(disclosure_lead, disclosure_v)
 
         basis_score, basis_meta, basis_flags, basis_why = self._basis_score(
             rwa_id, rwa_quotes, quote_flags=quote_flags

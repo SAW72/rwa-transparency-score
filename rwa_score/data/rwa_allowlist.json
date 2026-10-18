@@ -1,0 +1,100 @@
+{
+  "meta": {
+    "kind": "hand_kept_rwa_allowlist",
+    "verified_on": "2026-10-18",
+    "source": "keyless GET https://api.coingecko.com/api/v3/coins/markets",
+    "note": "Ids confirmed on CoinGecko that day. asset_class is unknown on every row. The PAXG contract is the ethereum token_address returned by the keyless public quotes payload the same day. Other contracts were not copied. This file is not generated from a CoinGecko list."
+  },
+  "assets": [
+    {
+      "rwa_id": 1,
+      "name": "PAX Gold",
+      "symbol": "PAXG",
+      "chain": "ethereum",
+      "contract_address": "0x45804880de22913dafe09f4980848ece6ecbaf78",
+      "coingecko_id": "pax-gold",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 2,
+      "name": "Tether Gold",
+      "symbol": "XAUT",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "tether-gold",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 3,
+      "name": "Matrixdock Gold",
+      "symbol": "XAUM",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "matrixdock-gold",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 4,
+      "name": "Ondo USDY",
+      "symbol": "USDY",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "ondo-us-dollar-yield",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 5,
+      "name": "BlackRock USD Institutional Digital Liquidity Fund",
+      "symbol": "BUIDL",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "blackrock-usd-institutional-digital-liquidity-fund",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 6,
+      "name": "Circle USYC",
+      "symbol": "USYC",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "hashnote-usyc",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 7,
+      "name": "Spiko US T-Bills Money Market Fund",
+      "symbol": "USTBL",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "spiko-us-t-bills-money-market-fund",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 8,
+      "name": "Figure Heloc",
+      "symbol": "FIGR_HELOC",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "figure-heloc",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 9,
+      "name": "NVIDIA xStock",
+      "symbol": "NVDAX",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "nvidia-xstock",
+      "asset_class": "unknown"
+    },
+    {
+      "rwa_id": 10,
+      "name": "Tesla xStock",
+      "symbol": "TSLAX",
+      "chain": null,
+      "contract_address": null,
+      "coingecko_id": "tesla-xstock",
+      "asset_class": "unknown"
+    }
+  ]
+}

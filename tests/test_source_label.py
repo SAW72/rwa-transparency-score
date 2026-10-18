@@ -14,6 +14,7 @@ def test_source_kind_maps_known_aliases() -> None:
     assert source_kind("live") == "live"
     assert source_kind("CMC") == "live"
     assert source_kind("coinmarketcap") == "live"
+    assert source_kind("coingecko") == "live"
     assert source_kind("") == "unknown"
     assert source_kind(None) == "unknown"
     assert source_kind("mystery") == "unknown"
@@ -26,6 +27,8 @@ def test_unknown_is_never_live() -> None:
     assert is_fixture_source("fixture")
     assert is_live_cmc_source("cmc")
     assert "not live" in source_honesty_label("fixture").lower()
-    assert source_honesty_label("live") == "live CoinMarketCap API"
+    assert source_honesty_label("live") == "live CoinGecko API"
+    assert "CoinGecko" in source_honesty_label("coingecko")
+    assert "keyless" in source_honesty_label("cmc_keyless").lower()
     assert "not labeled as live" in source_honesty_label("").lower()
-    assert "live CoinMarketCap API" not in source_honesty_label("mystery")
+    assert "live CoinGecko API" not in source_honesty_label("mystery")

@@ -12,6 +12,8 @@ Third-party components
 Dependencies and vendored code remain under their own licenses. This NOTICE
 does not relicense third-party material.
 
+Data provided by CoinGecko (https://www.coingecko.com/en/api).
+
 Trademarks
 ----------
 “RAT Score”, “RWA Transparency Score”, “Steward”, and related marks are not

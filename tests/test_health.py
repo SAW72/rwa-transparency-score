@@ -56,6 +56,7 @@ def test_health_payload_fixtures_false_when_env_off(
 ) -> None:
     monkeypatch.setenv("RWA_USE_FIXTURES", "0")
     monkeypatch.setenv("CMC_API_KEY", "configured")
+    monkeypatch.delenv("COINGECKO_DEMO_API_KEY", raising=False)
     monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.example.test")
     called: list[str] = []
 
@@ -87,7 +88,11 @@ def test_health_payload_fixtures_false_when_env_off(
         "timestamp",
         "git_sha",
         "share_ux",
+        "market_data_provider",
+        "coingecko_access",
     }
+    assert payload["market_data_provider"] == "coingecko"
+    assert payload["coingecko_access"] == "keyless"
     assert payload["share_ux"] == SHARE_UX
     assert called
 
@@ -255,7 +260,10 @@ def test_attach_registers_health_and_legal_on_streamlit_like_app() -> None:
                 "timestamp",
                 "git_sha",
                 "share_ux",
+                "market_data_provider",
+                "coingecko_access",
             }
+            assert body["market_data_provider"] == "coingecko"
             assert body["share_ux"] == SHARE_UX
             assert body["git_sha"]
             assert body["verifiers_live"] is (not body["fixtures"])

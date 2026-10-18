@@ -9,7 +9,8 @@ from tests.conftest import RecordingClient
 README_ONELINER = (
     "RAT Score (RWA Transparency Score) — an AI-assisted risk radar for tokenized stocks. "
     "Rates issuers 0–100 on backing, proof of reserves, redemption, price integrity, "
-    "disclosure, and cross-issuer basis using CoinMarketCap’s RWA API."
+    "disclosure, and cross-issuer basis. Live market data is CoinGecko "
+    "(`/coins/markets` on a hand-kept allowlist)."
 )
 
 EXPECTED_DISCLAIMER = (
@@ -554,10 +555,11 @@ def test_sidebar_density_keeps_required_copy() -> None:
     assert 'st.markdown("### Legal")' not in source
     assert "st.warning(" not in sidebar
     assert "st.success(" not in sidebar
-    assert "CMC_API_KEY is not set" in sidebar
+    assert "Using CoinGecko public keyless access; limits are lower." in sidebar
+    assert "CMC_API_KEY" not in sidebar
 
     legend = demo_app.sidebar_legend_markdown()
-    assert "self-reported CMC" in legend
+    assert "CoinGecko" in legend
     assert "heuristic fallback" in legend
     assert "Educational demo" in legend
     assert legend.count("\n- ") + 1 == len(demo_app.heuristic_legend_lines())
@@ -585,7 +587,7 @@ def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
     assert "Remaining heuristics stay labeled" in source
 
     lines = demo_app.heuristic_legend_lines()
-    assert any("self-reported CMC" in line for line in lines)
+    assert any("CoinGecko" in line for line in lines)
     assert any("heuristic fallback" in line for line in lines)
     assert any("not financial advice" in line.lower() or "Educational demo" in line for line in lines)
 

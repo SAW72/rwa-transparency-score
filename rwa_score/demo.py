@@ -1,6 +1,6 @@
 """Side-by-side demo: one solid issuer, one thin wrapper, one mid-tier name.
 
-Defaults to bundled fixtures so judges can run this without a CMC key.
+Defaults to bundled fixtures so judges can run this without a live market-data call.
 
 Run:  python -m rwa_score.demo
       python -m rwa_score.demo --live
@@ -22,7 +22,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Call the live CMC API (requires CMC_API_KEY).",
+        help="Call the live CoinGecko market-data API.",
     )
     args = parser.parse_args(argv)
 
@@ -34,7 +34,7 @@ def main(argv=None) -> int:
 
     scorer = TransparencyScorer(client)
     source = getattr(client, "source", "unknown")
-    print(f"DATA SOURCE: {'bundled DEMO FIXTURES (not live CMC)' if source == 'fixture' else 'live CMC API'}")
+    print(f"DATA SOURCE: {'bundled DEMO FIXTURES (not live CoinGecko)' if source == 'fixture' else 'live CoinGecko API'}")
     print(f"{'TICKER':<7}{'SCORE':>7}  BAND")
     print("-" * 60)
     for t in DEMO_TICKERS:

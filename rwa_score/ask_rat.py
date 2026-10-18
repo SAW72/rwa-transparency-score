@@ -269,8 +269,8 @@ def honesty_line(source: str) -> str:
     if kind == "fixture":
         return "FIXTURE (bundled demo data — not live CoinMarketCap)."
     if kind == "live":
-        return "LIVE CoinMarketCap (not fixtures)."
-    return "Data source not confirmed — not labeled as live CoinMarketCap."
+        return "LIVE CoinGecko (not fixtures)."
+    return "Data source not confirmed — not labeled as live CoinGecko."
 
 
 def format_ask_cmc_lines(block: dict[str, Any] | None) -> list[str]:
@@ -280,7 +280,7 @@ def format_ask_cmc_lines(block: dict[str, Any] | None) -> list[str]:
     if source == "fixture":
         header = "CMC calls this turn — Fixture (bundled demo, **not** live CMC)"
     elif source == "live":
-        header = "CMC calls this turn — Live CMC (not fixtures)"
+        header = "CMC calls this turn — Live CoinGecko (not fixtures)"
     else:
         header = "CMC calls this turn — source not confirmed (not labeled live CMC)"
     lines = [header]

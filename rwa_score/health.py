@@ -98,6 +98,15 @@ def log_deploy_canary() -> None:
     print(deploy_canary_log_line(), flush=True)
 
 
+def market_data_status() -> dict[str, str]:
+    """Provider status for ``GET /health``. Never includes a key value."""
+    configured = bool((os.getenv("COINGECKO_DEMO_API_KEY") or "").strip())
+    return {
+        "market_data_provider": "coingecko",
+        "coingecko_access": "demo" if configured else "keyless",
+    }
+
+
 def build_health_payload(
     *,
     getter: GetFn | None = None,
@@ -116,6 +125,7 @@ def build_health_payload(
         "cmc_key_present": cmc_key_present(),
         "backed_feed": backed,
         "timestamp": utc_timestamp(now),
+        **market_data_status(),
         **deploy_canary_fields(),
     }
 
@@ -167,6 +177,7 @@ def _health_handler_class() -> type:
                     "cmc_key_present": cmc_key_present(),
                     "backed_feed": "down",
                     "timestamp": utc_timestamp(),
+                    **market_data_status(),
                     **deploy_canary_fields(),
                 }
             self.set_header("Content-Type", "application/json")

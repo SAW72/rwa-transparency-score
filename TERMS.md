@@ -29,7 +29,7 @@ If you connect X:
 - We may suspend the feature at any time
 
 ## 6. Third-party services
-CoinMarketCap, Render, X, and other third parties have their own terms. We are not responsible for their outages, data errors, or policy changes.
+CoinGecko, Render, X, and other third parties have their own terms. CoinGecko API data is CoinGecko property. Data provided by CoinGecko (https://www.coingecko.com/en/api). Whether the Demo plan allows this service's use is an open question for the operator. We are not responsible for third-party outages, data errors, or policy changes.
 
 ## 7. Acceptable use
 No unlawful use; no attempts to disrupt the Service; no uploading malware; no using the Service to harass or defraud others.

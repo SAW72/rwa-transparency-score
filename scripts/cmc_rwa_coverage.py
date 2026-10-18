@@ -1,13 +1,13 @@
-"""Print / write the CMC RWA coverage matrix.
+"""Print / write the market-data coverage matrix.
 
-Fixture mode (default, no key):
+Fixture mode (default, no network):
 
     python -m scripts.cmc_rwa_coverage
-    python -m scripts.cmc_rwa_coverage --write docs/CMC_RWA_COVERAGE.md
+    python -m scripts.cmc_rwa_coverage --write docs/RWA_MARKET_DATA.md
 
-Live mode (needs CMC_API_KEY, never committed):
+Live mode calls CoinGecko (optional ``COINGECKO_DEMO_API_KEY``, never printed):
 
-    CMC_API_KEY=… python -m scripts.cmc_rwa_coverage --live
+    python -m scripts.cmc_rwa_coverage --live
 """
 
 from __future__ import annotations
@@ -25,11 +25,11 @@ from rwa_score.coverage import coverage_from_client
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CMC RWA coverage matrix")
+    parser = argparse.ArgumentParser(description="RWA market-data coverage matrix")
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Use CMC_API_KEY (paginated map + assets/list). Never prints the key.",
+        help="Use the CoinGecko allowlist client. Never prints a key.",
     )
     parser.add_argument(
         "--write",

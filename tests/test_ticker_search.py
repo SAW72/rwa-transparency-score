@@ -176,7 +176,7 @@ def test_readme_documents_search_categories() -> None:
     assert "| Currencies |" in text
     assert "`stock`" in text
     assert "government_security" in text
-    assert "docs/CMC_RWA_COVERAGE.md" in text
+    assert "docs/RWA_MARKET_DATA.md" in text
     assert "bNVDA" in text
     assert "BACKED_POR_FEEDS" in text
     assert "first-class Matches" in text or "first-class" in text
@@ -610,9 +610,13 @@ def test_compare_card_helpers_short_name_mode_and_weakest() -> None:
     ).lower()
     assert "not a live" in demo_app.data_source_caption({"data_source": "fixture"}).lower()
     live_cap = demo_app.data_source_caption({"data_source": "live"})
-    assert live_cap.startswith("Live CoinMarketCap directory/quotes")
-    assert "self-reported" in live_cap
-    assert "heuristic fallback" in live_cap
+    assert live_cap.startswith("Live CoinGecko market data")
+    assert "not available" in live_cap
+    assert "Data provided by CoinGecko" in live_cap
+    keyless_cap = demo_app.data_source_caption(
+        {"data_source": "live", "price": {"market_source": "cmc_keyless"}}
+    )
+    assert "CoinMarketCap keyless public quotes" in keyless_cap
     assert "not labeled as live" in demo_app.data_source_caption({})
     report = {
         "subscores": {

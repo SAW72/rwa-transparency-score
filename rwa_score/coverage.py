@@ -1,8 +1,9 @@
-"""CMC RWA coverage matrix — category → ticker → endpoint → status.
+"""Market-data coverage matrix — category → ticker → endpoint → status.
 
-Live catalogs come from paginated ``map`` + ``assets/list``. Fixture catalogs
+Live catalogs come from the hand-kept CoinGecko allowlist. Fixture catalogs
 are labeled ``fixture`` and never claim live. Native crypto is a separate
-class, not an RWA row.
+class, not an RWA row. Currency, real estate, and government security are
+not covered as CoinGecko RWA classes.
 """
 
 from __future__ import annotations
@@ -19,14 +20,8 @@ from .ticker_search import (
 )
 
 WIRED_ENDPOINTS = (
-    "/v5/real-world-assets/map",
-    "/v5/real-world-assets/assets/list",
-    "/v5/real-world-assets/info",
-    "/v5/real-world-assets/issuers/list",
-    "/v5/real-world-assets/issuers",
-    "/v5/real-world-assets/quotes/latest",
-    "/v5/real-world-assets/market-pairs/list",
-    "/v2/cryptocurrency/quotes/latest",
+    "https://api.coingecko.com/api/v3/coins/markets",
+    "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/quotes/latest",
 )
 
 
@@ -98,19 +93,17 @@ def render_coverage_markdown(
     rows = coverage_rows(catalog, client_source=client_source)
     missing = missing_rwa_classes(catalog)
     lines = [
-        "# CMC RWA coverage",
+        "# RWA market-data coverage",
         "",
-        "Spencer requirement: every official CMC RWA class appears in the UI; every",
-        "ticker CMC lists under those classes is wired through live `map` +",
-        "`assets/list` (paginated). No stub ticker list. No keys in repo.",
+        "Live rows come from a hand-kept CoinGecko allowlist (`/coins/markets`).",
+        "The six UI classes stay visible and say they are not covered when the",
+        "source has no class. No keys in the repo.",
         "",
-        "## Official taxonomy (docs + live endpoints)",
-        "",
-        "CMC Pro RWA docs (`/v5/real-world-assets/*`) expose **six** `asset_type`",
-        "values — not the old Look industry chips (AI/Tech, Oil, …). Public docs",
-        "cite **7.9K+** tokenized RWAs. `map` is 0 credits and paginated",
-        "(`start` / `limit`, max 250, `total_size` / `has_more`). `assets/list`",
-        "is the same pagination (1 credit / 250).",
+            "## Official taxonomy still shown in the UI",
+            "",
+            "The six `asset_type` pills stay on the bar. CoinGecko's RWA types are",
+            "not those six classes, and this allowlist marks `asset_class` unknown,",
+            "so each live pill says it is not covered by this source.",
         "",
         "| `asset_type` | UI label |",
         "|---|---|",
@@ -123,7 +116,7 @@ def render_coverage_markdown(
             "Live directory is **paginated** `map` (0 credits) plus paginated "
             "`assets/list` (1 credit / 250). Not a hard-coded ticker stub.",
             "",
-            "Wired CMC endpoints (live when `CMC_API_KEY` is set; fixture mode stays labeled):",
+            "Wired market-data endpoints (CoinGecko live; keyless CMC quotes only as a fallback; fixture mode stays labeled):",
             "",
         ]
     )
@@ -185,9 +178,9 @@ def coverage_from_client(client: Any) -> str:
     catalog = load_search_catalog(client)
     source = getattr(client, "source", "") or "unknown"
     note = (
-        "This snapshot is **bundled demo fixtures** — not live CoinMarketCap."
+        "This snapshot is **bundled demo fixtures** — not live CoinGecko."
         if source == "fixture"
-        else "This snapshot is from live CMC `map` + `assets/list` (paginated)."
+        else "This snapshot is the hand-kept CoinGecko allowlist."
     )
     return render_coverage_markdown(catalog, client_source=source, note=note)
 

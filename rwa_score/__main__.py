@@ -13,7 +13,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--fixtures",
         action="store_true",
-        help="Use bundled demo fixture data (no CMC_API_KEY, no live credits).",
+        help="Use bundled demo fixture data (no live market-data calls).",
     )
     args = parser.parse_args(argv)
 
@@ -36,7 +36,7 @@ def main(argv=None) -> int:
     else:
         source = getattr(client, "source", "unknown")
         if source == "fixture":
-            print("DATA SOURCE: bundled DEMO FIXTURES (not live CMC)\n")
+            print("DATA SOURCE: bundled DEMO FIXTURES (not live CoinGecko)\n")
         for r in results:
             if "error" in r:
                 print(f"{r['ticker']}: ERROR — {r['error']}")

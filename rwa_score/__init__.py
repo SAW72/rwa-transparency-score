@@ -1,7 +1,6 @@
 """RAT Score (RWA Transparency Score) — risk radar for tokenized stocks."""
 
 from .client import (
-    CMCClient,
     CMCError,
     CMCPlanBlockedError,
     PLAN_BLOCKED_LABEL,
@@ -13,6 +12,7 @@ from .client import (
     parse_rwa_quotes_payload,
     use_fixtures,
 )
+from .coingecko_client import CoinGeckoClient
 from .scorer import (
     PILLARS,
     WEIGHTS,
@@ -27,8 +27,8 @@ from .verifiers import VerificationLevel
 __version__ = "0.4.0"
 
 __all__ = [
-    "CMCClient",
     "CMCError",
+    "CoinGeckoClient",
     "CMCPlanBlockedError",
     "PLAN_BLOCKED_LABEL",
     "FixtureClient",

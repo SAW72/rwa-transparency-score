@@ -181,8 +181,9 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
     """Educational leftover-heuristic lines. Never invents a live path."""
     base = [
         "GREEN/YELLOW/ORANGE/RED bands are automated heuristics — not audited attestations.",
-        "Price, disclosure, and cross-issuer basis are always self-reported CMC (or fixture) fields "
-        "(RWA quotes/latest plus market-pairs; crypto 24hΔ is a labeled fallback).",
+        "Price, disclosure, and cross-issuer basis are self-reported market fields "
+        "(live CoinGecko allowlist quotes, or fixture samples). "
+        "CIK, venue names, and RWA rank are not available on the live source.",
         "Backing / reserves / redemption are live only when a verifier hits a published source; otherwise **heuristic fallback** (labeled, never silent).",
         "xStocks names without a published Chainlink PoR aggregator stay heuristic — that is expected coverage, not a failed probe.",
         "Fixture mode uses bundled demo data and skips live attestation / PoR / redemption HTTP.",
@@ -669,7 +670,7 @@ def _init_scorer(use_fixtures: bool) -> TransparencyScorer:
 def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     """One client + scorer per process (and fixture/live mode).
 
-    Widget reruns must not rebuild CMCClient — that would re-hit issuers/list.
+    Widget reruns must not rebuild the market-data client.
     """
     return _init_scorer(use_fixtures)
 
@@ -737,7 +738,7 @@ def format_cmc_calls_lines(block: dict) -> list[str]:
     if source == "fixture":
         header = "CMC calls this run — Fixture (bundled demo, **not** live CMC)"
     elif source == "live":
-        header = "CMC calls this run — Live CMC (not fixtures)"
+        header = "CMC calls this run — Live CoinGecko (not fixtures)"
     else:
         header = "CMC calls this run — source not confirmed (not labeled live CMC)"
     lines = [header]
@@ -1043,13 +1044,19 @@ def data_source_caption(report: dict) -> str:
     if kind == "fixture":
         return "Demo fixture data — not a live CoinMarketCap API response."
     if kind == "live":
+        market_source = str((report.get("price") or {}).get("market_source") or "")
+        if market_source == "cmc_keyless":
+            return (
+                "Price, market cap, and volume on this card came from "
+                "CoinMarketCap keyless public quotes. Not a keyed feed. "
+                "CIK, venue names, RWA rank, holders, and issuer backing are not available."
+            )
         return (
-            "Live CoinMarketCap directory/quotes. "
-            "Price, disclosure, and basis are self-reported CMC fields. "
-            "Backing / reserves / redemption are live only when a verifier "
-            "hits a published source — otherwise heuristic fallback."
+            "Live CoinGecko market data from the hand-kept allowlist. "
+            "CIK, venue names, RWA rank, holders, and issuer backing are not available. "
+            "Data provided by CoinGecko."
         )
-    return "Data source not confirmed — not labeled as live CoinMarketCap."
+    return "Data source not confirmed — not labeled as live CoinGecko."
 
 
 def normalize_band(band: str | None, *, score: float | None = None) -> str:
@@ -1500,6 +1507,9 @@ def share_footer_markdown(bundle: object) -> str:
     page_link = markdown_https_link(score_page_url(), "Open score page")
     if page_link:
         lines.append(page_link)
+    lines.append(
+        "Data provided by [CoinGecko](https://www.coingecko.com/en/api). Powered by CoinGecko."
+    )
     if getattr(bundle, "x_posted", False):
         x_url = str(getattr(bundle, "x_url", "") or "").strip()
         if is_x_status_url(x_url):
@@ -1786,8 +1796,11 @@ def _render_search_picker(
     chip_cols = st.columns(len(chip_cats), gap="small")
     for col, cat in zip(chip_cols, chip_cats):
         with col:
+            pill = chip_display_label(cat.label)
+            if not use_fixtures:
+                pill = f"{pill} — not covered by this source"
             if st.button(
-                chip_display_label(cat.label),
+                pill,
                 key=f"rwa_class_{cat.id}",
                 use_container_width=True,
                 on_click=_on_class_pill,
@@ -2004,6 +2017,16 @@ def _ticker_catalog(
         if key.startswith(prefix):
             merged = merge_search_catalog(merged, rows)
     return merge_por_catalog(merged, catalog_from_por_feeds())
+
+
+def on_chain_backing_note(report: dict) -> str:
+    """Exact line when this score did not read Chainlink or xStocks PoR."""
+    backing = (report.get("verification") or {}).get("backing") or {}
+    level = str(backing.get("level") or "")
+    source = str(backing.get("source") or "")
+    if level == VerificationLevel.ON_CHAIN_POR.value or source == "chainlink_por":
+        return ""
+    return "no on-chain backing evidence found"
 
 
 def chip_display_label(label: str) -> str:
@@ -2233,18 +2256,14 @@ def _render_sidebar_controls(default_fixtures: bool) -> bool:
         use_fixtures = st.toggle(
             "Use demo fixtures",
             value=default_fixtures,
-            help="Bypass the live CMC API. Required if you do not have CMC_API_KEY.",
+            help="Use bundled demo data instead of live CoinGecko.",
         )
         if use_fixtures:
-            st.caption("Fixture mode — bundled **demo data**, not live CMC.")
-        elif not os.getenv("CMC_API_KEY"):
-            st.error(
-                "CMC_API_KEY is not set. Switch fixtures on, or add the key in the host env."
-            )
+            st.caption("Fixture mode — bundled **demo data**, not a live market-data response.")
+        elif not (os.getenv("COINGECKO_DEMO_API_KEY") or "").strip():
+            st.markdown("Using CoinGecko public keyless access; limits are lower.")
         else:
-            st.caption(
-                "Live mode — CMC_API_KEY set. Issuer directory cached; Basic 429s retried."
-            )
+            st.caption("Live mode — CoinGecko Demo key is set. The key is not shown.")
 
         with st.expander("How scores are labeled", expanded=False):
             st.markdown(sidebar_legend_markdown())
@@ -2284,6 +2303,18 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
         key=f"pillar_ev_{slot_index}_{ticker}",
     ):
         st.caption(data_source_caption(report))
+        backing_note = on_chain_backing_note(report)
+        if backing_note:
+            st.markdown(backing_note)
+        price = report.get("price") or {}
+        if price.get("unverified"):
+            st.markdown("**unverified**")
+        if price.get("as_of"):
+            st.markdown(f"as of {price.get('as_of')}")
+        if source_kind(report.get("data_source")) == "live":
+            st.markdown(
+                "CIK, venue names, RWA rank, holders, and issuer backing are not available."
+            )
 
         st.caption(
             "Backing / reserves / redemption use **issuer-name heuristics** when live "
@@ -2686,6 +2717,9 @@ st.markdown(
 st.header(BRAND_H1)
 st.caption(BRAND_SUB)
 st.caption(TAGLINE)
+st.markdown(
+    "Data provided by [CoinGecko](https://www.coingecko.com/en/api). Powered by CoinGecko."
+)
 
 default_fixtures = sidebar_uses_fixtures()
 use_fixtures = _render_sidebar_controls(default_fixtures)
@@ -2696,9 +2730,9 @@ reminder = health_launcher_reminder()
 if reminder:
     st.caption(reminder)
 st.caption(
-    "Remaining heuristics stay labeled: name-list fallback, self-reported CMC "
-    "price/disclosure/basis (RWA quotes + market-pairs), and xStocks without "
-    "a published PoR proxy. Educational demo — not financial advice."
+    "Remaining heuristics stay labeled: name-list fallback, self-reported "
+    "price/disclosure/basis, and xStocks without a published PoR proxy. "
+    "Educational demo — not financial advice."
 )
 
 try:

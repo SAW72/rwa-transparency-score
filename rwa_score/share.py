@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None, *, x_client: Any | None = None) -> int:
     parser.add_argument(
         "--fixtures",
         action="store_true",
-        help="Use bundled demo fixtures (no CMC_API_KEY, no live credits).",
+        help="Use bundled demo fixtures (no live market-data calls).",
     )
     parser.add_argument(
         "--no-post",

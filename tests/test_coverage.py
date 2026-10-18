@@ -48,11 +48,12 @@ def test_coverage_matrix_never_claims_live_on_fixtures() -> None:
 
 
 def test_coverage_doc_matches_fixture_matrix() -> None:
-    text = Path("docs/CMC_RWA_COVERAGE.md").read_text(encoding="utf-8")
+    text = Path("docs/RWA_MARKET_DATA.md").read_text(encoding="utf-8")
     for kind in ASSET_TYPES:
         assert f"`{kind}`" in text
     assert "GOLD" in text
     assert "not live" in text.lower()
-    assert "/v5/real-world-assets/map" in text
+    assert "/coins/markets" in text
+    assert "not available" in text.lower()
+    assert "COINGECKO_DEMO_API_KEY" in text
     assert "BTC" in text and "not" in text.lower()
-    assert "RWA-bar pill" in text or "not on that bar" in text

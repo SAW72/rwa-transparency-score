@@ -325,7 +325,7 @@ def test_ask_xai_tool_round_executes_score_ticker(
 def test_fallback_live_client_says_live_not_fixture(recording_client) -> None:
     scorer = TransparencyScorer(recording_client)
     text = fallback_answer("What’s weakest on NVDA?", scorer)
-    assert text.startswith("LIVE CoinMarketCap")
+    assert text.startswith("LIVE CoinGecko")
     assert "not fixtures" in text
     assert "FIXTURE" not in text
 
