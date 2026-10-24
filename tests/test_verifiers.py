@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -47,9 +48,11 @@ def encode_latest_round(
     round_id: int = 7,
     answer: int,
     started_at: int = 1,
-    updated_at: int = 1_700_000_000,
+    updated_at: int | None = None,
     answered_in_round: int = 7,
 ) -> str:
+    if updated_at is None:
+        updated_at = int(time.time())
     return "0x" + "".join(
         encode_uint256(n)
         for n in (round_id, answer, started_at, updated_at, answered_in_round)

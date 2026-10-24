@@ -51,8 +51,9 @@ ISSUER_NOTES: dict[str, str] = {
         "with a public on-chain proof of reserves."
     ),
     "xstocks": (
-        "Equity-backed token (xStocks / Backed Finance): claims 1:1 share custody "
-        "with a public on-chain proof of reserves."
+        "Equity-backed token (xStocks): claims 1:1 share custody. "
+        "No published Chainlink AggregatorV3 proof-of-reserves feed "
+        "(the feed list is empty). DataLink stream names are not an on-chain reserve read."
     ),
     "dinari": (
         "Dinari dShares: equity-style 1:1 claim with a pending Big-4 attestation "

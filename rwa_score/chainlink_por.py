@@ -19,6 +19,7 @@ proxy addresses or score those streams as on-chain PoR.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +43,12 @@ DECIMALS_SELECTOR = "0x313ce567"
 TOTAL_SUPPLY_SELECTOR = "0x18160ddd"
 
 RPC_TIMEOUT_SECONDS = 12.0
+
+# Custody proof-of-reserves is a daily snapshot, not an hourly price.
+# A one-hour price-feed heartbeat would mark a normal daily update unverified.
+# 48 hours is two missed daily snapshots. A round older than that is not a
+# current reserve proof, and the stale answer is not returned.
+POR_MAX_AGE_SECONDS = 48 * 60 * 60
 
 # Public no-key JSON-RPC endpoints. Override with env in production.
 PUBLIC_RPC_FALLBACKS: dict[str, tuple[str, ...]] = {
@@ -290,6 +297,30 @@ def decode_latest_round(data: str) -> LatestRound:
     )
 
 
+def por_round_rejection(round_data: LatestRound, *, now: int) -> str | None:
+    """Why this round is not a verified reserve reading, or None when it is.
+
+    A completed AggregatorV3 round reports answeredInRound equal to roundId.
+    The answer itself is never included here, so a rejected round cannot be
+    copied forward as a reserve number.
+    """
+    if round_data.answer < 0:
+        return "answer was negative"
+    if round_data.updated_at <= 0:
+        return f"updatedAt was {round_data.updated_at}"
+    if round_data.answered_in_round != round_data.round_id:
+        return (
+            f"answeredInRound {round_data.answered_in_round} "
+            f"!= roundId {round_data.round_id}"
+        )
+    age = int(now) - int(round_data.updated_at)
+    if age < 0:
+        return "updatedAt is in the future"
+    if age > POR_MAX_AGE_SECONDS:
+        return f"updatedAt is {age}s old, limit is {POR_MAX_AGE_SECONDS}s"
+    return None
+
+
 def scale_answer(answer: int, decimals: int) -> float:
     if decimals < 0:
         raise ValueError("decimals must be >= 0")
@@ -455,10 +486,9 @@ class ChainlinkPorClient:
         if feed is None:
             raise RuntimeError(f"No published Chainlink PoR feed for {ticker}")
         rpc_url, round_data = self.latest_round(feed)
-        if round_data.answer < 0:
-            raise RuntimeError(f"Chainlink PoR {feed.symbol} answer was negative")
-        if round_data.updated_at <= 0:
-            raise RuntimeError(f"Chainlink PoR {feed.symbol} updatedAt was {round_data.updated_at}")
+        reason = por_round_rejection(round_data, now=int(time.time()))
+        if reason:
+            raise RuntimeError(f"Chainlink PoR {feed.symbol} not verified: {reason}")
         reserves = scale_answer(round_data.answer, feed.decimals)
         circulating = self.token_total_supply(feed) if USE_TOKEN_SUPPLY_FOR_RATIO else None
         return PorReading(
@@ -494,7 +524,7 @@ def probe_chainlink_por(
                 continue
             raw = parse_rpc_result(resp.json())
             decoded = decode_latest_round(raw)
-            if decoded.answer >= 0 and decoded.updated_at > 0:
+            if por_round_rejection(decoded, now=int(time.time())) is None:
                 return True
         except Exception:  # noqa: BLE001 — health must stay up
             continue

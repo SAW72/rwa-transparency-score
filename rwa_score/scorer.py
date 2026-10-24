@@ -1435,13 +1435,14 @@ class TransparencyScorer:
             "basis": basis_v.as_dict(),
         }
 
+        published = round(final, 1)
         return {
             "ticker": symbol,
             "rwa_id": rwa_id,
             "issuer": issuer_name or "unknown",
-            "score": round(final, 1),
-            "band": band_code(final),
-            "band_label": band_detail(final),
+            "score": published,
+            "band": band_code(published),
+            "band_label": band_detail(published),
             "subscores": {k: round(v, 1) for k, v in subscores.items()},
             "weights": dict(WEIGHTS),
             "pillars": PILLARS,

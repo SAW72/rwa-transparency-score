@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .chainlink_por import HEALTH_POR_FEED, probe_chainlink_por, rpc_urls_for_chain
-from .client import use_fixtures
+from .client import cmc_key_present, sidebar_uses_fixtures
 
 HEALTH_POR_SYMBOL = HEALTH_POR_FEED.symbol
 HEALTH_TIMEOUT_SECONDS = 2.0
@@ -105,7 +105,7 @@ def build_health_payload(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """JSON body for ``GET /health``. Does not run scoring."""
-    fixtures = use_fixtures()
+    fixtures = sidebar_uses_fixtures()
     try:
         backed = probe_backed_feed(getter=getter, poster=poster)
     except Exception:  # noqa: BLE001
@@ -113,6 +113,7 @@ def build_health_payload(
     return {
         "fixtures": fixtures,
         "verifiers_live": not fixtures,
+        "cmc_key_present": cmc_key_present(),
         "backed_feed": backed,
         "timestamp": utc_timestamp(now),
         **deploy_canary_fields(),
@@ -159,9 +160,11 @@ def _health_handler_class() -> type:
             try:
                 payload = build_health_payload()
             except Exception:  # noqa: BLE001 — never 500 the probe
+                fixtures = sidebar_uses_fixtures()
                 payload = {
-                    "fixtures": use_fixtures(),
-                    "verifiers_live": not use_fixtures(),
+                    "fixtures": fixtures,
+                    "verifiers_live": not fixtures,
+                    "cmc_key_present": cmc_key_present(),
                     "backed_feed": "down",
                     "timestamp": utc_timestamp(),
                     **deploy_canary_fields(),

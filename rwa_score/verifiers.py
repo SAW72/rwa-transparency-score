@@ -60,18 +60,11 @@ ISSUER_VERIFIER_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 _NEGATIVE_VERIFIER_RE = re.compile(r"\bunbacked\b|\bnot backed\b|\banti\b")
 
-BIG4_PATTERNS = (
-    "big 4",
-    "big-4",
-    "big4",
-    "deloitte",
-    "pwc",
-    "pricewaterhouse",
-    "ernst & young",
-    "ernst and young",
-    " kpmg",
-    "kpmg ",
-    "ey ",
+# Word-boundary firm names. A bare "ey " substring also matches "they".
+_BIG4_FIRM_RE = re.compile(
+    r"\b(?:big[\s-]?4|deloitte|pwc|pricewaterhouse(?:coopers)?|"
+    r"ernst\s+(?:&|and)\s+young|kpmg|ey)\b",
+    re.IGNORECASE,
 )
 
 
@@ -236,12 +229,15 @@ def parse_backed_redemption_docs(text: str) -> dict[str, Any]:
     has_kyc = "kyc" in blob
     has_whitelist = "whitelist" in blob
     has_in_kind_heading = bool(re.search(r"\bin-kind\b|\bin kind\b", blob))
-    in_kind_to_shares = bool(
+    share_delivery_phrase = bool(
         re.search(
             r"redeemed back into shares|tokens to shares|underlying shares",
             blob,
         )
     )
+    # The heading is the in-kind evidence this parser already records.
+    # A share phrase alone is not that evidence.
+    in_kind_to_shares = bool(has_in_kind_heading and share_delivery_phrase)
     documented = bool(has_redemption and (has_primary_market or has_underlying))
     missing: list[str] = []
     if not has_redemption:
@@ -586,14 +582,16 @@ class DinariVerifier:
         text = re.sub(r"\s+", " ", text)
         lower = text.lower()
 
-        big4_hits = [p.strip() for p in BIG4_PATTERNS if p in lower]
+        has_big4 = _BIG4_FIRM_RE.search(lower) is not None
         # Prefer an explicit firm name when present; else "Big 4" phrasing.
         audit_firm: str | None = None
         for firm in ("deloitte", "pwc", "pricewaterhousecoopers", "kpmg", "ernst & young", "ernst and young"):
             if firm in lower:
                 audit_firm = firm.title().replace("Pwc", "PwC").replace("Ernst & Young", "Ernst & Young")
                 break
-        if audit_firm is None and big4_hits:
+        if audit_firm is None and has_big4 and re.search(r"\bey\b", lower):
+            audit_firm = "EY"
+        elif audit_firm is None and has_big4:
             audit_firm = "Big 4 accounting firm (unnamed on page)"
 
         has_alpaca = "alpaca" in lower
@@ -601,7 +599,7 @@ class DinariVerifier:
 
         return {
             "audit_firm": audit_firm,
-            "has_big4": bool(big4_hits),
+            "has_big4": has_big4,
             "has_alpaca": has_alpaca,
             "has_one_to_one": has_one_to_one,
             "custody_provider": "Alpaca" if has_alpaca else None,
