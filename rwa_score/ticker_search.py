@@ -38,9 +38,13 @@ from .client import (
     ASSET_TYPE_LABELS,
     ASSET_TYPES,
     CMCError,
+    CMCPlanExpiredError,
     canonical_asset_type,
     directory_has_more,
 )
+
+# Last live directory failure on a client. Plan expiry is not a one-minute 429.
+PLAN_EXPIRED_REASON = "plan_expired"
 
 SEARCH_MIN_CHARS = 3
 CATEGORY_MIN_CHARS = 2
@@ -756,19 +760,23 @@ _CLASS_CATALOG_MEMO: dict[tuple[str, str, bool], list[TickerOption]] = {}
 class ClassShardStatus:
     """Outcome of the last class-page fetch for one client.
 
-    ``unavailable`` is a live directory failure (401 / 429 / 1008 / transport).
-    An empty 200 is not unavailable. ``truncated`` means CMC has another page
-    past this shard. ``failed_at`` is ``time.monotonic`` of that failure.
+    ``unavailable`` is a live directory failure (401 / 402 / 429 / 1004 / 1008
+    / transport). An empty 200 is not unavailable. ``truncated`` means CMC has
+    another page past this shard. ``failed_at`` is ``time.monotonic`` of that
+    failure. ``reason`` is ``plan_expired`` for CMC 1004 / HTTP 402.
     """
 
     unavailable: bool = False
     truncated: bool = False
     failed_at: float = 0.0
+    reason: str = ""
 
 
 _CLASS_STATUS: dict[tuple[str, str, bool], ClassShardStatus] = {}
 # client token -> normalized query whose ``map?symbol=`` just failed
 _SYMBOL_LOOKUP_FAILED: dict[str, str] = {}
+# client token -> ``plan_expired`` or ``unavailable`` for that symbol lookup
+_SYMBOL_LOOKUP_REASON: dict[str, str] = {}
 
 
 def clear_catalog_cache() -> None:
@@ -776,6 +784,7 @@ def clear_catalog_cache() -> None:
     _CLASS_CATALOG_MEMO.clear()
     _CLASS_STATUS.clear()
     _SYMBOL_LOOKUP_FAILED.clear()
+    _SYMBOL_LOOKUP_REASON.clear()
 
 
 def client_shard_token(client: Any) -> str:
@@ -869,16 +878,48 @@ def _remember_class_status(
     first_page_only: bool,
     unavailable: bool,
     truncated: bool,
+    reason: str = "",
 ) -> None:
     _CLASS_STATUS[_status_key(client, asset_type, first_page_only)] = ClassShardStatus(
         unavailable=bool(unavailable),
         truncated=bool(truncated) and not unavailable,
         failed_at=time.monotonic() if unavailable else 0.0,
+        reason=reason if unavailable else "",
     )
 
 
+def _directory_failure_reason(exc: BaseException) -> str:
+    if isinstance(exc, CMCPlanExpiredError):
+        return PLAN_EXPIRED_REASON
+    text = str(exc).lower()
+    if "1004" in text or "http 402" in text or "plan has expired" in text:
+        return PLAN_EXPIRED_REASON
+    return "unavailable"
+
+
+def _stamp_directory_failure(client: Any, exc: BaseException) -> None:
+    try:
+        setattr(client, "_rwa_last_directory_failure", _directory_failure_reason(exc))
+    except Exception:  # noqa: BLE001 — mocks may reject assignment
+        return
+
+
+def _consume_directory_failure(client: Any) -> str:
+    try:
+        reason = getattr(client, "_rwa_last_directory_failure", "") or ""
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+    try:
+        setattr(client, "_rwa_last_directory_failure", "")
+    except Exception:  # noqa: BLE001
+        pass
+    if reason == PLAN_EXPIRED_REASON:
+        return PLAN_EXPIRED_REASON
+    return "unavailable"
+
+
 def is_live_directory_failure(exc: BaseException) -> bool:
-    """401, 429, CMC 1008, or another CMC/transport failure. Not a TypeError."""
+    """401, 402, 429, CMC 1004 / 1008, or another CMC/transport failure. Not a TypeError."""
     if isinstance(exc, TypeError):
         return False
     if isinstance(exc, CMCError):
@@ -886,7 +927,7 @@ def is_live_directory_failure(exc: BaseException) -> bool:
     text = str(exc).lower()
     return any(
         token in text
-        for token in ("401", "429", "1008", "unauthorized", "rate limit")
+        for token in ("401", "402", "429", "1004", "1008", "unauthorized", "rate limit", "plan has expired")
     )
 
 
@@ -901,8 +942,12 @@ def _is_terminal_directory_failure(client: Any, exc: BaseException) -> bool:
     if getattr(client, "source", "") == "fixture":
         return False
     if getattr(client, "source", "") == "live":
+        _stamp_directory_failure(client, exc)
         return True
-    return is_live_directory_failure(exc)
+    if is_live_directory_failure(exc):
+        _stamp_directory_failure(client, exc)
+        return True
+    return False
 
 
 def _take_page_truncated(client: Any, batch_len: int) -> bool:
@@ -1274,6 +1319,7 @@ def load_class_catalog(
             first_page_only=first_page_only,
             unavailable=unavailable,
             truncated=truncated,
+            reason=_consume_directory_failure(client) if unavailable else "",
         )
         return options
 
@@ -1377,8 +1423,10 @@ def lookup_symbol_on_client(client: Any, query: str) -> list[TickerOption]:
     token = client_shard_token(client)
     if failed:
         _SYMBOL_LOOKUP_FAILED[token] = q.lower()
+        _SYMBOL_LOOKUP_REASON[token] = _consume_directory_failure(client)
         return []
     _SYMBOL_LOOKUP_FAILED.pop(token, None)
+    _SYMBOL_LOOKUP_REASON.pop(token, None)
     return catalog_from_rwa_map(rows)
 
 
@@ -1390,6 +1438,27 @@ def symbol_lookup_failed(client: Any, query: str) -> bool:
     if not failed:
         return False
     return failed == normalize_query(query).lower()
+
+
+def directory_failure_kind(client: Any, query: str) -> str:
+    """``plan_expired``, ``unavailable``, or ``""`` when this query is not a live failure."""
+    if client is None:
+        return ""
+    reasons: list[str] = []
+    for kind in classes_for_query(query):
+        status = class_shard_status(client, kind)
+        if status.unavailable:
+            reasons.append(status.reason or "unavailable")
+    failed = _SYMBOL_LOOKUP_FAILED.get(client_shard_token(client))
+    if failed and failed == normalize_query(query).lower():
+        reasons.append(
+            _SYMBOL_LOOKUP_REASON.get(client_shard_token(client)) or "unavailable"
+        )
+    if PLAN_EXPIRED_REASON in reasons:
+        return PLAN_EXPIRED_REASON
+    if reasons:
+        return "unavailable"
+    return ""
 
 
 def live_class_unavailable(client: Any, query: str) -> bool:

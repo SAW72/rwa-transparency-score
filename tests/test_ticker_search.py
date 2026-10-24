@@ -1428,7 +1428,8 @@ def test_app_search_uses_cache_data_and_pending_query() -> None:
     picker = source.split("def _render_search_picker", 1)[1]
     assert "FixtureClient(" not in picker
     assert "create_client(" not in picker
-    assert "st.error(LIVE_UNAVAILABLE_BANNER)" in picker
+    assert "st.error(unavailable_banner(client, query))" in picker
+    assert demo_app.PLAN_EXPIRED_BANNER.startswith("CoinMarketCap plan expired")
 
 
 def _ranked_stock_client():
@@ -1782,4 +1783,48 @@ def test_live_directory_failure_is_empty_not_fixture_swap() -> None:
     assert [opt.symbol for opt in demo_app.search_matches("stock", recovered, client)] == [
         "S1"
     ]
+
+
+def test_expired_cmc_plan_names_the_banner() -> None:
+    """HTTP 402 / error 1004 is a dead subscription, not a one-minute outage."""
+    import app as demo_app
+    from rwa_score.client import CMCPlanExpiredError
+    from rwa_score.scorer import TransparencyScorer
+    from rwa_score.ticker_search import class_shard_status
+
+    _isolate_live_catalog_memos()
+
+    class _Expired:
+        source = "live"
+
+        def __init__(self) -> None:
+            self.calls = {"rwa_map": 0, "assets_list": 0}
+
+        def rwa_map(self, *_args, **_kwargs):
+            self.calls["rwa_map"] += 1
+            raise CMCPlanExpiredError(
+                "/v5/real-world-assets/map",
+                402,
+                {
+                    "status": {
+                        "error_code": 1004,
+                        "error_message": "Your API Key's subscription plan has expired.",
+                    }
+                },
+            )
+
+        def assets_list(self, **_kwargs):
+            self.calls["assets_list"] += 1
+            raise CMCPlanExpiredError("/v5/real-world-assets/assets/list", 402, None)
+
+    client = _Expired()
+    scorer = TransparencyScorer(client)
+    catalog = demo_app._ticker_catalog(scorer, query="stock")
+    assert class_shard_status(client, "stock").unavailable is True
+    assert class_shard_status(client, "stock").reason == "plan_expired"
+    assert demo_app.search_matches("stock", catalog, client) == []
+    assert demo_app.live_unavailable_banner(False, client, "stock") is True
+    assert demo_app.unavailable_banner(client, "stock") == demo_app.PLAN_EXPIRED_BANNER
+    assert client.calls["assets_list"] == 0
+    assert client.calls["rwa_map"] == 1
 
