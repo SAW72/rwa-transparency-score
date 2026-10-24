@@ -28,7 +28,7 @@ from rwa_score.ask_rat import (
     ask as ask_rat,
     format_ask_cmc_lines,
 )
-from rwa_score.client import create_client, env_flag, summarize_call_log
+from rwa_score.client import create_client, sidebar_uses_fixtures, summarize_call_log
 from rwa_score.explainer import AI_FOOTNOTE, explain_score, fallback_explanation
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.seo import SEO_TITLE
@@ -2687,7 +2687,7 @@ st.header(BRAND_H1)
 st.caption(BRAND_SUB)
 st.caption(TAGLINE)
 
-default_fixtures = env_flag("RWA_USE_FIXTURES") or not os.getenv("CMC_API_KEY")
+default_fixtures = sidebar_uses_fixtures()
 use_fixtures = _render_sidebar_controls(default_fixtures)
 
 mode_label = "Fixture" if use_fixtures else "Live"

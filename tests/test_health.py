@@ -55,6 +55,7 @@ def test_health_payload_fixtures_false_when_env_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RWA_USE_FIXTURES", "0")
+    monkeypatch.setenv("CMC_API_KEY", "configured")
     monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.example.test")
     called: list[str] = []
 
@@ -74,11 +75,14 @@ def test_health_payload_fixtures_false_when_env_off(
     payload = build_health_payload(poster=fake_post, now=frozen)
     assert payload["fixtures"] is False
     assert payload["verifiers_live"] is True
+    assert payload["cmc_key_present"] is True
+    assert "configured" not in json.dumps(payload)
     assert payload["backed_feed"] == "ok"
     assert payload["timestamp"] == "2026-09-10T01:13:00Z"
     assert set(payload) == {
         "fixtures",
         "verifiers_live",
+        "cmc_key_present",
         "backed_feed",
         "timestamp",
         "git_sha",
@@ -120,6 +124,7 @@ def test_health_payload_backed_feed_down_on_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("RWA_USE_FIXTURES", "0")
+    monkeypatch.setenv("CMC_API_KEY", "configured")
     monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.example.test")
 
     def boom(_url: str, json=None, timeout: float | None = None, **_kwargs):
@@ -128,6 +133,8 @@ def test_health_payload_backed_feed_down_on_error(
     payload = build_health_payload(poster=boom)
     assert payload["fixtures"] is False
     assert payload["verifiers_live"] is True
+    assert payload["cmc_key_present"] is True
+    assert "configured" not in json.dumps(payload)
     assert payload["backed_feed"] == "down"
     datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
 
@@ -243,6 +250,7 @@ def test_attach_registers_health_and_legal_on_streamlit_like_app() -> None:
             assert set(body) == {
                 "fixtures",
                 "verifiers_live",
+                "cmc_key_present",
                 "backed_feed",
                 "timestamp",
                 "git_sha",

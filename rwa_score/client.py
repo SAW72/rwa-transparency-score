@@ -234,6 +234,21 @@ def use_fixtures(explicit: bool | None = None) -> bool:
     return env_flag("RWA_USE_FIXTURES")
 
 
+def cmc_key_present() -> bool:
+    """True when CMC_API_KEY is non-empty. The value is never returned."""
+    return bool(os.getenv("CMC_API_KEY", "").strip())
+
+
+def sidebar_uses_fixtures() -> bool:
+    """Process default the Streamlit sidebar starts from.
+
+    Fixtures are on when RWA_USE_FIXTURES is set, or when no CMC key is
+    configured. A missing key cannot score a live card, so the page starts
+    in fixture mode. This does not see a later in-session toggle.
+    """
+    return env_flag("RWA_USE_FIXTURES") or not cmc_key_present()
+
+
 def create_client(
     *,
     use_fixtures_mode: bool | None = None,
