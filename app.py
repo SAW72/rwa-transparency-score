@@ -62,6 +62,7 @@ from rwa_score.ticker_search import (
     class_shard_failure_is_fresh,
     class_shard_status,
     client_shard_token,
+    directory_failure_kind,
     empty_class_page_is_cached_success,
     classes_for_query,
     format_option,
@@ -247,6 +248,9 @@ _VERIFICATION_RANK = {
 # Matches can scroll the loaded CMC page instead of four top ranks.
 CANDIDATE_STRIP_LIMIT = 4
 LIVE_UNAVAILABLE_BANNER = "Live data unavailable"
+PLAN_EXPIRED_BANNER = (
+    "CoinMarketCap plan expired. Live scores need a current Basic key."
+)
 CLASS_REMAINDER_CAPTION = (
     f"Showing first {CLASS_PAGE_LIMIT} live results — type a ticker for the rest."
 )
@@ -954,12 +958,19 @@ def matches_limit_for_query(query: str) -> int:
     return CANDIDATE_STRIP_LIMIT
 
 
+def unavailable_banner(client, query: str) -> str:
+    """Copy for a live directory failure. Plan expiry is not a generic outage."""
+    if directory_failure_kind(client, query) == "plan_expired":
+        return PLAN_EXPIRED_BANNER
+    return LIVE_UNAVAILABLE_BANNER
+
+
 def live_unavailable_banner(use_fixtures: bool, client, query: str) -> bool:
     """True when Live chrome must show the banner and no directory rows.
 
-    Fixture mode never banners. A healthy live page never banners. 401 / 429 /
-    1008 (and any other live directory failure) does — including a symbol
-    lookup that failed after the class page itself succeeded.
+    Fixture mode never banners. A healthy live page never banners. 401 / 402 /
+    429 / 1004 / 1008 (and any other live directory failure) does — including a
+    symbol lookup that failed after the class page itself succeeded.
     """
     if use_fixtures or client is None:
         return False
@@ -1705,7 +1716,7 @@ def _render_class_browse(
     """
     with st.container(key="rwa_class_browse"):
         if directory_down:
-            st.error(LIVE_UNAVAILABLE_BANNER)
+            st.error(unavailable_banner(client, query))
             _clear_match_pick_state()
             _install_search_typeahead(dropdown_items=[])
             return
@@ -1836,7 +1847,7 @@ def _render_search_picker(
     elif directory_down:
         # Empty Matches. Do not paint fixture stubs under a Live label, and
         # do not swap the client to FixtureClient.
-        st.error(LIVE_UNAVAILABLE_BANNER)
+        st.error(unavailable_banner(client, query))
         _clear_match_pick_state()
     elif matches:
         options = [opt.symbol for opt in matches]

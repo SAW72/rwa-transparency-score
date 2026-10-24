@@ -40,6 +40,10 @@ RATE_LIMIT_CMC_CODES = {1008, "1008"}
 PLAN_BLOCK_HTTP = 403
 PLAN_BLOCK_CMC_CODES = {1006, "1006"}
 PLAN_BLOCK_REASON = "plan-blocked"
+# CMC error 1004 / HTTP 402: the key's subscription itself is expired.
+# Unlike 1006, this is not one endpoint missing from a live plan.
+PLAN_EXPIRED_HTTP = 402
+PLAN_EXPIRED_CMC_CODES = {1004, "1004"}
 PLAN_BLOCKED_LABEL = "plan-blocked / unavailable"
 _PLAN_BLOCK_MESSAGE_NEEDLES = (
     "subscription plan",
@@ -143,6 +147,27 @@ ENDPOINT_CRYPTO_QUOTE = "/v2/cryptocurrency/quotes/latest"
 
 class CMCError(RuntimeError):
     """Raised when the live CMC API cannot be used or returns an error."""
+
+
+class CMCPlanExpiredError(CMCError):
+    """CMC subscription has expired (error 1004 / HTTP 402). Not a per-endpoint 1006."""
+
+    def __init__(
+        self,
+        path: str = "",
+        status_code: int = PLAN_EXPIRED_HTTP,
+        payload: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> None:
+        self.path = path
+        self.status_code = int(status_code)
+        self.payload = payload
+        self.error_code = _cmc_error_code(payload)
+        if self.error_code in (None, 0, "0"):
+            self.error_code = 1004
+        super().__init__(
+            message or _plan_expired_message(self.path, self.status_code, payload)
+        )
 
 
 class CMCPlanBlockedError(CMCError):
@@ -276,10 +301,24 @@ def _cmc_error_message(payload: dict[str, Any] | None) -> str:
     return str((payload.get("status") or {}).get("error_message") or "")
 
 
+def is_cmc_plan_expired(
+    status_code: int, payload: dict[str, Any] | None
+) -> bool:
+    """True for CMC error 1004 or HTTP 402 (the subscription itself is expired)."""
+    if _cmc_error_code(payload) in PLAN_EXPIRED_CMC_CODES:
+        return True
+    if int(status_code) == PLAN_EXPIRED_HTTP:
+        return True
+    lowered = _cmc_error_message(payload).lower()
+    return "plan has expired" in lowered or "subscription has expired" in lowered
+
+
 def is_cmc_plan_blocked(
     status_code: int, payload: dict[str, Any] | None
 ) -> bool:
     """True for CMC error 1006 or a 403 whose body says the plan lacks the endpoint."""
+    if is_cmc_plan_expired(status_code, payload):
+        return False
     if _cmc_error_code(payload) in PLAN_BLOCK_CMC_CODES:
         return True
     if int(status_code) != PLAN_BLOCK_HTTP:
@@ -305,6 +344,19 @@ def market_pairs_plan_blocked(data: dict[str, Any] | None) -> bool:
         return False
     return bool(
         data.get("plan_blocked") or data.get("unavailable_reason") == PLAN_BLOCK_REASON
+    )
+
+
+def _plan_expired_message(
+    path: str, status_code: int, payload: dict[str, Any] | None
+) -> str:
+    code = _cmc_error_code(payload)
+    if code in (None, 0, "0"):
+        code = 1004
+    return (
+        f"{path} -> CoinMarketCap subscription plan has expired "
+        f"(HTTP {status_code}, error_code {code}). "
+        "Live scores need a current Basic plan key."
     )
 
 
@@ -354,7 +406,11 @@ def plan_blocked_market_pairs_payload(
 
 
 def _error_looks_like_pairs_plan_block(exc: BaseException) -> bool:
+    if isinstance(exc, CMCPlanExpiredError):
+        return False
     text = str(exc).lower()
+    if "1004" in text or "http 402" in text or "plan has expired" in text:
+        return False
     return (
         isinstance(exc, CMCPlanBlockedError)
         or "1006" in text
@@ -787,6 +843,9 @@ class CMCClient:
                         waited += delay
                     continue
                 raise CMCError(_rate_limit_message(path, resp.status_code, last_payload))
+
+            if is_cmc_plan_expired(resp.status_code, last_payload):
+                raise CMCPlanExpiredError(path, resp.status_code, last_payload)
 
             if is_market_pairs_plan_block(
                 resp.status_code, last_payload, path

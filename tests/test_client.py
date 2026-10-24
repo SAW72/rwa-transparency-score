@@ -11,6 +11,7 @@ from rwa_score.client import (
     CMCClient,
     CMCError,
     CMCPlanBlockedError,
+    CMCPlanExpiredError,
     ENDPOINT_ASSETS_LIST,
     ENDPOINT_MAP,
     ENDPOINT_MARKET_PAIRS,
@@ -21,6 +22,7 @@ from rwa_score.client import (
     directory_has_more,
     env_flag,
     is_cmc_plan_blocked,
+    is_cmc_plan_expired,
     is_market_pairs_plan_block,
     parse_market_pairs_payload,
     parse_rwa_map_payload,
@@ -699,6 +701,56 @@ def test_live_market_pairs_1006_on_http_200_degrades() -> None:
     payload = _live(session).market_pairs(rwa_id=2)
     assert payload["plan_blocked"] is True
     assert payload["error_code"] == 1006
+
+
+def test_http_402_is_plan_expired_and_does_not_retry() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                402,
+                {
+                    "status": {
+                        "error_code": "1004",
+                        "error_message": "Your API Key's subscription plan has expired.",
+                    }
+                },
+            )
+        ]
+    )
+    with pytest.raises(CMCPlanExpiredError, match="1004") as excinfo:
+        _live(session).rwa_map(symbol="NVDA")
+    assert excinfo.value.status_code == 402
+    assert excinfo.value.error_code == "1004"
+    assert len(session.calls) == 1
+    assert is_cmc_plan_expired(402, excinfo.value.payload)
+    assert not is_cmc_plan_blocked(
+        402,
+        {
+            "status": {
+                "error_code": 1004,
+                "error_message": "Your API Key's subscription plan has expired.",
+            }
+        },
+    )
+
+
+def test_market_pairs_402_raises_instead_of_degrading() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                402,
+                {
+                    "status": {
+                        "error_code": 1004,
+                        "error_message": "Your API Key's subscription plan has expired.",
+                    }
+                },
+            )
+        ]
+    )
+    with pytest.raises(CMCPlanExpiredError, match="expired"):
+        _live(session).market_pairs(symbol="NVDA")
+    assert len(session.calls) == 1
 
 
 def test_plan_block_on_other_endpoint_still_raises() -> None:
