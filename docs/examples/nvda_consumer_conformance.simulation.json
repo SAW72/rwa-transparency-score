@@ -3,8 +3,8 @@
   "simulationOnly": true,
   "fixture": {
     "path": "docs/examples/v1_score_NVDA.fixture.json",
-    "commit": "0e832c24a405e17cfc567ebe51cefd9046c5e10d",
-    "sha256": "76316c0d6b933a111d32e0cca9c50d9c02851da61c289a80701151370b46903a"
+    "commit": "bfcbe9957fdb3609a64994819c385b72cf67ddb7",
+    "sha256": "f33393f2aa74e7cfeeabe3b03d708958d9016cef9597a1210386981e3b3c0959"
   },
   "ratSignals": {
     "score": 90.4,
@@ -255,7 +255,7 @@
       ]
     },
     "attestation": {
-      "score_hash": "0x41ba52792b6162ce75f02131ddd1845292cfab019b7c1537adfd9d5d2bbd5406",
+      "score_hash": "0x8f04e51149ac6ebbbc3931d0d16ff2776a7e357ab3bb5b2f6a5faccc474d56a7",
       "algo": "sha256",
       "fields": [
         "ticker",
@@ -268,7 +268,11 @@
         "cik",
         "data_source",
         "verification",
-        "basis"
+        "basis",
+        "as_of",
+        "data_as_of",
+        "scorer_version",
+        "inputs_digest"
       ]
     }
   },

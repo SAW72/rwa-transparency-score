@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 
-FIXTURE_COMMIT = "0e832c24a405e17cfc567ebe51cefd9046c5e10d"
-FIXTURE_SHA256 = "76316c0d6b933a111d32e0cca9c50d9c02851da61c289a80701151370b46903a"
+FIXTURE_COMMIT = "bfcbe9957fdb3609a64994819c385b72cf67ddb7"
+FIXTURE_SHA256 = "f33393f2aa74e7cfeeabe3b03d708958d9016cef9597a1210386981e3b3c0959"
 FIXTURE_RELATIVE_PATH = "docs/examples/v1_score_NVDA.fixture.json"
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = ROOT / FIXTURE_RELATIVE_PATH
