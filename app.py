@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -1143,6 +1144,81 @@ def format_pillar_score(value: object) -> str:
     if number is None:
         return "not available"
     return f"{number:.0f}"
+
+
+_COMPARE_TEXT_COLUMNS = ("ticker", "issuer", "band")
+_NOT_AVAILABLE_CELL = "not available"
+
+
+def comparison_sort_value(value: object) -> tuple[int, float]:
+    """Missing and ``not available`` sort after numbers. Numbers sort numerically.
+
+    The pair is ``(0, number)`` for a measured score and ``(1, 0.0)`` for a
+    missing cell, so an ascending sort keeps unavailable last in both directions
+    when the caller negates the number for descending order.
+    """
+    if value is None:
+        return (1, 0.0)
+    if isinstance(value, str):
+        if value.strip().lower() == _NOT_AVAILABLE_CELL:
+            return (1, 0.0)
+        try:
+            number = float(value)
+        except ValueError:
+            return (1, 0.0)
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return (1, 0.0)
+    if number != number:
+        return (1, 0.0)
+    return (0, number)
+
+
+def sort_comparison_rows(
+    rows: list[dict],
+    column: str,
+    *,
+    ascending: bool = True,
+) -> list[dict]:
+    """Sort one comparison column. Unavailable is missing, not a word."""
+
+    def _key(row: dict) -> tuple[int, float]:
+        missing, number = comparison_sort_value(row.get(column))
+        if missing:
+            return (1, 0.0)
+        return (0, number if ascending else -number)
+
+    return sorted(rows, key=_key)
+
+
+def comparison_table_frame(reports: list[dict]) -> pd.DataFrame:
+    """Pillar columns stay numeric. ``None`` is missing, not the word."""
+    rows: list[dict] = []
+    for report in reports:
+        row = {
+            "ticker": report.get("ticker"),
+            "issuer": report.get("issuer"),
+            "score": report.get("score"),
+            "band": report.get("band"),
+        }
+        for key, value in (report.get("subscores") or {}).items():
+            row[key] = None if value is None else value
+        rows.append(row)
+    frame = pd.DataFrame(rows)
+    for column in frame.columns:
+        if column in _COMPARE_TEXT_COLUMNS:
+            continue
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def comparison_table(reports: list[dict]):
+    """Dataframe whose pillar sort is numeric and whose blank cells read ``not available``."""
+    frame = comparison_table_frame(reports)
+    pillars = [column for column in frame.columns if column not in {"ticker", "issuer", "score", "band"}]
+    return frame.style.format(na_rep=_NOT_AVAILABLE_CELL, subset=pillars)
 
 
 def pillar_evidence_rows(report: dict) -> list[dict]:
@@ -2865,19 +2941,8 @@ if any(symbol for symbol, _report, _error in results):
             )
 
 if ok_reports:
-    rows = []
-    for report in ok_reports:
-        row = {
-            "ticker": report["ticker"],
-            "issuer": report["issuer"],
-            "score": report["score"],
-            "band": report["band"],
-        }
-        for key, value in (report.get("subscores") or {}).items():
-            row[key] = "not available" if value is None else value
-        rows.append(row)
     st.markdown("#### Comparison table")
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(comparison_table(ok_reports), use_container_width=True, hide_index=True)
 
 _render_ask_rat(scorer, catalog=catalog)
 _render_sidebar_tail(ok_reports, scorer.client)

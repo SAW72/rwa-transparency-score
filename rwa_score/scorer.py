@@ -158,7 +158,7 @@ def coerce_failed_live(
         pillar,
         issuer_name,
         reason=result.error or evidence or "live check failed",
-        error=result.error or "live check failed",
+        error=result.error if result.error is not None else "live check failed",
     )
 
 
@@ -520,6 +520,25 @@ def _stamp_basis_meta(meta: dict[str, Any], *, plan_blocked: bool) -> dict[str, 
     return out
 
 
+_NAME_LIST_UNUSED = "Name-list scores are not used."
+
+
+def _collapse_name_list_sentence(parts: list[str]) -> list[str]:
+    """Show the name-list sentence once. Later copies drop only that sentence."""
+    seen = False
+    out: list[str] = []
+    for part in parts:
+        text = part
+        if _NAME_LIST_UNUSED in text:
+            if seen:
+                text = " ".join(text.replace(_NAME_LIST_UNUSED, "").split())
+            else:
+                seen = True
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def _append_verification_notes(
     explanation: str,
     result: VerificationResult,
@@ -532,9 +551,9 @@ def _append_verification_notes(
     for note in result.notes:
         if note and note not in bits:
             bits.append(note)
-    if result.error:
+    if result.error is not None:
         bits.append(f"Verifier failure recorded (not dropped): {result.error}")
-    return " ".join(bits)
+    return " ".join(_collapse_name_list_sentence(bits))
 
 
 class TransparencyScorer:
@@ -1172,7 +1191,7 @@ class TransparencyScorer:
                         pillar,
                         issuer_name,
                         reason=f"{verifier.name} verifier raised unexpectedly.",
-                        error=str(exc),
+                        error=(str(exc) or type(exc).__name__),
                     )
             return self._heuristic_redemption(issuer_name)
 
@@ -1193,7 +1212,7 @@ class TransparencyScorer:
                 pillar,
                 issuer_name,
                 reason=f"{verifier.name} verifier raised unexpectedly.",
-                error=str(exc),
+                error=(str(exc) or type(exc).__name__),
             )
 
         return heuristic_result(
@@ -1525,7 +1544,7 @@ class TransparencyScorer:
             for note in result.notes:
                 if note not in notes:
                     notes.append(note)
-            if not result.error:
+            if result.error is None:
                 continue
             recorded = f"Verifier error (not dropped): {result.error}"
             if recorded not in notes and f"Verifier error: {result.error}" not in notes:
@@ -1558,12 +1577,14 @@ class TransparencyScorer:
                 "Published score is held below GREEN because a live check is not available."
             )
         band = band_code(published)
-        if capped:
+        all_live_failed = set(failed_pillars) == set(LIVE_OR_HEURISTIC)
+        if capped or all_live_failed:
             band_label = (
                 f"{band} — not available: a live check failed, so this score is not GREEN"
             )
         else:
             band_label = band_detail(published)
+        notes = _collapse_name_list_sentence(notes)
         published_subscores: dict[str, float | None] = {}
         for key, value in subscores.items():
             if value is None:

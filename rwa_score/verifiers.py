@@ -137,15 +137,16 @@ def _heuristic_scores(issuer_name: str) -> dict[str, float]:
 def live_check_failed(result: VerificationResult) -> bool:
     """True when a live probe ran and failed.
 
-    Fixture/offline skips, unknown issuers, and tickers with no published
-    feed stay on the name list. Those results have no error and are not
-    ``not_available``.
+    An empty error string still counts. Only ``None`` means no failure was
+    recorded. Fixture/offline skips, unknown issuers, and tickers with no
+    published feed stay on the name list. Those results have no error and
+    are not ``not_available``.
     """
     if result.source == NOT_AVAILABLE_SOURCE:
         return True
     if result.level == VerificationLevel.NOT_AVAILABLE:
         return True
-    return bool(result.error)
+    return result.error is not None
 
 
 def unavailable_live_result(
@@ -164,17 +165,19 @@ def unavailable_live_result(
     if detail:
         evidence = f"{evidence} {detail}"
     evidence = f"{evidence} Name-list scores are not used."
-    err = error or "live check failed"
+    err = error if error is not None else "live check failed"
+    notes = [
+        "not available",
+        "Live check failed. Name-list scores are not used.",
+    ]
+    if err:
+        notes.append(f"Verifier error (not dropped): {err}")
     return VerificationResult(
         score=None,
         level=VerificationLevel.NOT_AVAILABLE,
         evidence=evidence,
         source=NOT_AVAILABLE_SOURCE,
-        notes=[
-            "not available",
-            "Live check failed. Name-list scores are not used.",
-            f"Verifier error (not dropped): {err}",
-        ],
+        notes=notes,
         ok=False,
         error=err,
         meta={
@@ -195,10 +198,10 @@ def heuristic_result(
 ) -> VerificationResult:
     """Name-match fallback when no live check ran.
 
-    A failed live check (``error`` set) does not use the name list. That
-    pillar is ``not available``.
+    A failed live check (``error`` is not None, even when the message is
+    empty) does not use the name list. That pillar is ``not available``.
     """
-    if error:
+    if error is not None:
         return unavailable_live_result(
             pillar, issuer_name, reason=reason, error=error
         )
@@ -419,7 +422,7 @@ class BackedVerifier:
                 pillar,
                 issuer_name,
                 reason=f"Chainlink PoR call failed for {ticker} ({feed.symbol} on {feed.chain}).",
-                error=str(exc),
+                error=(str(exc) or type(exc).__name__),
             )
 
         reserves = reading.reserves
@@ -554,7 +557,7 @@ class BackedVerifier:
                 reason=(
                     f"Backed / xStocks redemption docs fetch failed for {ticker}."
                 ),
-                error=str(exc),
+                error=(str(exc) or type(exc).__name__),
             )
 
         if not claims["documented"]:
@@ -696,7 +699,7 @@ class DinariVerifier:
                 pillar,
                 issuer_name,
                 reason=f"Dinari dShares scrape failed for {ticker}.",
-                error=str(exc),
+                error=(str(exc) or type(exc).__name__),
             )
 
         all_present = bool(claims["has_big4"] and claims["has_alpaca"] and claims["has_one_to_one"])
@@ -778,7 +781,7 @@ class DinariVerifier:
                 "redemption",
                 issuer_name,
                 reason=f"Dinari dShare redemption docs fetch failed for {ticker}.",
-                error=str(exc),
+                error=(str(exc) or type(exc).__name__),
             )
 
         if not claims["documented"]:
