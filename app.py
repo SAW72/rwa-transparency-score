@@ -217,13 +217,19 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
 def selected_slot_verification_lines(report: dict) -> list[str]:
     """Compact per-pillar verification labels for the active compare slot.
 
-    First line distinguishes LIVE/FIXTURE data from the strongest
-    backing/reserves/redemption check so a card with on-chain PoR is not
-    summarized as ``Verification: self-reported``.
+    First line is LIVE-VERIFIED only when backing, reserves, and redemption
+    are all live-verified. Otherwise it says PARTIAL or HEURISTIC (or
+    ATTESTATION PENDING for a scraped Dinari badge). ``LIVE`` alone read as
+    a verified score next to a GREEN band.
     """
-    mode = mode_cue(report)
+    evidence = card_evidence_label(report)
     cue = verification_cue(report)
-    lines = [f"{mode} data · strongest check: {cue}"]
+    # An unsigned or pending attestation is still a heuristic. Do not call it "attested".
+    if cue == VerificationLevel.ATTESTED.value and (
+        evidence.endswith("HEURISTIC") or evidence.endswith("ATTESTATION PENDING")
+    ):
+        cue = "unsigned attestation (heuristic)"
+    lines = [f"{evidence} · strongest check: {cue}"]
     for key in WEIGHTS:
         badge, _evidence = _verification_badge_label(key, report)
         lines.append(f"{PILLARS[key]['label']} — {badge}")
@@ -851,6 +857,10 @@ def _score_slots(
     scorer: TransparencyScorer, slots: list[str]
 ) -> list[tuple[str, dict | None, str | None]]:
     """Score each slot independently so one unknown ticker does not hide the row."""
+    prime = getattr(scorer, "prime_symbol_map", None)
+    if callable(prime):
+        primed = [normalize_ticker(raw) for raw in slots]
+        prime([symbol for symbol in primed if symbol])
     results: list[tuple[str, dict | None, str | None]] = []
     for raw in slots:
         symbol = normalize_ticker(raw)
@@ -1229,11 +1239,34 @@ def comparison_table_frame(reports: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def format_display_score(value: object) -> str:
+    """One decimal for the comparison table. Does not change the stored score."""
+    if value is None:
+        return _NOT_AVAILABLE_CELL
+    try:
+        if pd.isna(value):
+            return _NOT_AVAILABLE_CELL
+    except TypeError:
+        pass
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return _NOT_AVAILABLE_CELL
+
+
 def comparison_table(reports: list[dict]):
-    """Dataframe whose pillar sort is numeric and whose blank cells read ``not available``."""
+    """Dataframe whose pillar sort is numeric and whose blank cells read ``not available``.
+
+    Display text is one decimal place. The frame itself stays numeric so sort
+    order does not follow the formatted string.
+    """
     frame = comparison_table_frame(reports)
-    pillars = [column for column in frame.columns if column not in {"ticker", "issuer", "score", "band"}]
-    return frame.style.format(na_rep=_NOT_AVAILABLE_CELL, subset=pillars)
+    numeric = [column for column in frame.columns if column not in _COMPARE_TEXT_COLUMNS]
+    return frame.style.format(
+        format_display_score,
+        subset=numeric,
+        na_rep=_NOT_AVAILABLE_CELL,
+    )
 
 
 def pillar_evidence_rows(report: dict) -> list[dict]:
@@ -1329,6 +1362,128 @@ def verification_cue(report: dict) -> str:
     if not kinds:
         return VerificationLevel.SELF_REPORTED.value
     return max(kinds, key=lambda kind: _VERIFICATION_RANK.get(kind, 0))
+
+
+_LIVE_VERIFIED_CUES = frozenset(
+    {
+        VerificationLevel.ON_CHAIN_POR.value,
+        VerificationLevel.ATTESTED.value,
+        VerificationLevel.EXAMINED.value,
+    }
+)
+
+
+def _verification_block(report: dict, key: str) -> dict:
+    block = (report.get("verification") or {}).get(key) or {}
+    return block if isinstance(block, dict) else {}
+
+
+def _pillar_failed(block: dict) -> bool:
+    source = str(block.get("source") or "")
+    level = str(block.get("level") or "")
+    if source == "not_available" or level == "not available":
+        return True
+    return block.get("error") is not None
+
+
+def _attestation_pending(block: dict) -> bool:
+    """Scraped Dinari badge. That ATTESTED label is not a signed report."""
+    source = str(block.get("source") or "")
+    notes = block.get("notes") or []
+    blob = " ".join(
+        [
+            source,
+            str(block.get("evidence") or ""),
+            " ".join(str(note) for note in notes),
+        ]
+    ).lower()
+    if source == "dinari_dshares":
+        return True
+    return "attestation pending" in blob or "no signed report" in blob
+
+
+def _signed_attestation(block: dict) -> bool:
+    if _attestation_pending(block):
+        return False
+    meta = block.get("meta") if isinstance(block.get("meta"), dict) else {}
+    if meta.get("signed_report_url") or meta.get("signed_report"):
+        return True
+    blob = " ".join(
+        [
+            str(block.get("evidence") or ""),
+            " ".join(str(note) for note in (block.get("notes") or [])),
+        ]
+    ).lower()
+    return "signed report" in blob
+
+
+def _pillar_live_verified(block: dict) -> bool:
+    """True when this pillar itself is live-verified.
+
+    On-chain PoR and examined count. ATTESTED counts only with a signed
+    report. Self-reported, heuristic, and attestation-pending do not.
+    """
+    if _pillar_failed(block) or _attestation_pending(block):
+        return False
+    level = str(block.get("level") or "")
+    if level not in _LIVE_VERIFIED_CUES:
+        return False
+    if level == VerificationLevel.ATTESTED.value and not _signed_attestation(block):
+        return False
+    return True
+
+
+def _report_capped(report: dict) -> bool:
+    if report.get("capped") is True:
+        return True
+    label = str(report.get("band_label") or "").lower()
+    return "live check failed" in label and "not green" in label
+
+
+def pillar_evidence_label(report: dict) -> str:
+    """LIVE-VERIFIED only when every backing/reserves/redemption pillar is.
+
+    Some verified pillars are PARTIAL. None verified is HEURISTIC,
+    SELF-REPORTED, ATTESTATION PENDING, or NOT-AVAILABLE. A capped card or
+    any failed live check is never LIVE-VERIFIED. Copy only. Bands and
+    scores stay as the scorer computed them.
+    """
+    blocks = [_verification_block(report, key) for key in LIVE_OR_HEURISTIC]
+    verified = sum(1 for block in blocks if _pillar_live_verified(block))
+    failed = any(_pillar_failed(block) for block in blocks)
+    if (
+        verified == len(LIVE_OR_HEURISTIC)
+        and verified > 0
+        and not failed
+        and not _report_capped(report)
+    ):
+        return "LIVE-VERIFIED"
+    if verified:
+        return "PARTIAL"
+    if any(_attestation_pending(block) for block in blocks) and not failed:
+        heuristic = any(
+            str(block.get("source") or "") == "heuristic_fallback"
+            or "heuristic fallback" in str(block.get("evidence") or "").lower()
+            for block in blocks
+        )
+        if not heuristic:
+            return "ATTESTATION PENDING"
+    cue = verification_cue(report)
+    if cue == "not available":
+        return "NOT-AVAILABLE"
+    if cue == VerificationLevel.SELF_REPORTED.value:
+        return "SELF-REPORTED"
+    return "HEURISTIC"
+
+
+def card_evidence_label(report: dict) -> str:
+    """Card label. Fixture stays fixture. A heuristic live card is not LIVE."""
+    evidence = pillar_evidence_label(report)
+    if evidence == "LIVE-VERIFIED":
+        return "LIVE-VERIFIED"
+    if mode_cue(report) == "FIXTURE":
+        return f"FIXTURE · {evidence}"
+    return evidence
 
 
 def _empty_compare_diff() -> dict:
@@ -1515,13 +1670,16 @@ def compare_differentiation(reports: list[dict] | None) -> dict:
                     f"▼ {label} {largest['low']:.0f} vs {peer} {largest['high']:.0f}"
                 )
                 role = "low"
+        evidence = pillar_evidence_label(report)
         if ticker == high_ticker:
-            row_role = f"Highest in this row ({score:.1f} {band})."
+            row_role = f"Highest in this row ({score:.1f} {band}, {evidence})."
         elif ticker == low_ticker:
-            row_role = f"Lowest in this row ({score:.1f} {band})."
+            row_role = f"Lowest in this row ({score:.1f} {band}, {evidence})."
         else:
             gap = float(high.get("score") or 0) - score
-            row_role = f"{score:.1f} {band} · {gap:.1f} below {high_ticker}."
+            row_role = (
+                f"{score:.1f} {band}, {evidence} · {gap:.1f} below {high_ticker}."
+            )
         cards[ticker] = {
             "band": band,
             "verification": cue,
@@ -2593,11 +2751,11 @@ def _render_compare_card(
         report.get("band") or band_code(score)
     )
     issuer = short_company_name(str(report.get("issuer") or "")) or company
-    cue = mode_cue(report)
+    label = card_evidence_label(report)
     st.metric(
         title,
         f"{score:.1f}",
-        f"{issuer} · {cue}",
+        f"{issuer} · {label}",
         delta_color="off",
     )
     chip = band_chip_html(band, score=score, selected=selected)

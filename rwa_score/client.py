@@ -17,6 +17,7 @@ import copy
 import json
 import os
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -368,15 +369,22 @@ def plan_blocked_market_pairs_payload(
     return parsed
 
 
-def _error_looks_like_pairs_plan_block(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return (
-        isinstance(exc, CMCPlanBlockedError)
-        or "1006" in text
-        or "http 403" in text
-        or PLAN_BLOCK_REASON in text
-        or any(needle in text for needle in _PLAN_BLOCK_MESSAGE_NEEDLES)
-    )
+def _documented_market_pairs_plan_block(exc: BaseException) -> bool:
+    """True only for CMC's documented plan-block code 1006.
+
+    The code has to be JSON ``status.error_code`` on HTTP 200 or 403.
+    A defaulted 1006, the digits 1006 inside some other body, a 5xx, a plain
+    403, an HTML 403, and 403/1002 are not this code.
+    """
+    if not isinstance(exc, CMCPlanBlockedError):
+        return False
+    status = int(getattr(exc, "status_code", 0) or 0)
+    if status not in (200, PLAN_BLOCK_HTTP):
+        return False
+    payload = getattr(exc, "payload", None)
+    if not isinstance(payload, dict):
+        return False
+    return _cmc_error_code(payload) in PLAN_BLOCK_CMC_CODES
 
 
 def _optional_float(raw: Any) -> float | None:
@@ -707,10 +715,10 @@ class _TTLCache:
 class CMCClient:
     """Thin wrapper around the CoinMarketCap Pro API.
 
-    Retries HTTP 429 and CMC error 1008 with exponential backoff + jitter.
-    Caches ``issuers/list`` and per-issuer detail for the process lifetime so
-    Streamlit reruns and a second ticker do not re-burn those calls. Map and
-    info use a short TTL (enough to absorb widget interactions).
+    Retries HTTP 429 and CMC error 1008 with exponential backoff + jitter
+    (bounded by ``max_wait_seconds``). ``issuers/list``, per-issuer detail, and
+    ``info`` are single-flight cached so compare cards share one response.
+    Issuer list and detail stay for the process lifetime. Info uses a short TTL.
     """
 
     source = "live"
@@ -757,6 +765,10 @@ class CMCClient:
         self._sleep = sleeper or time.sleep
         self._cache = _TTLCache()
         self._journal = _CallJournal(self.source)
+        # One in-flight issuers/info fetch per client. The four compare cards
+        # share this client, so a second card waits instead of bursting CMC.
+        self._flight_lock = threading.Lock()
+        self._market_pairs_plan_block: dict[str, Any] | None = None
 
     def begin_run(self) -> None:
         self._journal.begin_run()
@@ -902,6 +914,7 @@ class CMCClient:
             parsed = parse_rwa_map_payload(data.get("data") or {})
             assets = parsed["rwa_assets"]
             self._cache.set(key, assets)
+            self._remember_symbol_map_rows(assets, kind)
             self._record(ENDPOINT_MAP, via="network")
             return copy.deepcopy(assets)
 
@@ -960,41 +973,57 @@ class CMCClient:
             ttl=self.directory_ttl,
         )
 
+    def _remember_symbol_map_rows(self, assets: list[dict[str, Any]], kind: str) -> None:
+        """Index each symbol from a batch map response so later cards hit cache."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in assets:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            if not sym:
+                continue
+            grouped.setdefault(sym, []).append(row)
+        for sym, rows in grouped.items():
+            self._cache.set(f"map:sym:{sym}:{kind}", rows)
+
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         key = f"info:{int(rwa_id)}"
-        cached = self._cache.get(key, self.info_ttl)
-        if cached is not None:
-            self._record(ENDPOINT_INFO, via="cache", cached=True)
-            return cached
-        data = self._get(ENDPOINT_INFO, {"rwa_id": rwa_id})
-        assets = data.get("data", {}).get("rwa_assets", [])
-        info = assets[0] if assets else {}
-        self._cache.set(key, info)
-        self._record(ENDPOINT_INFO, via="network")
-        return copy.deepcopy(info)
+        with self._flight_lock:
+            cached = self._cache.get(key, self.info_ttl)
+            if cached is not None:
+                self._record(ENDPOINT_INFO, via="cache", cached=True)
+                return cached
+            data = self._get(ENDPOINT_INFO, {"rwa_id": rwa_id})
+            assets = data.get("data", {}).get("rwa_assets", [])
+            info = assets[0] if assets else {}
+            self._cache.set(key, info)
+            self._record(ENDPOINT_INFO, via="network")
+            return copy.deepcopy(info)
 
     def issuers_list(self) -> list[dict[str, Any]]:
-        cached = self._cache.get("issuers_list", ttl=None)
-        if cached is not None:
-            self._record(ENDPOINT_ISSUERS_LIST, via="cache", cached=True)
-            return cached
-        data = self._get(ENDPOINT_ISSUERS_LIST)
-        issuers = data.get("data", {}).get("issuers", [])
-        self._cache.set("issuers_list", issuers)
-        self._record(ENDPOINT_ISSUERS_LIST, via="network")
-        return copy.deepcopy(issuers)
+        with self._flight_lock:
+            cached = self._cache.get("issuers_list", ttl=None)
+            if cached is not None:
+                self._record(ENDPOINT_ISSUERS_LIST, via="cache", cached=True)
+                return cached
+            data = self._get(ENDPOINT_ISSUERS_LIST)
+            issuers = data.get("data", {}).get("issuers", [])
+            self._cache.set("issuers_list", issuers)
+            self._record(ENDPOINT_ISSUERS_LIST, via="network")
+            return copy.deepcopy(issuers)
 
     def issuer(self, issuer_id: str) -> dict[str, Any]:
         key = f"issuer:{issuer_id}"
-        cached = self._cache.get(key, ttl=None)
-        if cached is not None:
-            self._record(ENDPOINT_ISSUERS, via="cache", cached=True)
-            return cached
-        data = self._get(ENDPOINT_ISSUERS, {"issuer_id": issuer_id})
-        detail = data.get("data", {})
-        self._cache.set(key, detail)
-        self._record(ENDPOINT_ISSUERS, via="network")
-        return copy.deepcopy(detail)
+        with self._flight_lock:
+            cached = self._cache.get(key, ttl=None)
+            if cached is not None:
+                self._record(ENDPOINT_ISSUERS, via="cache", cached=True)
+                return cached
+            data = self._get(ENDPOINT_ISSUERS, {"issuer_id": issuer_id})
+            detail = data.get("data", {})
+            self._cache.set(key, detail)
+            self._record(ENDPOINT_ISSUERS, via="network")
+            return copy.deepcopy(detail)
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
         key = f"crypto_quote:{int(crypto_id)}"
@@ -1140,8 +1169,11 @@ class CMCClient:
         Requires exactly one of ``rwa_id`` or ``symbol``. Cached on a short TTL
         so Streamlit widget reruns do not re-burn the Basic-plan credit.
 
-        CMC error 1006 and related HTTP 403 plan-blocks return a labeled empty
+        CMC error 1006 and a market-pairs HTTP 403 return a labeled empty
         payload instead of raising — callers must not treat that as live pairs.
+        Only documented error code 1006 is remembered, and only for this
+        endpoint, until ``pairs_ttl``. A 5xx, 1002, plain or HTML 403, or a
+        body that merely contains the digits 1006 is not remembered.
         """
         if rwa_id is None and not symbol:
             raise CMCError("market_pairs requires rwa_id or symbol")
@@ -1163,10 +1195,25 @@ class CMCClient:
         if cached is not None:
             self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
             return cached
+        shared = self._active_market_pairs_plan_block()
+        if shared is not None:
+            parsed = plan_blocked_market_pairs_payload(
+                rwa_id=rwa_id,
+                symbol=symbol,
+                status_code=shared.get("status_code"),
+                error_code=shared.get("error_code", 1006),
+                error_message=shared.get("error_message"),
+            )
+            self._cache.set(key, parsed)
+            self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
+            return copy.deepcopy(parsed)
         try:
             data = self._get(ENDPOINT_MARKET_PAIRS, params)
         except CMCError as exc:
-            if not _error_looks_like_pairs_plan_block(exc):
+            if not isinstance(exc, CMCPlanBlockedError):
+                raise
+            status = int(getattr(exc, "status_code", 0) or 0)
+            if status >= 500:
                 raise
             parsed = plan_blocked_market_pairs_payload(
                 rwa_id=rwa_id,
@@ -1175,6 +1222,7 @@ class CMCClient:
                 error_code=getattr(exc, "error_code", 1006),
                 error_message=str(exc),
             )
+            self._remember_market_pairs_plan_block(exc, parsed)
             self._cache.set(key, parsed)
             self._record(ENDPOINT_MARKET_PAIRS, via="network")
             return copy.deepcopy(parsed)
@@ -1182,6 +1230,43 @@ class CMCClient:
         self._cache.set(key, parsed)
         self._record(ENDPOINT_MARKET_PAIRS, via="network")
         return copy.deepcopy(parsed)
+
+    def _active_market_pairs_plan_block(self) -> dict[str, Any] | None:
+        """Shared market-pairs 1006 memo, or None once it has expired."""
+        shared = self._market_pairs_plan_block
+        if not isinstance(shared, dict):
+            return None
+        if shared.get("endpoint") != ENDPOINT_MARKET_PAIRS:
+            self._market_pairs_plan_block = None
+            return None
+        expires = shared.get("expires_at")
+        if not isinstance(expires, (int, float)) or time.monotonic() >= float(expires):
+            self._market_pairs_plan_block = None
+            return None
+        if shared.get("error_code") not in PLAN_BLOCK_CMC_CODES:
+            self._market_pairs_plan_block = None
+            return None
+        return shared
+
+    def _remember_market_pairs_plan_block(
+        self, exc: BaseException, parsed: dict[str, Any]
+    ) -> None:
+        """Remember a real 1006 for this endpoint only, until ``pairs_ttl``."""
+        if not _documented_market_pairs_plan_block(exc):
+            return
+        ttl = self.pairs_ttl if self.pairs_ttl is not None else DEFAULT_PAIRS_TTL_SECONDS
+        ttl = float(ttl)
+        if ttl <= 0:
+            return
+        payload = getattr(exc, "payload", None)
+        code = _cmc_error_code(payload) if isinstance(payload, dict) else None
+        self._market_pairs_plan_block = {
+            "endpoint": ENDPOINT_MARKET_PAIRS,
+            "expires_at": time.monotonic() + ttl,
+            "status_code": parsed.get("status_code"),
+            "error_code": code,
+            "error_message": parsed.get("error_message"),
+        }
 
 
 class FixtureClient:

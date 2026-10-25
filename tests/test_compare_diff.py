@@ -239,7 +239,7 @@ def test_compare_callout_and_card_wire_into_app() -> None:
     assert "Verify:" in card
     assert "_render_card_details" in card
     assert "st.progress" not in card
-    assert "mode_cue" in card
+    assert "card_evidence_label" in card
     assert "weakest_pillar_line" in card
     assert "pillar_dots" in card
     details = source.split("def _render_card_details", 1)[1].split(

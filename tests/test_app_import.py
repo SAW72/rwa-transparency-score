@@ -277,7 +277,7 @@ def test_why_this_score_copy_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "_render_card_details" in card
     assert "st.progress" not in card
     assert "Share score card" not in card
-    assert "mode_cue" in card
+    assert "card_evidence_label" in card
     assert "weakest_pillar_line" in card
     assert "pillar_dots" in card
     assert "band_chip_html" in card
@@ -484,7 +484,7 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     assert "st.caption" in render
     assert "share_score_card" not in render
     assert "Share score card" not in render
-    assert "mode_cue" in render
+    assert "card_evidence_label" in render
     assert "weakest_pillar_line" in render
     assert "_render_selected_slot_detail" in source
     assert "max-width" in source
@@ -592,7 +592,7 @@ def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
     report = fixture_scorer.score("NVDA")
     slot = demo_app.selected_slot_verification_lines(report)
     assert len(slot) == 7
-    assert slot[0].startswith("FIXTURE data · strongest check:")
+    assert slot[0].startswith("FIXTURE · HEURISTIC · strongest check:")
     assert "heuristic fallback" in slot[0]
     assert "self-reported" not in slot[0]
     assert any("heuristic fallback" in line for line in slot)
@@ -626,7 +626,8 @@ def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
         },
     }
     live_lines = demo_app.selected_slot_verification_lines(live_por)
-    assert live_lines[0] == "LIVE data · strongest check: on-chain PoR"
+    assert live_lines[0] == "PARTIAL · strongest check: on-chain PoR"
+    assert "LIVE-VERIFIED" not in live_lines[0]
     assert any("Verification: on-chain PoR" in line for line in live_lines)
     cmc_lines = [
         line
