@@ -6,9 +6,10 @@ why a token landed where it did.
 
 Backing and reserves prefer live attestation / PoR verifiers when the issuer
 is known. Redemption uses ``verify_redemption`` when that method exists
-(Robinhood debt wrapper; Backed / xStocks and Dinari public docs). Failed
-verifiers are never dropped silently — errors are appended to notes/flags and
-labeled **heuristic fallback**.
+(Robinhood debt wrapper; Backed / xStocks and Dinari public docs). A failed
+live check is **not available**: the name list does not stand in, and the
+token does not print GREEN. Intentional skips (fixture/offline, unknown
+issuer, no published feed) stay labeled **heuristic fallback**.
 """
 
 from __future__ import annotations
@@ -35,13 +36,17 @@ from .client import (
 )
 from .issuer_registry import HEURISTIC_NOTE, classify, issuer_note
 from .verifiers import (
+    NOT_AVAILABLE_LABEL,
+    NOT_AVAILABLE_SOURCE,
     VerificationLevel,
     VerificationResult,
     Verifier,
     build_default_verifiers,
     get_verifier_for_issuer,
     heuristic_result,
+    live_check_failed,
     resolve_verifier_id,
+    unavailable_live_result,
 )
 
 WEIGHTS: dict[str, float] = {
@@ -104,6 +109,10 @@ class ScoreError(RuntimeError):
     """Raised when a ticker cannot be scored (unknown symbol, empty info, etc.)."""
 
 
+# Highest one-decimal score that is not GREEN. ``band_code`` is GREEN at 75.
+NOT_GREEN_CAP = 74.9
+
+
 def band_code(score: float) -> str:
     if score >= 75:
         return "GREEN"
@@ -128,6 +137,51 @@ def band_detail(score: float) -> str:
 def _band(score: float) -> str:
     """Backward-compatible full band string."""
     return band_detail(score)
+
+
+def coerce_failed_live(
+    result: VerificationResult,
+    pillar: str,
+    issuer_name: str,
+) -> VerificationResult:
+    """Drop a name-list stand-in when the live check failed."""
+    if not live_check_failed(result):
+        return result
+    evidence = result.evidence or ""
+    if (
+        result.source == NOT_AVAILABLE_SOURCE
+        and result.score is None
+        and NOT_AVAILABLE_LABEL in evidence.lower()
+    ):
+        return result
+    return unavailable_live_result(
+        pillar,
+        issuer_name,
+        reason=result.error or evidence or "live check failed",
+        error=result.error if result.error is not None else "live check failed",
+    )
+
+
+def measured_pillar_score(result: VerificationResult) -> float | None:
+    """Pillar points, or None when a live check failed."""
+    if live_check_failed(result) or result.score is None:
+        return None
+    return float(result.score)
+
+
+def composite_from_subscores(subscores: dict[str, float | None]) -> float:
+    """Official weights. A failed live check adds no points.
+
+    ``None`` is not shown as a measured zero. The other weights are not
+    rescaled, so a missing pillar cannot be replaced by a name-list number.
+    """
+    total = 0.0
+    for key, weight in WEIGHTS.items():
+        value = subscores.get(key)
+        if value is None:
+            continue
+        total += float(value) * weight
+    return total
 
 
 def pair_usd_price(pair: dict[str, Any]) -> float | None:
@@ -374,6 +428,18 @@ def remaining_heuristic_paths(
         block = verification.get(key) or {}
         source = str(block.get("source") or "")
         evidence = str(block.get("evidence") or "")
+        level = str(block.get("level") or "")
+        if source == NOT_AVAILABLE_SOURCE or level == NOT_AVAILABLE_LABEL:
+            rows.append(
+                {
+                    "key": key,
+                    "label": PILLARS[key]["label"],
+                    "kind": "not available",
+                    "note": evidence
+                    or "Live check failed. Not available. Name-list scores are not used.",
+                }
+            )
+            continue
         if source == "heuristic_fallback" or "heuristic fallback" in evidence.lower():
             rows.append(
                 {
@@ -454,6 +520,43 @@ def _stamp_basis_meta(meta: dict[str, Any], *, plan_blocked: bool) -> dict[str, 
     return out
 
 
+_NAME_LIST_UNUSED = "Name-list scores are not used."
+
+
+def _collapse_name_list_sentence(parts: list[str]) -> list[str]:
+    """Show the name-list sentence once. Later copies drop only that sentence."""
+    seen = False
+    out: list[str] = []
+    for part in parts:
+        text = part
+        if _NAME_LIST_UNUSED in text:
+            if seen:
+                text = " ".join(text.replace(_NAME_LIST_UNUSED, "").split())
+            else:
+                seen = True
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _omit_stray_failure_note(note: str) -> bool:
+    """Drop marker fragments that restate a failure already in the sentence."""
+    text = " ".join((note or "").split())
+    lowered = text.lower()
+    if lowered == "not available":
+        return True
+    if lowered.startswith("live check failed"):
+        return True
+    return False
+
+
+def _is_recorded_error_note(note: str) -> bool:
+    lowered = note.lower()
+    return lowered.startswith("verifier error") or lowered.startswith(
+        "verifier failure recorded"
+    )
+
+
 def _append_verification_notes(
     explanation: str,
     result: VerificationResult,
@@ -463,12 +566,18 @@ def _append_verification_notes(
         f"Verification: {result.level.value}.",
         f"Evidence: {result.evidence}",
     ]
+    saw_error_line = False
     for note in result.notes:
-        if note and note not in bits:
-            bits.append(note)
-    if result.error:
+        if not note or note in bits or _omit_stray_failure_note(note):
+            continue
+        if _is_recorded_error_note(note):
+            if saw_error_line:
+                continue
+            saw_error_line = True
+        bits.append(note)
+    if result.error is not None and not saw_error_line:
         bits.append(f"Verifier failure recorded (not dropped): {result.error}")
-    return " ".join(bits)
+    return " ".join(_collapse_name_list_sentence(bits))
 
 
 class TransparencyScorer:
@@ -1106,7 +1215,7 @@ class TransparencyScorer:
                         pillar,
                         issuer_name,
                         reason=f"{verifier.name} verifier raised unexpectedly.",
-                        error=str(exc),
+                        error=(str(exc) or type(exc).__name__),
                     )
             return self._heuristic_redemption(issuer_name)
 
@@ -1127,7 +1236,7 @@ class TransparencyScorer:
                 pillar,
                 issuer_name,
                 reason=f"{verifier.name} verifier raised unexpectedly.",
-                error=str(exc),
+                error=(str(exc) or type(exc).__name__),
             )
 
         return heuristic_result(
@@ -1174,39 +1283,68 @@ class TransparencyScorer:
         flags = classify(issuer_name)
         symbol = backed_feed.symbol if backed_feed is not None else ticker.upper()
 
-        backing_v = self._verify_pillar("backing", ticker=symbol, issuer_name=issuer_name)
-        reserves_v = self._verify_pillar("reserves", ticker=symbol, issuer_name=issuer_name)
-        redemption_v = self._verify_pillar("redemption", ticker=symbol, issuer_name=issuer_name)
+        backing_v = coerce_failed_live(
+            self._verify_pillar("backing", ticker=symbol, issuer_name=issuer_name),
+            "backing",
+            issuer_name,
+        )
+        reserves_v = coerce_failed_live(
+            self._verify_pillar("reserves", ticker=symbol, issuer_name=issuer_name),
+            "reserves",
+            issuer_name,
+        )
+        redemption_v = coerce_failed_live(
+            self._verify_pillar("redemption", ticker=symbol, issuer_name=issuer_name),
+            "redemption",
+            issuer_name,
+        )
 
-        backing = backing_v.score
-        reserves = reserves_v.score
-        redemption = redemption_v.score
+        backing = measured_pillar_score(backing_v)
+        reserves = measured_pillar_score(reserves_v)
+        redemption = measured_pillar_score(redemption_v)
 
-        backing_why = _append_verification_notes(
-            (
+        if live_check_failed(backing_v):
+            backing_lead = (
+                f"Backing is not available: the live check for "
+                f"'{issuer_name or 'unknown'}' failed. Name-list scores are not used."
+            )
+        elif backing_v.source == "heuristic_fallback":
+            backing_lead = (
                 f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the fully-backed name list."
-                if flags["backed"] and backing_v.source == "heuristic_fallback"
+                if flags["backed"]
                 else (
-                    f"Heuristic: issuer '{issuer_name or 'unknown'}' did not match known fully-backed issuers."
-                    if backing_v.source == "heuristic_fallback"
-                    else f"Live backing check for '{issuer_name or 'unknown'}'."
+                    f"Heuristic: issuer '{issuer_name or 'unknown'}' did not match "
+                    "known fully-backed issuers."
                 )
-            ),
-            backing_v,
-        )
-        reserves_why = _append_verification_notes(
-            (
+            )
+        else:
+            backing_lead = f"Live backing check for '{issuer_name or 'unknown'}'."
+        backing_why = _append_verification_notes(backing_lead, backing_v)
+
+        if live_check_failed(reserves_v):
+            reserves_lead = (
+                f"Proof of reserves is not available: the live check for "
+                f"'{issuer_name or 'unknown'}' failed. Name-list scores are not used."
+            )
+        elif reserves_v.source == "heuristic_fallback":
+            reserves_lead = (
                 f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the independent-PoR name list."
-                if flags["audited"] and reserves_v.source == "heuristic_fallback"
+                if flags["audited"]
                 else (
-                    f"Heuristic: issuer '{issuer_name or 'unknown'}' has no independent on-chain PoR match."
-                    if reserves_v.source == "heuristic_fallback"
-                    else f"Live reserves check for '{issuer_name or 'unknown'}'."
+                    f"Heuristic: issuer '{issuer_name or 'unknown'}' has no independent "
+                    "on-chain PoR match."
                 )
-            ),
-            reserves_v,
-        )
-        if redemption_v.source == "heuristic_fallback":
+            )
+        else:
+            reserves_lead = f"Live reserves check for '{issuer_name or 'unknown'}'."
+        reserves_why = _append_verification_notes(reserves_lead, reserves_v)
+
+        if live_check_failed(redemption_v):
+            redemption_lead = (
+                f"Redemption is not available: the live check for "
+                f"'{issuer_name or 'unknown'}' failed. Name-list scores are not used."
+            )
+        elif redemption_v.source == "heuristic_fallback":
             redemption_lead = (
                 f"Heuristic: issuer '{issuer_name or 'unknown'}' matched the redeemable name list."
                 if flags["redeemable"]
@@ -1337,7 +1475,7 @@ class TransparencyScorer:
         )
         basis_why = _append_verification_notes(basis_why, basis_v)
 
-        subscores = {
+        subscores: dict[str, float | None] = {
             "backing": backing,
             "reserves": reserves,
             "redemption": redemption,
@@ -1345,14 +1483,23 @@ class TransparencyScorer:
             "disclosure": disclosure,
             "basis": basis_score,
         }
-        final = sum(subscores[k] * WEIGHTS[k] for k in WEIGHTS)
+        final = composite_from_subscores(subscores)
+        failed_pillars = [
+            key
+            for key, result in (
+                ("backing", backing_v),
+                ("reserves", reserves_v),
+                ("redemption", redemption_v),
+            )
+            if live_check_failed(result)
+        ]
 
         risk_flags: list[str] = []
         if disclosure < 50:
             risk_flags.append("No verifiable SEC CIK — issuer identity not matchable to filings.")
-        if reserves < 50:
+        if reserves is not None and reserves < 50:
             risk_flags.append("No independent on-chain proof of reserves found (heuristic).")
-        if redemption < 50:
+        if redemption is not None and redemption < 50:
             risk_flags.append(
                 "No redemption right — you can only sell the token, not claim the share (heuristic)."
             )
@@ -1373,16 +1520,18 @@ class TransparencyScorer:
         risk_flags.extend(price_flags)
         risk_flags.extend(basis_flags)
 
-        # Never silently drop a failed verifier — promote errors into flags.
+        # Never silently drop a failed verifier. Do not call it a name-list fallback.
         for pillar_key, result in (
             ("backing", backing_v),
             ("reserves", reserves_v),
             ("redemption", redemption_v),
         ):
-            if result.error:
-                risk_flags.append(
-                    f"{pillar_key} verifier failure (heuristic fallback): {result.error}"
-                )
+            if not live_check_failed(result):
+                continue
+            detail = result.error or "live check failed"
+            risk_flags.append(
+                f"{pillar_key} is not available: live check failed ({detail})."
+            )
 
         notes = [HEURISTIC_NOTE]
         source = getattr(self.client, "source", "unknown")
@@ -1410,12 +1559,22 @@ class TransparencyScorer:
                 "Fixture client blocked live verifiers "
                 "(allow_live_on_fixtures=False) — labeled heuristic fallback."
             )
+        if failed_pillars:
+            notes.append(
+                f"{', '.join(failed_pillars)} not available: live check failed. "
+                "Name-list scores are not used. This token is not GREEN."
+            )
         for result in (backing_v, reserves_v, redemption_v):
             for note in result.notes:
+                if _omit_stray_failure_note(note):
+                    continue
                 if note not in notes:
                     notes.append(note)
-            if result.error and f"Verifier error: {result.error}" not in notes:
-                notes.append(f"Verifier error (not dropped): {result.error}")
+            if result.error is None:
+                continue
+            recorded = f"Verifier error (not dropped): {result.error}"
+            if recorded not in notes and f"Verifier error: {result.error}" not in notes:
+                notes.append(recorded)
 
         explanations = {
             "backing": backing_why,
@@ -1436,14 +1595,36 @@ class TransparencyScorer:
         }
 
         published = round(final, 1)
+        capped = False
+        if failed_pillars and published >= 75:
+            published = NOT_GREEN_CAP
+            capped = True
+            notes.append(
+                "Published score is held below GREEN because a live check is not available."
+            )
+        band = band_code(published)
+        all_live_failed = set(failed_pillars) == set(LIVE_OR_HEURISTIC)
+        if capped or all_live_failed:
+            band_label = (
+                f"{band} — not available: a live check failed, so this score is not GREEN"
+            )
+        else:
+            band_label = band_detail(published)
+        notes = _collapse_name_list_sentence(notes)
+        published_subscores: dict[str, float | None] = {}
+        for key, value in subscores.items():
+            if value is None:
+                published_subscores[key] = None
+            else:
+                published_subscores[key] = round(float(value), 1)
         return {
             "ticker": symbol,
             "rwa_id": rwa_id,
             "issuer": issuer_name or "unknown",
             "score": published,
-            "band": band_code(published),
-            "band_label": band_detail(published),
-            "subscores": {k: round(v, 1) for k, v in subscores.items()},
+            "band": band,
+            "band_label": band_label,
+            "subscores": published_subscores,
             "weights": dict(WEIGHTS),
             "pillars": PILLARS,
             "explanations": explanations,

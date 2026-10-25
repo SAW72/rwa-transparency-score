@@ -47,9 +47,9 @@ This tool rates a tokenized stock on how its public CMC/issuer signals look unde
 
 | Pillar | What it checks | Weight | Verification |
 |---|---|---|---|
-| Backing model | Real shares with a regulated custodian vs. a thin debt note | 20% | on-chain PoR / attested when a verifier is registered; else **heuristic fallback** |
-| Proof of reserves | Independent PoR or attestation vs. a promise | 20% | on-chain PoR (Chainlink / Backed) or attested (Dinari); else **heuristic fallback** |
-| Redemption rights | Redeemable for the underlying share vs. sell-only | 15% | Live hook when registered: Robinhood (debt wrapper), Backed/xStocks (public issuance/redemption docs), Dinari (public dShare burn-as-redemption docs). Fail closed to **heuristic fallback** — never a silent miss |
+| Backing model | Real shares with a regulated custodian vs. a thin debt note | 20% | on-chain PoR / attested when a verifier is registered. Name-list **heuristic fallback** only when no live check ran. A failed live check is **not available** |
+| Proof of reserves | Independent PoR or attestation vs. a promise | 20% | on-chain PoR (Chainlink / Backed) or attested (Dinari). Name-list **heuristic fallback** only when no live check ran. A failed live check is **not available** |
+| Redemption rights | Redeemable for the underlying share vs. sell-only | 15% | Live hook when registered: Robinhood (debt wrapper), Backed/xStocks (public issuance/redemption docs), Dinari (public dShare burn-as-redemption docs). A failed live check is **not available** — never a name-list score and never a silent miss. No registered hook stays **heuristic fallback** |
 | Price integrity | Issuer tokens track CMC `average_tokenized_price` (RWA `quotes/latest`); crypto 24hΔ is the labeled fallback | 15% | self-reported (CMC RWA quotes, else crypto quote) |
 | Disclosure | Real, matchable SEC CIK vs. missing | 15% | self-reported (CMC RWA info) |
 | Cross-issuer basis | Same underlying ticker, different issuer token prices (RWA `tokens[]` plus market-pairs) | 15% | self-reported (CMC RWA quotes + market-pairs) |
@@ -60,7 +60,7 @@ Weights sum to **100%**. The sixth pillar took 5 points each from backing, reser
 
 **Basis math:** merge priced `tokens[]` from RWA quotes (issuer_name + price) with CMC market-pairs grouped by wrapper `crypto_id` (volume-weighted USD price per wrapper). Then `spread% = (max − min) / mid × 100`. Score is `max(15, 100 − |spread%| × 10)` so a 0.5% gap → 95, 5% → 50, ≥8.5% → 15. One wrapper or a missing payload is labeled unverified (defaults 55 / 50) — never treated as a measured tight market.
 
-Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** below 25.
+Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** below 25. A token with a failed live check does not print GREEN. That pillar is **not available** and adds no name-list points.
 
 ### Live attestation / PoR sources (free, no new paid APIs)
 
@@ -68,8 +68,8 @@ Bands: **GREEN** ≥ 75 · **YELLOW** ≥ 50 · **ORANGE** ≥ 25 · **RED** bel
 |---|---|---|
 | Backed **bTokens** via **Chainlink Proof of Reserve** | On-chain `AggregatorV3Interface.latestRoundData()` at the public SmartData proxy ([feed addresses](https://docs.chain.link/data-feeds/smartdata/addresses)). **Polygon only today** — see coverage note below. | `eth_call` via `POLYGON_RPC_URL` (or `BASE_RPC_URL` / `ETH_RPC_URL` when a feed lives there). **Reserves-only score 90** when the feed publishes a positive reserve balance. Same-chain ERC-20 `totalSupply` is **not** used for a ratio (multi-chain issuance / units unverified — live bIB01 ≈ 80 vs 4442 looks like 0.018 and must not be scored as undercollateralized PoR). An implausible ratio is ignored, not labeled a clean on-chain miss. Cached 1 hour. Badge: **on-chain PoR**. |
 | Dinari dShares page | `https://dinari.com/dshares` | Scrape for Big-4 / audit firm, Alpaca custody, and a **1:1** claim. Score 85 when all three are present. Badge: **attested** — labeled **attestation pending** (no signed report URL yet). |
-| Backed / xStocks **redemption** | Public markdown: [issuance and redemption](https://docs.xstocks.fi/docs/issuance-and-redemption.md) (+ optional [xPort in-kind](https://docs.xstocks.fi/docs/issuance-and-redemption/in-kind-flow-xport.md)) | Live hook in `BackedVerifier.verify_redemption`. Score **80** when primary-market redemption language is present (KYC/whitelist called out); **85** only if the in-kind page actually says tokens redeem back into shares. Marketing Webflow shells are **not** used (JS-only — no silent claim). Fetch/parse failure → labeled **heuristic fallback**. |
-| Dinari **redemption** | Public markdown: [What are dShares](https://docs.dinari.com/docs/what-is-dshare.md) | Live hook in `DinariVerifier.verify_redemption`. Score **80** when the page documents mint/burn as issuance/redemption (brokerage fill, funds transfer). Not treated as in-kind share delivery. Fetch/parse failure → labeled **heuristic fallback**. |
+| Backed / xStocks **redemption** | Public markdown: [issuance and redemption](https://docs.xstocks.fi/docs/issuance-and-redemption.md) (+ optional [xPort in-kind](https://docs.xstocks.fi/docs/issuance-and-redemption/in-kind-flow-xport.md)) | Live hook in `BackedVerifier.verify_redemption`. Score **80** when primary-market redemption language is present (KYC/whitelist called out); **85** only if the in-kind page actually says tokens redeem back into shares. Marketing Webflow shells are **not** used (JS-only — no silent claim). Fetch/parse failure → **not available** (name-list score is not used). |
+| Dinari **redemption** | Public markdown: [What are dShares](https://docs.dinari.com/docs/what-is-dshare.md) | Live hook in `DinariVerifier.verify_redemption`. Score **80** when the page documents mint/burn as issuance/redemption (brokerage fill, funds transfer). Not treated as in-kind share delivery. Fetch/parse failure → **not available** (name-list score is not used). |
 | Robinhood tokenized stocks | CMC issuer name `"Robinhood"` (no public PoR URL) | Static self-reported scores: backing **55**, reserves **40**, redemption **35**. Badge: **self-reported**. These tokens are **debt securities** — holders are creditors of Robinhood Assets Jersey, not shareholders of AAPL/NVDA/TSLA/META. Self-reported 1:1, no public proof of reserves. A low/orange score is expected; the bug this verifier fixes is missing-issuer heuristic fallback (~47) with the wrong label. |
 
 ### Chainlink PoR coverage (judges)
@@ -144,7 +144,7 @@ Caption includes the fingerprint and **Not financial advice**. MIT core stays op
 
 ### Heuristic fallback disclaimer
 
-If a live verifier errors, times out, or is skipped (fixture/offline mode), the pillar **falls back to issuer-name heuristics** and is explicitly labeled **heuristic fallback**. The same label applies when a Backed / xStocks ticker has **no published Chainlink PoR feed** (most xStocks symbols) — that is expected coverage, not a failed probe. Failed verifiers are never dropped silently — the error is recorded in notes/flags. Heuristics are **not** audited attestations.
+If a live verifier errors, times out, or returns incomplete required signals, that pillar is **not available**. The name-list score is not used, the error stays in notes/flags, and the token does not print GREEN. Fixture/offline mode still skips live checks and uses the labeled **heuristic fallback**. The same heuristic label applies when a Backed / xStocks ticker has **no published Chainlink PoR feed** (most xStocks symbols) — that is expected coverage, not a failed probe. Heuristics are **not** audited attestations.
 
 ## How to run
 

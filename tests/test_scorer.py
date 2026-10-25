@@ -360,9 +360,15 @@ def test_backed_redemption_docs_error_is_not_silent() -> None:
         verifiers={"backed": BackedVerifier(session=CombinedSession())},
         use_live_verifiers=True,
     ).score("NVDA")
-    assert report["verification"]["redemption"]["source"] == "heuristic_fallback"
+    assert report["verification"]["redemption"]["source"] == "not_available"
+    assert report["verification"]["redemption"]["score"] is None
+    assert report["subscores"]["redemption"] is None
     assert report["verification"]["redemption"]["error"]
-    assert any("verifier failure" in f.lower() or "503" in f for f in report["flags"])
+    assert "not available" in report["verification"]["redemption"]["evidence"].lower()
+    assert report["band"] != "GREEN"
+    assert report["score"] < 75
+    assert any("503" in f or "not available" in f.lower() for f in report["flags"])
+    assert report["verification"]["reserves"]["source"] == "chainlink_por"
 
 
 def test_fixture_scorer_never_calls_http() -> None:
@@ -424,8 +430,14 @@ def test_failed_verifier_is_not_silently_dropped() -> None:
     client = RecordingClient()
     verifiers = {"backed": BackedVerifier(session=FakeRpcSession(RuntimeError("network down")))}
     report = TransparencyScorer(client, verifiers=verifiers, use_live_verifiers=True).score("NVDA")
-    assert any("verifier failure" in f.lower() or "network down" in f.lower() for f in report["flags"])
-    assert any("heuristic fallback" in n.lower() for n in report["notes"])
+    assert any("network down" in f.lower() for f in report["flags"])
+    assert any("not available" in n.lower() for n in report["notes"])
+    assert report["verification"]["reserves"]["source"] == "not_available"
+    assert report["verification"]["reserves"]["score"] is None
+    assert report["subscores"]["reserves"] is None
+    assert report["subscores"]["reserves"] != 90.0
+    assert report["band"] != "GREEN"
+    assert report["score"] < 75
     assert report["verification"]["reserves"]["error"]
 
 

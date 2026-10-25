@@ -18,6 +18,10 @@ def compute_confidence(report: dict[str, Any]) -> dict[str, Any]:
     parts: list[float] = []
     for block in (report.get("verification") or {}).values():
         source = (block or {}).get("source") or ""
+        level = str((block or {}).get("level") or "")
+        if source == "not_available" or level == "not available":
+            parts.append(0.2)
+            continue
         if source == "heuristic_fallback":
             parts.append(0.3)
             continue
