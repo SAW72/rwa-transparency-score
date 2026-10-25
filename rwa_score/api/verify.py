@@ -58,6 +58,7 @@ from .attest import (
     hash_canonical,
     recompute_inputs_digest,
 )
+from .auto_attest import attest_status_ticker
 from .settings import BASE_SEPOLIA_CHAIN_ID
 
 EXIT_OK = 0
@@ -444,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    ticker = args.ticker.strip().upper()
+    ticker = attest_status_ticker(args.ticker)
     contract = (args.contract or "").strip() or PINNED_ATTESTATION_CONTRACT
     ignored = []
     if args.fixtures:
@@ -600,8 +601,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_HASH_MISMATCH
 
     assert payload is not None
-    payload_ticker = str(payload.get("ticker") or "").strip().upper()
-    row_ticker = str(row.get("ticker") or "").strip().upper()
+    payload_ticker = attest_status_ticker(str(payload.get("ticker") or ""))
+    row_ticker = attest_status_ticker(str(row.get("ticker") or ""))
     if payload_ticker != ticker or row_ticker != ticker:
         result["match"] = False
         result["ticker_ok"] = False

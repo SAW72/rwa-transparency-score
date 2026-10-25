@@ -368,6 +368,179 @@ def test_attest_status_does_not_score(
     store.close()
 
 
+def _case_sensitive_chain(stored: str, digest: str):
+    """Chain reads that match ScoreAttestation: exact ticker bytes, not casefold."""
+    from unittest.mock import Mock
+
+    attester = "0x" + "11" * 20
+    tx = "0x" + "ab" * 32
+
+    def hashes_for_ticker(ticker: str) -> list[str]:
+        return [digest] if ticker == stored else []
+
+    def verify(score_hash: str, ticker: str):
+        if score_hash == digest and ticker == stored:
+            return (True, 1_700_000_000, attester)
+        return (False, 0, "0x" + "00" * 20)
+
+    def get_attestation(score_hash: str) -> dict[str, Any]:
+        ticker = stored if score_hash == digest else ""
+        return {
+            "ticker": ticker,
+            "attested_at": 1_700_000_000,
+            "claimed_at": 1_699_000_000,
+            "attester": attester,
+            "score_hash": score_hash,
+        }
+
+    chain = Mock()
+    chain.hashes_for_ticker.side_effect = hashes_for_ticker
+    chain.verify.side_effect = verify
+    chain.get_attestation.side_effect = get_attestation
+    chain.attested.side_effect = lambda score_hash: score_hash == digest
+    chain.receipt_event.side_effect = lambda tx_hash: (
+        {
+            "ticker": stored,
+            "score_hash": digest,
+            "attested_at": 1_700_000_000,
+            "claimed_at": 1_699_000_000,
+            "attester": attester,
+        }
+        if tx_hash == tx
+        else None
+    )
+    return chain, tx
+
+
+@pytest.mark.parametrize(
+    ("query", "stored", "canonical"),
+    [
+        ("bNVDA", "bNVDA", "bNVDA"),
+        ("BNVDA", "bNVDA", "bNVDA"),
+        ("AAPL", "AAPL", "AAPL"),
+        ("aapl", "AAPL", "AAPL"),
+    ],
+)
+def test_attest_status_matches_stored_ticker_case(
+    tmp_path: Path, query: str, stored: str, canonical: str
+) -> None:
+    """bNVDA stays bNVDA. An all-caps ticker still matches its uppercased record."""
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    digest = "0x" + "cd" * 32
+    chain, tx = _case_sensitive_chain(stored, digest)
+    settings = _settings(tmp_path)
+    store = Store()
+    scorer = Mock()
+    scorer.score.side_effect = AssertionError("status must not score")
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = _headers(raw)
+
+    by_ticker = client.get(f"/v1/attest/{query}/status", headers=headers)
+    assert by_ticker.status_code == 200
+    body = by_ticker.json()
+    assert body["ticker"] == canonical
+    assert body["status"] == "confirmed"
+    assert body["on_chain"]["ticker"] == canonical
+    assert body["on_chain"]["attested"] is True
+    assert body["on_chain"]["status"] == "confirmed"
+    assert body["score_hash"] == digest
+
+    by_hash = client.get(
+        f"/v1/attest/{query}/status",
+        headers=headers,
+        params={"score_hash": digest},
+    )
+    assert by_hash.status_code == 200
+    hashed = by_hash.json()
+    assert hashed["ticker"] == canonical
+    assert hashed["on_chain"]["attested"] is True
+    assert hashed["status"] == "confirmed"
+
+    by_tx = client.get(
+        f"/v1/attest/{query}/status",
+        headers=headers,
+        params={"tx_hash": tx},
+    )
+    assert by_tx.status_code == 200
+    receipt = by_tx.json()
+    assert receipt["ticker"] == canonical
+    assert receipt["on_chain"]["attested"] is True
+    assert receipt["on_chain"]["event"]["ticker"] == stored
+    assert receipt["tx_hash"] == tx
+
+    assert [call.args for call in chain.hashes_for_ticker.call_args_list] == [(canonical,)]
+    assert all(call.args == (digest, canonical) for call in chain.verify.call_args_list)
+    assert chain.verify.call_args_list
+    scorer.score.assert_not_called()
+    store.close()
+
+
+def test_attest_status_does_not_treat_nvda_as_bnvda(tmp_path: Path) -> None:
+    """NVDA and bNVDA are different chain keys. Uppercasing must not collapse them."""
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    digest = "0x" + "ef" * 32
+    chain, tx = _case_sensitive_chain("bNVDA", digest)
+    settings = _settings(tmp_path)
+    store = Store()
+    scorer = Mock()
+    scorer.score.side_effect = AssertionError("status must not score")
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    headers = _headers(raw)
+    missed = client.get("/v1/attest/NVDA/status", headers=headers)
+    assert missed.status_code == 200
+    assert missed.json()["ticker"] == "NVDA"
+    assert missed.json()["on_chain"]["attested"] is False
+    assert missed.json()["on_chain"]["status"] == "absent"
+    assert [call.args for call in chain.hashes_for_ticker.call_args_list] == [("NVDA",)]
+
+    crossed = client.get(
+        "/v1/attest/NVDA/status",
+        headers=headers,
+        params={"tx_hash": tx},
+    )
+    assert crossed.status_code == 200
+    assert crossed.json()["on_chain"]["attested"] is False
+    assert crossed.json()["on_chain"]["message"] == "Receipt event ticker does not match."
+    scorer.score.assert_not_called()
+    store.close()
+
+
 def test_me_quota(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     client, store = _client(tmp_path, fixture_scorer, free_daily_limit=50)
     raw = store.create_key(name="free", tier="free")

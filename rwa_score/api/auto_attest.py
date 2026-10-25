@@ -36,6 +36,7 @@ from urllib.parse import unquote, urlsplit
 
 from rwa_score.api.attest import hash_canonical
 from rwa_score.api.settings import BASE_SEPOLIA_CHAIN_ID
+from rwa_score.chainlink_por import canonical_backed_por_feed
 
 logger = logging.getLogger(__name__)
 
@@ -1664,6 +1665,24 @@ def _as_int(value: Any) -> int | None:
     return int(value)
 
 
+def attest_status_ticker(raw: str) -> str:
+    """Ticker bytes ScoreAttestation indexes, matching what scoring stores.
+
+    Published bToken symbols keep their published case (``bNVDA``). Every
+    other ticker is uppercased. ``hashesForTicker`` and ``verify`` hash the
+    exact string, so a blind ``upper()`` looks up ``BNVDA`` and misses a
+    record stored as ``bNVDA``. The same form is applied to the query and to
+    the ticker read back from the chain.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    feed = canonical_backed_por_feed(text)
+    if feed is not None:
+        return feed.symbol
+    return text.upper()
+
+
 def chain_status(
     chain: Any,
     *,
@@ -1676,9 +1695,11 @@ def chain_status(
     By ``tx_hash``: receipt plus a decoded ``ScoreAttested`` log.
     By ``score_hash``: ``attested``, ``getAttestation``, and ``verify``.
     By ticker alone: ``hashesForTicker``, then the same getters.
-    A probe that throws becomes a generic error. The exception text is dropped.
+    Ticker arguments use :func:`attest_status_ticker` on the query and on
+    the chain record. A probe that throws becomes a generic error. The
+    exception text is dropped.
     """
-    symbol = ticker.strip().upper()
+    symbol = attest_status_ticker(ticker)
     body: dict[str, Any] = {
         "ticker": symbol,
         "attested": False,
@@ -1717,7 +1738,7 @@ def chain_status(
         }
         score_hash = str(event.get("score_hash") or score_hash or "")
         body["score_hash"] = score_hash or None
-        if str(event.get("ticker") or "").upper() != symbol:
+        if attest_status_ticker(str(event.get("ticker") or "")) != symbol:
             body["status"] = "absent"
             body["attested"] = False
             body["message"] = "Receipt event ticker does not match."
@@ -1771,7 +1792,8 @@ def chain_status(
     elif attested_flag is not True:
         ok = False
     if isinstance(record, dict):
-        if str(record.get("ticker") or "").upper() not in {"", symbol}:
+        recorded = attest_status_ticker(str(record.get("ticker") or ""))
+        if recorded not in {"", symbol}:
             ok = False
         body["attestedAt"] = _as_int(record.get("attested_at"))
         body["claimedAt"] = _as_int(record.get("claimed_at"))

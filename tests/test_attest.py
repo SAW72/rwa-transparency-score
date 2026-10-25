@@ -789,6 +789,73 @@ def test_verify_hash_for_another_ticker_exits_4(capsys, tmp_path: Path) -> None:
     assert body["match"] is False
 
 
+def test_verify_accepts_bnvda_case_variants_and_rejects_nvda(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    """A stored bNVDA attestation matches bNVDA, BNVDA, and bnvda, and rejects NVDA.
+
+    The chain indexes the published bytes ``bNVDA``. The fake cast returns
+    verify() true only for that exact string.
+    """
+    db = _seed(tmp_path, ticker="bNVDA")
+    attester = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+    verify_tickers: list[str] = []
+
+    def run(args, **_kwargs):
+        cmd = args[1] if len(args) > 1 else ""
+        if cmd == "chain-id":
+            return "84532\n"
+        if cmd == "call":
+            sig = args[3] if len(args) > 3 else ""
+            if sig.startswith("attested("):
+                return "true\n"
+            if sig.startswith("getAttestation("):
+                digest = args[4] if len(args) > 4 else ""
+                return f"{digest}\nbNVDA\n1700000000\n{attester}\n0\n"
+            if sig.startswith("verify("):
+                queried = args[5] if len(args) > 5 else ""
+                verify_tickers.append(queried)
+                if queried == "bNVDA":
+                    return f"true\n1700000000\n{attester}\n"
+                return "false\n0\n" + "0x" + ("00" * 20) + "\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr("rwa_score.api.verify.shutil.which", lambda _name: "/usr/bin/cast")
+    monkeypatch.setattr("rwa_score.api.verify.subprocess.check_output", run)
+    common = [
+        "--json",
+        "--payload-file",
+        str(db),
+        "--rpc-url",
+        "http://127.0.0.1:9",
+        "--attester",
+        attester,
+    ]
+    for query in ("bNVDA", "BNVDA", "bnvda"):
+        verify_tickers.clear()
+        code = main([query, *common])
+        body = json.loads(capsys.readouterr().out)
+        assert code == EXIT_OK, (query, code, body.get("ticker_ok"), body.get("on_chain"))
+        assert body["hash_ok"] is True
+        assert body["ticker_ok"] is True
+        assert body["ticker"] == "bNVDA"
+        assert body["match"] is True
+        assert body["on_chain"]["ok"] is True
+        assert body["on_chain"]["record"]["ticker"] == "bNVDA"
+        assert verify_tickers == ["bNVDA"]
+
+    verify_tickers.clear()
+    code = main(["NVDA", *common])
+    body = json.loads(capsys.readouterr().out)
+    assert code == EXIT_NO_MATCH
+    assert body["hash_ok"] is True
+    assert body["ticker"] == "NVDA"
+    assert body["ticker_ok"] is False
+    assert body["match"] is False
+    assert body["on_chain"] is None
+    assert verify_tickers == []
+
+
 def test_verify_hash_mismatch_without_json_exits_4(capsys, tmp_path: Path) -> None:
     payload = _base_payload()
     raw = canonical_bytes(payload)

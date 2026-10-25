@@ -32,6 +32,8 @@ from rwa_score.api.auto_attest import (
     TerminalAttestError,
     Web3Chain,
     _assert_dedicated_attester,
+    attest_status_ticker,
+    chain_status,
     choose_nonce,
     clamp_eip1559_fees,
     redact,
@@ -691,6 +693,76 @@ def test_fee_and_nonce_helpers() -> None:
     assert low_priority <= low_fee
     assert choose_nonce(stored_nonce=4, unresolved=True, suggested=9) == 4
     assert choose_nonce(stored_nonce=None, unresolved=False, suggested=9) == 9
+
+
+def test_chain_status_preserves_bnvda_and_uppercases_other_tickers() -> None:
+    """Query and record use one ticker form. bNVDA is not looked up as BNVDA."""
+    digest = "0x" + "cd" * 32
+    attester = "0x" + "11" * 20
+    assert attest_status_ticker("bNVDA") == "bNVDA"
+    assert attest_status_ticker("BNVDA") == "bNVDA"
+    assert attest_status_ticker("  bnvda ") == "bNVDA"
+    assert attest_status_ticker("AAPL") == "AAPL"
+    assert attest_status_ticker("aapl") == "AAPL"
+
+    def chain_for(stored: str) -> Mock:
+        chain = Mock()
+
+        def hashes_for_ticker(ticker: str) -> list[str]:
+            return [digest] if ticker == stored else []
+
+        def verify(score_hash: str, ticker: str):
+            if score_hash == digest and ticker == stored:
+                return (True, 1_700_000_000, attester)
+            return (False, 0, "0x" + "00" * 20)
+
+        chain.hashes_for_ticker.side_effect = hashes_for_ticker
+        chain.verify.side_effect = verify
+        chain.attested.side_effect = lambda score_hash: score_hash == digest
+        chain.get_attestation.side_effect = lambda score_hash: {
+            "ticker": stored if score_hash == digest else "",
+            "attested_at": 1_700_000_000,
+            "claimed_at": 1_699_000_000,
+            "attester": attester,
+            "score_hash": score_hash,
+        }
+        chain.receipt_event.return_value = {
+            "ticker": stored,
+            "score_hash": digest,
+            "attested_at": 1_700_000_000,
+            "claimed_at": 1_699_000_000,
+            "attester": attester,
+        }
+        return chain
+
+    bnvda = chain_for("bNVDA")
+    listed = chain_status(bnvda, ticker="bNVDA")
+    assert listed["ticker"] == "bNVDA"
+    assert listed["attested"] is True
+    assert listed["status"] == "confirmed"
+    assert bnvda.hashes_for_ticker.call_args.args == ("bNVDA",)
+    assert bnvda.verify.call_args.args == (digest, "bNVDA")
+
+    from_upper = chain_status(chain_for("bNVDA"), ticker="BNVDA")
+    assert from_upper["ticker"] == "bNVDA"
+    assert from_upper["attested"] is True
+
+    receipt = chain_status(chain_for("bNVDA"), ticker="bNVDA", tx_hash="0x" + "ab" * 32)
+    assert receipt["attested"] is True
+    assert receipt["event"]["ticker"] == "bNVDA"
+    assert receipt["status"] == "confirmed"
+
+    aapl = chain_for("AAPL")
+    caps = chain_status(aapl, ticker="aapl")
+    assert caps["ticker"] == "AAPL"
+    assert caps["attested"] is True
+    assert aapl.hashes_for_ticker.call_args.args == ("AAPL",)
+    assert aapl.verify.call_args.args == (digest, "AAPL")
+
+    other = chain_status(chain_for("bNVDA"), ticker="NVDA")
+    assert other["ticker"] == "NVDA"
+    assert other["attested"] is False
+    assert other["status"] == "absent"
 
 
 def _forge_deploy(rpc: str) -> str:
