@@ -626,7 +626,8 @@ def test_ui_heuristic_legend_and_selected_slot_badges(fixture_scorer) -> None:
         },
     }
     live_lines = demo_app.selected_slot_verification_lines(live_por)
-    assert live_lines[0] == "LIVE-VERIFIED · strongest check: on-chain PoR"
+    assert live_lines[0] == "PARTIAL · strongest check: on-chain PoR"
+    assert "LIVE-VERIFIED" not in live_lines[0]
     assert any("Verification: on-chain PoR" in line for line in live_lines)
     cmc_lines = [
         line

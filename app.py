@@ -217,9 +217,10 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
 def selected_slot_verification_lines(report: dict) -> list[str]:
     """Compact per-pillar verification labels for the active compare slot.
 
-    First line says whether backing/reserves/redemption evidence is
-    LIVE-VERIFIED or HEURISTIC, then the strongest check. ``LIVE`` alone
-    read as a verified score next to a GREEN band.
+    First line is LIVE-VERIFIED only when backing, reserves, and redemption
+    are all live-verified. Otherwise it says PARTIAL or HEURISTIC (or
+    ATTESTATION PENDING for a scraped Dinari badge). ``LIVE`` alone read as
+    a verified score next to a GREEN band.
     """
     evidence = card_evidence_label(report)
     cue = verification_cue(report)
@@ -1367,14 +1368,102 @@ _LIVE_VERIFIED_CUES = frozenset(
 )
 
 
-def pillar_evidence_label(report: dict) -> str:
-    """LIVE-VERIFIED, HEURISTIC, SELF-REPORTED, or NOT-AVAILABLE.
+def _verification_block(report: dict, key: str) -> dict:
+    block = (report.get("verification") or {}).get(key) or {}
+    return block if isinstance(block, dict) else {}
 
-    Copy only. Bands and scores stay as the scorer computed them.
+
+def _pillar_failed(block: dict) -> bool:
+    source = str(block.get("source") or "")
+    level = str(block.get("level") or "")
+    if source == "not_available" or level == "not available":
+        return True
+    return block.get("error") is not None
+
+
+def _attestation_pending(block: dict) -> bool:
+    """Scraped Dinari badge. That ATTESTED label is not a signed report."""
+    source = str(block.get("source") or "")
+    notes = block.get("notes") or []
+    blob = " ".join(
+        [
+            source,
+            str(block.get("evidence") or ""),
+            " ".join(str(note) for note in notes),
+        ]
+    ).lower()
+    if source == "dinari_dshares":
+        return True
+    return "attestation pending" in blob or "no signed report" in blob
+
+
+def _signed_attestation(block: dict) -> bool:
+    if _attestation_pending(block):
+        return False
+    meta = block.get("meta") if isinstance(block.get("meta"), dict) else {}
+    if meta.get("signed_report_url") or meta.get("signed_report"):
+        return True
+    blob = " ".join(
+        [
+            str(block.get("evidence") or ""),
+            " ".join(str(note) for note in (block.get("notes") or [])),
+        ]
+    ).lower()
+    return "signed report" in blob
+
+
+def _pillar_live_verified(block: dict) -> bool:
+    """True when this pillar itself is live-verified.
+
+    On-chain PoR and examined count. ATTESTED counts only with a signed
+    report. Self-reported, heuristic, and attestation-pending do not.
     """
-    cue = verification_cue(report)
-    if cue in _LIVE_VERIFIED_CUES:
+    if _pillar_failed(block) or _attestation_pending(block):
+        return False
+    level = str(block.get("level") or "")
+    if level not in _LIVE_VERIFIED_CUES:
+        return False
+    if level == VerificationLevel.ATTESTED.value and not _signed_attestation(block):
+        return False
+    return True
+
+
+def _report_capped(report: dict) -> bool:
+    if report.get("capped") is True:
+        return True
+    label = str(report.get("band_label") or "").lower()
+    return "live check failed" in label and "not green" in label
+
+
+def pillar_evidence_label(report: dict) -> str:
+    """LIVE-VERIFIED only when every backing/reserves/redemption pillar is.
+
+    Some verified pillars are PARTIAL. None verified is HEURISTIC,
+    SELF-REPORTED, ATTESTATION PENDING, or NOT-AVAILABLE. A capped card or
+    any failed live check is never LIVE-VERIFIED. Copy only. Bands and
+    scores stay as the scorer computed them.
+    """
+    blocks = [_verification_block(report, key) for key in LIVE_OR_HEURISTIC]
+    verified = sum(1 for block in blocks if _pillar_live_verified(block))
+    failed = any(_pillar_failed(block) for block in blocks)
+    if (
+        verified == len(LIVE_OR_HEURISTIC)
+        and verified > 0
+        and not failed
+        and not _report_capped(report)
+    ):
         return "LIVE-VERIFIED"
+    if verified:
+        return "PARTIAL"
+    if any(_attestation_pending(block) for block in blocks) and not failed:
+        heuristic = any(
+            str(block.get("source") or "") == "heuristic_fallback"
+            or "heuristic fallback" in str(block.get("evidence") or "").lower()
+            for block in blocks
+        )
+        if not heuristic:
+            return "ATTESTATION PENDING"
+    cue = verification_cue(report)
     if cue == "not available":
         return "NOT-AVAILABLE"
     if cue == VerificationLevel.SELF_REPORTED.value:

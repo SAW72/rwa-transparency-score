@@ -745,13 +745,14 @@ class TransparencyScorer:
                 "crypto_id": tok.get("crypto_id"),
             }
 
-    def _token_for(self, rwa_id: int, issuer_hint: str = "") -> dict[str, Any]:
-        """Issuer row for one rwa_id. Does not fetch every issuer in the directory.
+    def _token_for(self, rwa_id: int) -> dict[str, Any]:
+        """Issuer row for one rwa_id.
 
-        CMC Basic allows only a few HTTP calls per minute. The old full-directory
-        walk 429'd ``/issuers`` on a cold four-card load. The info issuer name
-        is tried first; other issuers are fetched only until this rwa_id is found.
-        A failed detail call is not marked fetched, so the next card can retry.
+        The last issuer in directory order that lists this rwa_id wins, the
+        same overwrite base ``4c23bfd`` did on a full walk. The info issuer
+        name is not a selector. Issuers are fetched from the end of the
+        directory so that winner is the first hit. A failed detail call is
+        not marked fetched, so the next card can retry.
         """
         try:
             key = int(rwa_id)
@@ -761,11 +762,7 @@ class TransparencyScorer:
         if hit is not None:
             return hit
         entries = self._issuer_entries()
-        ordered = sorted(
-            entries,
-            key=lambda entry: _issuer_name_rank(str(entry.get("name") or ""), issuer_hint),
-        )
-        for entry in ordered:
+        for entry in reversed(list(entries)):
             iid = str(entry.get("issuer_id") or "")
             if not iid or iid in self._issuers_fetched:
                 continue
@@ -1365,8 +1362,7 @@ class TransparencyScorer:
             if not info:
                 raise ScoreError(f"No RWA info returned for {ticker} (rwa_id={rwa_id})")
 
-            hint = str((info.get("issuer") or {}).get("name") or "")
-            token = self._token_for(rwa_id, hint)
+            token = self._token_for(rwa_id)
             issuer_name = (
                 token.get("issuer_name")
                 or (info.get("issuer") or {}).get("name")
