@@ -217,13 +217,13 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
 def selected_slot_verification_lines(report: dict) -> list[str]:
     """Compact per-pillar verification labels for the active compare slot.
 
-    First line distinguishes LIVE/FIXTURE data from the strongest
-    backing/reserves/redemption check so a card with on-chain PoR is not
-    summarized as ``Verification: self-reported``.
+    First line says whether backing/reserves/redemption evidence is
+    LIVE-VERIFIED or HEURISTIC, then the strongest check. ``LIVE`` alone
+    read as a verified score next to a GREEN band.
     """
-    mode = mode_cue(report)
+    evidence = card_evidence_label(report)
     cue = verification_cue(report)
-    lines = [f"{mode} data · strongest check: {cue}"]
+    lines = [f"{evidence} · strongest check: {cue}"]
     for key in WEIGHTS:
         badge, _evidence = _verification_badge_label(key, report)
         lines.append(f"{PILLARS[key]['label']} — {badge}")
@@ -851,6 +851,10 @@ def _score_slots(
     scorer: TransparencyScorer, slots: list[str]
 ) -> list[tuple[str, dict | None, str | None]]:
     """Score each slot independently so one unknown ticker does not hide the row."""
+    prime = getattr(scorer, "prime_symbol_map", None)
+    if callable(prime):
+        primed = [normalize_ticker(raw) for raw in slots]
+        prime([symbol for symbol in primed if symbol])
     results: list[tuple[str, dict | None, str | None]] = []
     for raw in slots:
         symbol = normalize_ticker(raw)
@@ -1229,11 +1233,34 @@ def comparison_table_frame(reports: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def format_display_score(value: object) -> str:
+    """One decimal for the comparison table. Does not change the stored score."""
+    if value is None:
+        return _NOT_AVAILABLE_CELL
+    try:
+        if pd.isna(value):
+            return _NOT_AVAILABLE_CELL
+    except TypeError:
+        pass
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return _NOT_AVAILABLE_CELL
+
+
 def comparison_table(reports: list[dict]):
-    """Dataframe whose pillar sort is numeric and whose blank cells read ``not available``."""
+    """Dataframe whose pillar sort is numeric and whose blank cells read ``not available``.
+
+    Display text is one decimal place. The frame itself stays numeric so sort
+    order does not follow the formatted string.
+    """
     frame = comparison_table_frame(reports)
-    pillars = [column for column in frame.columns if column not in {"ticker", "issuer", "score", "band"}]
-    return frame.style.format(na_rep=_NOT_AVAILABLE_CELL, subset=pillars)
+    numeric = [column for column in frame.columns if column not in _COMPARE_TEXT_COLUMNS]
+    return frame.style.format(
+        format_display_score,
+        subset=numeric,
+        na_rep=_NOT_AVAILABLE_CELL,
+    )
 
 
 def pillar_evidence_rows(report: dict) -> list[dict]:
@@ -1329,6 +1356,40 @@ def verification_cue(report: dict) -> str:
     if not kinds:
         return VerificationLevel.SELF_REPORTED.value
     return max(kinds, key=lambda kind: _VERIFICATION_RANK.get(kind, 0))
+
+
+_LIVE_VERIFIED_CUES = frozenset(
+    {
+        VerificationLevel.ON_CHAIN_POR.value,
+        VerificationLevel.ATTESTED.value,
+        VerificationLevel.EXAMINED.value,
+    }
+)
+
+
+def pillar_evidence_label(report: dict) -> str:
+    """LIVE-VERIFIED, HEURISTIC, SELF-REPORTED, or NOT-AVAILABLE.
+
+    Copy only. Bands and scores stay as the scorer computed them.
+    """
+    cue = verification_cue(report)
+    if cue in _LIVE_VERIFIED_CUES:
+        return "LIVE-VERIFIED"
+    if cue == "not available":
+        return "NOT-AVAILABLE"
+    if cue == VerificationLevel.SELF_REPORTED.value:
+        return "SELF-REPORTED"
+    return "HEURISTIC"
+
+
+def card_evidence_label(report: dict) -> str:
+    """Card label. Fixture stays fixture. A heuristic live card is not LIVE."""
+    evidence = pillar_evidence_label(report)
+    if evidence == "LIVE-VERIFIED":
+        return "LIVE-VERIFIED"
+    if mode_cue(report) == "FIXTURE":
+        return f"FIXTURE · {evidence}"
+    return evidence
 
 
 def _empty_compare_diff() -> dict:
@@ -1515,13 +1576,16 @@ def compare_differentiation(reports: list[dict] | None) -> dict:
                     f"▼ {label} {largest['low']:.0f} vs {peer} {largest['high']:.0f}"
                 )
                 role = "low"
+        evidence = pillar_evidence_label(report)
         if ticker == high_ticker:
-            row_role = f"Highest in this row ({score:.1f} {band})."
+            row_role = f"Highest in this row ({score:.1f} {band}, {evidence})."
         elif ticker == low_ticker:
-            row_role = f"Lowest in this row ({score:.1f} {band})."
+            row_role = f"Lowest in this row ({score:.1f} {band}, {evidence})."
         else:
             gap = float(high.get("score") or 0) - score
-            row_role = f"{score:.1f} {band} · {gap:.1f} below {high_ticker}."
+            row_role = (
+                f"{score:.1f} {band}, {evidence} · {gap:.1f} below {high_ticker}."
+            )
         cards[ticker] = {
             "band": band,
             "verification": cue,
@@ -2593,11 +2657,11 @@ def _render_compare_card(
         report.get("band") or band_code(score)
     )
     issuer = short_company_name(str(report.get("issuer") or "")) or company
-    cue = mode_cue(report)
+    label = card_evidence_label(report)
     st.metric(
         title,
         f"{score:.1f}",
-        f"{issuer} · {cue}",
+        f"{issuer} · {label}",
         delta_color="off",
     )
     chip = band_chip_html(band, score=score, selected=selected)

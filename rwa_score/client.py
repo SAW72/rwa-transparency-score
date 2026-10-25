@@ -17,6 +17,7 @@ import copy
 import json
 import os
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -707,10 +708,10 @@ class _TTLCache:
 class CMCClient:
     """Thin wrapper around the CoinMarketCap Pro API.
 
-    Retries HTTP 429 and CMC error 1008 with exponential backoff + jitter.
-    Caches ``issuers/list`` and per-issuer detail for the process lifetime so
-    Streamlit reruns and a second ticker do not re-burn those calls. Map and
-    info use a short TTL (enough to absorb widget interactions).
+    Retries HTTP 429 and CMC error 1008 with exponential backoff + jitter
+    (bounded by ``max_wait_seconds``). ``issuers/list``, per-issuer detail, and
+    ``info`` are single-flight cached so compare cards share one response.
+    Issuer list and detail stay for the process lifetime. Info uses a short TTL.
     """
 
     source = "live"
@@ -757,6 +758,10 @@ class CMCClient:
         self._sleep = sleeper or time.sleep
         self._cache = _TTLCache()
         self._journal = _CallJournal(self.source)
+        # One in-flight issuers/info fetch per client. The four compare cards
+        # share this client, so a second card waits instead of bursting CMC.
+        self._flight_lock = threading.Lock()
+        self._market_pairs_plan_block: dict[str, Any] | None = None
 
     def begin_run(self) -> None:
         self._journal.begin_run()
@@ -902,6 +907,7 @@ class CMCClient:
             parsed = parse_rwa_map_payload(data.get("data") or {})
             assets = parsed["rwa_assets"]
             self._cache.set(key, assets)
+            self._remember_symbol_map_rows(assets, kind)
             self._record(ENDPOINT_MAP, via="network")
             return copy.deepcopy(assets)
 
@@ -960,41 +966,57 @@ class CMCClient:
             ttl=self.directory_ttl,
         )
 
+    def _remember_symbol_map_rows(self, assets: list[dict[str, Any]], kind: str) -> None:
+        """Index each symbol from a batch map response so later cards hit cache."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in assets:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            if not sym:
+                continue
+            grouped.setdefault(sym, []).append(row)
+        for sym, rows in grouped.items():
+            self._cache.set(f"map:sym:{sym}:{kind}", rows)
+
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         key = f"info:{int(rwa_id)}"
-        cached = self._cache.get(key, self.info_ttl)
-        if cached is not None:
-            self._record(ENDPOINT_INFO, via="cache", cached=True)
-            return cached
-        data = self._get(ENDPOINT_INFO, {"rwa_id": rwa_id})
-        assets = data.get("data", {}).get("rwa_assets", [])
-        info = assets[0] if assets else {}
-        self._cache.set(key, info)
-        self._record(ENDPOINT_INFO, via="network")
-        return copy.deepcopy(info)
+        with self._flight_lock:
+            cached = self._cache.get(key, self.info_ttl)
+            if cached is not None:
+                self._record(ENDPOINT_INFO, via="cache", cached=True)
+                return cached
+            data = self._get(ENDPOINT_INFO, {"rwa_id": rwa_id})
+            assets = data.get("data", {}).get("rwa_assets", [])
+            info = assets[0] if assets else {}
+            self._cache.set(key, info)
+            self._record(ENDPOINT_INFO, via="network")
+            return copy.deepcopy(info)
 
     def issuers_list(self) -> list[dict[str, Any]]:
-        cached = self._cache.get("issuers_list", ttl=None)
-        if cached is not None:
-            self._record(ENDPOINT_ISSUERS_LIST, via="cache", cached=True)
-            return cached
-        data = self._get(ENDPOINT_ISSUERS_LIST)
-        issuers = data.get("data", {}).get("issuers", [])
-        self._cache.set("issuers_list", issuers)
-        self._record(ENDPOINT_ISSUERS_LIST, via="network")
-        return copy.deepcopy(issuers)
+        with self._flight_lock:
+            cached = self._cache.get("issuers_list", ttl=None)
+            if cached is not None:
+                self._record(ENDPOINT_ISSUERS_LIST, via="cache", cached=True)
+                return cached
+            data = self._get(ENDPOINT_ISSUERS_LIST)
+            issuers = data.get("data", {}).get("issuers", [])
+            self._cache.set("issuers_list", issuers)
+            self._record(ENDPOINT_ISSUERS_LIST, via="network")
+            return copy.deepcopy(issuers)
 
     def issuer(self, issuer_id: str) -> dict[str, Any]:
         key = f"issuer:{issuer_id}"
-        cached = self._cache.get(key, ttl=None)
-        if cached is not None:
-            self._record(ENDPOINT_ISSUERS, via="cache", cached=True)
-            return cached
-        data = self._get(ENDPOINT_ISSUERS, {"issuer_id": issuer_id})
-        detail = data.get("data", {})
-        self._cache.set(key, detail)
-        self._record(ENDPOINT_ISSUERS, via="network")
-        return copy.deepcopy(detail)
+        with self._flight_lock:
+            cached = self._cache.get(key, ttl=None)
+            if cached is not None:
+                self._record(ENDPOINT_ISSUERS, via="cache", cached=True)
+                return cached
+            data = self._get(ENDPOINT_ISSUERS, {"issuer_id": issuer_id})
+            detail = data.get("data", {})
+            self._cache.set(key, detail)
+            self._record(ENDPOINT_ISSUERS, via="network")
+            return copy.deepcopy(detail)
 
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
         key = f"crypto_quote:{int(crypto_id)}"
@@ -1163,6 +1185,18 @@ class CMCClient:
         if cached is not None:
             self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
             return cached
+        shared = self._market_pairs_plan_block
+        if isinstance(shared, dict):
+            parsed = plan_blocked_market_pairs_payload(
+                rwa_id=rwa_id,
+                symbol=symbol,
+                status_code=shared.get("status_code"),
+                error_code=shared.get("error_code", 1006),
+                error_message=shared.get("error_message"),
+            )
+            self._cache.set(key, parsed)
+            self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
+            return copy.deepcopy(parsed)
         try:
             data = self._get(ENDPOINT_MARKET_PAIRS, params)
         except CMCError as exc:
@@ -1175,6 +1209,11 @@ class CMCClient:
                 error_code=getattr(exc, "error_code", 1006),
                 error_message=str(exc),
             )
+            self._market_pairs_plan_block = {
+                "status_code": parsed.get("status_code"),
+                "error_code": parsed.get("error_code"),
+                "error_message": parsed.get("error_message"),
+            }
             self._cache.set(key, parsed)
             self._record(ENDPOINT_MARKET_PAIRS, via="network")
             return copy.deepcopy(parsed)

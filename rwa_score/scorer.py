@@ -580,6 +580,20 @@ def _append_verification_notes(
     return " ".join(_collapse_name_list_sentence(bits))
 
 
+def _issuer_name_rank(name: str, hint: str) -> int:
+    """0 when ``hint`` names this issuer. Short fragments do not match."""
+    left = " ".join((name or "").casefold().split())
+    right = " ".join((hint or "").casefold().split())
+    if not left or not right:
+        return 1
+    if left == right:
+        return 0
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    if len(shorter) >= 4 and shorter in longer:
+        return 0
+    return 1
+
+
 class TransparencyScorer:
     def __init__(
         self,
@@ -592,8 +606,11 @@ class TransparencyScorer:
     ) -> None:
         self.client = client
         self._map_cache: dict[str, int] | None = None
+        self._map_misses: set[str] = set()
         # rwa_id -> {issuer_id, issuer_name, crypto_id}
-        self._issuer_index: dict[int, dict[str, Any]] | None = None
+        self._issuer_index: dict[int, dict[str, Any]] = {}
+        self._issuers_list: list[dict[str, Any]] | None = None
+        self._issuers_fetched: set[str] = set()
         self._issuer_detail_cache: dict[str, dict[str, Any]] = {}
         self._session = session
         self._verifiers = verifiers if verifiers is not None else build_default_verifiers(session)
@@ -610,18 +627,69 @@ class TransparencyScorer:
             self.use_live_verifiers = False
             self._fixture_live_blocked = True
 
-    def _load_map_cache(self) -> dict[str, int]:
+    def _remember_map_rows(self, assets: list[Any]) -> None:
         if self._map_cache is None:
+            self._map_cache = {}
+        for row in assets or []:
+            if not isinstance(row, dict):
+                continue
+            sym = (row.get("symbol") or "").upper()
+            rid = row.get("rwa_id")
+            if not sym or rid is None:
+                continue
             try:
-                assets = self.client.rwa_map()
-            except Exception as exc:  # noqa: BLE001 — surface map failures
-                raise ScoreError(f"Could not load RWA map: {exc}") from exc
-            self._map_cache = {
-                (a.get("symbol") or "").upper(): int(a["rwa_id"])
-                for a in assets
-                if a.get("symbol") and a.get("rwa_id") is not None
-            }
-        return self._map_cache
+                self._map_cache[sym] = int(rid)
+            except (TypeError, ValueError):
+                continue
+            self._map_misses.discard(sym)
+
+    def _map_lookup(self, symbol: str) -> int | None:
+        """One symbol map call. Does not page the full RWA book."""
+        key = (symbol or "").upper()
+        if not key:
+            return None
+        if self._map_cache and key in self._map_cache:
+            return self._map_cache[key]
+        if key in self._map_misses:
+            return None
+        try:
+            assets = self.client.rwa_map(key)
+        except Exception as exc:  # noqa: BLE001 — surface map failures
+            raise ScoreError(f"Could not load RWA map: {exc}") from exc
+        self._remember_map_rows(assets)
+        if self._map_cache and key in self._map_cache:
+            return self._map_cache[key]
+        self._map_misses.add(key)
+        return None
+
+    def prime_symbol_map(self, symbols: list[str]) -> None:
+        """Fetch the compare-row symbols in one map call when the client caches.
+
+        A full-book ``rwa_map()`` is dozens of pages on Basic and is what
+        pushes the following issuers/info calls into HTTP 429. Symbol lookup
+        is one request. Failure here is retried per ticker.
+        """
+        if not hasattr(self.client, "_cache"):
+            return
+        pending: list[str] = []
+        seen: set[str] = set()
+        for raw in symbols:
+            key = str(raw or "").strip().upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            if self._map_cache and key in self._map_cache:
+                continue
+            if key in self._map_misses:
+                continue
+            pending.append(key)
+        if not pending:
+            return
+        try:
+            assets = self.client.rwa_map(",".join(pending))
+        except Exception:
+            return
+        self._remember_map_rows(assets)
 
     def _resolve_score_target(self, ticker: str) -> tuple[int | None, PorFeed | None]:
         """Map a ticker to a CMC/fixture row and/or a canonical Backed bToken.
@@ -631,12 +699,11 @@ class TransparencyScorer:
         and scoring uses labeled missing-field defaults — never invented
         prices or CIKs.
         """
-        cache = self._load_map_cache()
         feed = canonical_backed_por_feed(ticker)
-        rwa_id = cache.get(ticker.upper())
+        rwa_id = self._map_lookup(ticker.upper())
         if rwa_id is None and feed is not None:
             for cand in backed_map_candidates(feed):
-                mapped = cache.get(cand)
+                mapped = self._map_lookup(cand)
                 if mapped is not None:
                     return mapped, feed
         if rwa_id is None and feed is None:
@@ -650,45 +717,72 @@ class TransparencyScorer:
             raise ScoreError(f"{symbol} not found in RWA map")
         return rwa_id
 
-    def _ensure_issuer_index(self) -> None:
-        """Walk the issuer directory once per scorer and cache details.
+    def _issuer_entries(self) -> list[dict[str, Any]]:
+        if self._issuers_list is None:
+            try:
+                entries = self.client.issuers_list()
+            except Exception as exc:  # noqa: BLE001
+                raise ScoreError(f"Could not load issuer list: {exc}") from exc
+            self._issuers_list = list(entries or [])
+        return self._issuers_list
 
-        Live mode: 1 credit for the list + 1 credit per issuer detail, then reuse.
-        CMCClient also caches list + detail for the process lifetime, so a new
-        scorer sharing that client does not re-hit the API.
+    def _absorb_issuer(self, issuer_id: str, detail: dict[str, Any], fallback_name: str) -> None:
+        self._issuer_detail_cache[str(issuer_id)] = detail
+        name = detail.get("name") or fallback_name or ""
+        for tok in detail.get("tokens") or []:
+            if not isinstance(tok, dict):
+                continue
+            rid = tok.get("rwa_id")
+            if rid is None:
+                continue
+            try:
+                key = int(rid)
+            except (TypeError, ValueError):
+                continue
+            self._issuer_index[key] = {
+                "issuer_id": issuer_id,
+                "issuer_name": name,
+                "crypto_id": tok.get("crypto_id"),
+            }
+
+    def _token_for(self, rwa_id: int, issuer_hint: str = "") -> dict[str, Any]:
+        """Issuer row for one rwa_id. Does not fetch every issuer in the directory.
+
+        CMC Basic allows only a few HTTP calls per minute. The old full-directory
+        walk 429'd ``/issuers`` on a cold four-card load. The info issuer name
+        is tried first; other issuers are fetched only until this rwa_id is found.
+        A failed detail call is not marked fetched, so the next card can retry.
         """
-        if self._issuer_index is not None:
-            return
-        self._issuer_index = {}
         try:
-            entries = self.client.issuers_list()
-        except Exception as exc:  # noqa: BLE001
-            raise ScoreError(f"Could not load issuer list: {exc}") from exc
-
-        for entry in entries:
-            iid = entry.get("issuer_id")
-            if not iid:
+            key = int(rwa_id)
+        except (TypeError, ValueError):
+            return {}
+        hit = self._issuer_index.get(key)
+        if hit is not None:
+            return hit
+        entries = self._issuer_entries()
+        ordered = sorted(
+            entries,
+            key=lambda entry: _issuer_name_rank(str(entry.get("name") or ""), issuer_hint),
+        )
+        for entry in ordered:
+            iid = str(entry.get("issuer_id") or "")
+            if not iid or iid in self._issuers_fetched:
                 continue
             try:
                 detail = self.client.issuer(iid)
             except Exception as exc:  # noqa: BLE001
                 raise ScoreError(f"Could not load issuer {iid}: {exc}") from exc
-            self._issuer_detail_cache[str(iid)] = detail
-            name = detail.get("name") or entry.get("name") or ""
-            for tok in detail.get("tokens") or []:
-                rid = tok.get("rwa_id")
-                if rid is None:
-                    continue
-                self._issuer_index[int(rid)] = {
-                    "issuer_id": iid,
-                    "issuer_name": name,
-                    "crypto_id": tok.get("crypto_id"),
-                }
-
-    def _token_for(self, rwa_id: int) -> dict[str, Any]:
-        self._ensure_issuer_index()
-        assert self._issuer_index is not None
-        return self._issuer_index.get(rwa_id, {})
+            self._issuers_fetched.add(iid)
+            self._absorb_issuer(
+                iid,
+                detail if isinstance(detail, dict) else {},
+                str(entry.get("name") or ""),
+            )
+            found = self._issuer_index.get(key)
+            if found is not None:
+                return found
+        return {}
 
     def _load_rwa_quotes(
         self, rwa_id: int | None
@@ -899,8 +993,7 @@ class TransparencyScorer:
         return self._crypto_quote_price(crypto_id)
 
     def _issuer_by_crypto_id(self) -> dict[int, str]:
-        """crypto_id → issuer name from the already-built issuer index."""
-        self._ensure_issuer_index()
+        """crypto_id → issuer name from issuers already fetched for this score."""
         names: dict[int, str] = {}
         for row in (self._issuer_index or {}).values():
             crypto_id = row.get("crypto_id")
@@ -1272,7 +1365,8 @@ class TransparencyScorer:
             if not info:
                 raise ScoreError(f"No RWA info returned for {ticker} (rwa_id={rwa_id})")
 
-            token = self._token_for(rwa_id)
+            hint = str((info.get("issuer") or {}).get("name") or "")
+            token = self._token_for(rwa_id, hint)
             issuer_name = (
                 token.get("issuer_name")
                 or (info.get("issuer") or {}).get("name")
