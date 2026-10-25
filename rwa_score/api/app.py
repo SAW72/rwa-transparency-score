@@ -34,6 +34,7 @@ from .auto_attest import (
     AttestWorker,
     AttesterSettings,
     SubmitResult,
+    attest_status_ticker,
     chain_status,
     safety_status,
 )
@@ -451,7 +452,7 @@ def create_app(
         _ = key
         if _control_ticker(ticker):
             raise _http_error(400, "bad_ticker", "Ticker contains a control character.")
-        symbol = ticker.strip().upper()
+        symbol = attest_status_ticker(ticker)
         chain = getattr(worker, "_chain", None)
         if chain is None and attester_cfg.rpc_url and attester_cfg.contract and attester_cfg.enabled:
             try:
