@@ -235,7 +235,6 @@ def test_rat6_health_mode_matches_sidebar(monkeypatch: pytest.MonkeyPatch) -> No
     payload = build_health_payload(poster=boom)
     assert payload["fixtures"] is False
     assert payload["verifiers_live"] is True
-    assert payload["cmc_key_present"] is False
     assert payload["market_data_provider"] == "coingecko"
     assert payload["coingecko_access"] == "keyless"
     blob = json.dumps(payload)
@@ -246,20 +245,15 @@ def test_rat6_health_mode_matches_sidebar(monkeypatch: pytest.MonkeyPatch) -> No
     live = build_health_payload(poster=boom)
     assert live["fixtures"] is False
     assert live["verifiers_live"] is True
-    assert live["cmc_key_present"] is False
     assert live["coingecko_access"] == "demo"
     assert "configured" not in json.dumps(live)
 
-    monkeypatch.setenv("CMC_API_KEY", "cmc-sentinel")
     monkeypatch.setenv("RWA_USE_FIXTURES", "1")
     forced = build_health_payload(poster=boom)
     assert forced["fixtures"] is True
     assert forced["verifiers_live"] is False
-    assert forced["cmc_key_present"] is True
     assert forced["coingecko_access"] == "demo"
-    dumped = json.dumps(forced)
-    assert "configured" not in dumped
-    assert "cmc-sentinel" not in dumped
+    assert "configured" not in json.dumps(forced)
 
 
 def test_rat7_xstocks_note_matches_empty_feed_list() -> None:

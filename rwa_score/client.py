@@ -227,11 +227,6 @@ def use_fixtures(explicit: bool | None = None) -> bool:
     return env_flag("RWA_USE_FIXTURES")
 
 
-def cmc_key_present() -> bool:
-    """True when CMC_API_KEY is non-empty. The value is never returned."""
-    return bool(os.getenv("CMC_API_KEY", "").strip())
-
-
 def sidebar_uses_fixtures() -> bool:
     """Process default the Streamlit sidebar starts from.
 

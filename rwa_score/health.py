@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .chainlink_por import HEALTH_POR_FEED, probe_chainlink_por, rpc_urls_for_chain
-from .client import cmc_key_present, sidebar_uses_fixtures
+from .client import sidebar_uses_fixtures
 
 HEALTH_POR_SYMBOL = HEALTH_POR_FEED.symbol
 HEALTH_TIMEOUT_SECONDS = 2.0
@@ -122,7 +122,6 @@ def build_health_payload(
     return {
         "fixtures": fixtures,
         "verifiers_live": not fixtures,
-        "cmc_key_present": cmc_key_present(),
         "backed_feed": backed,
         "timestamp": utc_timestamp(now),
         **market_data_status(),
@@ -174,7 +173,6 @@ def _health_handler_class() -> type:
                 payload = {
                     "fixtures": fixtures,
                     "verifiers_live": not fixtures,
-                    "cmc_key_present": cmc_key_present(),
                     "backed_feed": "down",
                     "timestamp": utc_timestamp(),
                     **market_data_status(),
