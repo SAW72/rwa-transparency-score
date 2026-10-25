@@ -159,6 +159,8 @@ def _verification_badge_label(pillar_key: str, report: dict) -> tuple[str, str]:
         report.get("basis") or {}, verification=report.get("verification") or {}
     ):
         return PLAN_BLOCKED_LABEL, evidence
+    if source == "not_available" or str(level) == "not available":
+        return "not available", evidence
     if pillar_key in ALWAYS_SELF_REPORTED:
         # LIVE/FIXTURE is the data source, not an oracle. Do not label CMC-only
         # pillars as the card's overall "Verification:" line.
@@ -183,7 +185,9 @@ def heuristic_legend_lines(report: dict | None = None) -> list[str]:
         "GREEN/YELLOW/ORANGE/RED bands are automated heuristics — not audited attestations.",
         "Price, disclosure, and cross-issuer basis are always self-reported CMC (or fixture) fields "
         "(RWA quotes/latest plus market-pairs; crypto 24hΔ is a labeled fallback).",
-        "Backing / reserves / redemption are live only when a verifier hits a published source; otherwise **heuristic fallback** (labeled, never silent).",
+        "Backing / reserves / redemption are live only when a verifier hits a published source. "
+        "If no live check ran, the pillar is a labeled **heuristic fallback**. "
+        "If a live check fails, that pillar is **not available** and the token is not GREEN.",
         "xStocks names without a published Chainlink PoR aggregator stay heuristic — that is expected coverage, not a failed probe.",
         "Fixture mode uses bundled demo data and skips live attestation / PoR / redemption HTTP.",
         "Educational demo — not financial advice.",
@@ -242,6 +246,7 @@ _VERIFICATION_RANK = {
     VerificationLevel.EXAMINED.value: 2,
     "heuristic fallback": 1,
     VerificationLevel.SELF_REPORTED.value: 0,
+    "not available": 0,
 }
 # Prefix typeahead only. Category / class browse uses CLASS_PAGE_LIMIT so
 # Matches can scroll the loaded CMC page instead of four top ranks.
@@ -1122,6 +1127,24 @@ def basis_status_caption(basis_meta: dict | None) -> str | None:
     return None
 
 
+def pillar_score_number(value: object) -> float | None:
+    """Measured pillar points. ``None`` means the pillar is not available."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_pillar_score(value: object) -> str:
+    """``not available`` or a whole-number score. Never prints a stand-in zero."""
+    number = pillar_score_number(value)
+    if number is None:
+        return "not available"
+    return f"{number:.0f}"
+
+
 def pillar_evidence_rows(report: dict) -> list[dict]:
     """Existing per-pillar badge + evidence. No new feeds or invented metrics."""
     subs = report.get("subscores") or {}
@@ -1130,12 +1153,13 @@ def pillar_evidence_rows(report: dict) -> list[dict]:
     for key in WEIGHTS:
         badge, evidence = _verification_badge_label(key, report)
         meta = PILLARS[key]
+        score = pillar_score_number(subs.get(key) if key in subs else None)
         rows.append(
             {
                 "key": key,
                 "label": meta["label"],
                 "what": meta["what"],
-                "score": float(subs.get(key) or 0),
+                "score": score,
                 "weight": float(WEIGHTS[key]),
                 "badge": badge,
                 "evidence": evidence,
@@ -1148,9 +1172,14 @@ def pillar_evidence_rows(report: dict) -> list[dict]:
 def pillar_dots(report: dict) -> str:
     """One compact dot per pillar (filled / half / empty by band)."""
     subs = report.get("subscores") or {}
-    return "".join(
-        _DOT_BY_BAND.get(band_code(float(subs.get(key) or 0)), "·") for key in WEIGHTS
-    )
+    parts: list[str] = []
+    for key in WEIGHTS:
+        number = pillar_score_number(subs.get(key) if key in subs else None)
+        if number is None:
+            parts.append("·")
+            continue
+        parts.append(_DOT_BY_BAND.get(band_code(number), "·"))
+    return "".join(parts)
 
 
 def weakest_pillar_line(report: dict) -> str:
@@ -1158,8 +1187,26 @@ def weakest_pillar_line(report: dict) -> str:
     subs = report.get("subscores") or {}
     if not subs:
         return ""
-    key = min(WEIGHTS, key=lambda item: float(subs.get(item) or 0))
-    return f"Weakest: {PILLARS[key]['label']} {float(subs.get(key) or 0):.0f}"
+    missing = [
+        PILLARS[key]["label"]
+        for key in WEIGHTS
+        if key in subs and pillar_score_number(subs.get(key)) is None
+    ]
+    numeric: list[tuple[str, float]] = []
+    for key in WEIGHTS:
+        if key not in subs:
+            continue
+        number = pillar_score_number(subs.get(key))
+        if number is None:
+            continue
+        numeric.append((key, number))
+    bits: list[str] = []
+    if missing:
+        bits.append("Not available: " + ", ".join(missing))
+    if numeric:
+        key, value = min(numeric, key=lambda item: item[1])
+        bits.append(f"Weakest: {PILLARS[key]['label']} {value:.0f}")
+    return " · ".join(bits)
 
 
 def _join_tickers(tickers: list[str]) -> str:
@@ -1178,6 +1225,8 @@ def pillar_verification_kind(pillar_key: str, report: dict) -> str:
     level = str(block.get("level") or VerificationLevel.SELF_REPORTED.value)
     source = str(block.get("source") or "")
     evidence = str(block.get("evidence") or "")
+    if source == "not_available" or level == "not available":
+        return "not available"
     if source == "heuristic_fallback" or "heuristic fallback" in evidence.lower():
         return "heuristic fallback"
     return level
@@ -1233,7 +1282,10 @@ def _largest_pillar_delta(reports: list[dict]) -> dict | None:
             subs = report.get("subscores") or {}
             if key not in subs:
                 continue
-            values.append((ticker, float(subs.get(key) or 0)))
+            number = pillar_score_number(subs.get(key))
+            if number is None:
+                continue
+            values.append((ticker, number))
         if len(values) < 2:
             continue
         high_val = max(item[1] for item in values)
@@ -2285,10 +2337,23 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
     ):
         st.caption(data_source_caption(report))
 
-        st.caption(
-            "Backing / reserves / redemption use **issuer-name heuristics** when live "
-            "attestation/PoR is unavailable — labeled **heuristic fallback**, not audited attestations."
-        )
+        rows = pillar_evidence_rows(report)
+        unavailable = [
+            row["label"]
+            for row in rows
+            if row["score"] is None or row["badge"] == "not available"
+        ]
+        if unavailable:
+            st.caption(
+                "Not available: "
+                + ", ".join(unavailable)
+                + ". A live check failed. Name-list scores are not used, and this score is not GREEN."
+            )
+        else:
+            st.caption(
+                "Backing / reserves / redemption use **issuer-name heuristics** when no live "
+                "check ran — labeled **heuristic fallback**, not audited attestations."
+            )
 
         caption = basis_status_caption(report.get("basis") or {})
         if caption:
@@ -2301,9 +2366,13 @@ def _render_card_details(report: dict, *, slot_index: int = 0) -> None:
         else:
             st.caption("No risk flags on this pass.")
 
-        for row in pillar_evidence_rows(report):
+        for row in rows:
+            if row["score"] is None:
+                score_txt = "not available"
+            else:
+                score_txt = f"{row['score']:.0f}/100"
             st.markdown(
-                f"**{row['label']}** — {row['score']:.0f}/100 "
+                f"**{row['label']}** — {score_txt} "
                 f"(weight {row['weight']:.0%})"
             )
             st.caption(row["badge"])
@@ -2397,11 +2466,15 @@ def _render_selected_slot_detail(
     if rank:
         st.caption(rank)
     subs = report.get("subscores") or {}
-    bits = [
-        f"**{PILLARS[key]['label']}** {subs[key]:.0f}"
-        for key in WEIGHTS
-        if key in subs
-    ]
+    bits = []
+    for key in WEIGHTS:
+        if key not in subs:
+            continue
+        label = PILLARS[key]["label"]
+        if pillar_score_number(subs.get(key)) is None:
+            bits.append(f"**{label}** not available")
+        else:
+            bits.append(f"**{label}** {format_pillar_score(subs.get(key))}")
     if bits:
         st.caption(" · ".join(bits))
     for line in selected_slot_verification_lines(report):
@@ -2800,7 +2873,8 @@ if ok_reports:
             "score": report["score"],
             "band": report["band"],
         }
-        row.update(report["subscores"])
+        for key, value in (report.get("subscores") or {}).items():
+            row[key] = "not available" if value is None else value
         rows.append(row)
     st.markdown("#### Comparison table")
     st.dataframe(rows, use_container_width=True, hide_index=True)

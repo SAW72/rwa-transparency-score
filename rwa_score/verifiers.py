@@ -6,8 +6,10 @@ Live sources (no paid APIs, ``requests`` only):
   - Dinari dShares marketing page scrape (attestation pending — no signed URL yet)
   - Dinari redemption via public dShare docs (mint/burn = issuance/redemption)
 
-Failed verifiers never fail silently: the scorer must surface the error and
-fall back to the name heuristic labeled **"heuristic fallback"**.
+A live check that fails is **not available**. The name list must not stand
+in for it, and the scorer must not print GREEN from that stand-in. The name
+heuristic labeled **"heuristic fallback"** is only for an intentional skip:
+fixture/offline mode, an unknown issuer, or no published feed.
 """
 
 from __future__ import annotations
@@ -75,13 +77,19 @@ class VerificationLevel(str, Enum):
     ON_CHAIN_POR = "on-chain PoR"
     ATTESTED = "attested"
     EXAMINED = "examined"
+    NOT_AVAILABLE = "not available"
+
+
+# A failed live check. Not a measured score, and not a name-list stand-in.
+NOT_AVAILABLE_SOURCE = "not_available"
+NOT_AVAILABLE_LABEL = "not available"
 
 
 @dataclass
 class VerificationResult:
     """Outcome of one pillar verification attempt."""
 
-    score: float
+    score: float | None
     level: VerificationLevel
     evidence: str
     source: str
@@ -91,6 +99,10 @@ class VerificationResult:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
+        if self.score is None:
+            score_out: float | None = None
+        else:
+            score_out = round(float(self.score), 1)
         return {
             "level": self.level.value,
             "evidence": self.evidence,
@@ -99,7 +111,7 @@ class VerificationResult:
             "ok": self.ok,
             "error": self.error,
             "meta": dict(self.meta),
-            "score": round(self.score, 1),
+            "score": score_out,
         }
 
 
@@ -122,6 +134,58 @@ def _heuristic_scores(issuer_name: str) -> dict[str, float]:
     }
 
 
+def live_check_failed(result: VerificationResult) -> bool:
+    """True when a live probe ran and failed.
+
+    Fixture/offline skips, unknown issuers, and tickers with no published
+    feed stay on the name list. Those results have no error and are not
+    ``not_available``.
+    """
+    if result.source == NOT_AVAILABLE_SOURCE:
+        return True
+    if result.level == VerificationLevel.NOT_AVAILABLE:
+        return True
+    return bool(result.error)
+
+
+def unavailable_live_result(
+    pillar: str,
+    issuer_name: str,
+    *,
+    reason: str,
+    error: str | None,
+) -> VerificationResult:
+    """Failed live check. No name-list score. Label is ``not available``."""
+    detail = " ".join((reason or "").split())
+    evidence = (
+        f"not available: live {pillar} check failed for "
+        f"'{issuer_name or 'unknown'}'."
+    )
+    if detail:
+        evidence = f"{evidence} {detail}"
+    evidence = f"{evidence} Name-list scores are not used."
+    err = error or "live check failed"
+    return VerificationResult(
+        score=None,
+        level=VerificationLevel.NOT_AVAILABLE,
+        evidence=evidence,
+        source=NOT_AVAILABLE_SOURCE,
+        notes=[
+            "not available",
+            "Live check failed. Name-list scores are not used.",
+            f"Verifier error (not dropped): {err}",
+        ],
+        ok=False,
+        error=err,
+        meta={
+            "pillar": pillar,
+            "available": False,
+            "issuer": issuer_name,
+            "label": NOT_AVAILABLE_LABEL,
+        },
+    )
+
+
 def heuristic_result(
     pillar: str,
     issuer_name: str,
@@ -129,7 +193,15 @@ def heuristic_result(
     reason: str,
     error: str | None = None,
 ) -> VerificationResult:
-    """Name-match fallback. Always labeled ``heuristic fallback``."""
+    """Name-match fallback when no live check ran.
+
+    A failed live check (``error`` set) does not use the name list. That
+    pillar is ``not available``.
+    """
+    if error:
+        return unavailable_live_result(
+            pillar, issuer_name, reason=reason, error=error
+        )
     scores = _heuristic_scores(issuer_name)
     score = scores.get(pillar, 30.0)
     flags = classify(issuer_name)
@@ -428,7 +500,11 @@ class BackedVerifier:
         # Live PoR is primarily a reserves signal; treat solid collateralization as
         # corroboration of a real share-backed model.
         result = self._from_por(ticker=ticker, issuer_name=issuer_name, pillar="backing")
-        if result.ok and result.level == VerificationLevel.ON_CHAIN_POR:
+        if (
+            result.ok
+            and result.level == VerificationLevel.ON_CHAIN_POR
+            and result.score is not None
+        ):
             # Cap backing slightly below reserves when ratio is excellent — still high.
             result.score = min(result.score, 92.0)
             result.notes.append("Backing corroborated by Chainlink PoR collateralization.")
@@ -457,8 +533,8 @@ class BackedVerifier:
     def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
         """Live hook: public xStocks/Backed issuance + redemption markdown.
 
-        Fails closed into labeled heuristic fallback. Does not claim in-kind
-        share delivery unless that language is actually on the fetched page.
+        A fetch or parse failure is not available. The name list is not used.
+        Does not claim in-kind share delivery unless that language is on the page.
         """
         try:
             overview = self._fetch_doc(BACKED_REDEMPTION_DOCS_URL)
@@ -690,8 +766,9 @@ class DinariVerifier:
     def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
         """Live hook: Dinari public dShare docs (burn = redemption).
 
-        Fails closed into labeled heuristic fallback. Does not claim in-kind
-        share delivery — the published flow burns tokens and transfers funds.
+        A fetch or parse failure is not available. The name list is not used.
+        Does not claim in-kind share delivery — the published flow burns tokens
+        and transfers funds.
         """
         try:
             text = self._fetch_doc(DINARI_DSHARE_DOCS_URL)

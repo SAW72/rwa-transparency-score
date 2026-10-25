@@ -481,7 +481,7 @@ def _compare_lines(
             raw = subs.get(key)
             ver = (compact.get("verification") or {}).get(key) or {}
             level = ver.get("level") or ""
-            score_bit = f"{float(raw):.1f}" if raw is not None else "n/a"
+            score_bit = f"{float(raw):.1f}" if raw is not None else "not available"
             extra = f" ({level})" if level else ""
             pieces.append(f"{compact.get('ticker')} {score_bit}{extra}")
         bits.append(f"{label}: " + " vs ".join(pieces) + ".")
@@ -575,14 +575,42 @@ def _calls_since(client: object, start: int) -> dict[str, Any]:
 def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
     subs = report.get("subscores") or {}
     verification = report.get("verification") or {}
+
+    def _subscore_number(key: str) -> float | None:
+        if key not in subs or subs.get(key) is None:
+            return None
+        try:
+            return float(subs.get(key))
+        except (TypeError, ValueError):
+            return None
+
     weakest_key = ""
-    if subs:
-        weakest_key = min(WEIGHTS, key=lambda item: float(subs.get(item) or 0))
+    weakest_score: float | None = None
+    missing = [key for key in WEIGHTS if key in subs and _subscore_number(key) is None]
+    if missing:
+        weakest_key = missing[0]
+        weakest_score = None
+    elif subs:
+        weakest_key = min(
+            (key for key in WEIGHTS if _subscore_number(key) is not None),
+            key=lambda item: _subscore_number(item) or 0.0,
+            default="",
+        )
+        weakest_score = _subscore_number(weakest_key) if weakest_key else None
     self_reported = []
     for key in WEIGHTS:
         block = verification.get(key) or {}
         level = str(block.get("level") or "")
         source = str(block.get("source") or "")
+        if source == "not_available" or level == "not available":
+            self_reported.append(
+                {
+                    "pillar": key,
+                    "label": PILLARS[key]["label"],
+                    "kind": "not available",
+                }
+            )
+            continue
         if key in ALWAYS_SELF_REPORTED or level == "self-reported":
             basis_meta = report.get("basis") or {}
             if key == "basis" and (
@@ -633,7 +661,7 @@ def _compact_score(report: dict[str, Any]) -> dict[str, Any]:
         "weakest": {
             "key": weakest_key,
             "label": PILLARS[weakest_key]["label"] if weakest_key else "",
-            "score": float(subs.get(weakest_key) or 0) if weakest_key else None,
+            "score": weakest_score,
         },
         "self_reported": self_reported,
         "verification": compact_ver,
@@ -1088,10 +1116,12 @@ def _self_reported_line(compact: dict[str, Any]) -> str:
         return f"No self-reported pillars recorded on {compact.get('ticker')}."
     always = [row["label"] for row in rows if row.get("kind") == "CMC field (self-reported)"]
     blocked = [row["label"] for row in rows if row.get("kind") == PLAN_BLOCKED_LABEL]
+    unavailable = [row["label"] for row in rows if row.get("kind") == "not available"]
     other = [
         row["label"]
         for row in rows
-        if row.get("kind") not in {"CMC field (self-reported)", PLAN_BLOCKED_LABEL}
+        if row.get("kind")
+        not in {"CMC field (self-reported)", PLAN_BLOCKED_LABEL, "not available"}
     ]
     bits = []
     if always:
@@ -1102,6 +1132,12 @@ def _self_reported_line(compact: dict[str, Any]) -> str:
         bits.append(
             "Cross-issuer basis is plan-blocked / unavailable "
             "(CMC market-pairs not on this plan — not live market-pairs data)."
+        )
+    if unavailable:
+        bits.append(
+            "Not available (live check failed; name-list scores are not used): "
+            + ", ".join(unavailable)
+            + "."
         )
     if other:
         bits.append(

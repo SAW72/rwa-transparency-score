@@ -199,11 +199,15 @@ def test_backed_verifier_fallback_on_rpc_error() -> None:
     session = FakeRpcSession(RuntimeError("rpc timeout"))
     v = BackedVerifier(session=session)
     result = v.verify_reserves(ticker="NVDA", issuer_name="Backed Finance")
-    assert result.level == VerificationLevel.SELF_REPORTED
-    assert result.source == "heuristic_fallback"
-    assert any("heuristic fallback" in n for n in result.notes)
+    assert result.level == VerificationLevel.NOT_AVAILABLE
+    assert result.source == "not_available"
+    assert result.score is None
+    assert result.ok is False
+    assert "not available" in result.evidence.lower()
+    assert "name-list" in result.evidence.lower()
+    assert any("not available" in n.lower() for n in result.notes)
     assert result.error
-    assert result.score == 90.0  # Backed Finance is on AUDITED list
+    assert "rpc timeout" in (result.error or "")
 
 
 def test_backed_verifier_fallback_when_no_feed() -> None:
@@ -299,8 +303,10 @@ def test_dinari_verifier_fallback_when_incomplete() -> None:
     session = FakeSession({DINARI_DSHARES_URL: FakeResponse(200, text=html)})
     v = DinariVerifier(session=session)
     result = v.verify_backing(ticker="AAPL", issuer_name="Dinari")
-    assert result.source == "heuristic_fallback"
-    assert any("heuristic fallback" in n for n in result.notes)
+    assert result.source == "not_available"
+    assert result.score is None
+    assert "not available" in result.evidence.lower()
+    assert any("not available" in n.lower() for n in result.notes)
     assert result.error
 
 
@@ -432,11 +438,12 @@ def test_backed_verifier_redemption_fails_closed_on_http_error() -> None:
     result = BackedVerifier(session=session).verify_redemption(
         ticker="NVDA", issuer_name="Backed Finance"
     )
-    assert result.source == "heuristic_fallback"
+    assert result.source == "not_available"
     assert result.ok is False
     assert result.error
-    assert "heuristic fallback" in result.evidence
-    assert result.score == 85.0  # Backed Finance is on the redeemable name list
+    assert "not available" in result.evidence.lower()
+    assert result.score is None
+    assert "name-list" in result.evidence.lower()
 
 
 def test_backed_verifier_redemption_fails_closed_when_claims_missing() -> None:
@@ -449,10 +456,11 @@ def test_backed_verifier_redemption_fails_closed_when_claims_missing() -> None:
     result = BackedVerifier(session=session).verify_redemption(
         ticker="NVDA", issuer_name="Backed Finance"
     )
-    assert result.source == "heuristic_fallback"
+    assert result.source == "not_available"
+    assert result.score is None
     assert result.error
     assert "incomplete redemption signals" in (result.error or "")
-    assert "heuristic fallback" in result.evidence
+    assert "not available" in result.evidence.lower()
 
 
 def test_dinari_verifier_redemption_live_docs() -> None:
@@ -472,12 +480,15 @@ def test_dinari_verifier_redemption_fails_closed() -> None:
     down = DinariVerifier(
         session=FakeSession({DINARI_DSHARE_DOCS_URL: FakeResponse(500, text="nope")})
     ).verify_redemption(ticker="AAPL", issuer_name="Dinari")
-    assert down.source == "heuristic_fallback"
+    assert down.source == "not_available"
     assert down.error
-    assert down.score == 25.0  # Dinari is not on the redeemable name list
+    assert down.score is None
+    assert "not available" in down.evidence.lower()
 
     incomplete = DinariVerifier(
         session=FakeSession({DINARI_DSHARE_DOCS_URL: FakeResponse(200, text="Welcome.")})
     ).verify_redemption(ticker="AAPL", issuer_name="Dinari")
-    assert incomplete.source == "heuristic_fallback"
+    assert incomplete.source == "not_available"
+    assert incomplete.score is None
     assert "incomplete redemption signals" in (incomplete.error or "")
+    assert "not available" in incomplete.evidence.lower()

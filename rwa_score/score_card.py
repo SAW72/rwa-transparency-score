@@ -82,9 +82,13 @@ def signing_secret_from_env() -> str:
 def canonical_score_payload(report: dict[str, Any], timestamp: str) -> dict[str, Any]:
     """Stable, signed subset: ticker, score, band, pillars, timestamp."""
     raw_subs = report.get("subscores") or {}
-    subscores: dict[str, float] = {}
+    subscores: dict[str, float | None] = {}
     for key in WEIGHTS:
-        subscores[key] = round(float(raw_subs.get(key) or 0.0), 1)
+        raw = raw_subs.get(key) if key in raw_subs else None
+        if raw is None:
+            subscores[key] = None
+        else:
+            subscores[key] = round(float(raw), 1)
     return {
         "band": str(report.get("band") or ""),
         "score": round(float(report.get("score") or 0.0), 1),
@@ -129,7 +133,11 @@ def share_caption(payload: dict[str, Any], fingerprint: str) -> str:
         if key in subs:
             label = PILLARS.get(key, {}).get("label", key)
             short = label.split()[0]
-            pillar_bits.append(f"{short} {subs[key]:.0f}")
+            raw = subs.get(key)
+            if raw is None:
+                pillar_bits.append(f"{short} not available")
+            else:
+                pillar_bits.append(f"{short} {float(raw):.0f}")
     lines = [
         f"RAT Score · {ticker} · {score} {band}",
         " · ".join(pillar_bits),
@@ -272,13 +280,14 @@ def render_score_card_png(
     for key in WEIGHTS:
         meta = PILLARS.get(key) or {"label": key}
         label = meta["label"]
-        value = float(subs.get(key) or 0.0)
+        raw_value = subs.get(key) if key in subs else None
+        value = None if raw_value is None else float(raw_value)
         draw.text((56, y - 4), label, font=font_pillar, fill=text)
         _rounded_rect(draw, (bar_x, y + 4, bar_x + bar_w, y + 4 + bar_h), 6, bar_bg)
-        fill_w = max(0, min(bar_w, int(bar_w * (value / 100.0))))
+        fill_w = 0 if value is None else max(0, min(bar_w, int(bar_w * (value / 100.0))))
         if fill_w > 0:
             _rounded_rect(draw, (bar_x, y + 4, bar_x + fill_w, y + 4 + bar_h), 6, accent)
-        num = f"{value:.0f}"
+        num = "not available" if value is None else f"{value:.0f}"
         num_bbox = draw.textbbox((0, 0), num, font=font_pillar_num)
         draw.text((CARD_WIDTH - 56 - (num_bbox[2] - num_bbox[0]), y - 4), num, font=font_pillar_num, fill=text)
         y += step
