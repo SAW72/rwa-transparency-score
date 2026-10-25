@@ -739,6 +739,8 @@ class TransparencyScorer:
                 key = int(rid)
             except (TypeError, ValueError):
                 continue
+            if key in self._issuer_index:
+                continue
             self._issuer_index[key] = {
                 "issuer_id": issuer_id,
                 "issuer_name": name,
@@ -749,10 +751,11 @@ class TransparencyScorer:
         """Issuer row for one rwa_id.
 
         The last issuer in directory order that lists this rwa_id wins, the
-        same overwrite base ``4c23bfd`` did on a full walk. The info issuer
-        name is not a selector. Issuers are fetched from the end of the
-        directory so that winner is the first hit. A failed detail call is
-        not marked fetched, so the next card can retry.
+        same choice base ``4c23bfd`` made on a full forward walk. The info
+        issuer name is not a selector. Issuers are fetched from the end of
+        the directory so that winner is the first hit. ``_absorb_issuer``
+        keeps that first hit and does not overwrite it. A failed detail call
+        is not marked fetched, so the next card can retry.
         """
         try:
             key = int(rwa_id)

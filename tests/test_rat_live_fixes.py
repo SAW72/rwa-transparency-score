@@ -19,7 +19,7 @@ from rwa_score.client import (
     ENDPOINT_MARKET_PAIRS,
 )
 from rwa_score.scorer import TransparencyScorer, _issuer_name_rank
-from rwa_score.verifiers import VerificationLevel
+from rwa_score.verifiers import VerificationLevel, VerificationResult
 from tests.conftest import RecordingClient
 from tests.test_client import FakeResponse, FakeSession, _live, cmc_1006, cmc_429, cmc_ok
 
@@ -781,3 +781,169 @@ def test_live_verified_requires_every_pillar() -> None:
     label = demo_app.card_evidence_label(dinari)
     assert label == "ATTESTATION PENDING"
     assert "LIVE-VERIFIED" not in label
+
+
+def test_http_503_with_error_1006_is_not_a_plan_block() -> None:
+    """Q1-M04: a 503 whose JSON body carries error 1006 raises. It is not a plan block."""
+    session = FakeSession([cmc_1006(http_status=503), _pairs_ok(15)])
+    client = _live(session)
+    try:
+        client.market_pairs(rwa_id=2)
+    except CMCError:
+        pass
+    else:
+        raise AssertionError("503 with error 1006 was treated as a plan block")
+    second = client.market_pairs(rwa_id=15)
+    assert second.get("plan_blocked") is not True
+    assert second["rwa_id"] == 15
+    assert session.paths().count(ENDPOINT_MARKET_PAIRS) == 2
+    assert client._market_pairs_plan_block is None
+
+
+def test_unsigned_attestation_is_not_verified() -> None:
+    """Q3-M05: PoR + PoR + unsigned non-Dinari ATTESTED is PARTIAL, not LIVE-VERIFIED."""
+    import app as demo_app
+
+    por = {
+        "level": "on-chain PoR",
+        "source": "chainlink_por",
+        "evidence": "published feed",
+    }
+    unsigned = {
+        "level": "attested",
+        "source": "issuer_attestation",
+        "evidence": "issuer page mentions an attestation",
+    }
+    card = _pillars(backing=por, reserves=por, redemption=unsigned)
+    assert demo_app._pillar_live_verified(unsigned) is False
+    assert demo_app.pillar_evidence_label(card) == "PARTIAL"
+    assert demo_app.card_evidence_label(card) == "PARTIAL"
+    assert "LIVE-VERIFIED" not in demo_app.card_evidence_label(card)
+    lines = demo_app.selected_slot_verification_lines(card)
+    assert lines[0] == "PARTIAL · strongest check: on-chain PoR"
+
+
+def test_unsigned_attestation_slot_line_does_not_say_attested() -> None:
+    """Three unsigned attestations stay heuristic and do not say 'strongest check: attested'."""
+    import app as demo_app
+
+    unsigned = {
+        "level": "attested",
+        "source": "issuer_attestation",
+        "evidence": "issuer page mentions an attestation",
+    }
+    card = _pillars(backing=unsigned, reserves=unsigned, redemption=unsigned)
+    assert demo_app.card_evidence_label(card) == "HEURISTIC"
+    lines = demo_app.selected_slot_verification_lines(card)
+    assert lines[0] == "HEURISTIC · strongest check: unsigned attestation (heuristic)"
+    assert "strongest check: attested" not in lines[0]
+
+    signed = {
+        "level": "attested",
+        "source": "issuer_attestation",
+        "evidence": "signed report https://example.test/nvda.pdf",
+    }
+    verified = _pillars(backing=signed, reserves=signed, redemption=signed)
+    verified_lines = demo_app.selected_slot_verification_lines(verified)
+    assert verified_lines[0] == "LIVE-VERIFIED · strongest check: attested"
+
+
+def _order_directory_client() -> RecordingClient:
+    """Alpha lists TSLA, then Ondo lists NVDA, then Backed lists NVDA."""
+    quote = {
+        "symbol": "NVDA",
+        "average_tokenized_price": 100.0,
+        "tokenized_volume_24h": 10.0,
+        "tokens": [
+            {
+                "symbol": "NVDAX",
+                "price": 100.0,
+                "crypto_id": 11,
+                "volume_24h": 10.0,
+            }
+        ],
+    }
+    return RecordingClient(
+        assets=[
+            {"symbol": "TSLA", "rwa_id": 15},
+            {"symbol": "NVDA", "rwa_id": 2},
+        ],
+        info={
+            15: {"symbol": "TSLA", "cik": "0001318605"},
+            2: {"symbol": "NVDA", "cik": "0001045810"},
+        },
+        issuers=[
+            {"issuer_id": "alpha", "name": "Alpha"},
+            {"issuer_id": "ondo", "name": "Ondo"},
+            {"issuer_id": "backed", "name": "Backed Finance"},
+        ],
+        issuer_details={
+            "alpha": {
+                "name": "Alpha",
+                "tokens": [{"rwa_id": 15, "crypto_id": 30}],
+            },
+            "ondo": {
+                "name": "Ondo",
+                "tokens": [{"rwa_id": 2, "crypto_id": 21}],
+            },
+            "backed": {
+                "name": "Backed Finance",
+                "tokens": [{"rwa_id": 2, "crypto_id": 11}],
+            },
+        },
+        quotes={
+            30: {"quote": {"USD": {"percent_change_24h": 0.0, "price": 100.0}}},
+        },
+        rwa_quotes={2: quote, 15: dict(quote, symbol="TSLA")},
+        market_pairs={
+            2: {"rwa_id": 2, "symbol": "NVDA", "num_market_pairs": 0, "market_pairs": []},
+            15: {"rwa_id": 15, "symbol": "TSLA", "num_market_pairs": 0, "market_pairs": []},
+        },
+    )
+
+
+class _PorBackedVerifier:
+    """Backed pillars at 95. With CIK 80, price 100, and one wrapper, NVDA is 87.5."""
+
+    name = "backed"
+
+    def _por(self) -> VerificationResult:
+        return VerificationResult(
+            score=95.0,
+            level=VerificationLevel.ON_CHAIN_POR,
+            evidence="Chainlink PoR ok",
+            source="chainlink_por",
+            ok=True,
+        )
+
+    def verify_backing(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        return self._por()
+
+    def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        return self._por()
+
+    def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+        return self._por()
+
+
+def _score_order(order: list[str]) -> dict:
+    scorer = TransparencyScorer(
+        _order_directory_client(),
+        verifiers={"backed": _PorBackedVerifier()},
+        use_live_verifiers=True,
+    )
+    reports = {ticker: scorer.score(ticker) for ticker in order}
+    return reports["NVDA"]
+
+
+def test_shared_nvda_issuer_is_independent_of_card_order() -> None:
+    """Q4: Alpha [TSLA], Ondo [NVDA], Backed [NVDA]. Both orders pick Backed 87.5 GREEN.
+
+    Base ``4c23bfd`` keeps the last directory issuer. Revert the
+    ``_absorb_issuer`` skip and TSLA-then-NVDA returns Ondo instead.
+    """
+    for order in (["TSLA", "NVDA"], ["NVDA", "TSLA"]):
+        report = _score_order(order)
+        assert report["issuer"] == "Backed Finance", order
+        assert report["score"] == 87.5, order
+        assert report["band"] == "GREEN", order
