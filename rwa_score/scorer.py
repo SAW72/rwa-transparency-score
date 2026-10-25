@@ -739,7 +739,7 @@ class TransparencyScorer:
                 key = int(rid)
             except (TypeError, ValueError):
                 continue
-            if key in self._issuer_index:
+            if key in self._issuer_index and self._issuer_index[key]["issuer_id"] != issuer_id:
                 continue
             self._issuer_index[key] = {
                 "issuer_id": issuer_id,

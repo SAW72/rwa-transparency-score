@@ -224,8 +224,10 @@ def selected_slot_verification_lines(report: dict) -> list[str]:
     """
     evidence = card_evidence_label(report)
     cue = verification_cue(report)
-    # An unsigned attestation is still a heuristic. Do not call it "attested".
-    if evidence.endswith("HEURISTIC") and cue == VerificationLevel.ATTESTED.value:
+    # An unsigned or pending attestation is still a heuristic. Do not call it "attested".
+    if cue == VerificationLevel.ATTESTED.value and (
+        evidence.endswith("HEURISTIC") or evidence.endswith("ATTESTATION PENDING")
+    ):
         cue = "unsigned attestation (heuristic)"
     lines = [f"{evidence} · strongest check: {cue}"]
     for key in WEIGHTS:

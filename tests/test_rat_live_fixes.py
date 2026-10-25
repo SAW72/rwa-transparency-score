@@ -947,3 +947,141 @@ def test_shared_nvda_issuer_is_independent_of_card_order() -> None:
         assert report["issuer"] == "Backed Finance", order
         assert report["score"] == 87.5, order
         assert report["band"] == "GREEN", order
+
+
+def test_http_401_with_error_1006_does_not_stick() -> None:
+    """N02 and N10: a 401 with JSON 1006 on A is not remembered. B stays 70.5 YELLOW."""
+    session = FakeSession([cmc_1006(http_status=401), *_wide_b_responses()])
+    client = _live(session)
+    client.market_pairs(rwa_id=2)
+    assert client._market_pairs_plan_block is None
+    report = TransparencyScorer(client, use_live_verifiers=False).score("B")
+    assert report["subscores"]["basis"] == 15.0
+    assert report["score"] == 70.5
+    assert report["band"] == "YELLOW"
+    assert session.paths().count(ENDPOINT_MARKET_PAIRS) == 2
+
+
+def test_http_200_with_error_1006_is_remembered_as_plan_block() -> None:
+    """N02b: a 200 with JSON error 1006 is remembered. The next asset is plan-blocked."""
+    session = FakeSession([cmc_1006(http_status=200), *_wide_b_responses()])
+    client = _live(session)
+    first = client.market_pairs(rwa_id=2)
+    assert first["plan_blocked"] is True
+    assert client._market_pairs_plan_block is not None
+    assert client._market_pairs_plan_block.get("error_code") in (1006, "1006")
+    report = TransparencyScorer(client, use_live_verifiers=False).score("B")
+    assert report["score"] == 75.8
+    assert report["band"] == "GREEN"
+    assert session.paths().count(ENDPOINT_MARKET_PAIRS) == 1
+
+
+def test_http_500_with_error_1006_raises_and_is_not_cached() -> None:
+    """N06b: HTTP 500 with JSON 1006 raises and is not cached as a plan block."""
+    session = FakeSession([cmc_1006(http_status=500), _pairs_ok(2)])
+    client = _live(session)
+    try:
+        client.market_pairs(rwa_id=2)
+    except CMCError:
+        pass
+    else:
+        raise AssertionError("500 with error 1006 was treated as a plan block")
+    assert client._market_pairs_plan_block is None
+    second = client.market_pairs(rwa_id=2)
+    assert second.get("plan_blocked") is not True
+    assert second["rwa_id"] == 2
+    assert session.paths().count(ENDPOINT_MARKET_PAIRS) == 2
+
+
+def _dinari_pending_block() -> dict:
+    return {
+        "level": "attested",
+        "source": "dinari_dshares",
+        "evidence": (
+            "dinari.com/dshares: audit=Big 4; custody=Alpaca; 1:1 claim present. "
+            "attestation pending — no signed report URL yet."
+        ),
+        "notes": ["attestation pending"],
+    }
+
+
+def _dinari_docs_block() -> dict:
+    return {
+        "level": "self-reported",
+        "source": "dinari_redemption_docs",
+        "evidence": "Dinari dShare docs: burn on sell transfers funds.",
+        "notes": ["live redemption hook: issuer public docs"],
+    }
+
+
+def test_dinari_pending_card_does_not_say_attested() -> None:
+    """X5: a normal Dinari card is pending, so the strongest check is not 'attested'."""
+    import app as demo_app
+
+    card = _pillars(
+        backing=_dinari_pending_block(),
+        reserves=_dinari_pending_block(),
+        redemption=_dinari_docs_block(),
+    )
+    assert demo_app.pillar_evidence_label(card) == "ATTESTATION PENDING"
+    lines = demo_app.selected_slot_verification_lines(card)
+    assert lines[0] == (
+        "ATTESTATION PENDING · strongest check: unsigned attestation (heuristic)"
+    )
+    assert "strongest check: attested" not in lines[0]
+
+
+def test_dinari_pending_plus_failed_redemption_is_heuristic() -> None:
+    """N48 and N31+N32: pending Dinari plus a failed redemption check stays HEURISTIC."""
+    import app as demo_app
+
+    failed = {
+        "level": "not available",
+        "source": "not_available",
+        "evidence": "not available: live redemption check failed for 'Dinari'.",
+        "error": "Dinari dShare redemption docs fetch failed",
+        "notes": ["Verifier error (not dropped): Dinari dShare redemption docs fetch failed"],
+    }
+    card = _pillars(
+        backing=_dinari_pending_block(),
+        reserves=_dinari_pending_block(),
+        redemption=failed,
+    )
+    assert demo_app.pillar_evidence_label(card) == "HEURISTIC"
+    lines = demo_app.selected_slot_verification_lines(card)
+    assert lines[0] == "HEURISTIC · strongest check: unsigned attestation (heuristic)"
+    assert not lines[0].startswith("ATTESTATION PENDING")
+
+
+def test_same_issuer_duplicate_token_keeps_last_on_price_fallback() -> None:
+    """X6: one issuer listing the same rwa_id twice keeps the last token.
+
+    Base ``4c23bfd`` uses that token's crypto quote when RWA quotes 5xx.
+    The last token's 24h change scores 39.5 ORANGE. Keeping the first token
+    scores 42.2 instead.
+    """
+    client = RecordingClient(
+        assets=[{"symbol": "NVDA", "rwa_id": 2}],
+        info={2: {"symbol": "NVDA", "name": "Nvidia"}},
+        issuers=[{"issuer_id": "dup", "name": "Dup Ledger"}],
+        issuer_details={
+            "dup": {
+                "name": "Dup Ledger",
+                "tokens": [
+                    {"symbol": "bNVDA", "rwa_id": 2, "crypto_id": 111},
+                    {"symbol": "NVDAX", "rwa_id": 2, "crypto_id": 222},
+                ],
+            }
+        },
+        quotes={
+            111: {"quote": {"USD": {"percent_change_24h": 0.2, "price": 100.0}}},
+            222: {"quote": {"USD": {"percent_change_24h": 9.2, "price": 90.8}}},
+        },
+        rwa_quotes_error=RuntimeError("HTTP 500"),
+    )
+    report = TransparencyScorer(client, use_live_verifiers=False).score("NVDA")
+    assert report["score"] == 39.5
+    assert report["band"] == "ORANGE"
+    assert report["price"]["source"] == "cmc_crypto_quote"
+    assert report["price"]["fallback"] is True
+    assert report["price"]["crypto_id"] == 222
