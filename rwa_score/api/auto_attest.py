@@ -582,7 +582,11 @@ class SafetyRefusal(TerminalAttestError):
 
 
 class AlreadyAttestedError(Exception):
-    """The contract reverted ``AlreadyAttested``. Treat as success."""
+    """The contract reverted ``AlreadyAttested``.
+
+    That revert is a confirmed attest only when ``verify`` then returns
+    exactly ``True``. Any other verify result stays non-confirmed.
+    """
 
 
 class Chain(Protocol):
@@ -608,6 +612,10 @@ class SendOutcome:
     tx_hash: str | None
     attested_at: int | None
     already: bool
+    # ``verify_ok`` is set only when the on-chain verify call returned exactly True.
+    verify_ok: bool = False
+    # AlreadyAttested fired and verify did not return exactly True.
+    reverted_unverified: bool = False
 
 
 @dataclass(frozen=True)
@@ -738,11 +746,6 @@ def _raw_receipt(chain: Any, tx_hash: str | None) -> Any:
         return getter(tx_hash)
     except Exception:
         return None
-
-
-def _receipt_succeeded(chain: Any, tx_hash: str | None) -> bool:
-    """True when a receipt for ``tx_hash`` is already mined with status 1."""
-    return _status_of(_raw_receipt(chain, tx_hash)) == 1
 
 
 def choose_nonce(*, stored_nonce: int | None, unresolved: bool, suggested: int) -> int:
@@ -1541,7 +1544,10 @@ def send_one(
     receipt_timeout: float | None = None,
     skip_initial_verify: bool = False,
 ) -> SendOutcome:
-    """Pre-check ``verify``, then send. ``AlreadyAttested`` is success.
+    """Pre-check ``verify``, then send.
+
+    A result is confirmed only when ``verify`` returned exactly ``True``.
+    ``AlreadyAttested`` follows that same rule. A mined receipt is not enough.
 
     ``skip_initial_verify`` is set when the caller already read ``eth_chainId``
     and ``verify`` for this attempt. The post-send ``verify`` still runs.
@@ -1564,11 +1570,12 @@ def send_one(
                 f"refusing eth_chainId {chain_id}; only {BASE_SEPOLIA_CHAIN_ID}"
             )
         ok, attested_at, _who = chain.verify(job["score_hash"], job["ticker"])
-        if ok:
+        if ok is True:
             return SendOutcome(
                 tx_hash=_receipt_hash(chain, job),
                 attested_at=int(attested_at),
                 already=True,
+                verify_ok=True,
             )
     if settings.min_balance_wei > 0:
         balance = read_balance_wei(chain)
@@ -1610,28 +1617,41 @@ def send_one(
         )
     except AlreadyAttestedError:
         ok2, ts2, _who2 = chain.verify(job["score_hash"], job["ticker"])
+        if ok2 is True:
+            return SendOutcome(
+                tx_hash=_receipt_hash(chain, job),
+                attested_at=int(ts2),
+                already=True,
+                verify_ok=True,
+            )
         return SendOutcome(
             tx_hash=_receipt_hash(chain, job),
-            attested_at=int(ts2) if ok2 else None,
-            already=True,
+            attested_at=None,
+            already=False,
+            reverted_unverified=True,
         )
     except TerminalAttestError:
         raise
     except Exception:
         ok_late, ts_late, _who_late = chain.verify(job["score_hash"], job["ticker"])
-        if ok_late:
+        if ok_late is True:
             return SendOutcome(
                 tx_hash=_receipt_hash(chain, job),
                 attested_at=int(ts_late) if isinstance(ts_late, int) else None,
                 already=True,
+                verify_ok=True,
             )
         raise
     ok3, ts3, _who3 = chain.verify(job["score_hash"], job["ticker"])
     if ok3 is True:
         attested_at = int(ts3) if isinstance(ts3, int) and not isinstance(ts3, bool) else 0
-        return SendOutcome(tx_hash=tx_hash, attested_at=attested_at, already=False)
-    if _receipt_succeeded(chain, tx_hash):
-        return SendOutcome(tx_hash=tx_hash, attested_at=0, already=False)
+        return SendOutcome(
+            tx_hash=tx_hash,
+            attested_at=attested_at,
+            already=False,
+            verify_ok=True,
+        )
+    # A status-1 receipt is not confirmation. Verify has to be exactly True.
     return SendOutcome(tx_hash=tx_hash, attested_at=None, already=False)
 
 
@@ -2164,13 +2184,22 @@ class AttestWorker:
                 self._limiter.release(ticker=ticker, key_id=api_key_id, now=clock)
             if claimed and not job.get("tx_hash"):
                 self.store.release_reserve(score_hash)
-        if outcome.already or (outcome.attested_at is not None and outcome.tx_hash):
+        if outcome.verify_ok and (
+            outcome.already or (outcome.attested_at is not None and outcome.tx_hash)
+        ):
             if job.get("tx_hash"):
                 self.store.drop_inflight(str(job["tx_hash"]))
             return SubmitResult(
                 status="confirmed",
                 tx_hash=outcome.tx_hash,
                 attested_at=outcome.attested_at,
+            )
+        if outcome.reverted_unverified:
+            return SubmitResult(
+                status="unavailable",
+                tx_hash=job.get("tx_hash") or outcome.tx_hash,
+                attested_at=None,
+                message="Not confirmed. On-chain verify did not return true.",
             )
         if job.get("tx_hash") and _status_of(_raw_receipt(self.chain(), str(job["tx_hash"]))) == 0:
             self.store.drop_inflight(str(job["tx_hash"]))

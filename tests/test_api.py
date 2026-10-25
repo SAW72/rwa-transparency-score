@@ -690,6 +690,231 @@ def test_attest_status_receipt_without_hash_is_not_confirmed(tmp_path: Path) -> 
     store.close()
 
 
+def _get_status(tmp_path: Path, chain: Any, ticker: str, **params: str) -> dict[str, Any]:
+    client, store, scorer = _status_client(tmp_path, chain)
+    raw = store.create_key(name="paid", tier="paid")
+    response = client.get(
+        f"/v1/attest/{ticker}/status",
+        headers=_headers(raw),
+        params=params,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    scorer.score.assert_not_called()
+    store.close()
+    return body
+
+
+def _matching_record(ticker: str, digest: str) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "attested_at": 1_700_000_000,
+        "claimed_at": 1_700_000_000,
+        "attester": "0x" + "11" * 20,
+        "score_hash": digest,
+    }
+
+
+def test_attest_status_attested_with_verify_false_is_absent(tmp_path: Path) -> None:
+    """S04. attested alone must not confirm when verify returns False."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "a4" * 32
+    chain = Mock()
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = _matching_record("NVDA", digest)
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    body = _get_status(tmp_path, chain, "NVDA", score_hash=digest)
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+    chain.verify.assert_called_once_with(digest, "NVDA")
+
+
+def test_attest_status_attested_with_verify_none_is_absent(tmp_path: Path) -> None:
+    """S05. A verify result of None is not a successful verify."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "a5" * 32
+    chain = Mock()
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = _matching_record("NVDA", digest)
+    chain.verify.return_value = None
+    body = _get_status(tmp_path, chain, "NVDA", score_hash=digest)
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+
+
+def test_attest_status_truthy_verify_is_not_confirmed(tmp_path: Path) -> None:
+    """S06. Only verify returning exactly True can confirm."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "a6" * 32
+    chain = Mock()
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = _matching_record("NVDA", digest)
+    chain.verify.return_value = (1, 1_700_000_000, "0x" + "11" * 20)
+    body = _get_status(tmp_path, chain, "NVDA", score_hash=digest)
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+
+
+def test_attest_status_stale_attested_flag_is_absent(tmp_path: Path) -> None:
+    """S09. verify True with attested False is a stale flag, not a confirm."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "a9" * 32
+    chain = Mock()
+    chain.attested.return_value = False
+    chain.get_attestation.return_value = _matching_record("NVDA", digest)
+    chain.verify.return_value = (True, 1_700_000_000, "0x" + "11" * 20)
+    body = _get_status(tmp_path, chain, "NVDA", score_hash=digest)
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+
+
+def test_attest_status_tx_event_without_verify_ok_is_absent(tmp_path: Path) -> None:
+    """S17. A ScoreAttested log does not confirm when verify is not exactly True."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "b7" * 32
+    tx_hash = "0x" + "c7" * 32
+    chain = Mock()
+    chain.receipt_event.return_value = {
+        "ticker": "NVDA",
+        "score_hash": digest,
+        "attested_at": 1_700_000_111,
+        "claimed_at": 1_700_000_000,
+        "attester": "0x" + "33" * 20,
+    }
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = _matching_record("NVDA", digest)
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    body = _get_status(tmp_path, chain, "NVDA", tx_hash=tx_hash, score_hash=digest)
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+
+    stale = Mock()
+    stale.receipt_event.return_value = {
+        "ticker": "NVDA",
+        "score_hash": digest,
+        "attested_at": 1_700_000_111,
+        "claimed_at": 1_700_000_000,
+        "attester": "0x" + "33" * 20,
+    }
+    stale.attested.return_value = False
+    stale.get_attestation.return_value = _matching_record("NVDA", digest)
+    stale.verify.return_value = (True, 1_700_000_000, "0x" + "11" * 20)
+    stale_body = _get_status(tmp_path, stale, "NVDA", tx_hash=tx_hash, score_hash=digest)
+    assert stale_body["status"] == "absent"
+    assert stale_body["on_chain"]["status"] == "absent"
+    assert stale_body["on_chain"]["attested"] is False
+
+
+def test_attest_status_chain_without_verify_is_absent(tmp_path: Path) -> None:
+    """S20. A chain object with no verify method cannot confirm."""
+    digest = "0x" + "c0" * 32
+
+    class _AttestedOnly:
+        def attested(self, _digest: str) -> bool:
+            return True
+
+        def get_attestation(self, _digest: str) -> dict[str, Any]:
+            return _matching_record("NVDA", digest)
+
+        def hashes_for_ticker(self, _symbol: str) -> list[str]:
+            return []
+
+    body = _get_status(tmp_path, _AttestedOnly(), "NVDA", score_hash=digest)
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+    assert not hasattr(_AttestedOnly(), "verify")
+
+
+def _post_attest(tmp_path: Path, chain: Any, scorer: TransparencyScorer):
+    from rwa_score.api.auto_attest import PINNED_ATTESTATION_CONTRACT, AttesterSettings
+
+    settings = _settings(tmp_path)
+    store = Store()
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract=PINNED_ATTESTATION_CONTRACT,
+        rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
+        min_balance_wei=0,
+        value_cap_wei=0,
+        min_interval_seconds=0,
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    client = TestClient(app)
+    raw = store.create_key(name="paid", tier="paid")
+    response = client.post("/v1/attest/NVDA", headers=_headers(raw))
+    return response, store
+
+
+def test_post_already_attested_verify_false_is_not_confirmed(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    """U04. AlreadyAttested plus verify False must not say confirmed."""
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AlreadyAttestedError
+
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.attest.side_effect = AlreadyAttestedError("AlreadyAttested")
+    response, store = _post_attest(tmp_path, chain, fixture_scorer)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["status"] != "confirmed"
+    assert body.get("attested_at") is None
+    store.close()
+
+
+def test_post_receipt_status_one_verify_false_is_pending(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    """U07. A mined receipt with verify not True stays pending."""
+    from unittest.mock import Mock
+
+    tx_hash = "0x" + "e7" * 32
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.get_receipt.return_value = {"status": 1}
+
+    def _attest(*_args: object, **kwargs: object) -> str:
+        on_submitted = kwargs.get("on_submitted")
+        if callable(on_submitted):
+            on_submitted(tx_hash, 1)
+        return tx_hash
+
+    chain.attest.side_effect = _attest
+    response, store = _post_attest(tmp_path, chain, fixture_scorer)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "pending"
+    assert body["status"] != "confirmed"
+    assert body["tx_hash"] == tx_hash
+    store.close()
+
+
 def test_me_quota(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     client, store = _client(tmp_path, fixture_scorer, free_daily_limit=50)
     raw = store.create_key(name="free", tier="free")

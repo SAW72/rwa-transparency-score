@@ -210,6 +210,27 @@ def test_already_attested_revert_counts_as_success(
     assert store.queue_depth() == 0
 
 
+def test_already_attested_verify_false_is_unavailable(
+    tmp_path: Path, fixture_scorer: TransparencyScorer
+) -> None:
+    """AlreadyAttested followed by verify False is not a confirmed attest."""
+    chain = Mock()
+    chain.chain_id.return_value = 84532
+    chain.fee_wei.return_value = 0
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    chain.attest.side_effect = AlreadyAttestedError("AlreadyAttested")
+    store = Store()
+    digest, claimed, raw_bytes = _seed(fixture_scorer)
+    worker = _worker(store, _settings("0x" + "34" * 32), chain)
+    result = worker.submit(
+        canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed, now=1_000.0
+    )
+    assert result.status == "unavailable"
+    assert result.status != "confirmed"
+    assert result.attested_at is None
+    chain.attest.assert_called_once()
+
+
 def test_verify_precheck_skips_send(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     chain = Mock()
     chain.chain_id.return_value = 84532
@@ -1323,9 +1344,10 @@ def test_timeout_after_broadcast_stays_pending(fixture_scorer: TransparencyScore
     assert store.get_inflight(tx_hash) is not None
 
 
-def test_mined_receipt_at_response_time_is_confirmed(
+def test_mined_receipt_without_verify_true_stays_pending(
     fixture_scorer: TransparencyScorer,
 ) -> None:
+    """Receipt status 1 is not confirmation when verify did not return True."""
     chain = Mock()
     chain.chain_id.return_value = 84532
     chain.fee_wei.return_value = 0
@@ -1346,9 +1368,11 @@ def test_mined_receipt_at_response_time_is_confirmed(
     result = worker.submit(
         canonical=raw_bytes, score_hash=digest, ticker="NVDA", claimed_at=claimed
     )
-    assert result.status == "confirmed"
+    assert result.status == "pending"
+    assert result.status != "confirmed"
+    assert result.attested_at is None
     assert result.tx_hash == tx_hash
-    assert store.get_inflight(tx_hash) is None
+    assert store.get_inflight(tx_hash) is not None
 
 
 def test_dropped_reasons_stay_bounded() -> None:
