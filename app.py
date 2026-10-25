@@ -28,7 +28,12 @@ from rwa_score.ask_rat import (
     ask as ask_rat,
     format_ask_cmc_lines,
 )
-from rwa_score.client import create_client, sidebar_uses_fixtures, summarize_call_log
+from rwa_score.client import (
+    ASSET_TYPE_LABELS,
+    create_client,
+    sidebar_uses_fixtures,
+    summarize_call_log,
+)
 from rwa_score.explainer import AI_FOOTNOTE, explain_score, fallback_explanation
 from rwa_score.health import install_health_route, serve_health_if_requested
 from rwa_score.seo import SEO_TITLE
@@ -55,13 +60,16 @@ from rwa_score.ticker_search import (
     RWA_CLASS_CATEGORIES,
     RWA_CLASS_IDS,
     SEARCH_MIN_CHARS,
+    ClassBrowseSnapshot,
     TickerOption,
     cached_class_catalog,
     catalog_from_por_feeds,
     class_browse_truncated,
+    class_catalog_cache_key,
     class_shard_failure_is_fresh,
     class_shard_status,
     client_shard_token,
+    commit_class_browse,
     empty_class_page_is_cached_success,
     classes_for_query,
     format_option,
@@ -72,7 +80,9 @@ from rwa_score.ticker_search import (
     merge_search_catalog,
     normalize_ticker,
     resolve_assign_symbol,
+    rwa_class_browse_ids,
     search_tickers,
+    start_class_browse,
     symbol_lookup_failed,
 )
 from rwa_score.verifiers import VerificationLevel
@@ -262,6 +272,11 @@ SEARCH_LIST_KEY = "search_match_list"
 CLASS_PICK_KEY = "class_ticker_pick"
 CLASS_PICK_LABEL = "Class match"
 CLASS_CHOSEN_KEY = "class_ticker_chosen"
+# Category pills filter by CMC asset class. They do not write the raw key
+# (``stock``, ``government_security``) into the Search box.
+BROWSE_CLASS_KEY = "browse_class"
+BROWSE_REQUEST_KEY = "browse_request_id"
+BROWSE_LOADING_KEY = "browse_loading"
 SEARCH_FIELD_MAX = "17rem"  # ~272px — ticker-sized, not full-bleed
 # Streamlit 1.39 text_input commits on Enter/blur only. Debounced input
 # events commit the same widget so Matches update as the user types.
@@ -1568,22 +1583,59 @@ def _clear_match_pick_state() -> None:
     st.session_state.pop(CLASS_CHOSEN_KEY, None)
 
 
+def class_loading_message(class_id: str) -> str:
+    """Visible cue while a category page is in flight."""
+    kind = class_id if class_id in RWA_CLASS_IDS else ""
+    label = ASSET_TYPE_LABELS.get(kind, "") or "category"
+    return f"Loading {label}..."
+
+
+def _select_browse_class(class_id: str, *, bump: bool) -> None:
+    """Select a CMC class. Search text stays empty — it is free text only."""
+    kind = class_id if class_id in RWA_CLASS_IDS else ""
+    if not kind:
+        return
+    current = str(st.session_state.get(BROWSE_CLASS_KEY) or "")
+    if bump or current != kind:
+        prev = ClassBrowseSnapshot(
+            int(st.session_state.get(BROWSE_REQUEST_KEY) or 0),
+            current,
+            False,
+            (),
+        )
+        snap = start_class_browse(prev, kind)
+        st.session_state[BROWSE_CLASS_KEY] = snap.class_id
+        st.session_state[BROWSE_REQUEST_KEY] = snap.request_id
+        st.session_state[BROWSE_LOADING_KEY] = True
+    st.session_state.ticker_query = ""
+
+
 def _on_search_query_change() -> None:
-    """Drop a stale Matches pick when Search text changes (type-ahead or Enter)."""
+    """Drop a stale Matches pick when Search text changes (type-ahead or Enter).
+
+    Typed text leaves category browse so the box is not also a class filter.
+    Bumping the request id makes an in-flight class response stale.
+    """
     _clear_match_pick_state()
+    text = str(st.session_state.get("ticker_query") or "").strip()
+    if text and st.session_state.get(BROWSE_CLASS_KEY):
+        st.session_state[BROWSE_CLASS_KEY] = ""
+        st.session_state[BROWSE_LOADING_KEY] = False
+        st.session_state[BROWSE_REQUEST_KEY] = int(
+            st.session_state.get(BROWSE_REQUEST_KEY) or 0
+        ) + 1
 
 
-def _on_class_pill(query: str) -> None:
-    """Select a class before the script body builds the catalog.
+def _on_class_pill(class_id: str) -> None:
+    """Select a CMC asset class before the script body builds the catalog.
 
-    Streamlit runs this callback before the script. The pill ``if`` body runs
-    only after ``_ticker_catalog(pending_search_query())``, so without this
-    the click frame still has the previous query: a live 401 never marks the
-    class unavailable and Matches shows "No directory matches" instead of the
-    banner.
+    Streamlit runs this callback before the script. The class id is not
+    copied into Search — category results come from the asset class field.
+    The request id moves immediately so a slower response for the previous
+    category cannot paint over this click.
     """
     st.session_state.pop("_clear_search", None)
-    st.session_state.ticker_query = query
+    _select_browse_class(class_id, bump=True)
     _clear_match_pick_state()
 
 
@@ -1754,6 +1806,8 @@ def _render_search_picker(
     if st.session_state.get("_clear_search"):
         st.session_state["_clear_search"] = False
         st.session_state.ticker_query = ""
+        st.session_state[BROWSE_CLASS_KEY] = ""
+        st.session_state[BROWSE_LOADING_KEY] = False
         _clear_match_pick_state()
         try:
             del st.query_params["rwa_cat"]
@@ -1769,16 +1823,17 @@ def _render_search_picker(
         cat = CATEGORY_BY_ID.get(str(cid)) or next(
             (row for row in chip_cats if row.id == str(cid)), None
         )
-        if cat is not None:
-            st.session_state.ticker_query = chip_query(cat)
+        if cat is not None and getattr(cat, "id", "") in RWA_CLASS_IDS:
+            # Deep link selects the class. It does not put the raw key in Search.
+            _select_browse_class(cat.id, bump=True)
         try:
             del st.query_params["rwa_cat"]
         except (KeyError, TypeError):
             pass
 
     # Widget buttons, not <a href="?…"> — a full navigation remounts Streamlit
-    # and Chrome Aw Snaps after a slot change (query/session fight). Same-run
-    # ticker_query write keeps compare slots in session_state.
+    # and Chrome Aw Snaps after a slot change (query/session fight). The class
+    # id stays in session, not in the Search box, so compare slots stay put.
     st.markdown(
         '<div class="rat-cat-row" role="list" data-rat-cat-pill="1"></div>',
         unsafe_allow_html=True,
@@ -1791,9 +1846,9 @@ def _render_search_picker(
                 key=f"rwa_class_{cat.id}",
                 use_container_width=True,
                 on_click=_on_class_pill,
-                args=(chip_query(cat),),
+                args=(cat.id,),
             ):
-                st.session_state.ticker_query = chip_query(cat)
+                st.session_state.ticker_query = ""
                 _clear_match_pick_state()
 
     query = st.text_input(
@@ -1803,32 +1858,87 @@ def _render_search_picker(
         key="ticker_query",
         on_change=_on_search_query_change,
     )
-    # Category-button and class-keyword queries already committed ticker_query.
-    # Skip the 1px typeahead iframe so the Matches selectbox is not fighting a
-    # MutationObserver remount on the same run (Aw Snap when opening the list).
+    browse_class = str(st.session_state.get(BROWSE_CLASS_KEY) or "")
+    free_text = (query or "").strip()
+    pill_browse = bool(browse_class) and not free_text
+    # Pill: class id is internal. Typed text stays free-text (or a class word).
+    effective = browse_class if pill_browse else query
+    # Category-button and class-keyword queries skip the 1px typeahead iframe
+    # so the class overlay is not fighting a MutationObserver remount.
     # Keep SEARCH_MATCH_KEY stable — do not delete it while the menu can be open.
-    if not is_browse_chip_query(query) and not is_class_browse_query(query):
+    if (
+        not is_browse_chip_query(query)
+        and not is_class_browse_query(query)
+        and not pill_browse
+    ):
         _install_search_typeahead()
-    # Pill click updates Search after the outer catalog build. Reload for
-    # this query so a 401/429 sets class_shard_status before the banner.
-    catalog = catalog_for_active_query(scorer, catalog, query)
-    matches = search_matches(
-        query, catalog, client, use_fixtures=use_fixtures
+    # Reload for this class so a 401/429 sets class_shard_status before the banner.
+    # The spinner is the loading cue; a stale request id drops the old class.
+    browse_ids = rwa_class_browse_ids(effective)
+    started_class = browse_class if pill_browse else (browse_ids[0] if browse_ids else "")
+    strict_class = bool(started_class) and started_class in RWA_CLASS_IDS and (
+        pill_browse or is_class_browse_query(effective)
     )
-    directory_down = live_unavailable_banner(use_fixtures, client, query)
+    started_id = int(st.session_state.get(BROWSE_REQUEST_KEY) or 0)
+    hold_for_load = False
+    if strict_class:
+        message = class_loading_message(started_class)
+        loading_slot = st.empty()
+        loading_slot.caption(message)
+        with st.spinner(message):
+            catalog = catalog_for_active_query(scorer, catalog, effective)
+            matches = search_matches(
+                effective, catalog, client, use_fixtures=use_fixtures
+            )
+        now_id = int(st.session_state.get(BROWSE_REQUEST_KEY) or 0)
+        now_class = str(st.session_state.get(BROWSE_CLASS_KEY) or "")
+        if not pill_browse:
+            now_id = started_id
+            now_class = started_class
+        elif not now_class:
+            now_class = started_class
+        committed = commit_class_browse(
+            ClassBrowseSnapshot(now_id, now_class, True, ()),
+            started_id,
+            started_class,
+            matches,
+        )
+        if committed is None or committed.loading:
+            hold_for_load = True
+            matches = []
+        else:
+            matches = list(committed.rows)
+            loading_slot.empty()
+            st.session_state[BROWSE_LOADING_KEY] = False
+    else:
+        catalog = catalog_for_active_query(scorer, catalog, effective)
+        matches = search_matches(
+            effective, catalog, client, use_fixtures=use_fixtures
+        )
+    # Compare cards read the outer catalog. Publish the class page that just
+    # loaded so a pill click does not drop company names.
+    if catalog:
+        st.session_state["_active_search_catalog"] = list(catalog)
+    directory_down = live_unavailable_banner(use_fixtures, client, effective)
     if directory_down:
         # Before the compare chips render. Defaults NVDA/TSLA/AAPL/META are
         # a stub shortlist under a Live outage — clear them, do not swap in
         # FixtureClient. Slot button keys stay so the row does not remount.
         clear_compare_slots()
-    if is_class_browse_query(query):
+    show_class = pill_browse or is_class_browse_query(query) or is_class_browse_query(
+        effective
+    )
+    if hold_for_load and not directory_down:
+        # Previous category stays off the page. The status line is the cue.
+        st.caption(class_loading_message(started_class))
+    elif show_class:
         # Compact ticker overlay, not a radio in a fixed-height container and
         # not a paged button strip. Those Aw Snapped Chrome on Stocks / ETFs
         # and when a row was activated. A 250-option selectbox is also wrong
         # here: it mounts a BaseWeb menu on this same pill rerun.
         _render_class_browse(
             matches,
-            query,
+            effective,
             directory_down=directory_down,
             use_fixtures=use_fixtures,
             client=client,
@@ -1907,18 +2017,18 @@ def _shard_store() -> dict:
 
 
 def pending_search_query() -> str:
-    """Search text the next catalog build should honor (chip or typed)."""
+    """Free-text Search only. A category click is not search text.
+
+    The picker loads the selected CMC class itself, inside the loading
+    state, so this prefetch must not block the rerun on the class page.
+    """
     try:
         if st.session_state.get("_clear_search"):
             return ""
-        raw_cat = st.query_params.get("rwa_cat")
-        if raw_cat:
-            cid = raw_cat if isinstance(raw_cat, str) else (
-                raw_cat[0] if isinstance(raw_cat, (list, tuple)) and raw_cat else str(raw_cat)
-            )
-            cat = CATEGORY_BY_ID.get(str(cid))
-            if cat is not None:
-                return chip_query(cat)
+        if st.session_state.get(BROWSE_CLASS_KEY) and not str(
+            st.session_state.get("ticker_query") or ""
+        ).strip():
+            return ""
         return str(st.session_state.get("ticker_query") or "")
     except Exception:  # noqa: BLE001 — pytest / no ScriptRunContext
         return ""
@@ -1934,7 +2044,9 @@ def _class_shard(scorer: TransparencyScorer, asset_type: str) -> list[TickerOpti
     """
     source = str(getattr(scorer.client, "source", "") or "")
     store = _shard_store()
-    key = f"{source}:{client_shard_token(scorer.client)}:{asset_type}"
+    key = class_catalog_cache_key(
+        source, client_shard_token(scorer.client), asset_type
+    )
     # A recent 401/429 stays empty without another directory call.
     if class_shard_failure_is_fresh(scorer.client, asset_type):
         store.pop(key, None)
@@ -2723,6 +2835,9 @@ st.caption(
 
 catalog = _ticker_catalog(scorer, query=pending_search_query())
 _render_search_picker(catalog, use_fixtures, client=scorer.client, scorer=scorer)
+_loaded_catalog = st.session_state.get("_active_search_catalog")
+if isinstance(_loaded_catalog, list) and _loaded_catalog:
+    catalog = _loaded_catalog
 
 active = int(st.session_state.active_slot)
 target = next_place_index(list(st.session_state.slots), active)
