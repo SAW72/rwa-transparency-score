@@ -539,6 +539,24 @@ def _collapse_name_list_sentence(parts: list[str]) -> list[str]:
     return out
 
 
+def _omit_stray_failure_note(note: str) -> bool:
+    """Drop marker fragments that restate a failure already in the sentence."""
+    text = " ".join((note or "").split())
+    lowered = text.lower()
+    if lowered == "not available":
+        return True
+    if lowered.startswith("live check failed"):
+        return True
+    return False
+
+
+def _is_recorded_error_note(note: str) -> bool:
+    lowered = note.lower()
+    return lowered.startswith("verifier error") or lowered.startswith(
+        "verifier failure recorded"
+    )
+
+
 def _append_verification_notes(
     explanation: str,
     result: VerificationResult,
@@ -548,10 +566,16 @@ def _append_verification_notes(
         f"Verification: {result.level.value}.",
         f"Evidence: {result.evidence}",
     ]
+    saw_error_line = False
     for note in result.notes:
-        if note and note not in bits:
-            bits.append(note)
-    if result.error is not None:
+        if not note or note in bits or _omit_stray_failure_note(note):
+            continue
+        if _is_recorded_error_note(note):
+            if saw_error_line:
+                continue
+            saw_error_line = True
+        bits.append(note)
+    if result.error is not None and not saw_error_line:
         bits.append(f"Verifier failure recorded (not dropped): {result.error}")
     return " ".join(_collapse_name_list_sentence(bits))
 
@@ -1542,6 +1566,8 @@ class TransparencyScorer:
             )
         for result in (backing_v, reserves_v, redemption_v):
             for note in result.notes:
+                if _omit_stray_failure_note(note):
+                    continue
                 if note not in notes:
                     notes.append(note)
             if result.error is None:

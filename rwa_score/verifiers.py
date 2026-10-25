@@ -166,12 +166,9 @@ def unavailable_live_result(
         evidence = f"{evidence} {detail}"
     evidence = f"{evidence} Name-list scores are not used."
     err = error if error is not None else "live check failed"
-    notes = [
-        "not available",
-        "Live check failed. Name-list scores are not used.",
-    ]
-    if err:
-        notes.append(f"Verifier error (not dropped): {err}")
+    # One error line. The bare "not available" marker and the second
+    # "Live check failed" sentence were the same failure stated again.
+    notes = [f"Verifier error (not dropped): {err}"] if err else []
     return VerificationResult(
         score=None,
         level=VerificationLevel.NOT_AVAILABLE,

@@ -205,7 +205,8 @@ def test_backed_verifier_fallback_on_rpc_error() -> None:
     assert result.ok is False
     assert "not available" in result.evidence.lower()
     assert "name-list" in result.evidence.lower()
-    assert any("not available" in n.lower() for n in result.notes)
+    assert any(n.startswith("Verifier error (not dropped):") for n in result.notes)
+    assert not any(n.strip().lower() == "not available" for n in result.notes)
     assert result.error
     assert "rpc timeout" in (result.error or "")
 
@@ -306,7 +307,8 @@ def test_dinari_verifier_fallback_when_incomplete() -> None:
     assert result.source == "not_available"
     assert result.score is None
     assert "not available" in result.evidence.lower()
-    assert any("not available" in n.lower() for n in result.notes)
+    assert any(n.startswith("Verifier error (not dropped):") for n in result.notes)
+    assert not any(n.strip().lower() == "not available" for n in result.notes)
     assert result.error
 
 

@@ -650,3 +650,325 @@ def test_comparison_table_sorts_not_available_as_missing() -> None:
     html = styled.to_html()
     assert "not available" in html
     assert "not available" not in set(frame["backing"].dropna().astype(str))
+
+
+def _all_failed_report() -> dict:
+    return TransparencyScorer(
+        _failed_live_client(),
+        verifiers={"backed": _BareTimeoutVerifier()},
+        use_live_verifiers=True,
+    ).score("NVDA")
+
+
+def test_source_guard_alone_marks_not_available_failed() -> None:
+    """R03. Only ``source == not_available`` is set. Level and error are not."""
+    from rwa_score.scorer import coerce_failed_live, measured_pillar_score
+    from rwa_score.verifiers import NOT_AVAILABLE_SOURCE, live_check_failed
+
+    result = VerificationResult(
+        score=90.0,
+        level=VerificationLevel.ON_CHAIN_POR,
+        evidence="stand-in score",
+        source=NOT_AVAILABLE_SOURCE,
+        ok=True,
+        error=None,
+    )
+    assert result.level != VerificationLevel.NOT_AVAILABLE
+    assert result.error is None
+    assert live_check_failed(result) is True
+    assert measured_pillar_score(result) is None
+    coerced = coerce_failed_live(result, "backing", "Backed Finance")
+    assert coerced.score is None
+    assert coerced.source == NOT_AVAILABLE_SOURCE
+
+
+def test_coerce_failed_live_alone_drops_a_scored_error() -> None:
+    """R04. Called directly, so measured_pillar_score cannot mask a no-op."""
+    from rwa_score.scorer import coerce_failed_live
+    from rwa_score.verifiers import NOT_AVAILABLE_SOURCE
+
+    result = VerificationResult(
+        score=90.0,
+        level=VerificationLevel.ON_CHAIN_POR,
+        evidence="probe error with a score",
+        source="chainlink_por",
+        ok=False,
+        error="503",
+    )
+    assert result.source != NOT_AVAILABLE_SOURCE
+    assert result.level != VerificationLevel.NOT_AVAILABLE
+    coerced = coerce_failed_live(result, "reserves", "Backed Finance")
+    assert coerced.score is None
+    assert coerced.source == NOT_AVAILABLE_SOURCE
+    assert coerced.error == "503"
+
+
+def test_measured_pillar_score_alone_drops_a_failed_score() -> None:
+    """R05. Not passed through coerce_failed_live first."""
+    from rwa_score.scorer import measured_pillar_score
+    from rwa_score.verifiers import NOT_AVAILABLE_SOURCE, live_check_failed
+
+    result = VerificationResult(
+        score=90.0,
+        level=VerificationLevel.ON_CHAIN_POR,
+        evidence="probe error with a score",
+        source="chainlink_por",
+        ok=False,
+        error="503",
+    )
+    assert result.source != NOT_AVAILABLE_SOURCE
+    assert result.level != VerificationLevel.NOT_AVAILABLE
+    assert result.score == 90.0
+    assert live_check_failed(result) is True
+    assert measured_pillar_score(result) is None
+
+
+def test_failed_backing_explanation_is_not_a_live_check() -> None:
+    """R14. A failed backing check must not read as a live check."""
+    text = _all_failed_report()["explanations"]["backing"]
+    assert text.startswith("Backing is not available")
+    assert "Live backing check for" not in text
+
+
+def test_failed_redemption_explanation_is_not_a_live_check() -> None:
+    """R15. A failed redemption check must not read as a live check."""
+    text = _all_failed_report()["explanations"]["redemption"]
+    assert text.startswith("Redemption is not available")
+    assert "Live redemption check for" not in text
+
+
+def _capture_widgets(monkeypatch):
+    import app as demo_app
+    from contextlib import contextmanager
+
+    captured: list[str] = []
+
+    def grab(text="", *args, **kwargs):
+        captured.append(str(text))
+
+    @contextmanager
+    def expander(*args, **kwargs):
+        yield None
+
+    monkeypatch.setattr(demo_app, "open_expander", expander)
+    monkeypatch.setattr(demo_app.st, "caption", grab)
+    monkeypatch.setattr(demo_app.st, "markdown", grab)
+    monkeypatch.setattr(demo_app.st, "write", grab)
+    monkeypatch.setattr(demo_app.st, "warning", grab)
+    monkeypatch.setattr(demo_app.st, "info", grab)
+    return demo_app, captured
+
+
+def test_failed_card_caption_says_not_available_not_heuristic(monkeypatch) -> None:
+    """A06. The card caption for a failed check is not the heuristic copy."""
+    demo_app, captured = _capture_widgets(monkeypatch)
+    demo_app._render_card_details(_all_failed_report(), slot_index=0)
+    text = "\n".join(captured)
+    assert (
+        "Not available: Backing model, Proof of reserves, Redemption rights"
+        in text
+    )
+    assert "issuer-name heuristics" not in text
+
+
+def test_failed_evidence_row_says_not_available_not_zero(monkeypatch) -> None:
+    """A07. A failed pillar is not printed as 0/100."""
+    demo_app, captured = _capture_widgets(monkeypatch)
+    demo_app._render_card_details(_all_failed_report(), slot_index=0)
+    for label in ("Backing model", "Proof of reserves", "Redemption rights"):
+        row = next(line for line in captured if line.startswith(f"**{label}**"))
+        assert f"**{label}** — not available" in row
+        assert "0/100" not in row
+
+
+def test_failed_slot_caption_says_not_available_not_zero(monkeypatch) -> None:
+    """A08. The selected-slot caption does not print 0 for a failed pillar."""
+    demo_app, captured = _capture_widgets(monkeypatch)
+    demo_app._render_selected_slot_detail(_all_failed_report(), slot_index=0)
+    slot = next(line for line in captured if "**Backing model**" in line)
+    assert "**Backing model** not available" in slot
+    assert "**Proof of reserves** not available" in slot
+    assert "**Redemption rights** not available" in slot
+    assert "**Backing model** 0" not in slot
+    assert "**Proof of reserves** 0" not in slot
+    assert "**Redemption rights** 0" not in slot
+
+
+def test_pillar_verification_kind_not_available_needs_its_branch() -> None:
+    """A10. ``source == not_available`` alone must not fall through to a live label."""
+    import app as demo_app
+
+    report = _all_failed_report()
+    for key in ("backing", "reserves", "redemption"):
+        assert demo_app.pillar_verification_kind(key, report) == "not available"
+    kind = demo_app.pillar_verification_kind(
+        "backing",
+        {
+            "verification": {
+                "backing": {
+                    "source": "not_available",
+                    "level": "on-chain PoR",
+                    "evidence": "Chainlink PoR reading was recorded.",
+                }
+            }
+        },
+    )
+    assert kind == "not available"
+    assert kind != "on-chain PoR"
+    assert "heuristic" not in kind
+
+
+def test_ask_rat_compare_says_not_available() -> None:
+    """K04. Compare wording for a failed pillar is ``not available``, not ``n/a``."""
+    from rwa_score.ask_rat import _compare_lines, fallback_answer
+
+    scorer = TransparencyScorer(
+        _failed_live_client(),
+        verifiers={"backed": _BareTimeoutVerifier()},
+        use_live_verifiers=True,
+    )
+    answer = fallback_answer("Compare NVDA backing", scorer)
+    assert "Backing model: NVDA not available (not available)." in answer
+    assert "n/a" not in answer.lower()
+    direct = _compare_lines(
+        {
+            "NVDA": {
+                "ticker": "NVDA",
+                "subscores": {"backing": None},
+                "verification": {"backing": {"level": "not available"}},
+            }
+        },
+        ["backing"],
+    )
+    assert direct == "Comparing only NVDA on Backing model. Backing model: NVDA not available (not available)."
+    assert "n/a" not in direct.lower()
+
+
+def test_raw_just_under_75_displays_74_9_yellow() -> None:
+    """G04. Raw 74.952 rounds to 75.0 and must still display 74.9 YELLOW."""
+
+    class _RoundingGap:
+        name = "backed"
+
+        def verify_backing(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+            return VerificationResult(
+                score=69.76,
+                level=VerificationLevel.ON_CHAIN_POR,
+                evidence="Chainlink PoR backing",
+                source="chainlink_por",
+                ok=True,
+            )
+
+        def verify_reserves(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+            return VerificationResult(
+                score=95.0,
+                level=VerificationLevel.ON_CHAIN_POR,
+                evidence="Chainlink PoR reserves",
+                source="chainlink_por",
+                ok=True,
+            )
+
+        def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+            return heuristic_result(
+                "redemption",
+                issuer_name,
+                reason="Backed docs fetch failed.",
+                error="503",
+            )
+
+    raw = (
+        69.76 * WEIGHTS["backing"]
+        + 95.0 * WEIGHTS["reserves"]
+        + 100.0 * WEIGHTS["price"]
+        + 80.0 * WEIGHTS["disclosure"]
+        + 100.0 * WEIGHTS["basis"]
+    )
+    assert abs(raw - 74.952) < 1e-9
+    assert raw < 75.0
+    assert round(raw, 1) == 75.0
+    report = TransparencyScorer(
+        _high_quote_client(),
+        verifiers={"backed": _RoundingGap()},
+        use_live_verifiers=True,
+    ).score("NVDA")
+    assert report["subscores"]["backing"] == 69.8
+    assert report["subscores"]["reserves"] == 95.0
+    assert report["subscores"]["redemption"] is None
+    assert report["subscores"]["price"] == 100.0
+    assert report["subscores"]["disclosure"] == 80.0
+    assert report["subscores"]["basis"] == 100.0
+    assert report["verification"]["redemption"]["error"] == "503"
+    assert report["score"] == 74.9
+    assert report["score"] == NOT_GREEN_CAP
+    assert report["band"] == "YELLOW"
+    assert report["band"] != "GREEN"
+
+
+def test_zero_reserves_por_reading_is_not_green() -> None:
+    """G20. A zero Chainlink PoR reserves reading is an error, not a name-list GREEN."""
+    from rwa_score.chainlink_por import PorReading, resolve_por_feed
+    from rwa_score.verifiers import BackedVerifier
+    from tests.test_verifiers import _StubPorClient
+
+    feed = resolve_por_feed("NVDA")
+    assert feed is not None
+    reading = PorReading(
+        feed=feed,
+        reserves=0.0,
+        circulating=None,
+        round_id=1,
+        updated_at=1_700_000_000,
+        rpc_url="https://rpc.example.test",
+    )
+
+    class _ZeroReserves(BackedVerifier):
+        def verify_redemption(self, *, ticker: str, issuer_name: str) -> VerificationResult:
+            return VerificationResult(
+                score=85.0,
+                level=VerificationLevel.SELF_REPORTED,
+                evidence="redemption docs live",
+                source="backed_redemption_docs",
+                ok=True,
+            )
+
+    report = TransparencyScorer(
+        _failed_live_client(),
+        verifiers={"backed": _ZeroReserves(client=_StubPorClient(reading))},
+        use_live_verifiers=True,
+    ).score("NVDA")
+    assert report["subscores"]["redemption"] == 85.0
+    assert report["verification"]["redemption"]["source"] == "backed_redemption_docs"
+    for key in ("backing", "reserves"):
+        assert report["subscores"][key] is None
+        block = report["verification"][key]
+        assert block["source"] == "not_available"
+        assert block["score"] is None
+        assert block["error"] == "reserves <= 0"
+    assert report["score"] == 39.8
+    assert report["band"] == "ORANGE"
+    assert report["band"] != "GREEN"
+
+
+def test_failed_pillar_explanation_states_the_error_once() -> None:
+    """Copy fix. Each failed pillar names the error once, with no stray fragment."""
+    report = _all_failed_report()
+    assert report["score"] == 27.0
+    assert report["band"] == "ORANGE"
+    assert report["band"] != "GREEN"
+    for key in ("backing", "reserves", "redemption"):
+        text = report["explanations"][key]
+        assert text.count("TimeoutError") == 1
+        assert (
+            text.count("Verifier error (not dropped):")
+            + text.count("Verifier failure recorded (not dropped):")
+            == 1
+        )
+        assert "not available Live check failed" not in text
+    notes = report["notes"]
+    assert all(note.strip().lower() != "not available" for note in notes)
+    assert all(not note.strip().lower().startswith("live check failed") for note in notes)
+    error_notes = [
+        note for note in notes if note.startswith("Verifier error (not dropped):")
+    ]
+    assert error_notes == ["Verifier error (not dropped): TimeoutError"]
+    assert not any("Verifier failure recorded" in note for note in notes)
