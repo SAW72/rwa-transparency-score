@@ -231,7 +231,12 @@ def test_category_search_lists_matching_tickers() -> None:
     assert {opt.symbol for opt in search_tickers("AI", catalog)} == {"NVDA", "AAPL", "META"}
     assert "GOLD" not in {opt.symbol for opt in search_tickers("AI", catalog)}
     assert [opt.symbol for opt in search_tickers("oil", catalog)] == ["XOM"]
-    assert {opt.symbol for opt in search_tickers("real estate", catalog)} == {"HOME", "PLD"}
+    # Real Estate is the CMC class, not a name search. PLD is a stock REIT.
+    assert {opt.symbol for opt in search_tickers("real estate", catalog)} == {"HOME"}
+    assert "PLD" not in {opt.symbol for opt in search_tickers("real estate", catalog)}
+    stocks = {opt.symbol for opt in search_tickers("stock", catalog)}
+    assert {"NVDA", "PLD", "XOM"} <= stocks
+    assert "SPY" not in stocks and "HOME" not in stocks and "USTB" not in stocks
     assert [opt.symbol for opt in search_tickers("auto", catalog)] == ["TSLA"]
     assert search_tickers("finance", catalog) == []
     assert "GOLD" in {opt.symbol for opt in search_tickers("commodity", catalog)}
@@ -241,8 +246,8 @@ def test_category_search_lists_matching_tickers() -> None:
     assert "XOM — " in format_option(oil)
     assert resolve_assign_symbol("oil", matches=[oil]) == "XOM"
     estate = search_tickers("real estate", catalog)
-    assert {opt.symbol for opt in estate} == {"HOME", "PLD"}
-    assert resolve_assign_symbol("real estate", matches=estate) in {"HOME", "PLD"}
+    assert {opt.symbol for opt in estate} == {"HOME"}
+    assert resolve_assign_symbol("real estate", matches=estate) == "HOME"
 
 
 def test_category_hits_can_be_scored_from_fixtures(fixture_scorer) -> None:
@@ -251,7 +256,7 @@ def test_category_hits_can_be_scored_from_fixtures(fixture_scorer) -> None:
     catalog = demo_app._ticker_catalog(fixture_scorer)
     for query, symbol in (
         ("oil", "XOM"),
-        ("real estate", "PLD"),
+        ("real estate", "HOME"),
         ("AI", "AAPL"),
         ("commodity", "GOLD"),
         ("treasury", "USTB"),
@@ -407,7 +412,9 @@ def test_app_picker_wires_continuous_category_search_compare() -> None:
     assert demo_app.chip_query(CATEGORY_BY_ID["government_security"]) == (
         "government_security"
     )
-    assert "st.session_state.ticker_query = chip_query(cat)" in source
+    # A category click must not copy the raw class key into Search.
+    assert "st.session_state.ticker_query = chip_query(cat)" not in source
+    assert "BROWSE_CLASS_KEY" in source
     assert 'st.session_state.ticker_query = ""' in source
     assert "_clear_search" in source
     assert "pending_ticker_query" not in source
@@ -484,12 +491,13 @@ def test_search_typeahead_commits_without_enter_and_keeps_category_chips() -> No
     assert "height=1" in picker or 'height=1' in source
     assert "st.form" not in source
 
-    # Category pills still pre-fill Search with the documented keyword.
+    # Category pills select the CMC class. They do not pre-fill Search.
     assert demo_app.chip_query(RWA_CLASS_CATEGORIES[0]) == "stock"
     assert demo_app.chip_query(CATEGORY_BY_ID["government_security"]) == (
         "government_security"
     )
-    assert "st.session_state.ticker_query = chip_query(cat)" in source
+    assert "st.session_state.ticker_query = chip_query(cat)" not in source
+    assert "def _on_class_pill" in source
 
 
 def test_search_query_change_clears_stale_match_pick(monkeypatch) -> None:
@@ -1247,44 +1255,50 @@ def test_classify_treasuries_when_cmc_labels_etf_or_omits_type() -> None:
     assert TREASURY_PROBE_SYMBOLS == ("USTB", "OUSG")
 
 
-def test_treasuries_keeps_etf_labeled_cmc_rows() -> None:
+def test_treasuries_does_not_pull_etf_page_into_the_class() -> None:
+    """ETF-tagged USTB/OUSG/SPY stay out of Treasuries. No ETF directory walk."""
     client = _EtfLabeledTreasuryClient()
     rows = load_class_catalog(client, "government_security", first_page_only=True)
-    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
-    assert "SPY" not in {opt.symbol for opt in rows}
-    assert {opt.asset_type for opt in rows} == {"etf"}
-    assert all(TREASURY_CLASS in opt.categories for opt in rows)
+    assert rows == []
     assert client.calls["assets_list_all"] == 0
-    assert {opt.symbol for opt in search_tickers("treasuries", rows)} == {
-        "USTB",
-        "OUSG",
-    }
+    assert search_tickers("treasuries", rows) == []
+    etfs = load_class_catalog(client, "etf", first_page_only=True)
+    by_symbol = {opt.symbol: opt for opt in etfs}
+    assert {"USTB", "OUSG", "SPY"} <= set(by_symbol)
+    assert by_symbol["OUSG"].asset_type == "etf"
+    assert "ETFs" in format_option(by_symbol["OUSG"])
+    assert "Treasuries" not in format_option(by_symbol["OUSG"])
 
 
 def test_treasuries_uses_symbol_probe_when_typed_filters_empty() -> None:
+    """Untyped OUSG is stamped Treasuries. ETF-class USTB is not retagged."""
     client = _SymbolOnlyTreasuryClient()
     rows = load_class_catalog(client, "government_security", first_page_only=True)
-    assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
-    ustb = next(opt for opt in rows if opt.symbol == "USTB")
-    ousg = next(opt for opt in rows if opt.symbol == "OUSG")
-    assert ustb.asset_type == "etf"
-    assert ousg.asset_type == ""
+    assert [opt.symbol for opt in rows] == ["OUSG"]
+    assert rows[0].asset_type == "government_security"
+    assert "Treasuries" in format_option(rows[0])
     assert client.calls["assets_list_all"] == 0
-    query = "government_security"
-    assert {opt.symbol for opt in search_tickers(query, rows)} == {"USTB", "OUSG"}
+    assert {opt.symbol for opt in search_tickers("government_security", rows)} == {"OUSG"}
 
 
 def test_treasuries_keeps_mixed_etf_and_untyped_rows() -> None:
+    """Untyped USTB inherits the class. ETF-typed OUSG on that page does not.
+
+    The symbol probe still adds OUSG when ``map?symbol=OUSG`` lists it as
+    ``government_security``. NVDA (stock) stays out. The ETF book is not read.
+    """
     client = _MixedLiveTypeTreasuryClient()
     rows = load_class_catalog(client, "government_security", first_page_only=True)
     assert {opt.symbol for opt in rows} == {"USTB", "OUSG"}
+    assert all(opt.asset_type == "government_security" for opt in rows)
     assert "NVDA" not in {opt.symbol for opt in rows}
-    assert client.calls["rwa_map"] == 1
+    assert [opt.symbol for opt in rows] == ["OUSG", "USTB"]
     assert client.calls["assets_list"] == 0
     assert client.calls["assets_list_all"] == 0
 
 
 def test_app_treasuries_pill_lists_etf_labeled_cmc_rows() -> None:
+    """Treasuries pill does not list rows CMC classified as ETFs."""
     import app as demo_app
     from rwa_score.scorer import TransparencyScorer
 
@@ -1293,7 +1307,8 @@ def test_app_treasuries_pill_lists_etf_labeled_cmc_rows() -> None:
     query = demo_app.chip_query(CATEGORY_BY_ID["government_security"])
     catalog = demo_app._ticker_catalog(scorer, query=query)
     hits = demo_app.search_tickers(query, catalog)
-    assert {opt.symbol for opt in hits} >= {"USTB", "OUSG"}
+    assert "USTB" not in {opt.symbol for opt in hits}
+    assert "OUSG" not in {opt.symbol for opt in hits}
     assert "SPY" not in {opt.symbol for opt in hits}
     assert "NVDA" not in {opt.symbol for opt in hits}
     assert client.calls["assets_list_all"] == 0
@@ -1782,4 +1797,250 @@ def test_live_directory_failure_is_empty_not_fixture_swap() -> None:
     assert [opt.symbol for opt in demo_app.search_matches("stock", recovered, client)] == [
         "S1"
     ]
+
+
+def _mixed_class_book() -> list[TickerOption]:
+    """Stocks, ETFs whose names contain 'Stock', and treasury-named ETFs."""
+    rows = [
+        {"symbol": "NVDA", "name": "Nvidia Corp", "asset_type": "stock", "rwa_rank": 2},
+        {"symbol": "PLD", "name": "Prologis", "asset_type": "stock", "rwa_rank": 18},
+        {
+            "symbol": "VT",
+            "name": "Vanguard Total World Stock ETF",
+            "asset_type": "etf",
+            "rwa_rank": 40,
+        },
+        {
+            "symbol": "WLDU",
+            "name": "World Stock ETF WLDU",
+            "asset_type": "etf",
+            "rwa_rank": 41,
+        },
+        {
+            "symbol": "ZROZ",
+            "name": "PIMCO 25+ Year Zero Coupon US Treasury ETF",
+            "asset_type": "etf",
+            "rwa_rank": 50,
+        },
+        {
+            "symbol": "XTWY",
+            "name": "BondBloxx Bloomberg Twenty Year US Treasury ETF",
+            "asset_type": "etf",
+            "rwa_rank": 51,
+        },
+        {
+            "symbol": "XTWO",
+            "name": "BondBloxx Bloomberg Two Year US Treasury ETF",
+            "asset_type": "etf",
+            "rwa_rank": 52,
+        },
+        {
+            "symbol": "USTB",
+            "name": "US Treasury Bill",
+            "asset_type": "government_security",
+            "rwa_rank": 20,
+        },
+        {
+            "symbol": "OUSG",
+            "name": "Ondo Short-Term US Government Treasuries",
+            "asset_type": "government_security",
+            "rwa_rank": 21,
+        },
+        {"symbol": "GOLD", "name": "Gold", "asset_type": "commodity", "rwa_rank": 1},
+        {"symbol": "SLV", "name": "Silver", "asset_type": "commodity", "rwa_rank": 4},
+        {"symbol": "PAXG", "name": "Pax Gold", "asset_type": "commodity", "rwa_rank": 3},
+        {"symbol": "HOME", "name": "Tokenized Home", "asset_type": "real_estate", "rwa_rank": 8},
+    ]
+    return catalog_from_rwa_map(rows)
+
+
+def test_category_filter_uses_asset_class_not_search_text() -> None:
+    """Stocks excludes ETFs. Real Estate excludes stocks. Treasuries are tagged."""
+    catalog = _mixed_class_book()
+    stocks = search_tickers("stock", catalog)
+    assert [opt.symbol for opt in stocks] == ["NVDA", "PLD"]
+    assert "VT" not in {opt.symbol for opt in stocks}
+    assert "WLDU" not in {opt.symbol for opt in stocks}
+    etfs = {opt.symbol for opt in search_tickers("etf", catalog)}
+    assert {"VT", "WLDU", "ZROZ", "XTWY", "XTWO"} <= etfs
+    assert "NVDA" not in etfs and "USTB" not in etfs
+    treasuries = search_tickers("government_security", catalog)
+    assert [opt.symbol for opt in treasuries] == ["USTB", "OUSG"]
+    assert all("Treasuries" in format_option(opt) for opt in treasuries)
+    assert all(opt.asset_type == "government_security" for opt in treasuries)
+    assert "ZROZ" not in {opt.symbol for opt in treasuries}
+    zroz = next(opt for opt in catalog if opt.symbol == "ZROZ")
+    assert zroz.asset_type == "etf"
+    assert "ETFs" in format_option(zroz)
+    estate = {opt.symbol for opt in search_tickers("real estate", catalog)}
+    assert estate == {"HOME"}
+    assert "PLD" not in estate
+
+
+def test_class_results_are_deterministic_and_cached_per_class() -> None:
+    from rwa_score.ticker_search import class_catalog_cache_key, filter_by_asset_class
+
+    catalog = _mixed_class_book()
+    shuffled = list(reversed(catalog))
+    first = [opt.symbol for opt in filter_by_asset_class(catalog, "commodity")]
+    second = [opt.symbol for opt in filter_by_asset_class(shuffled, "commodity")]
+    assert first == second == ["GOLD", "PAXG", "SLV"]
+    assert len(first) == 3
+    again = [opt.symbol for opt in search_tickers("commodity", shuffled)]
+    assert again == first
+    stock_key = class_catalog_cache_key("live", "tok", "stock")
+    commodity_key = class_catalog_cache_key("live", "tok", "commodity")
+    treasury_key = class_catalog_cache_key("live", "tok", "treasury")
+    assert stock_key != commodity_key
+    assert treasury_key.endswith(":government_security")
+    assert class_catalog_cache_key("live", "tok", "commodity") == commodity_key
+
+
+def test_stale_class_response_is_ignored() -> None:
+    from rwa_score.ticker_search import (
+        ClassBrowseSnapshot,
+        commit_class_browse,
+        start_class_browse,
+    )
+
+    catalog = _mixed_class_book()
+    commodities = [opt for opt in catalog if opt.asset_type == "commodity"]
+    stocks = [opt for opt in catalog if opt.asset_type == "stock"]
+    started = start_class_browse(None, "commodity")
+    assert started.loading is True
+    assert started.rows == ()
+    # A later click wins. The commodities payload must not paint the list.
+    latest = start_class_browse(started, "stock")
+    late = commit_class_browse(latest, started.request_id, "commodity", commodities)
+    assert late is latest
+    assert late.class_id == "stock"
+    assert late.loading is True
+    assert late.rows == ()
+    fresh = commit_class_browse(latest, latest.request_id, "stock", [*stocks, *commodities])
+    assert fresh is not None
+    assert fresh.loading is False
+    assert [opt.symbol for opt in fresh.rows] == ["NVDA", "PLD"]
+    # Same inputs, same order, including a duplicate delivery.
+    again = commit_class_browse(latest, latest.request_id, "stock", list(reversed(stocks)))
+    assert [opt.symbol for opt in again.rows] == [opt.symbol for opt in fresh.rows]
+
+
+def test_class_pill_does_not_put_raw_key_in_search(monkeypatch) -> None:
+    import app as demo_app
+
+    class _FakeSS(dict):
+        def __getattr__(self, name):
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name, value):
+            self[name] = value
+
+    monkeypatch.setattr(demo_app.st, "session_state", _FakeSS())
+    demo_app._on_class_pill("stock")
+    assert demo_app.st.session_state.ticker_query == ""
+    assert demo_app.st.session_state[demo_app.BROWSE_CLASS_KEY] == "stock"
+    assert demo_app.st.session_state[demo_app.BROWSE_LOADING_KEY] is True
+    first_id = demo_app.st.session_state[demo_app.BROWSE_REQUEST_KEY]
+    demo_app._on_class_pill("commodity")
+    assert demo_app.st.session_state.ticker_query == ""
+    assert demo_app.st.session_state[demo_app.BROWSE_CLASS_KEY] == "commodity"
+    assert demo_app.st.session_state[demo_app.BROWSE_REQUEST_KEY] == first_id + 1
+    assert demo_app.class_loading_message("commodity") == "Loading Commodities..."
+    assert demo_app.class_loading_message("government_security") == "Loading Treasuries..."
+    source = Path(demo_app.__file__).read_text(encoding="utf-8")
+    picker = source.split("def _render_search_picker", 1)[1]
+    assert "class_loading_message" in picker
+    assert "st.spinner" in picker
+    assert "st.caption" in picker
+    assert "commit_class_browse" in picker
+
+
+def test_ousg_probe_included_only_when_cmc_class_is_treasury() -> None:
+    """OUSG joins Treasuries when the symbol probe says government_security."""
+
+    class _Client(_StockScopedLiveClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.asset_types: list[str | None] = []
+            self.symbols: list[str] = []
+
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+            self.asset_types.append(asset_type)
+            self.symbols.append(symbol or "")
+            if symbol and str(symbol).upper() == "OUSG":
+                self.calls["rwa_map"] += 1
+                return [
+                    {
+                        "symbol": "OUSG",
+                        "name": "Ondo Short-Term US Government Treasuries",
+                        "rwa_id": 31,
+                        "asset_type": "government_security",
+                        "rwa_rank": 21,
+                    }
+                ]
+            if (asset_type or "") == "government_security" and not symbol:
+                self.calls["rwa_map"] += 1
+                return [
+                    {
+                        "symbol": "USTB",
+                        "name": "US Treasury Bill",
+                        "rwa_id": 30,
+                        "asset_type": "government_security",
+                        "rwa_rank": 20,
+                    }
+                ]
+            if (asset_type or "") == "etf":
+                self.calls["rwa_map"] += 1
+                return [
+                    {
+                        "symbol": "ZROZ",
+                        "name": "PIMCO 25+ Year Zero Coupon US Treasury ETF",
+                        "rwa_id": 90,
+                        "asset_type": "etf",
+                    }
+                ]
+            return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+    client = _Client()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert [opt.symbol for opt in rows] == ["USTB", "OUSG"]
+    assert all(opt.asset_type == "government_security" for opt in rows)
+    assert all("Treasuries" in format_option(opt) for opt in rows)
+    assert "etf" not in {kind for kind in client.asset_types if kind}
+    assert "ZROZ" not in {opt.symbol for opt in rows}
+
+
+def test_ousg_left_out_when_cmc_class_is_etf() -> None:
+    """Documented miss: CMC lists OUSG, but not as government_security."""
+
+    class _Client(_StockScopedLiveClient):
+        def rwa_map(self, symbol=None, *, asset_type: str | None = None, **kwargs):
+            if symbol and str(symbol).upper() == "OUSG":
+                self.calls["rwa_map"] += 1
+                return [
+                    {
+                        "symbol": "OUSG",
+                        "name": "OUSG",
+                        "rwa_id": 31,
+                        "asset_type": "etf",
+                    }
+                ]
+            if (asset_type or "") == "government_security" and not symbol:
+                self.calls["rwa_map"] += 1
+                return []
+            return super().rwa_map(symbol, asset_type=asset_type, **kwargs)
+
+        def assets_list(self, *, asset_type: str | None = None, **kwargs):
+            if (asset_type or "") == "government_security":
+                self.calls["assets_list"] += 1
+                return {"rwa_assets": [], "total_size": 0, "has_more": False}
+            return super().assets_list(asset_type=asset_type, **kwargs)
+
+    client = _Client()
+    rows = load_class_catalog(client, "government_security", first_page_only=True)
+    assert "OUSG" not in {opt.symbol for opt in rows}
+    assert all(opt.asset_type == "government_security" for opt in rows)
 

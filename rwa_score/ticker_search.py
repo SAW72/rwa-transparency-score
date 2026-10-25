@@ -1093,11 +1093,100 @@ def classes_for_query(query: str) -> tuple[str, ...]:
 
 
 def _option_in_class(opt: TickerOption, kind: str) -> bool:
-    if _row_asset_type(opt) == kind:
-        return True
-    if kind in opt.categories:
-        return True
-    return kind == TREASURY_CLASS and _row_is_treasury_like(opt)
+    """True only when CMC's asset_type field is this class.
+
+    Keyword hits and treasury-like names do not move an ETF into Stocks,
+    Treasuries, or Real Estate. Native crypto is never an RWA class.
+    Untyped rows stay out until a typed class page stamps them.
+    """
+    if is_native_crypto(symbol=opt.symbol, name=opt.name, asset_type=opt.asset_type):
+        return False
+    return _row_asset_type(opt) == kind
+
+
+def order_class_options(options: Sequence[TickerOption]) -> list[TickerOption]:
+    """Stable class order: CMC rank, then symbol. Identical inputs match."""
+    return sorted(
+        options,
+        key=lambda opt: (
+            opt.rwa_rank is None,
+            opt.rwa_rank if opt.rwa_rank is not None else 0,
+            (opt.symbol or "").upper(),
+            (opt.name or "").lower(),
+        ),
+    )
+
+
+def filter_by_asset_class(
+    options: Sequence[TickerOption], asset_type: str
+) -> list[TickerOption]:
+    """Rows whose CMC asset class is ``asset_type``, in deterministic order."""
+    kind = canonical_asset_type(asset_type)
+    if kind not in ASSET_TYPES:
+        return []
+    return order_class_options(
+        [opt for opt in options if _option_in_class(opt, kind)]
+    )
+
+
+def class_catalog_cache_key(source: str, token: str, asset_type: str) -> str:
+    """One cache entry per CMC class. Commodities cannot reuse a Stocks page."""
+    kind = canonical_asset_type(asset_type) or (asset_type or "").strip().lower()
+    return f"{source}:{token}:{kind}"
+
+
+@dataclass(frozen=True)
+class ClassBrowseSnapshot:
+    """In-flight category click. ``rows`` stay empty until this id commits."""
+
+    request_id: int
+    class_id: str
+    loading: bool
+    rows: tuple[TickerOption, ...] = ()
+
+
+def start_class_browse(
+    previous: ClassBrowseSnapshot | None, class_id: str
+) -> ClassBrowseSnapshot:
+    """Begin a class click. Drops the previous class's rows immediately."""
+    kind = canonical_asset_type(class_id) or ""
+    prev_id = previous.request_id if previous is not None else 0
+    return ClassBrowseSnapshot(request_id=prev_id + 1, class_id=kind, loading=True, rows=())
+
+
+def commit_class_browse(
+    current: ClassBrowseSnapshot | None,
+    request_id: int,
+    class_id: str,
+    rows: Sequence[TickerOption],
+) -> ClassBrowseSnapshot | None:
+    """Keep ``rows`` only when they belong to the latest class click.
+
+    A slower response for the previous category is ignored. The visible list
+    does not flip back, and it is not filled with another class's rows.
+    """
+    kind = canonical_asset_type(class_id) or ""
+    if current is None or current.request_id != int(request_id) or current.class_id != kind:
+        return current
+    return ClassBrowseSnapshot(
+        request_id=int(request_id),
+        class_id=kind,
+        loading=False,
+        rows=tuple(filter_by_asset_class(rows, kind)),
+    )
+
+
+def rwa_class_browse_ids(query: str) -> tuple[str, ...]:
+    """Official CMC classes named by ``query``.
+
+    Industry words (``oil``, ``AI``) are not an asset-class filter. A class
+    word filters on ``asset_type`` and does not also prefix-match that word
+    against ETF or stock names.
+    """
+    cats = resolve_categories(query)
+    if any(cid in INDUSTRY_IDS for cid in cats):
+        return ()
+    return tuple(cid for cid in cats if cid in RWA_CLASS_IDS)
 
 
 def _stamp_typed_rows(
@@ -1123,33 +1212,52 @@ def _stamp_typed_rows(
     return items
 
 
-def _promote_treasury_options(options: Sequence[TickerOption]) -> list[TickerOption]:
-    """Ensure Treasuries Matches can see CMC-listed treasury-like rows."""
-    out: list[TickerOption] = []
-    for opt in options:
-        if TREASURY_CLASS in opt.categories:
-            out.append(opt)
-            continue
-        out.append(
-            replace(
-                opt,
-                categories=tuple(dict.fromkeys((TREASURY_CLASS, *opt.categories))),
-            )
-        )
-    return out
+def _stamp_treasury_class(opt: TickerOption) -> TickerOption:
+    """Tag an untyped CMC treasury row with the class we asked for."""
+    return replace(
+        opt,
+        asset_type=TREASURY_CLASS,
+        categories=tuple(dict.fromkeys((TREASURY_CLASS, *opt.categories))),
+    )
 
 
-def _treasury_options_from_rows(
-    client: Any,
-    rows: Sequence[dict[str, Any]] | None,
-    *,
-    require_like: bool,
+def _probe_missing_treasuries(
+    client: Any, options: Sequence[TickerOption]
 ) -> list[TickerOption]:
-    info = _fixture_info_by_id(client, rows or [])
-    options = catalog_from_rwa_map(rows, info_by_id=info)
-    if require_like:
-        options = [opt for opt in options if _row_is_treasury_like(opt)]
-    return _promote_treasury_options(options)
+    """Add USTB / OUSG when CMC lists that symbol and the class page missed it.
+
+    Each symbol is its own ``map?symbol=`` call. A comma-joined probe is not
+    stable (USTB comes back, OUSG does not). Rows CMC already classified as
+    another asset class stay in that class — they are not retagged, and the
+    ETF directory is not scanned for treasury-like names (that list was
+    ZROZ / XTWY / XTWO, all tagged ETFs).
+    """
+    found = list(options)
+    have = {(opt.symbol or "").upper() for opt in found if opt.symbol}
+    for symbol in TREASURY_PROBE_SYMBOLS:
+        if symbol in have:
+            continue
+        rows, _truncated, failed = _map_page(client, symbol)
+        if failed:
+            continue
+        info = _fixture_info_by_id(client, rows or [])
+        for opt in catalog_from_rwa_map(rows, info_by_id=info):
+            if (opt.symbol or "").upper() != symbol:
+                continue
+            typed = _row_asset_type(opt)
+            if typed and typed != TREASURY_CLASS:
+                continue
+            if not typed:
+                opt = _stamp_treasury_class(opt)
+            elif TREASURY_CLASS not in opt.categories:
+                opt = replace(
+                    opt,
+                    categories=tuple(dict.fromkeys((TREASURY_CLASS, *opt.categories))),
+                )
+            found.append(opt)
+            have.add(symbol)
+            break
+    return found
 
 
 def _recover_treasury_catalog(
@@ -1157,65 +1265,18 @@ def _recover_treasury_catalog(
     *,
     first_page_only: bool,
 ) -> tuple[list[TickerOption], bool]:
-    """Find CMC-listed treasuries when ``government_security`` pages are empty.
+    """Find USTB / OUSG when the ``government_security`` page is empty.
 
-    Live CMC may label USTB / OUSG ``etf``, omit ``asset_type`` on map, or
-    ignore the official filter on both ``map`` and ``assets/list``. Probe
-    ``map?symbol=`` (0 credits; docs: symbol ignores other filters), then one
-    ``etf`` map page, then one unfiltered map page, then one ``assets/list``
-    page. Never ``assets_list_all``. Never invent a ticker.
+    Probes each symbol on ``map?symbol=`` (0 credits). Does not read the ETF
+    page, an unfiltered map, or ``assets/list`` without a class — those were
+    how Treasuries flipped between one T-bill and a page of ETFs.
 
-    Returns ``(options, failed)``. A live directory error stops the probe
-    instead of walking every fallback (those calls would fail the same way).
+    Returns ``(options, failed)``. A failed probe is skipped; it does not
+    wipe a class page that already succeeded. ``first_page_only`` is unused:
+    a symbol lookup is one row, not a class page.
     """
-    probed, _truncated, failed = _map_page(client, ",".join(TREASURY_PROBE_SYMBOLS))
-    if failed:
-        return [], True
-    options = _treasury_options_from_rows(client, probed, require_like=False)
-    if options:
-        return options, False
-
-    if first_page_only:
-        etf_rows, _truncated, failed = _map_page(
-            client, asset_type="etf", start=1, limit=CLASS_PAGE_LIMIT
-        )
-    else:
-        etf_rows, _truncated, failed = _map_page(client, asset_type="etf")
-    if failed:
-        return [], True
-    options = _treasury_options_from_rows(client, etf_rows, require_like=True)
-    if options:
-        return options, False
-
-    if first_page_only:
-        raw_rows, _truncated, failed = _map_page(
-            client, start=1, limit=CLASS_PAGE_LIMIT
-        )
-    else:
-        raw_rows, _truncated, failed = _map_page(client)
-    if failed:
-        return [], True
-    options = _treasury_options_from_rows(client, raw_rows, require_like=True)
-    if options:
-        return options, False
-
-    listed, _truncated, failed = _fetch_assets_list_page(client, "etf")
-    if failed:
-        return [], True
-    matched = _promote_treasury_options(
-        [opt for opt in listed if _row_is_treasury_like(opt)]
-    )
-    if matched:
-        return matched, False
-    listed, _truncated, failed = _fetch_assets_list_page(client, None)
-    if failed:
-        return [], True
-    return (
-        _promote_treasury_options(
-            [opt for opt in listed if _row_is_treasury_like(opt)]
-        ),
-        False,
-    )
+    _ = first_page_only
+    return _probe_missing_treasuries(client, []), False
 
 
 def _options_for_class(
@@ -1275,7 +1336,9 @@ def load_class_catalog(
             unavailable=unavailable,
             truncated=truncated,
         )
-        return options
+        if unavailable:
+            return []
+        return order_class_options(options)
 
     if first_page_only:
         rows, truncated, failed = _map_page(
@@ -1287,6 +1350,8 @@ def load_class_catalog(
         return _finish([], unavailable=True, truncated=False)
     options = _options_for_class(client, rows, kind)
     if options:
+        if kind == TREASURY_CLASS:
+            options = _probe_missing_treasuries(client, options)
         return _finish(options, unavailable=False, truncated=truncated)
 
     list_truncated = False
@@ -1303,6 +1368,8 @@ def load_class_catalog(
         return _finish([], unavailable=True, truncated=False)
     matched = _listed_for_class(listed, kind)
     if matched:
+        if kind == TREASURY_CLASS:
+            matched = _probe_missing_treasuries(client, matched)
         return _finish(matched, unavailable=False, truncated=list_truncated)
     if kind == TREASURY_CLASS:
         recovered, failed = _recover_treasury_catalog(
@@ -1335,7 +1402,7 @@ def cached_class_catalog(
         return []
     hit = _CLASS_CATALOG_MEMO.get(key)
     if hit:
-        return list(hit)
+        return order_class_options(hit)
     if (
         hit is not None
         and empty_class_page_is_cached_success(
@@ -1583,6 +1650,22 @@ def search_tickers(
     q = normalize_query(query)
     if not q:
         return []
+    browse_ids = rwa_class_browse_ids(q)
+    if browse_ids:
+        # Category text names a CMC class. Membership is asset_type, not a
+        # prefix hit on the word "stock" inside an ETF name.
+        hits: list[TickerOption] = []
+        seen: set[str] = set()
+        for browse_kind in browse_ids:
+            for opt in filter_by_asset_class(catalog, browse_kind):
+                key = (opt.symbol or "").upper()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                hits.append(opt)
+        hits = order_class_options(hits)
+        cap = max(0, int(limit))
+        return hits[:cap]
     cats = resolve_categories(q)
     allow_prefix = len(q) >= min_chars
     if not allow_prefix and not cats:
