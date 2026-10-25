@@ -541,6 +541,155 @@ def test_attest_status_does_not_treat_nvda_as_bnvda(tmp_path: Path) -> None:
     store.close()
 
 
+def _status_client(tmp_path: Path, chain: Any):
+    from unittest.mock import Mock
+
+    from rwa_score.api.auto_attest import AttesterSettings
+
+    settings = _settings(tmp_path)
+    store = Store()
+    scorer = Mock()
+    scorer.score.side_effect = AssertionError("status must not score")
+    attester = AttesterSettings(
+        private_key="0x" + "11" * 32,
+        contract="0x" + "ab" * 20,
+        rpc_url="http://127.0.0.1:8545",
+        attest_enabled=True,
+    )
+    app = create_app(
+        settings=settings,
+        store=store,
+        scorer=scorer,
+        attester=attester,
+        chain=chain,
+        start_worker=False,
+    )
+    return TestClient(app), store, scorer
+
+
+def test_attest_status_requires_verify_for_caller_hash(tmp_path: Path) -> None:
+    """A caller-supplied hash must not confirm a ticker when verify fails."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "ab" * 32
+    chain = Mock()
+    chain.hashes_for_ticker.return_value = []
+    chain.attested.return_value = True
+    chain.get_attestation.side_effect = RuntimeError("getAttestation down")
+    chain.verify.side_effect = RuntimeError("verify down")
+    client, store, scorer = _status_client(tmp_path, chain)
+    raw = store.create_key(name="paid", tier="paid")
+    response = client.get(
+        "/v1/attest/ZZZZ/status",
+        headers=_headers(raw),
+        params={"score_hash": digest},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "unavailable"
+    assert body["on_chain"]["status"] == "unavailable"
+    assert body["on_chain"]["attested"] is False
+    assert body["on_chain"]["ticker"] == "ZZZZ"
+    assert body["score_hash"] == digest
+    assert "verify down" not in response.text
+    assert "getAttestation down" not in response.text
+    chain.verify.assert_called_once_with(digest, "ZZZZ")
+    scorer.score.assert_not_called()
+    store.close()
+
+
+def test_attest_status_confirms_verified_ticker(tmp_path: Path) -> None:
+    """attested plus verify for this ticker still shows confirmed."""
+    from unittest.mock import Mock
+
+    digest = "0x" + "cd" * 32
+    chain = Mock()
+    chain.hashes_for_ticker.return_value = []
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = {
+        "ticker": "NVDA",
+        "attested_at": 1_700_000_000,
+        "claimed_at": 1_700_000_000,
+        "attester": "0x" + "11" * 20,
+        "score_hash": digest,
+    }
+    chain.verify.return_value = (True, 1_700_000_000, "0x" + "11" * 20)
+    client, store, scorer = _status_client(tmp_path, chain)
+    raw = store.create_key(name="paid", tier="paid")
+    body = client.get(
+        "/v1/attest/NVDA/status",
+        headers=_headers(raw),
+        params={"score_hash": digest},
+    ).json()
+    assert body["status"] == "confirmed"
+    assert body["on_chain"]["status"] == "confirmed"
+    assert body["on_chain"]["attested"] is True
+    assert body["on_chain"]["ticker"] == "NVDA"
+    assert body["on_chain"]["attestedAt"] == 1_700_000_000
+    assert body["score_hash"] == digest
+    chain.verify.assert_called_once_with(digest, "NVDA")
+    scorer.score.assert_not_called()
+    store.close()
+
+
+def test_attest_status_rejects_empty_record_ticker(tmp_path: Path) -> None:
+    from unittest.mock import Mock
+
+    digest = "0x" + "ef" * 32
+    chain = Mock()
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = {
+        "ticker": "",
+        "attested_at": 1_700_000_000,
+        "claimed_at": 0,
+        "attester": "0x" + "22" * 20,
+        "score_hash": digest,
+    }
+    chain.verify.return_value = (True, 1_700_000_000, "0x" + "22" * 20)
+    client, store, scorer = _status_client(tmp_path, chain)
+    raw = store.create_key(name="paid", tier="paid")
+    body = client.get(
+        "/v1/attest/NVDA/status",
+        headers=_headers(raw),
+        params={"score_hash": digest},
+    ).json()
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+    assert body["on_chain"]["ticker"] == "NVDA"
+    scorer.score.assert_not_called()
+    store.close()
+
+
+def test_attest_status_receipt_without_hash_is_not_confirmed(tmp_path: Path) -> None:
+    from unittest.mock import Mock
+
+    chain = Mock()
+    chain.receipt_event.return_value = {
+        "ticker": "NVDA",
+        "attested_at": 1_700_000_111,
+        "claimed_at": 0,
+        "attester": "0x" + "33" * 20,
+    }
+    chain.hashes_for_ticker.return_value = []
+    chain.attested.side_effect = AssertionError("no digest to attest")
+    chain.verify.side_effect = AssertionError("no digest to verify")
+    chain.get_attestation.side_effect = AssertionError("no digest to read")
+    client, store, _scorer = _status_client(tmp_path, chain)
+    raw = store.create_key(name="paid", tier="paid")
+    body = client.get(
+        "/v1/attest/NVDA/status",
+        headers=_headers(raw),
+        params={"tx_hash": "0x" + "12" * 32},
+    ).json()
+    assert body["status"] == "absent"
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+    chain.attested.assert_not_called()
+    chain.verify.assert_not_called()
+    store.close()
+
+
 def test_me_quota(tmp_path: Path, fixture_scorer: TransparencyScorer) -> None:
     client, store = _client(tmp_path, fixture_scorer, free_daily_limit=50)
     raw = store.create_key(name="free", tier="free")

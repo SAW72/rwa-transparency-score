@@ -1696,8 +1696,9 @@ def chain_status(
     By ``score_hash``: ``attested``, ``getAttestation``, and ``verify``.
     By ticker alone: ``hashesForTicker``, then the same getters.
     Ticker arguments use :func:`attest_status_ticker` on the query and on
-    the chain record. A probe that throws becomes a generic error. The
-    exception text is dropped.
+    the chain record. ``confirmed`` requires ``verify`` to return true for
+    this ticker. An empty record ticker is not a match. A probe that throws
+    becomes a generic error. The exception text is dropped.
     """
     symbol = attest_status_ticker(ticker)
     body: dict[str, Any] = {
@@ -1755,10 +1756,6 @@ def chain_status(
                 digest = found[-1]
                 body["score_hash"] = digest
     if not digest:
-        if event is not None:
-            body["status"] = "confirmed"
-            body["attested"] = True
-            body["attestedAt"] = _as_int(event.get("attested_at"))
         return body
     attested_fn = getattr(chain, "attested", None)
     attested_flag: bool | None = None
@@ -1781,19 +1778,28 @@ def chain_status(
             record = None
     verified = None
     verifier = getattr(chain, "verify", None)
+    verify_failed = False
     if callable(verifier):
         try:
             verified = verifier(digest, symbol)
         except Exception:
             verified = None
-    ok = attested_flag is True
-    if isinstance(verified, tuple) and verified:
-        ok = ok and verified[0] is True
-    elif attested_flag is not True:
-        ok = False
+            verify_failed = True
+    if verify_failed:
+        body["attested"] = False
+        body["status"] = "unavailable"
+        body["reason"] = FAILED_REASON
+        body["message"] = FAILED_MESSAGE
+        return body
+    ok = (
+        attested_flag is True
+        and isinstance(verified, tuple)
+        and len(verified) >= 1
+        and verified[0] is True
+    )
     if isinstance(record, dict):
         recorded = attest_status_ticker(str(record.get("ticker") or ""))
-        if recorded not in {"", symbol}:
+        if not recorded or recorded != symbol:
             ok = False
         body["attestedAt"] = _as_int(record.get("attested_at"))
         body["claimedAt"] = _as_int(record.get("claimed_at"))
