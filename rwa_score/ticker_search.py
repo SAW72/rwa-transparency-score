@@ -1223,7 +1223,7 @@ def _stamp_treasury_class(opt: TickerOption) -> TickerOption:
 
 def _probe_missing_treasuries(
     client: Any, options: Sequence[TickerOption]
-) -> list[TickerOption]:
+) -> tuple[list[TickerOption], bool]:
     """Add USTB / OUSG when CMC lists that symbol and the class page missed it.
 
     Each symbol is its own ``map?symbol=`` call. A comma-joined probe is not
@@ -1231,6 +1231,10 @@ def _probe_missing_treasuries(
     another asset class stay in that class — they are not retagged, and the
     ETF directory is not scanned for treasury-like names (that list was
     ZROZ / XTWY / XTWO, all tagged ETFs).
+
+    A 429, an auth error, or any other failed lookup stops at that symbol.
+    The returned flag is True. Callers must surface that as unavailable and
+    must not cache the miss as a successful empty list.
     """
     found = list(options)
     have = {(opt.symbol or "").upper() for opt in found if opt.symbol}
@@ -1239,7 +1243,7 @@ def _probe_missing_treasuries(
             continue
         rows, _truncated, failed = _map_page(client, symbol)
         if failed:
-            continue
+            return found, True
         info = _fixture_info_by_id(client, rows or [])
         for opt in catalog_from_rwa_map(rows, info_by_id=info):
             if (opt.symbol or "").upper() != symbol:
@@ -1257,7 +1261,7 @@ def _probe_missing_treasuries(
             found.append(opt)
             have.add(symbol)
             break
-    return found
+    return found, False
 
 
 def _recover_treasury_catalog(
@@ -1271,12 +1275,16 @@ def _recover_treasury_catalog(
     page, an unfiltered map, or ``assets/list`` without a class — those were
     how Treasuries flipped between one T-bill and a page of ETFs.
 
-    Returns ``(options, failed)``. A failed probe is skipped; it does not
-    wipe a class page that already succeeded. ``first_page_only`` is unused:
-    a symbol lookup is one row, not a class page.
+    Returns ``(options, failed)``. The first failed USTB/OUSG lookup is
+    unavailable: ``failed`` is True and the options are empty, so the caller
+    does not cache ``[]`` as a successful Treasuries page. ``first_page_only``
+    is unused: a symbol lookup is one row, not a class page.
     """
     _ = first_page_only
-    return _probe_missing_treasuries(client, []), False
+    found, failed = _probe_missing_treasuries(client, [])
+    if failed:
+        return [], True
+    return found, False
 
 
 def _options_for_class(
@@ -1351,7 +1359,9 @@ def load_class_catalog(
     options = _options_for_class(client, rows, kind)
     if options:
         if kind == TREASURY_CLASS:
-            options = _probe_missing_treasuries(client, options)
+            options, probe_failed = _probe_missing_treasuries(client, options)
+            if probe_failed:
+                return _finish([], unavailable=True, truncated=False)
         return _finish(options, unavailable=False, truncated=truncated)
 
     list_truncated = False
@@ -1369,7 +1379,9 @@ def load_class_catalog(
     matched = _listed_for_class(listed, kind)
     if matched:
         if kind == TREASURY_CLASS:
-            matched = _probe_missing_treasuries(client, matched)
+            matched, probe_failed = _probe_missing_treasuries(client, matched)
+            if probe_failed:
+                return _finish([], unavailable=True, truncated=False)
         return _finish(matched, unavailable=False, truncated=list_truncated)
     if kind == TREASURY_CLASS:
         recovered, failed = _recover_treasury_catalog(

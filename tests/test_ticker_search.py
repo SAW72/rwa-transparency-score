@@ -2044,3 +2044,156 @@ def test_ousg_left_out_when_cmc_class_is_etf() -> None:
     assert "OUSG" not in {opt.symbol for opt in rows}
     assert all(opt.asset_type == "government_security" for opt in rows)
 
+
+class _EmptyPageTreasuryProbeClient:
+    """government_security page and assets/list are empty. Symbol probes are scripted.
+
+    This is the live Treasuries path: an empty class page, then ``map?symbol=``
+    for USTB and OUSG. ``mode`` selects which of those lookups fail.
+    """
+
+    source = "live"
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.symbols: list[str] = []
+        self.calls = {"rwa_map": 0, "assets_list": 0, "assets_list_all": 0}
+
+    def rwa_map(self, symbol=None, *, asset_type: str | None = None, **_kwargs):
+        from rwa_score.client import CMCError
+
+        self.calls["rwa_map"] += 1
+        if not symbol:
+            return []
+        wanted = str(symbol).strip().upper()
+        self.symbols.append(wanted)
+        if wanted == "USTB" and self.mode == "ustb_429":
+            raise CMCError(
+                "map hit CoinMarketCap rate limit (HTTP 429, error_code 1008)"
+            )
+        if wanted == "OUSG" and self.mode == "ousg_auth":
+            raise CMCError("/v5/real-world-assets/map -> HTTP 401: unauthorized")
+        if wanted == "USTB":
+            return [
+                {
+                    "symbol": "USTB",
+                    "name": "US Treasury Bill",
+                    "rwa_id": 30,
+                    "asset_type": "government_security",
+                    "rwa_rank": 1,
+                }
+            ]
+        if wanted == "OUSG":
+            return [
+                {
+                    "symbol": "OUSG",
+                    "name": "Ondo Short-Term US Treasuries",
+                    "rwa_id": 31,
+                    "asset_type": "government_security",
+                    "rwa_rank": 2,
+                }
+            ]
+        return []
+
+    def assets_list(self, *, asset_type: str | None = None, **_kwargs):
+        self.calls["assets_list"] += 1
+        return {"rwa_assets": [], "total_size": 0, "has_more": False}
+
+
+def _assert_treasury_probe_failure_is_not_a_cached_empty(client) -> None:
+    """Caller and UI see unavailable. ``[]`` is not stored as a successful class."""
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+    from rwa_score.ticker_search import (
+        _CLASS_CATALOG_MEMO,
+        class_shard_status,
+        client_shard_token,
+    )
+
+    scorer = TransparencyScorer(client)
+    catalog = demo_app._ticker_catalog(scorer, query="treasuries")
+    assert class_shard_status(client, "government_security").unavailable is True
+    assert demo_app.live_unavailable_banner(False, client, "treasuries") is True
+    assert demo_app.search_matches("treasuries", catalog, client) == []
+    token = client_shard_token(client)
+    assert (token, "government_security", True) not in _CLASS_CATALOG_MEMO
+    store = demo_app._shard_store()
+    shard_key = f"live:{token}:government_security"
+    assert shard_key not in store
+    # A second browse must not turn the failure into a warm empty success.
+    again = demo_app._ticker_catalog(scorer, query="treasuries")
+    assert demo_app.search_matches("treasuries", again, client) == []
+    assert class_shard_status(client, "government_security").unavailable is True
+    assert (token, "government_security", True) not in _CLASS_CATALOG_MEMO
+    assert shard_key not in demo_app._shard_store()
+
+
+def test_treasury_ustb_429_is_unavailable_not_cached_empty() -> None:
+    """A 429 on USTB stops the probe and is not memoized as an empty Treasuries list."""
+    client = _EmptyPageTreasuryProbeClient("ustb_429")
+    _assert_treasury_probe_failure_is_not_a_cached_empty(client)
+    assert client.symbols == ["USTB"]
+    assert "OUSG" not in client.symbols
+
+
+def test_treasury_ousg_auth_error_is_unavailable_not_cached_empty() -> None:
+    """An auth error on OUSG is unavailable. USTB's row is not a successful catalog."""
+    client = _EmptyPageTreasuryProbeClient("ousg_auth")
+    _assert_treasury_probe_failure_is_not_a_cached_empty(client)
+    assert client.symbols == ["USTB", "OUSG"]
+
+
+def test_treasury_probe_failure_retries_and_returns_rows() -> None:
+    """After a 429 and then an OUSG auth error, a later call returns the rows.
+
+    The empty result must not stick. Once the failure window has passed, the
+    next Treasuries load calls the directory again.
+    """
+    import time
+
+    import app as demo_app
+    from rwa_score.scorer import TransparencyScorer
+    from rwa_score.ticker_search import (
+        DIRECTORY_FAILURE_RETRY_SECONDS,
+        ClassShardStatus,
+        _CLASS_STATUS,
+        _status_key,
+        class_shard_status,
+    )
+
+    client = _EmptyPageTreasuryProbeClient("ustb_429")
+    scorer = TransparencyScorer(client)
+    failed = demo_app._ticker_catalog(scorer, query="treasuries")
+    assert class_shard_status(client, "government_security").unavailable is True
+    assert demo_app.search_matches("treasuries", failed, client) == []
+    assert client.symbols == ["USTB"]
+    maps_after_429 = client.calls["rwa_map"]
+
+    _CLASS_STATUS[_status_key(client, "government_security", True)] = ClassShardStatus(
+        unavailable=True,
+        truncated=False,
+        failed_at=time.monotonic() - DIRECTORY_FAILURE_RETRY_SECONDS - 5,
+    )
+    client.mode = "ousg_auth"
+    auth_failed = demo_app._ticker_catalog(scorer, query="treasuries")
+    assert client.calls["rwa_map"] > maps_after_429
+    assert client.symbols == ["USTB", "USTB", "OUSG"]
+    assert class_shard_status(client, "government_security").unavailable is True
+    assert demo_app.live_unavailable_banner(False, client, "treasuries") is True
+    assert demo_app.search_matches("treasuries", auth_failed, client) == []
+    maps_after_auth = client.calls["rwa_map"]
+
+    _CLASS_STATUS[_status_key(client, "government_security", True)] = ClassShardStatus(
+        unavailable=True,
+        truncated=False,
+        failed_at=time.monotonic() - DIRECTORY_FAILURE_RETRY_SECONDS - 5,
+    )
+    client.mode = "ok"
+    recovered = demo_app._ticker_catalog(scorer, query="treasuries")
+    assert client.calls["rwa_map"] > maps_after_auth
+    assert class_shard_status(client, "government_security").unavailable is False
+    assert [
+        opt.symbol for opt in demo_app.search_matches("treasuries", recovered, client)
+    ] == ["USTB", "OUSG"]
+    assert demo_app.live_unavailable_banner(False, client, "treasuries") is False
+
