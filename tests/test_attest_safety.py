@@ -44,6 +44,8 @@ def _subject(ticker: str, as_of: int) -> tuple[str, int, bytes]:
 def _ready_chain() -> Mock:
     chain = Mock()
     chain.chain_id.return_value = 84532
+    # verify stays false. A status-1 receipt is accepted as a send, and the
+    # result stays pending until verify returns exactly True.
     chain.verify.return_value = (False, 0, "0x" + "00" * 20)
     chain.fee_wei.return_value = 0
     chain.get_receipt.return_value = {"status": 1}
@@ -159,7 +161,7 @@ def test_kill_switch_on_can_send() -> None:
     settings = _settings(_anvil_key(2), attest_enabled=True, min_balance_wei=0)
     assert settings.enabled is True
     result = _submit(_worker(Store(), settings, chain), "NVDA", 1_700_000_001, now=2_000.0)
-    assert result.status == "confirmed"
+    assert result.status == "pending"
     assert result.tx_hash
     chain.attest.assert_called_once()
 
@@ -216,7 +218,7 @@ def test_balance_at_floor_is_ok_and_unknown_when_unread(
     chain.balance_wei.return_value = floor
     settings = _settings(_anvil_key(4), min_balance_wei=floor)
     result = _submit(_worker(Store(), settings, chain), "NVDA", 1_700_000_003, now=4_000.0)
-    assert result.status == "confirmed"
+    assert result.status == "pending"
     chain.attest.assert_called_once()
 
     client, store = _client(settings, chain, fixture_scorer)
@@ -246,7 +248,7 @@ def test_hourly_and_daily_caps_refuse_with_no_tx() -> None:
     )
     worker = _worker(Store(), settings, chain)
     first = _submit(worker, "NVDA", 1_700_000_010, now=10_000.0)
-    assert first.status == "confirmed"
+    assert first.status == "pending"
     assert chain.attest.call_count == 1
     second = _submit(worker, "NVDA", 1_700_000_011, now=10_001.0)
     assert second.status == "failed"
@@ -268,7 +270,7 @@ def test_hourly_and_daily_caps_refuse_with_no_tx() -> None:
         ),
         daily_chain,
     )
-    assert _submit(daily, "AAPL", 1_700_000_012, now=20_000.0).status == "confirmed"
+    assert _submit(daily, "AAPL", 1_700_000_012, now=20_000.0).status == "pending"
     blocked = _submit(daily, "AAPL", 1_700_000_013, now=20_000.0 + 4000)
     assert blocked.reason == "attest_daily_cap"
     assert blocked.tx_hash is None
@@ -286,12 +288,12 @@ def test_per_ticker_interval_blocks_same_ticker_only() -> None:
         min_balance_wei=0,
     )
     worker = _worker(Store(), settings, chain)
-    assert _submit(worker, "NVDA", 1_700_000_020, now=1_000.0).status == "confirmed"
+    assert _submit(worker, "NVDA", 1_700_000_020, now=1_000.0).status == "pending"
     blocked = _submit(worker, "NVDA", 1_700_000_021, now=1_001.0)
     assert blocked.reason == "attest_ticker_interval"
     assert blocked.tx_hash is None
     other = _submit(worker, "AAPL", 1_700_000_022, now=1_001.0)
-    assert other.status == "confirmed"
+    assert other.status == "pending"
     assert chain.attest.call_count == 2
 
 
@@ -307,12 +309,12 @@ def test_per_api_key_daily_cap_and_same_hash_dedup() -> None:
     )
     worker = _worker(Store(), settings, chain)
     first = _submit(worker, "NVDA", 1_700_000_030, now=30_000.0, api_key_id=7)
-    assert first.status == "confirmed"
+    assert first.status == "pending"
     second = _submit(worker, "NVDA", 1_700_000_031, now=30_001.0, api_key_id=7)
     assert second.reason == "attest_key_daily_cap"
     assert second.tx_hash is None
     other_key = _submit(worker, "AAPL", 1_700_000_032, now=30_002.0, api_key_id=8)
-    assert other_key.status == "confirmed"
+    assert other_key.status == "pending"
     assert chain.attest.call_count == 2
 
     pending_chain = Mock()
@@ -592,7 +594,7 @@ def test_startup_balance_read_is_cached_and_send_is_fresh() -> None:
         assert chain.balance_wei.call_count == cached_calls + 1
         before_send = chain.balance_wei.call_count
         result = _submit(worker, "NVDA", 1_700_000_092, now=92_000.0)
-        assert result.status == "confirmed"
+        assert result.status == "pending"
         assert chain.balance_wei.call_count > before_send
     finally:
         worker.stop()
