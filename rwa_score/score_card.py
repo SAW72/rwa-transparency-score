@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -29,8 +30,16 @@ PNG_BUILD_FAILED_PREFIX = "Score card generation failed:"
 # Per-request X HTTP timeout. 8s was too tight once simple-upload can
 # fall back to initialize/append/finalize + tweet create.
 X_SHARE_UI_TIMEOUT = 20.0
+# X wraps every URL as a t.co link and counts that link as 23 characters.
+X_TCO_URL_WEIGHT = 23
+SHARE_CAPTION_LIMIT = 280
 CARD_WIDTH = 1200
 CARD_HEIGHT = 675
+FOOTER_MARGIN_X = 56
+FOOTER_MIN_GAP = 16.0
+FOOTER_FONT_MAX = 16
+FOOTER_FONT_MIN = 11
+FOOTER_TOP_INSET = 62
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 MONOGRAM_CANDIDATES = (
     ASSETS_DIR / "rat-monogram.png",
@@ -122,6 +131,40 @@ def verify_signature(canonical: str, signature: str, secret: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def caption_weighted_length(text: str, url: str | None = None) -> int:
+    """Length against the X post cap. A trailing URL counts as 23 characters."""
+    if url is None:
+        from . import seo
+
+        url = seo.CANONICAL_URL
+    url = (url or "").strip()
+    if url and text.endswith(url):
+        return len(text) - len(url) + X_TCO_URL_WEIGHT
+    return len(text)
+
+
+def _assemble_caption(parts: list[str], url: str) -> str:
+    body = [part for part in parts if part]
+    if url:
+        body.append(url)
+    return "\n".join(body)
+
+
+def _shrink_caption_part(part: str, overflow: int) -> str:
+    """Drop ``overflow`` weighted characters from the end of one caption line."""
+    if overflow <= 0 or not part:
+        return part
+    if len(part) <= overflow:
+        return ""
+    keep = len(part) - overflow
+    if keep <= 1:
+        return ""
+    trimmed = part[: keep - 1].rstrip(" ·")
+    if not trimmed:
+        return ""
+    return trimmed + "…"
+
+
 def share_caption(payload: dict[str, Any], fingerprint: str) -> str:
     ticker = payload.get("ticker") or "?"
     score = payload.get("score")
@@ -138,14 +181,36 @@ def share_caption(payload: dict[str, Any], fingerprint: str) -> str:
                 pillar_bits.append(f"{short} not available")
             else:
                 pillar_bits.append(f"{short} {float(raw):.0f}")
-    lines = [
+    from . import seo
+
+    url = (seo.CANONICAL_URL or "").strip()
+    parts = [
         f"RAT Score · {ticker} · {score} {band}",
         " · ".join(pillar_bits),
         f"{timestamp} · sig {fingerprint}",
         "Not financial advice",
     ]
-    text = "\n".join(line for line in lines if line)
-    return text[:280]
+    text = _assemble_caption(parts, url)
+    # Shrink pillars, then the timestamp line, then the headline. Keep the
+    # disclaimer and the URL. The URL is weighted as a t.co link.
+    for _ in range(4):
+        weight = caption_weighted_length(text, url)
+        if weight <= SHARE_CAPTION_LIMIT:
+            return text
+        overflow = weight - SHARE_CAPTION_LIMIT
+        for index in (1, 2, 0):
+            if not parts[index]:
+                continue
+            parts[index] = _shrink_caption_part(parts[index], overflow)
+            text = _assemble_caption(parts, url)
+            break
+        else:
+            break
+    if caption_weighted_length(text, url) <= SHARE_CAPTION_LIMIT:
+        return text
+    if url and caption_weighted_length(url, url) <= SHARE_CAPTION_LIMIT:
+        return url
+    return parts[3][:SHARE_CAPTION_LIMIT]
 
 
 @dataclass
@@ -198,6 +263,153 @@ def _rounded_rect(draw, box, radius: int, fill) -> None:
     draw.rounded_rectangle(box, radius=radius, fill=fill)
 
 
+def score_card_site_label(url: str | None = None) -> str:
+    """Public host for the card footer. Scheme, path, and port are stripped.
+
+    Reads ``seo.CANONICAL_URL`` at call time unless ``url`` is passed.
+    """
+    if url is None:
+        from . import seo
+
+        url = seo.CANONICAL_URL
+    return _host_from_url(url)
+
+
+def _host_from_url(url: str) -> str:
+    text = (url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"//{text}")
+    return (parsed.hostname or "").strip().strip("/")
+
+
+def footer_text(timestamp: str, fingerprint: str, *, signed: bool) -> tuple[str, str, str]:
+    """Return footer segments: time + signature, site host, disclaimer."""
+    sig_label = (
+        f"sig {fingerprint}" if signed else "unsigned — set SCORE_CARD_SIGNING_SECRET to sign"
+    )
+    left = f"{timestamp}  ·  {sig_label}"
+    return left, score_card_site_label(), "Not financial advice  ·  RAT Score"
+
+
+def _text_ink(draw, text: str, font) -> tuple[float, float]:
+    """Left bearing and ink width for ``text`` drawn at x=0."""
+    if not text:
+        return 0.0, 0.0
+    box = draw.textbbox((0, 0), text, font=font)
+    return float(box[0]), float(box[2] - box[0])
+
+
+def layout_footer_segments(
+    draw,
+    font,
+    segments: list[str],
+    *,
+    width: int = CARD_WIDTH,
+    margin: int = FOOTER_MARGIN_X,
+    min_gap: float = FOOTER_MIN_GAP,
+) -> list[tuple[str, float]] | None:
+    """Place footer segments on one line. None when they cannot fit with ``min_gap``."""
+    texts = [segment for segment in segments if segment]
+    if not texts:
+        return []
+    bearings: list[float] = []
+    inks: list[float] = []
+    for text in texts:
+        bearing, ink = _text_ink(draw, text, font)
+        bearings.append(bearing)
+        inks.append(ink)
+    avail = float(width - 2 * margin)
+    gaps = len(texts) - 1
+    if sum(inks) + gaps * min_gap > avail + 0.01:
+        return None
+    if len(texts) == 1:
+        return [(texts[0], float(margin) - bearings[0])]
+    extra = avail - sum(inks)
+    gap = extra / gaps
+    placed: list[tuple[str, float]] = []
+    ink_left = float(margin)
+    for index, (text, bearing, ink) in enumerate(zip(texts, bearings, inks)):
+        if index == len(texts) - 1:
+            ink_left = float(width - margin) - ink
+        placed.append((text, ink_left - bearing))
+        ink_left += ink + gap
+    return placed
+
+
+def _ellipsize_to_ink(draw, font, text: str, max_ink: float) -> str:
+    if not text or max_ink <= 0:
+        return ""
+    if _text_ink(draw, text, font)[1] <= max_ink:
+        return text
+    ellipsis = "…"
+    if _text_ink(draw, ellipsis, font)[1] > max_ink:
+        return ""
+    best = ellipsis
+    lo = 0
+    hi = len(text)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid].rstrip() + ellipsis
+        if _text_ink(draw, candidate, font)[1] <= max_ink:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _compress_footer(draw, font, left: str, site: str, right: str) -> list[tuple[str, float]]:
+    """Fit a too-wide footer by shortening the left segment, then the host."""
+    disclaimer = "Not financial advice"
+    right_options = [right]
+    if disclaimer in right and right != disclaimer:
+        right_options.append(disclaimer)
+    for right_text in right_options:
+        placed = layout_footer_segments(draw, font, [left, site, right_text])
+        if placed is not None:
+            return placed
+
+    right_text = right_options[-1]
+    others = [part for part in (site, right_text) if part]
+    other_ink = sum(_text_ink(draw, part, font)[1] for part in others)
+    gaps = len(others)
+    avail = float(CARD_WIDTH - 2 * FOOTER_MARGIN_X)
+    max_left = avail - other_ink - gaps * FOOTER_MIN_GAP
+    shrunk_left = _ellipsize_to_ink(draw, font, left, max_left)
+    placed = layout_footer_segments(draw, font, [shrunk_left, site, right_text])
+    if placed is not None:
+        return placed
+
+    right_ink = _text_ink(draw, right_text, font)[1] if right_text else 0.0
+    max_site = avail - right_ink - (FOOTER_MIN_GAP if right_text else 0.0)
+    shrunk_site = _ellipsize_to_ink(draw, font, site, max_site)
+    placed = layout_footer_segments(draw, font, [shrunk_left, shrunk_site, right_text])
+    if placed is not None:
+        return placed
+
+    packed = "  ".join(part for part in (shrunk_left, shrunk_site, right_text) if part)
+    packed = _ellipsize_to_ink(draw, font, packed, avail)
+    placed = layout_footer_segments(draw, font, [packed])
+    return placed or []
+
+
+def fit_footer(
+    draw,
+    left: str,
+    site: str,
+    right: str,
+) -> tuple[Any, list[tuple[str, float]]]:
+    """Pick a footer font and x positions so the three segments do not overlap."""
+    for size in range(FOOTER_FONT_MAX, FOOTER_FONT_MIN - 1, -1):
+        font = _load_font(size, bold=False)
+        placed = layout_footer_segments(draw, font, [left, site, right])
+        if placed is not None:
+            return font, placed
+    font = _load_font(FOOTER_FONT_MIN, bold=False)
+    return font, _compress_footer(draw, font, left, site, right)
+
+
 def render_score_card_png(
     report: dict[str, Any],
     *,
@@ -240,7 +452,6 @@ def render_score_card_png(
     font_band = _load_font(22, bold=True)
     font_pillar = _load_font(18, bold=False)
     font_pillar_num = _load_font(18, bold=True)
-    font_foot = _load_font(16, bold=False)
 
     draw.text((title_x, 54), "RAT Score", font=font_title, fill=text)
     draw.text((title_x, 96), "RWA Transparency Score", font=font_sub, fill=muted)
@@ -272,7 +483,7 @@ def render_score_card_png(
 
     pillar_count = max(1, len(WEIGHTS))
     y = 304
-    footer_y = CARD_HEIGHT - 62
+    footer_y = CARD_HEIGHT - FOOTER_TOP_INSET
     step = min(46, max(36, (footer_y - 18 - y) // pillar_count))
     bar_x = 360
     bar_w = 520
@@ -292,17 +503,10 @@ def render_score_card_png(
         draw.text((CARD_WIDTH - 56 - (num_bbox[2] - num_bbox[0]), y - 4), num, font=font_pillar_num, fill=text)
         y += step
 
-    sig_label = f"sig {fingerprint}" if signed else "unsigned — set SCORE_CARD_SIGNING_SECRET to sign"
-    foot_left = f"{timestamp}  ·  {sig_label}"
-    foot_right = "Not financial advice  ·  RAT Score"
-    draw.text((56, footer_y), foot_left, font=font_foot, fill=muted)
-    right_bbox = draw.textbbox((0, 0), foot_right, font=font_foot)
-    draw.text(
-        (CARD_WIDTH - 56 - (right_bbox[2] - right_bbox[0]), footer_y),
-        foot_right,
-        font=font_foot,
-        fill=muted,
-    )
+    foot_left, foot_site, foot_right = footer_text(timestamp, fingerprint, signed=signed)
+    font_foot, placed = fit_footer(draw, foot_left, foot_site, foot_right)
+    for segment, segment_x in placed:
+        draw.text((segment_x, footer_y), segment, font=font_foot, fill=muted)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)

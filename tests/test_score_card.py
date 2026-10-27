@@ -21,9 +21,18 @@ from rwa_score.score_card import (
     SIGNING_SECRET_ENV,
     UNSIGNED_FINGERPRINT,
     attach_x_share,
+    FOOTER_MARGIN_X,
+    FOOTER_MIN_GAP,
+    FOOTER_TOP_INSET,
     build_signed_card,
+    X_TCO_URL_WEIGHT,
     canonical_json,
     canonical_score_payload,
+    caption_weighted_length,
+    fit_footer,
+    footer_text,
+    render_score_card_png,
+    score_card_site_label,
     share_caption,
     share_score_card,
     signature_fingerprint,
@@ -183,6 +192,150 @@ def test_share_caption_mentions_pillars() -> None:
     assert "Cross-issuer 92" in text
     assert "sig abc123def4567890" in text
     assert "Not financial advice" in text
+
+
+def test_share_caption_appends_canonical_url_with_tco_weight() -> None:
+    from rwa_score.seo import CANONICAL_URL
+
+    payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    text = share_caption(payload, "abc123def4567890")
+    assert text.endswith(CANONICAL_URL)
+    assert "\n" + CANONICAL_URL in text
+    assert "Not financial advice" in text
+    assert "Backing 95" in text
+    assert "Cross-issuer 92" in text
+    assert X_TCO_URL_WEIGHT == 23
+    assert caption_weighted_length(text) == len(text) - len(CANONICAL_URL) + X_TCO_URL_WEIGHT
+    assert caption_weighted_length(text) <= 280
+
+
+def test_share_caption_counts_long_url_as_tco_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_url = "https://example.test/" + ("a" * 180)
+    monkeypatch.setattr("rwa_score.seo.CANONICAL_URL", long_url)
+    payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    text = share_caption(payload, "abc123def4567890")
+    assert text.endswith(long_url)
+    assert "Backing 95" in text
+    assert "Not financial advice" in text
+    assert len(text) > 280
+    weighted = caption_weighted_length(text, long_url)
+    assert weighted <= 280
+    assert weighted == len(text) - len(long_url) + 23
+
+
+def test_share_caption_truncates_other_content_to_keep_url() -> None:
+    from rwa_score.seo import CANONICAL_URL
+
+    payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    payload["ticker"] = "T" * 400
+    text = share_caption(payload, "abc123def4567890")
+    assert text.endswith(CANONICAL_URL)
+    assert "Not financial advice" in text
+    assert "T" * 400 not in text
+    assert caption_weighted_length(text) <= 280
+    without_url = text[: -len(CANONICAL_URL)]
+    assert len(without_url) + 23 <= 280
+
+
+def _assert_footer_inside(draw, font, placed: list[tuple[str, float]], y: int) -> None:
+    boxes = []
+    for text, x in placed:
+        box = draw.textbbox((x, y), text, font=font)
+        assert box[0] >= FOOTER_MARGIN_X - 0.5
+        assert box[2] <= CARD_WIDTH - FOOTER_MARGIN_X + 0.5
+        assert box[1] >= 0
+        assert box[3] <= CARD_HEIGHT
+        boxes.append(box)
+    boxes.sort(key=lambda item: item[0])
+    for prev, nxt in zip(boxes, boxes[1:]):
+        assert nxt[0] - prev[2] >= FOOTER_MIN_GAP - 1
+
+
+def test_footer_site_label_follows_canonical_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from urllib.parse import urlparse
+
+    from rwa_score.seo import CANONICAL_URL
+
+    host = score_card_site_label()
+    assert host == urlparse(CANONICAL_URL).hostname
+    assert host == "rwa-transparency-score.onrender.com"
+    assert "://" not in host
+    assert "/" not in host
+    source = Path("rwa_score/score_card.py").read_text(encoding="utf-8")
+    assert "rwa-transparency-score.onrender.com" not in source
+
+    monkeypatch.setattr("rwa_score.seo.CANONICAL_URL", "https://cards.example.test:8443/score")
+    assert score_card_site_label() == "cards.example.test"
+    left, site, right = footer_text(FIXED_TS, "abc123def4567890", signed=True)
+    assert site == "cards.example.test"
+    assert "Not financial advice" in right
+    assert FIXED_TS in left
+    assert "abc123def4567890" in left
+
+
+def test_footer_layout_fits_signed_and_unsigned() -> None:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT))
+    draw = ImageDraw.Draw(image)
+    y = CARD_HEIGHT - FOOTER_TOP_INSET
+    for signed in (True, False):
+        left, site, right = footer_text(FIXED_TS, "abc123def4567890", signed=signed)
+        font, placed = fit_footer(draw, left, site, right)
+        texts = [text for text, _x in placed]
+        assert site in texts
+        assert any("Not financial advice" in text for text in texts)
+        assert any(FIXED_TS in text for text in texts)
+        if signed:
+            assert getattr(font, "size", None) == 16
+            assert any("sig abc123def4567890" in text for text in texts)
+            assert abs(placed[0][1] - FOOTER_MARGIN_X) < 0.6
+        else:
+            assert any("SCORE_CARD_SIGNING_SECRET" in text for text in texts)
+        _assert_footer_inside(draw, font, placed, y)
+
+
+def test_footer_layout_ellipsizes_huge_left_without_overlap() -> None:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT))
+    draw = ImageDraw.Draw(image)
+    y = CARD_HEIGHT - FOOTER_TOP_INSET
+    left = FIXED_TS + "  ·  " + ("sig " + "f" * 40 + " ") * 20
+    site = score_card_site_label()
+    right = "Not financial advice  ·  RAT Score"
+    font, placed = fit_footer(draw, left, site, right)
+    texts = [text for text, _x in placed]
+    assert site in texts
+    assert any(text.startswith("Not financial advice") for text in texts)
+    _assert_footer_inside(draw, font, placed, y)
+
+
+def test_render_draws_canonical_host_in_footer(monkeypatch: pytest.MonkeyPatch) -> None:
+    import rwa_score.score_card as score_card
+
+    seen: list[tuple[str, str, str]] = []
+    real = score_card.fit_footer
+
+    def spy(draw, left: str, site: str, right: str):
+        seen.append((left, site, right))
+        return real(draw, left, site, right)
+
+    monkeypatch.setattr(score_card, "fit_footer", spy)
+    png = render_score_card_png(
+        SAMPLE_REPORT,
+        timestamp=FIXED_TS,
+        fingerprint="abc123def4567890",
+        signed=True,
+    )
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert seen == [
+        (
+            f"{FIXED_TS}  ·  sig abc123def4567890",
+            "rwa-transparency-score.onrender.com",
+            "Not financial advice  ·  RAT Score",
+        )
+    ]
 
 
 def test_fixture_report_builds_card(fixture_scorer: TransparencyScorer) -> None:
