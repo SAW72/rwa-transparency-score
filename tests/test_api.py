@@ -836,6 +836,52 @@ def test_attest_status_chain_without_verify_is_absent(tmp_path: Path) -> None:
     assert not hasattr(_AttestedOnly(), "verify")
 
 
+def test_attest_status_ticker_path_unverified_is_not_confirmed(tmp_path: Path) -> None:
+    """Ticker lookup keeps the stored case and still requires a successful verify.
+
+    No score_hash is supplied, so the digest comes from hashesForTicker.
+    Querying BNVDA must read bNVDA, and attested() alone must not confirm.
+    """
+    from unittest.mock import Mock
+
+    digest = "0x" + "b1" * 32
+    stored = "bNVDA"
+
+    def hashes_for_ticker(ticker: str) -> list[str]:
+        return [digest] if ticker == stored else []
+
+    chain = Mock()
+    chain.hashes_for_ticker.side_effect = hashes_for_ticker
+    chain.attested.return_value = True
+    chain.get_attestation.return_value = _matching_record(stored, digest)
+    chain.verify.return_value = (False, 0, "0x" + "00" * 20)
+    body = _get_status(tmp_path, chain, "BNVDA")
+    assert body["ticker"] == stored
+    assert body["score_hash"] == digest
+    assert body["status"] == "absent"
+    assert body["status"] != "confirmed"
+    assert body["on_chain"]["ticker"] == stored
+    assert body["on_chain"]["status"] == "absent"
+    assert body["on_chain"]["attested"] is False
+    chain.hashes_for_ticker.assert_called_once_with(stored)
+    chain.verify.assert_called_once_with(digest, stored)
+
+    raised = Mock()
+    raised.hashes_for_ticker.side_effect = hashes_for_ticker
+    raised.attested.return_value = True
+    raised.get_attestation.return_value = _matching_record(stored, digest)
+    raised.verify.side_effect = RuntimeError("verify down")
+    failed = _get_status(tmp_path, raised, "bNVDA")
+    assert failed["ticker"] == stored
+    assert failed["status"] == "unavailable"
+    assert failed["status"] != "confirmed"
+    assert failed["on_chain"]["attested"] is False
+    assert failed["on_chain"]["ticker"] == stored
+    assert "verify down" not in str(failed)
+    raised.hashes_for_ticker.assert_called_once_with(stored)
+    raised.verify.assert_called_once_with(digest, stored)
+
+
 def _post_attest(tmp_path: Path, chain: Any, scorer: TransparencyScorer):
     from rwa_score.api.auto_attest import PINNED_ATTESTATION_CONTRACT, AttesterSettings
 
