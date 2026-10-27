@@ -25,8 +25,10 @@ from rwa_score.score_card import (
     FOOTER_MIN_GAP,
     FOOTER_TOP_INSET,
     build_signed_card,
+    X_TCO_URL_WEIGHT,
     canonical_json,
     canonical_score_payload,
+    caption_weighted_length,
     fit_footer,
     footer_text,
     render_score_card_png,
@@ -190,6 +192,49 @@ def test_share_caption_mentions_pillars() -> None:
     assert "Cross-issuer 92" in text
     assert "sig abc123def4567890" in text
     assert "Not financial advice" in text
+
+
+def test_share_caption_appends_canonical_url_with_tco_weight() -> None:
+    from rwa_score.seo import CANONICAL_URL
+
+    payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    text = share_caption(payload, "abc123def4567890")
+    assert text.endswith(CANONICAL_URL)
+    assert "\n" + CANONICAL_URL in text
+    assert "Not financial advice" in text
+    assert "Backing 95" in text
+    assert "Cross-issuer 92" in text
+    assert X_TCO_URL_WEIGHT == 23
+    assert caption_weighted_length(text) == len(text) - len(CANONICAL_URL) + X_TCO_URL_WEIGHT
+    assert caption_weighted_length(text) <= 280
+
+
+def test_share_caption_counts_long_url_as_tco_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    long_url = "https://example.test/" + ("a" * 180)
+    monkeypatch.setattr("rwa_score.seo.CANONICAL_URL", long_url)
+    payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    text = share_caption(payload, "abc123def4567890")
+    assert text.endswith(long_url)
+    assert "Backing 95" in text
+    assert "Not financial advice" in text
+    assert len(text) > 280
+    weighted = caption_weighted_length(text, long_url)
+    assert weighted <= 280
+    assert weighted == len(text) - len(long_url) + 23
+
+
+def test_share_caption_truncates_other_content_to_keep_url() -> None:
+    from rwa_score.seo import CANONICAL_URL
+
+    payload = canonical_score_payload(SAMPLE_REPORT, FIXED_TS)
+    payload["ticker"] = "T" * 400
+    text = share_caption(payload, "abc123def4567890")
+    assert text.endswith(CANONICAL_URL)
+    assert "Not financial advice" in text
+    assert "T" * 400 not in text
+    assert caption_weighted_length(text) <= 280
+    without_url = text[: -len(CANONICAL_URL)]
+    assert len(without_url) + 23 <= 280
 
 
 def _assert_footer_inside(draw, font, placed: list[tuple[str, float]], y: int) -> None:

@@ -30,6 +30,9 @@ PNG_BUILD_FAILED_PREFIX = "Score card generation failed:"
 # Per-request X HTTP timeout. 8s was too tight once simple-upload can
 # fall back to initialize/append/finalize + tweet create.
 X_SHARE_UI_TIMEOUT = 20.0
+# X wraps every URL as a t.co link and counts that link as 23 characters.
+X_TCO_URL_WEIGHT = 23
+SHARE_CAPTION_LIMIT = 280
 CARD_WIDTH = 1200
 CARD_HEIGHT = 675
 FOOTER_MARGIN_X = 56
@@ -128,6 +131,40 @@ def verify_signature(canonical: str, signature: str, secret: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+def caption_weighted_length(text: str, url: str | None = None) -> int:
+    """Length against the X post cap. A trailing URL counts as 23 characters."""
+    if url is None:
+        from . import seo
+
+        url = seo.CANONICAL_URL
+    url = (url or "").strip()
+    if url and text.endswith(url):
+        return len(text) - len(url) + X_TCO_URL_WEIGHT
+    return len(text)
+
+
+def _assemble_caption(parts: list[str], url: str) -> str:
+    body = [part for part in parts if part]
+    if url:
+        body.append(url)
+    return "\n".join(body)
+
+
+def _shrink_caption_part(part: str, overflow: int) -> str:
+    """Drop ``overflow`` weighted characters from the end of one caption line."""
+    if overflow <= 0 or not part:
+        return part
+    if len(part) <= overflow:
+        return ""
+    keep = len(part) - overflow
+    if keep <= 1:
+        return ""
+    trimmed = part[: keep - 1].rstrip(" ·")
+    if not trimmed:
+        return ""
+    return trimmed + "…"
+
+
 def share_caption(payload: dict[str, Any], fingerprint: str) -> str:
     ticker = payload.get("ticker") or "?"
     score = payload.get("score")
@@ -144,14 +181,36 @@ def share_caption(payload: dict[str, Any], fingerprint: str) -> str:
                 pillar_bits.append(f"{short} not available")
             else:
                 pillar_bits.append(f"{short} {float(raw):.0f}")
-    lines = [
+    from . import seo
+
+    url = (seo.CANONICAL_URL or "").strip()
+    parts = [
         f"RAT Score · {ticker} · {score} {band}",
         " · ".join(pillar_bits),
         f"{timestamp} · sig {fingerprint}",
         "Not financial advice",
     ]
-    text = "\n".join(line for line in lines if line)
-    return text[:280]
+    text = _assemble_caption(parts, url)
+    # Shrink pillars, then the timestamp line, then the headline. Keep the
+    # disclaimer and the URL. The URL is weighted as a t.co link.
+    for _ in range(4):
+        weight = caption_weighted_length(text, url)
+        if weight <= SHARE_CAPTION_LIMIT:
+            return text
+        overflow = weight - SHARE_CAPTION_LIMIT
+        for index in (1, 2, 0):
+            if not parts[index]:
+                continue
+            parts[index] = _shrink_caption_part(parts[index], overflow)
+            text = _assemble_caption(parts, url)
+            break
+        else:
+            break
+    if caption_weighted_length(text, url) <= SHARE_CAPTION_LIMIT:
+        return text
+    if url and caption_weighted_length(url, url) <= SHARE_CAPTION_LIMIT:
+        return url
+    return parts[3][:SHARE_CAPTION_LIMIT]
 
 
 @dataclass
