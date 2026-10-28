@@ -1005,7 +1005,9 @@ def _fetch_assets_list_page(
         raw_rows = payload.get("rwa_assets")
         if isinstance(raw_rows, list):
             batch_len = len(raw_rows)
-        truncated = directory_has_more(payload, start=start, batch_len=batch_len)
+        truncated = directory_has_more(
+            payload, start=start, batch_len=batch_len, page_limit=limit
+        )
     elif batch_len >= limit:
         truncated = True
     return options, truncated, False

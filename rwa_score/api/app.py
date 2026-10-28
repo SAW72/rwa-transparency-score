@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from rwa_score import __version__
-from rwa_score.client import create_client
+from rwa_score.client import CMCError, create_client
 from rwa_score.health import build_health_payload
 from rwa_score.scorer import ScoreError, TransparencyScorer
 
@@ -66,6 +66,11 @@ BREAKDOWN_KEYS = (
     "issuer_note",
     "summary",
 )
+
+
+_CMC_UNAVAILABLE = "cmc_unavailable"
+_CMC_KEY_MESSAGE = "Live scoring needs CMC_API_KEY."
+_CMC_DOWN_MESSAGE = "CoinMarketCap is unavailable."
 
 
 def _http_error(status: int, error: str, message: str, **extra: Any) -> HTTPException:
@@ -249,7 +254,11 @@ def create_app(
 
     def get_scorer() -> TransparencyScorer:
         if app.state.scorer is None:
-            app.state.scorer = TransparencyScorer(create_client())
+            try:
+                client = create_client()
+            except CMCError:
+                raise _http_error(503, _CMC_UNAVAILABLE, _CMC_KEY_MESSAGE) from None
+            app.state.scorer = TransparencyScorer(client)
         return app.state.scorer
 
     def require_key(
@@ -296,6 +305,8 @@ def create_app(
             report = get_scorer().score(symbol)
         except ScoreError as exc:
             raise _http_error(404, "not_found", str(exc)) from exc
+        except CMCError:
+            raise _http_error(503, _CMC_UNAVAILABLE, _CMC_DOWN_MESSAGE) from None
         cleaned, missing = _scrub_report(report)
         if for_attest and missing:
             note = _unavailable_note(missing)

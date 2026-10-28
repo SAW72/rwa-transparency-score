@@ -18,7 +18,7 @@ from rwa_score.client import (
     ENDPOINT_MAP,
     ENDPOINT_MARKET_PAIRS,
 )
-from rwa_score.scorer import TransparencyScorer, _issuer_name_rank
+from rwa_score.scorer import ScoreError, TransparencyScorer, _issuer_name_rank
 from rwa_score.verifiers import VerificationLevel, VerificationResult
 from tests.conftest import RecordingClient
 from tests.test_client import FakeResponse, FakeSession, _live, cmc_1006, cmc_429, cmc_ok
@@ -235,10 +235,163 @@ def test_failed_issuer_fetch_is_retried_and_not_cached() -> None:
         raise AssertionError("first score should fail the issuer fetch")
     report = scorer.score("NVDA")
     assert report["issuer"] == "Ondo"
-    # Reverse directory order fetches extra, then the failing ondo call, then
-    # the retry of ondo. other is never reached.
-    assert client.calls["issuer"] == 3
+    # Reverse directory order fetches extra, skips the failing ondo call, then
+    # fetches other. The first score still has no NVDA row, so it raises.
+    # The retry fetches ondo. other and extra stay cached.
+    assert client.calls["issuer"] == 4
     assert client.calls["issuers_list"] == 1
+
+
+def test_issuer_detail_error_does_not_block_a_later_issuer() -> None:
+    client = RecordingClient(
+        assets=[{"symbol": "NVDA", "rwa_id": 2}],
+        info={2: {"symbol": "NVDA", "cik": "0001045810", "issuer": {"name": "Ondo"}}},
+        issuers=[
+            {"issuer_id": "ondo", "name": "Ondo"},
+            {"issuer_id": "tail", "name": "Tail Issuer"},
+        ],
+        issuer_details={
+            "ondo": {"name": "Ondo", "tokens": [{"rwa_id": 2, "crypto_id": 11}]},
+            "tail": {"name": "Tail Issuer", "tokens": []},
+        },
+    )
+    real = client.issuer
+
+    def _issuer(issuer_id: str) -> dict:
+        if issuer_id == "tail":
+            client.calls["issuer"] += 1
+            raise RuntimeError("HTTP 404")
+        return real(issuer_id)
+
+    client.issuer = _issuer  # type: ignore[method-assign]
+    scorer = TransparencyScorer(client, use_live_verifiers=False)
+    report = scorer.score("NVDA")
+    assert report["issuer"] == "Ondo"
+    assert any("404" in flag for flag in report["flags"])
+    assert "tail" not in scorer._issuers_fetched
+    assert "ondo" in scorer._issuers_fetched
+
+
+def test_clean_issuer_miss_is_not_a_score_error() -> None:
+    client = RecordingClient(
+        issuers=[{"issuer_id": "other", "name": "Other"}],
+        issuer_details={"other": {"name": "Other", "tokens": []}},
+        info={2: {"symbol": "NVDA", "cik": "1", "issuer": {"name": "From Info"}}},
+    )
+    scorer = TransparencyScorer(client, use_live_verifiers=False)
+    report = scorer.score("NVDA")
+    assert report["issuer"] == "From Info"
+
+
+def test_map_miss_expires_instead_of_sticking_for_the_process() -> None:
+    class _Maps:
+        source = "fixture"
+
+        def __init__(self, ttl: float) -> None:
+            self.map_ttl = ttl
+            self.n = 0
+
+        def rwa_map(self, symbol: str | None = None, **kwargs):
+            self.n += 1
+            return []
+
+    held = _Maps(120.0)
+    scorer = TransparencyScorer(held)
+    assert scorer._map_lookup("nvda") is None
+    assert scorer._map_lookup("NVDA") is None
+    assert held.n == 1
+    scorer._map_misses["NVDA"] = time.monotonic() - 1
+    assert scorer._map_lookup("NVDA") is None
+    assert held.n == 2
+
+    fresh = _Maps(0.0)
+    scorer = TransparencyScorer(fresh)
+    assert scorer._map_lookup("NVDA") is None
+    assert scorer._map_lookup("NVDA") is None
+    assert fresh.n == 2
+
+
+def test_rate_limited_compare_map_does_not_fan_out() -> None:
+    class _Maps:
+        source = "fixture"
+        map_ttl = 120.0
+
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+            self._cache: dict = {}
+
+        def rwa_map(self, symbol: str | None = None, **kwargs):
+            self.calls.append(symbol)
+            if symbol and "," in str(symbol):
+                raise CMCError(
+                    "map hit CoinMarketCap's HTTP request rate limit "
+                    "(HTTP 429, error_code 1008). Basic plan limits reset every minute."
+                )
+            return [{"symbol": "NVDA", "rwa_id": 2}]
+
+    client = _Maps()
+    scorer = TransparencyScorer(client)
+    scorer.prime_symbol_map(["NVDA", "AAPL"])
+    try:
+        scorer.score("NVDA")
+    except ScoreError as exc:
+        assert "1008" in str(exc)
+    else:
+        raise AssertionError("expected the rate limit to surface")
+    assert client.calls == ["NVDA,AAPL"]
+
+
+def test_non_rate_map_batch_failure_still_tries_each_ticker() -> None:
+    class _Maps:
+        source = "fixture"
+        map_ttl = 120.0
+
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+            self._cache: dict = {}
+
+        def rwa_map(self, symbol: str | None = None, **kwargs):
+            self.calls.append(symbol)
+            if symbol and "," in str(symbol):
+                raise CMCError("map -> HTTP 400: bad request")
+            return [{"symbol": str(symbol or "").upper(), "rwa_id": 2}]
+
+        def rwa_info(self, rwa_id: int) -> dict:
+            return {"symbol": "NVDA", "cik": "1", "issuer": {"name": "From Info"}}
+
+        def issuers_list(self) -> list:
+            return []
+
+        def rwa_quotes(self, **kwargs) -> dict:
+            return {}
+
+        def market_pairs(self, **kwargs) -> dict:
+            return {"market_pairs": []}
+
+    client = _Maps()
+    scorer = TransparencyScorer(client)
+    scorer.prime_symbol_map(["NVDA", "AAPL"])
+    report = scorer.score("NVDA")
+    assert report["ticker"] == "NVDA"
+    assert client.calls[0] == "NVDA,AAPL"
+    assert "NVDA" in client.calls[1:]
+
+
+def test_partial_market_pairs_are_labeled_on_the_card() -> None:
+    client = RecordingClient(
+        market_pairs={
+            2: {
+                "symbol": "NVDA",
+                "market_pairs": [],
+                "has_more": True,
+                "pairs_partial": True,
+            }
+        }
+    )
+    scorer = TransparencyScorer(client, use_live_verifiers=False)
+    report = scorer.score("NVDA")
+    assert report["basis"].get("pairs_partial") is True
+    assert any("partial" in flag.lower() for flag in report["flags"])
 
 
 def test_plan_blocked_market_pairs_are_not_refetched_per_card() -> None:
@@ -377,18 +530,14 @@ def test_plan_block_memo_is_only_documented_1006_and_expires() -> None:
     for bad in cases:
         session = FakeSession([bad, _pairs_ok(15)])
         client = _live(session)
-        if bad.status_code != 403:
-            try:
-                client.market_pairs(rwa_id=2)
-            except CMCError:
-                pass
-            else:
-                raise AssertionError(
-                    f"HTTP {bad.status_code} was treated as a plan block"
-                )
+        try:
+            client.market_pairs(rwa_id=2)
+        except CMCError:
+            pass
         else:
-            first = client.market_pairs(rwa_id=2)
-            assert first["plan_blocked"] is True
+            raise AssertionError(
+                f"HTTP {bad.status_code} was treated as a plan block"
+            )
         second = client.market_pairs(rwa_id=15)
         assert second.get("plan_blocked") is not True
         assert second["rwa_id"] == 15
@@ -477,8 +626,12 @@ def test_asset_a_403_does_not_flip_asset_b_to_green() -> None:
         [FakeResponse(403, text="<html>Forbidden</html>"), *_wide_b_responses()]
     )
     client = _live(session)
-    blocked = client.market_pairs(rwa_id=2)
-    assert blocked["plan_blocked"] is True
+    try:
+        client.market_pairs(rwa_id=2)
+    except CMCError:
+        pass
+    else:
+        raise AssertionError("a bare market-pairs 403 was treated as a plan block")
     report = TransparencyScorer(client, use_live_verifiers=False).score("B")
     assert report["subscores"]["basis"] == 15.0
     assert report["score"] == 70.5

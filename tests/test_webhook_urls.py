@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 from typing import Any
 
 import pytest
@@ -114,3 +115,60 @@ def test_default_poster_records_2xx_without_following(
     code, ok = default_poster("https://hooks.example.com/rat", "{}", {})
     assert code == 204
     assert ok is True
+
+
+def test_dns_failure_rejects_the_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*_args, **_kwargs):
+        raise socket.gaierror(8, "nodename nor servname provided, or not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _boom)
+    with pytest.raises(ValueError, match="resolv"):
+        assert_public_https_url("https://hooks.example.com/rat")
+
+
+def test_empty_dns_result_rejects_the_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
+    with pytest.raises(ValueError, match="resolv"):
+        assert_public_https_url("https://hooks.example.com/rat")
+
+
+def test_dns_failure_does_not_post(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(*_args, **_kwargs):
+        raise socket.gaierror(8, "nodename nor servname provided, or not known")
+
+    def _post(*_args, **_kwargs):
+        raise AssertionError("posted after a DNS failure")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _boom)
+    monkeypatch.setattr(requests, "post", _post)
+    code, ok = default_poster("https://hooks.example.com/rat", "{}", {})
+    assert (code, ok) == (0, False)
+
+
+def test_post_uses_the_pinned_public_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    public = "93.184.216.34"
+    lookups = {"host": 0}
+
+    def _resolve(hostname, port, *args, **kwargs):
+        name = str(hostname or "")
+        if name == public:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (public, port or 443))]
+        lookups["host"] += 1
+        if lookups["host"] == 1:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (public, port or 443))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port or 443))]
+
+    def _post(url, **kwargs):
+        infos = socket.getaddrinfo("hooks.example.com", 443)
+        assert [item[4][0] for item in infos] == [public]
+        assert kwargs.get("allow_redirects") is False
+
+        class _Resp:
+            status_code = 204
+
+        return _Resp()
+
+    monkeypatch.setattr(socket, "getaddrinfo", _resolve)
+    monkeypatch.setattr(requests, "post", _post)
+    code, ok = default_poster("https://hooks.example.com/rat", "{}", {})
+    assert (code, ok) == (204, True)

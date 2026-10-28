@@ -38,7 +38,7 @@ CMC **Basic** keys allow only a few HTTP requests per minute.
 
 **Market-pairs plan-block:** a live 1006 / related 403 on market-pairs does **not** crash the score card or Ask RAT. Cross-issuer basis is labeled **plan-blocked / unavailable** (not live market-pairs data). Other pillars keep scoring. Upgrade the CMC plan to restore pairs; until then the degrade is honest.
 
-**What to do:** wait about **one minute** and retry. The live client already retries 429 / 1008 with exponential backoff and jitter (honors `Retry-After`, waits ~60s total), then raises a clear error.
+**What to do:** wait about **one minute** and retry a minute-cap `429` / `1008`. The live client retries that cap, and a 429 with no error code, with exponential backoff and jitter (honors `Retry-After`). Without `Retry-After` each wait is a few seconds (`2**attempt` plus jitter), bounded by 60 seconds, then it raises a clear error. Daily `1009`, monthly `1010`, and per-IP `1011` are not retried.
 
 [DoraHacks Startup](https://coinmarketcap.com/api/) unlocks a higher request rate (and more credits) than Basic. Prefer fixtures for judging so you never hit the cap.
 

@@ -88,6 +88,20 @@ def signing_secret_from_env() -> str:
     return (os.getenv(SIGNING_SECRET_ENV) or "").strip()
 
 
+def published_ticker(raw: Any, *, default: str = "") -> str:
+    """Keep a Backed bToken's published case. Uppercase every other ticker.
+
+    The chain stores ``bNVDA``. Uppercasing that string misses the on-chain
+    record. ``bnvda`` is not the published form and still uppercases.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return default
+    if len(text) >= 2 and text[0] == "b" and text[1:].isupper():
+        return text
+    return text.upper()
+
+
 def canonical_score_payload(report: dict[str, Any], timestamp: str) -> dict[str, Any]:
     """Stable, signed subset: ticker, score, band, pillars, timestamp."""
     raw_subs = report.get("subscores") or {}
@@ -102,7 +116,7 @@ def canonical_score_payload(report: dict[str, Any], timestamp: str) -> dict[str,
         "band": str(report.get("band") or ""),
         "score": round(float(report.get("score") or 0.0), 1),
         "subscores": subscores,
-        "ticker": str(report.get("ticker") or "").upper(),
+        "ticker": published_ticker(report.get("ticker")),
         "timestamp": timestamp,
     }
 
@@ -420,7 +434,7 @@ def render_score_card_png(
     """Draw a clean 1200×675 PNG. Uses Pillow only."""
     from PIL import Image, ImageDraw
 
-    ticker = str(report.get("ticker") or "UNKNOWN").upper()
+    ticker = published_ticker(report.get("ticker"), default="UNKNOWN")
     issuer = str(report.get("issuer") or "unknown")
     score = float(report.get("score") or 0.0)
     band = str(report.get("band") or "")

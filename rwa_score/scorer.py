@@ -14,6 +14,9 @@ issuer, no published feed) stay labeled **heuristic fallback**.
 
 from __future__ import annotations
 
+import functools
+import threading
+import time
 from typing import Any
 
 import requests
@@ -26,6 +29,7 @@ from .chainlink_por import (
 )
 from .client import (
     CMCPlanBlockedError,
+    DEFAULT_MAP_TTL_SECONDS,
     PLAN_BLOCK_REASON,
     PLAN_BLOCKED_LABEL,
     RWAClient,
@@ -510,14 +514,41 @@ def _exception_is_plan_blocked(exc: BaseException) -> bool:
     )
 
 
-def _stamp_basis_meta(meta: dict[str, Any], *, plan_blocked: bool) -> dict[str, Any]:
+def _stamp_basis_meta(
+    meta: dict[str, Any], *, plan_blocked: bool, pairs_partial: bool = False
+) -> dict[str, Any]:
     out = dict(meta)
     out.pop("plan_blocked", None)
     out.pop("unavailable_reason", None)
+    out.pop("pairs_partial", None)
     if plan_blocked:
         out["plan_blocked"] = True
         out["unavailable_reason"] = PLAN_BLOCK_REASON
+    if pairs_partial:
+        out["pairs_partial"] = True
     return out
+
+
+def _map_failure_is_rate_limit(exc: BaseException) -> bool:
+    """True when a map batch failed on a CMC rate or quota cap.
+
+    A 400 or a transport error is not this. Those can still be retried per ticker.
+    """
+    text = str(exc).lower()
+    if not any(word in text for word in ("rate", "limit", "cap")):
+        return False
+    return any(code in text for code in ("429", "1008", "1009", "1010", "1011"))
+
+
+def _with_scorer_lock(method):
+    """One score, map prime, or issuer walk at a time on this scorer."""
+
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 _NAME_LIST_UNUSED = "Name-list scores are not used."
@@ -605,8 +636,10 @@ class TransparencyScorer:
         allow_live_on_fixtures: bool = False,
     ) -> None:
         self.client = client
+        self._lock = threading.RLock()
         self._map_cache: dict[str, int] | None = None
-        self._map_misses: set[str] = set()
+        self._map_misses: dict[str, float] = {}
+        self._map_rate_limit: str | None = None
         # rwa_id -> {issuer_id, issuer_name, crypto_id}
         self._issuer_index: dict[int, dict[str, Any]] = {}
         self._issuers_list: list[dict[str, Any]] | None = None
@@ -641,8 +674,27 @@ class TransparencyScorer:
                 self._map_cache[sym] = int(rid)
             except (TypeError, ValueError):
                 continue
-            self._map_misses.discard(sym)
+            self._map_misses.pop(sym, None)
 
+    def _map_ttl_seconds(self) -> float:
+        ttl = getattr(self.client, "map_ttl", DEFAULT_MAP_TTL_SECONDS)
+        if ttl is None:
+            ttl = DEFAULT_MAP_TTL_SECONDS
+        return max(0.0, float(ttl))
+
+    def _map_miss_active(self, key: str) -> bool:
+        expires = self._map_misses.get(key)
+        if expires is None:
+            return False
+        if time.monotonic() >= float(expires):
+            self._map_misses.pop(key, None)
+            return False
+        return True
+
+    def _remember_map_miss(self, key: str) -> None:
+        self._map_misses[key] = time.monotonic() + self._map_ttl_seconds()
+
+    @_with_scorer_lock
     def _map_lookup(self, symbol: str) -> int | None:
         """One symbol map call. Does not page the full RWA book."""
         key = (symbol or "").upper()
@@ -650,8 +702,10 @@ class TransparencyScorer:
             return None
         if self._map_cache and key in self._map_cache:
             return self._map_cache[key]
-        if key in self._map_misses:
+        if self._map_miss_active(key):
             return None
+        if self._map_rate_limit:
+            raise ScoreError(f"Could not load RWA map: {self._map_rate_limit}")
         try:
             assets = self.client.rwa_map(key)
         except Exception as exc:  # noqa: BLE001 — surface map failures
@@ -659,9 +713,10 @@ class TransparencyScorer:
         self._remember_map_rows(assets)
         if self._map_cache and key in self._map_cache:
             return self._map_cache[key]
-        self._map_misses.add(key)
+        self._remember_map_miss(key)
         return None
 
+    @_with_scorer_lock
     def prime_symbol_map(self, symbols: list[str]) -> None:
         """Fetch the compare-row symbols in one map call when the client caches.
 
@@ -680,15 +735,18 @@ class TransparencyScorer:
             seen.add(key)
             if self._map_cache and key in self._map_cache:
                 continue
-            if key in self._map_misses:
+            if self._map_miss_active(key):
                 continue
             pending.append(key)
         if not pending:
             return
         try:
             assets = self.client.rwa_map(",".join(pending))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — a rate limit must not fan out
+            if _map_failure_is_rate_limit(exc):
+                self._map_rate_limit = str(exc)
             return
+        self._map_rate_limit = None
         self._remember_map_rows(assets)
 
     def _resolve_score_target(self, ticker: str) -> tuple[int | None, PorFeed | None]:
@@ -747,6 +805,7 @@ class TransparencyScorer:
                 "crypto_id": tok.get("crypto_id"),
             }
 
+    @_with_scorer_lock
     def _token_for(self, rwa_id: int) -> dict[str, Any]:
         """Issuer row for one rwa_id.
 
@@ -755,7 +814,11 @@ class TransparencyScorer:
         issuer name is not a selector. Issuers are fetched from the end of
         the directory so that winner is the first hit. ``_absorb_issuer``
         keeps that first hit and does not overwrite it. A failed detail call
-        is not marked fetched, so the next card can retry.
+        is not marked fetched. The walk continues so one tail issuer cannot
+        block every cold ticker. The failure is recorded on the card when a
+        later issuer has the row. A hard error is reserved for a walk that
+        ends with no row and at least one detail error. A clean miss stays
+        an empty row.
         """
         try:
             key = int(rwa_id)
@@ -765,14 +828,16 @@ class TransparencyScorer:
         if hit is not None:
             return hit
         entries = self._issuer_entries()
+        detail_errors: list[str] = []
         for entry in reversed(list(entries)):
             iid = str(entry.get("issuer_id") or "")
             if not iid or iid in self._issuers_fetched:
                 continue
             try:
                 detail = self.client.issuer(iid)
-            except Exception as exc:  # noqa: BLE001
-                raise ScoreError(f"Could not load issuer {iid}: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001 — skip this issuer, keep walking
+                detail_errors.append(f"Could not load issuer {iid}: {exc}")
+                continue
             self._issuers_fetched.add(iid)
             self._absorb_issuer(
                 iid,
@@ -781,7 +846,15 @@ class TransparencyScorer:
             )
             found = self._issuer_index.get(key)
             if found is not None:
+                if detail_errors:
+                    found = dict(found)
+                    found["detail_errors"] = list(detail_errors)
                 return found
+        if detail_errors:
+            raise ScoreError(
+                "Could not load an issuer that lists this asset: "
+                + "; ".join(detail_errors)
+            )
         return {}
 
     def _load_rwa_quotes(
@@ -1041,6 +1114,7 @@ class TransparencyScorer:
         pair_error: str | None = None
         pair_wrappers: list[dict[str, Any]] = []
         plan_blocked = False
+        pairs_partial = False
         plan_block_note = (
             f"Cross-issuer basis: {PLAN_BLOCKED_LABEL} "
             "(CMC market-pairs not on this plan — not live market-pairs data)."
@@ -1059,6 +1133,12 @@ class TransparencyScorer:
                 plan_blocked = True
                 flags.append(plan_block_note)
             else:
+                if raw.get("has_more") or raw.get("pairs_partial"):
+                    pairs_partial = True
+                    flags.append(
+                        "Market-pairs book is partial — spread uses loaded pages, "
+                        "not the full book."
+                    )
                 payload = parse_market_pairs_payload(raw)
                 pair_wrappers = group_wrapper_quotes(payload.get("market_pairs") or [])
                 issuer_names = self._issuer_by_crypto_id()
@@ -1095,6 +1175,7 @@ class TransparencyScorer:
                             "source": SOURCE_MARKET_PAIRS_PLAN_BLOCKED,
                         },
                         plan_blocked=True,
+                        pairs_partial=pairs_partial,
                     ),
                     flags,
                     f"{plan_block_note} Assigned the plan-blocked default "
@@ -1106,6 +1187,7 @@ class TransparencyScorer:
                     _stamp_basis_meta(
                         {**empty_meta, "tradfi_markets": tradfi},
                         plan_blocked=False,
+                        pairs_partial=pairs_partial,
                     ),
                     flags,
                     f"Market-pairs endpoint error; assigned the error default "
@@ -1120,6 +1202,7 @@ class TransparencyScorer:
                 _stamp_basis_meta(
                     {**empty_meta, "tradfi_markets": tradfi, "source": source},
                     plan_blocked=False,
+                    pairs_partial=pairs_partial,
                 ),
                 flags,
                 "No wrapper USD prices in RWA quotes tokens[] or market-pairs; "
@@ -1143,6 +1226,7 @@ class TransparencyScorer:
                     "tradfi_markets": tradfi,
                 },
                 plan_blocked=plan_blocked,
+                pairs_partial=pairs_partial,
             )
             why = (
                 f"Single wrapper {only['symbol']} at {only['price']:.4f}; "
@@ -1175,6 +1259,7 @@ class TransparencyScorer:
                         "tradfi_markets": tradfi,
                     },
                     plan_blocked=plan_blocked,
+                    pairs_partial=pairs_partial,
                 ),
                 flags,
                 f"Invalid spread inputs; assigned the missing default ({MISSING_BASIS_SCORE:.0f}).",
@@ -1196,6 +1281,7 @@ class TransparencyScorer:
                 "tradfi_markets": tradfi,
             },
             plan_blocked=plan_blocked,
+            pairs_partial=pairs_partial,
         )
         cheap = f"{low['symbol']} {low['price']:.4f}"
         dear = f"{high['symbol']} {high['price']:.4f}"
@@ -1338,6 +1424,7 @@ class TransparencyScorer:
             reason=f"No verifier method for pillar {pillar}.",
         )
 
+    @_with_scorer_lock
     def score(self, ticker: str) -> dict[str, Any]:
         log_start = 0
         if hasattr(self.client, "call_log"):
@@ -1347,6 +1434,7 @@ class TransparencyScorer:
                 log_start = 0
         rwa_id, backed_feed = self._resolve_score_target(ticker)
         catalog_only = rwa_id is None
+        detail_errors: list[str] = []
         if catalog_only:
             assert backed_feed is not None
             info = {
@@ -1366,6 +1454,11 @@ class TransparencyScorer:
                 raise ScoreError(f"No RWA info returned for {ticker} (rwa_id={rwa_id})")
 
             token = self._token_for(rwa_id)
+            detail_errors = [
+                str(item)
+                for item in (token.get("detail_errors") or [])
+                if str(item).strip()
+            ]
             issuer_name = (
                 token.get("issuer_name")
                 or (info.get("issuer") or {}).get("name")
@@ -1612,6 +1705,11 @@ class TransparencyScorer:
             )
         risk_flags.extend(price_flags)
         risk_flags.extend(basis_flags)
+        for err in detail_errors:
+            risk_flags.append(
+                "Issuer directory detail failed and was skipped (not cached): "
+                + err
+            )
 
         # Never silently drop a failed verifier. Do not call it a name-list fallback.
         for pillar_key, result in (

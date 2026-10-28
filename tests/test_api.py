@@ -979,6 +979,28 @@ def test_unknown_ticker_404(tmp_path: Path, fixture_scorer: TransparencyScorer) 
     assert resp.json()["error"] == "not_found"
 
 
+def test_score_without_cmc_key_is_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CMC_API_KEY", raising=False)
+    monkeypatch.delenv("RWA_USE_FIXTURES", raising=False)
+    store = Store()
+    app = create_app(
+        settings=_settings(tmp_path),
+        store=store,
+        scorer=None,
+        start_worker=False,
+    )
+    raw = store.create_key(name="paid", tier="paid")
+    client = TestClient(app)
+    resp = client.get("/v1/score/NVDA", headers=_headers(raw))
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body == {
+        "error": "cmc_unavailable",
+        "message": "Live scoring needs CMC_API_KEY.",
+    }
+    assert "X-CMC_PRO_API_KEY" not in resp.text
+
+
 def test_keys_cli_create_is_not_kept(capsys: pytest.CaptureFixture[str]) -> None:
     from rwa_score.api.keys import main as keys_main
 
