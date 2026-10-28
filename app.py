@@ -37,7 +37,7 @@ from rwa_score.client import (
 )
 from rwa_score.explainer import AI_FOOTNOTE, explain_score, fallback_explanation
 from rwa_score.health import install_health_route, serve_health_if_requested
-from rwa_score.seo import SEO_TITLE
+from rwa_score.seo import EDUCATIONAL_DISCLAIMER, SEO_TITLE
 from rwa_score.score_card import (
     PNG_BUILD_FAILED_PREFIX,
     attach_x_share,
@@ -234,6 +234,14 @@ def selected_slot_verification_lines(report: dict) -> list[str]:
         badge, _evidence = _verification_badge_label(key, report)
         lines.append(f"{PILLARS[key]['label']} — {badge}")
     return lines
+
+
+def above_fold_disclaimer_html() -> str:
+    """Large high-contrast notice. Injected with the page CSS, above the title."""
+    return (
+        '<div class="rat-disclaimer-banner" role="note">'
+        f"{html.escape(EDUCATIONAL_DISCLAIMER)}</div>"
+    )
 
 
 def sidebar_legend_markdown(lines: list[str] | None = None) -> str:
@@ -3097,7 +3105,23 @@ st.markdown(
       [data-testid="stSidebarNav"] {{
         display: none !important;
       }}
+      /* Educational disclaimer — large, high-contrast, first thing on the page.
+         Replaces the small grey caption that used to carry this sentence. */
+      div[data-testid="stMarkdown"] .rat-disclaimer-banner,
+      .rat-disclaimer-banner {{
+        background: #F5C542 !important;
+        color: #0D1117 !important;
+        font-size: 1.75rem !important;
+        font-weight: 800 !important;
+        line-height: 1.25 !important;
+        letter-spacing: 0.01em;
+        text-align: center;
+        padding: 0.95rem 1.15rem;
+        margin: 0 0 0.9rem 0;
+        border-radius: 0.5rem;
+      }}
     </style>
+    {above_fold_disclaimer_html()}
     """,
     unsafe_allow_html=True,
 )
@@ -3117,7 +3141,7 @@ if reminder:
 st.caption(
     "Remaining heuristics stay labeled: name-list fallback, self-reported CMC "
     "price/disclosure/basis (RWA quotes + market-pairs), and xStocks without "
-    "a published PoR proxy. Educational demo — not financial advice."
+    "a published PoR proxy."
 )
 
 try:

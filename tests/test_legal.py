@@ -49,6 +49,11 @@ def test_legal_html_serves_policy_body() -> None:
         assert OPERATOR in page
         assert "Disclaimer" in page
         assert "/privacy" in page and "/terms" in page
+        assert 'class="rat-disclaimer-banner"' in page
+        assert "Educational demo — not financial advice." in page
+        assert page.index("rat-disclaimer-banner") < page.index("<header>")
+        assert "#F5C542" in page
+        assert "font-size: 1.75rem" in page
         html_body = markdown_to_html(md)
         assert "<h1>" in html_body
         assert "<h2>" in html_body

@@ -41,6 +41,16 @@ def test_brand_copy_replaces_old_page_title() -> None:
     assert 'page_title="RWA Transparency Score"' not in source
     assert "st.title(" not in source
     assert "st.header(BRAND_H1)" in source
+    assert "{above_fold_disclaimer_html()}" in source
+    assert source.index("{above_fold_disclaimer_html()}") < source.index("st.header(BRAND_H1)")
+    assert "rat-disclaimer-banner" in source
+    assert "font-size: 1.75rem" in source
+    assert "#F5C542" in source
+    assert "#0D1117" in source
+    # The old grey caption under the mode line no longer carries the notice.
+    after_header = source.split("st.header(BRAND_H1)", 1)[1]
+    before_score = after_header.split('st.subheader("Score / Compare")', 1)[0]
+    assert "Educational demo — not financial advice." not in before_score
     assert 'Mode: {mode_label}' in source or "Mode:" in source
     assert "RTS" not in demo_app.PAGE_TITLE
     assert "RTS" not in demo_app.BRAND_H1
@@ -463,6 +473,7 @@ def test_compare_row_is_native_streamlit_not_html() -> None:
     assert "_empty_slot_html" not in source
     assert "score-hero" not in source
     # Band chip + category pills + Share markdown data-URI + page CSS.
+    # The educational banner is inside the page-CSS markdown, not a fifth call.
     assert source.count("unsafe_allow_html") <= 4
     assert "Pick a ticker to compare here" in source
     assert "Assign a ticker" not in source

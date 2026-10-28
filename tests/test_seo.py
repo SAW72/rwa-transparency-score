@@ -41,6 +41,9 @@ def test_render_index_html_injects_title_description_canonical_og_and_noscript()
     assert f'<meta property="og:url" content="{CANONICAL_URL}"/>' in out
     assert f"<noscript><h1>{SEO_TITLE}</h1><p>{SEO_DESCRIPTION}</p>" in out
     assert "Not financial advice. This app needs JavaScript." in out
+    assert "Educational demo — not financial advice." in out
+    assert "background:#F5C542" in out
+    assert "font-size:1.75rem" in out
     assert _TITLE_MARKER not in out
     assert "You need to enable JavaScript to run this app." not in out
     assert '<div id="root"></div>' in out

@@ -19,6 +19,11 @@ SEO_DESCRIPTION = (
     "Educational risk radar for tokenized stocks: scores issuers 0-100 on "
     "backing, proof of reserves, redemption, price, disclosure and basis."
 )
+# Short product notice. The Streamlit page, legal pages, no-JS shell, and
+# share-card PNG all render this same sentence large and high-contrast.
+EDUCATIONAL_DISCLAIMER = "Educational demo — not financial advice."
+DISCLAIMER_BANNER_BG = "#F5C542"
+DISCLAIMER_BANNER_INK = "#0D1117"
 CANONICAL_URL = "https://rwa-transparency-score.onrender.com/"
 _TITLE_MARKER = "<title>Streamlit</title>"
 _NOSCRIPT_MARKER = "<noscript>You need to enable JavaScript to run this app.</noscript>"
@@ -59,9 +64,13 @@ def render_index_html(shell: str) -> str:
         f'<meta property="og:url" content="{CANONICAL_URL}"/>'
     )
     out = shell.replace(_TITLE_MARKER, head, 1)
+    banner = html.escape(EDUCATIONAL_DISCLAIMER)
     return out.replace(
         _NOSCRIPT_MARKER,
         f"<noscript><h1>{t}</h1><p>{d}</p>"
+        f'<p style="margin:1rem 0;padding:0.95rem 1.15rem;background:{DISCLAIMER_BANNER_BG};'
+        f"color:{DISCLAIMER_BANNER_INK};font-size:1.75rem;font-weight:800;"
+        f'line-height:1.25;text-align:center;">{banner}</p>'
         "<p>Not financial advice. This app needs JavaScript.</p></noscript>",
         1,
     )
