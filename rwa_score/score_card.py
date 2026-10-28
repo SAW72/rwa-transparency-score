@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 from .scorer import PILLARS, WEIGHTS
+from .seo import DISCLAIMER_BANNER_BG, DISCLAIMER_BANNER_INK, EDUCATIONAL_DISCLAIMER
 from .x_client import X_POST_UNAVAILABLE_MESSAGE, user_facing_x_skip_message
 
 SIGNING_SECRET_ENV = "SCORE_CARD_SIGNING_SECRET"
@@ -40,6 +41,11 @@ FOOTER_MIN_GAP = 16.0
 FOOTER_FONT_MAX = 16
 FOOTER_FONT_MIN = 11
 FOOTER_TOP_INSET = 62
+# Top banner. Replaces the old 11–16px muted footer line.
+DISCLAIMER_BANNER_HEIGHT = 72
+DISCLAIMER_BANNER_FONT = 36
+_BANNER_BG = tuple(int(DISCLAIMER_BANNER_BG[i : i + 2], 16) for i in (1, 3, 5))
+_BANNER_INK = tuple(int(DISCLAIMER_BANNER_INK[i : i + 2], 16) for i in (1, 3, 5))
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 MONOGRAM_CANDIDATES = (
     ASSETS_DIR / "rat-monogram.png",
@@ -284,12 +290,33 @@ def _host_from_url(url: str) -> str:
 
 
 def footer_text(timestamp: str, fingerprint: str, *, signed: bool) -> tuple[str, str, str]:
-    """Return footer segments: time + signature, site host, disclaimer."""
+    """Return footer segments: time + signature, site host, brand.
+
+    The educational disclaimer is the top banner, not this muted footer line.
+    """
     sig_label = (
         f"sig {fingerprint}" if signed else "unsigned — set SCORE_CARD_SIGNING_SECRET to sign"
     )
     left = f"{timestamp}  ·  {sig_label}"
-    return left, score_card_site_label(), "Not financial advice  ·  RAT Score"
+    return left, score_card_site_label(), "RAT Score"
+
+
+def _draw_disclaimer_banner(draw) -> None:
+    """Full-bleed banner on the top edge. Yellow on near-black, large bold type."""
+    draw.rectangle((0, 0, CARD_WIDTH, DISCLAIMER_BANNER_HEIGHT), fill=_BANNER_BG)
+    text = EDUCATIONAL_DISCLAIMER
+    font = _load_font(DISCLAIMER_BANNER_FONT, bold=True)
+    for size in range(DISCLAIMER_BANNER_FONT, 21, -2):
+        font = _load_font(size, bold=True)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] <= CARD_WIDTH - 48:
+            break
+    bbox = draw.textbbox((0, 0), text, font=font)
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    x = (CARD_WIDTH - width) / 2 - bbox[0]
+    y = (DISCLAIMER_BANNER_HEIGHT - height) / 2 - bbox[1]
+    draw.text((x, y), text, font=font, fill=_BANNER_INK)
 
 
 def _text_ink(draw, text: str, font) -> tuple[float, float]:
@@ -435,11 +462,20 @@ def render_score_card_png(
 
     img = Image.new("RGB", (CARD_WIDTH, CARD_HEIGHT), bg)
     draw = ImageDraw.Draw(img)
-    _rounded_rect(draw, (28, 28, CARD_WIDTH - 28, CARD_HEIGHT - 28), 28, panel)
+    _draw_disclaimer_banner(draw)
+    # Body sits under the banner. The old panel started at y=28; keep that
+    # same inset relative to the banner's bottom edge.
+    shift = DISCLAIMER_BANNER_HEIGHT - 28
+    _rounded_rect(
+        draw,
+        (28, DISCLAIMER_BANNER_HEIGHT, CARD_WIDTH - 28, CARD_HEIGHT - 28),
+        28,
+        panel,
+    )
 
     monogram = _load_monogram(72)
     if monogram is not None:
-        img.paste(monogram, (56, 48), monogram)
+        img.paste(monogram, (56, 48 + shift), monogram)
         title_x = 148
     else:
         title_x = 56
@@ -453,8 +489,8 @@ def render_score_card_png(
     font_pillar = _load_font(18, bold=False)
     font_pillar_num = _load_font(18, bold=True)
 
-    draw.text((title_x, 54), "RAT Score", font=font_title, fill=text)
-    draw.text((title_x, 96), "RWA Transparency Score", font=font_sub, fill=muted)
+    draw.text((title_x, 54 + shift), "RAT Score", font=font_title, fill=text)
+    draw.text((title_x, 96 + shift), "RWA Transparency Score", font=font_sub, fill=muted)
 
     pill = f" {band or '—'} "
     pill_bbox = draw.textbbox((0, 0), pill, font=font_band)
@@ -462,27 +498,28 @@ def render_score_card_png(
     pill_h = pill_bbox[3] - pill_bbox[1] + 16
     pill_x1 = CARD_WIDTH - 56
     pill_x0 = pill_x1 - pill_w
-    _rounded_rect(draw, (pill_x0, 58, pill_x1, 58 + pill_h), 999, accent)
-    draw.text((pill_x0 + 14, 64), band or "—", font=font_band, fill=(14, 17, 23))
+    pill_y = 58 + shift
+    _rounded_rect(draw, (pill_x0, pill_y, pill_x1, pill_y + pill_h), 999, accent)
+    draw.text((pill_x0 + 14, 64 + shift), band or "—", font=font_band, fill=(14, 17, 23))
 
-    draw.text((56, 150), ticker, font=font_ticker, fill=text)
+    draw.text((56, 150 + shift), ticker, font=font_ticker, fill=text)
     issuer_line = issuer if len(issuer) <= 42 else issuer[:39] + "…"
-    draw.text((56, 218), issuer_line, font=font_issuer, fill=muted)
+    draw.text((56, 218 + shift), issuer_line, font=font_issuer, fill=muted)
 
     score_text = f"{score:.1f}"
     score_bbox = draw.textbbox((0, 0), score_text, font=font_score)
     score_w = score_bbox[2] - score_bbox[0]
     score_x = CARD_WIDTH - 56 - score_w
-    draw.text((score_x, 140), score_text, font=font_score, fill=accent)
+    draw.text((score_x, 140 + shift), score_text, font=font_score, fill=accent)
     band_short = band_label.split("—")[0].strip() if band_label else band
     band_bbox = draw.textbbox((0, 0), band_short, font=font_band)
     band_w = band_bbox[2] - band_bbox[0]
-    draw.text((CARD_WIDTH - 56 - band_w, 268), band_short, font=font_band, fill=accent)
+    draw.text((CARD_WIDTH - 56 - band_w, 268 + shift), band_short, font=font_band, fill=accent)
 
-    draw.line((56, 288, CARD_WIDTH - 56, 288), fill=(48, 54, 61), width=1)
+    draw.line((56, 288 + shift, CARD_WIDTH - 56, 288 + shift), fill=(48, 54, 61), width=1)
 
     pillar_count = max(1, len(WEIGHTS))
-    y = 304
+    y = 304 + shift
     footer_y = CARD_HEIGHT - FOOTER_TOP_INSET
     step = min(46, max(36, (footer_y - 18 - y) // pillar_count))
     bar_x = 360

@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .seo import DISCLAIMER_BANNER_BG, DISCLAIMER_BANNER_INK, EDUCATIONAL_DISCLAIMER
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTACT_EMAIL = "hello@stewardoftheking.com"
 OPERATOR = "Steward of the King LLC"
@@ -142,6 +144,16 @@ def render_legal_html(slug: str) -> str:
       color: var(--text);
       line-height: 1.55;
     }}
+    .rat-disclaimer-banner {{
+      background: {DISCLAIMER_BANNER_BG};
+      color: {DISCLAIMER_BANNER_INK};
+      font-size: 1.75rem;
+      font-weight: 800;
+      line-height: 1.25;
+      text-align: center;
+      padding: 0.95rem 1.15rem;
+      margin: 0;
+    }}
     header, main {{
       max-width: 48rem;
       margin: 0 auto;
@@ -172,6 +184,7 @@ def render_legal_html(slug: str) -> str:
   </style>
 </head>
 <body>
+  <div class="rat-disclaimer-banner" role="note">{html.escape(EDUCATIONAL_DISCLAIMER)}</div>
   <header>
     <a href="/">RAT Score</a>
     <nav>
@@ -181,7 +194,8 @@ def render_legal_html(slug: str) -> str:
   </header>
   <main>
     {article}
-    <p class="note">Product Disclaimer lives in the app sidebar/footer and README.
+    <p class="note">The banner at the top of this page is the product disclaimer.
+    The long form also lives in the app sidebar, the app footer, and the README.
     These pages do not replace it. Contact: {html.escape(CONTACT_EMAIL)}</p>
     <p class="note"><a href="/">Back to RAT Score</a> · <a href="/{other}">{other_label}</a></p>
   </main>

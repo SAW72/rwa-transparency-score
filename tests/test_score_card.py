@@ -14,6 +14,7 @@ from rwa_score.x_client import (
     X_POST_UNAVAILABLE_MESSAGE,
     user_facing_x_skip_message,
 )
+from rwa_score.seo import EDUCATIONAL_DISCLAIMER
 from rwa_score.score_card import (
     CARD_HEIGHT,
     CARD_WIDTH,
@@ -21,6 +22,8 @@ from rwa_score.score_card import (
     SIGNING_SECRET_ENV,
     UNSIGNED_FINGERPRINT,
     attach_x_share,
+    DISCLAIMER_BANNER_FONT,
+    DISCLAIMER_BANNER_HEIGHT,
     FOOTER_MARGIN_X,
     FOOTER_MIN_GAP,
     FOOTER_TOP_INSET,
@@ -268,7 +271,9 @@ def test_footer_site_label_follows_canonical_url(monkeypatch: pytest.MonkeyPatch
     assert score_card_site_label() == "cards.example.test"
     left, site, right = footer_text(FIXED_TS, "abc123def4567890", signed=True)
     assert site == "cards.example.test"
-    assert "Not financial advice" in right
+    assert right == "RAT Score"
+    assert "Not financial advice" not in right
+    assert EDUCATIONAL_DISCLAIMER not in right
     assert FIXED_TS in left
     assert "abc123def4567890" in left
 
@@ -284,7 +289,8 @@ def test_footer_layout_fits_signed_and_unsigned() -> None:
         font, placed = fit_footer(draw, left, site, right)
         texts = [text for text, _x in placed]
         assert site in texts
-        assert any("Not financial advice" in text for text in texts)
+        assert "RAT Score" in texts
+        assert not any("Not financial advice" in text for text in texts)
         assert any(FIXED_TS in text for text in texts)
         if signed:
             assert getattr(font, "size", None) == 16
@@ -333,9 +339,76 @@ def test_render_draws_canonical_host_in_footer(monkeypatch: pytest.MonkeyPatch) 
         (
             f"{FIXED_TS}  ·  sig abc123def4567890",
             "rwa-transparency-score.onrender.com",
-            "Not financial advice  ·  RAT Score",
+            "RAT Score",
         )
     ]
+
+
+def _contrast_ratio(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    def channel(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    def luminance(rgb: tuple[int, int, int]) -> float:
+        r, g, b = (channel(part) for part in rgb)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    dark, light = sorted((luminance(a), luminance(b)))
+    return (light + 0.05) / (dark + 0.05)
+
+
+def test_png_disclaimer_banner_is_large_high_contrast_and_above_the_fold() -> None:
+    """The educational notice is a top banner, not the old muted footer line."""
+    from PIL import Image, ImageDraw
+
+    from rwa_score.score_card import _BANNER_BG, _BANNER_INK
+
+    drawn: list[tuple[tuple[float, float], str, object, int | None]] = []
+    original = ImageDraw.ImageDraw.text
+
+    def _capture(self, xy, text, *args, **kwargs):
+        font = kwargs.get("font")
+        if font is None and args:
+            font = args[0]
+        fill = kwargs.get("fill")
+        drawn.append((tuple(xy), str(text), fill, getattr(font, "size", None)))
+        return original(self, xy, text, *args, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(ImageDraw.ImageDraw, "text", _capture)
+    try:
+        png = render_score_card_png(
+            SAMPLE_REPORT,
+            timestamp=FIXED_TS,
+            fingerprint="abc123def4567890",
+            signed=True,
+        )
+    finally:
+        monkeypatch.undo()
+
+    banners = [row for row in drawn if row[1] == EDUCATIONAL_DISCLAIMER]
+    assert len(banners) == 1
+    xy, _text, fill, size = banners[0]
+    assert xy[1] < DISCLAIMER_BANNER_HEIGHT
+    assert size is not None and size >= 32
+    assert size == DISCLAIMER_BANNER_FONT
+    assert fill == _BANNER_INK
+    assert _contrast_ratio(_BANNER_BG, _BANNER_INK) >= 7
+    assert not any("Not financial advice" in text for _xy, text, _fill, _size in drawn)
+
+    image = Image.open(io.BytesIO(png)).convert("RGB")
+    assert image.getpixel((8, 8)) == _BANNER_BG
+    assert image.getpixel((CARD_WIDTH - 9, 8)) == _BANNER_BG
+    assert image.getpixel((8, DISCLAIMER_BANNER_HEIGHT // 2)) == _BANNER_BG
+    # Ink from the banner sentence is inside the top band, not the footer.
+    ink_rows = [
+        y
+        for y in range(DISCLAIMER_BANNER_HEIGHT)
+        for x in range(0, CARD_WIDTH, 3)
+        if image.getpixel((x, y)) == _BANNER_INK
+    ]
+    assert ink_rows
+    assert max(ink_rows) < DISCLAIMER_BANNER_HEIGHT
 
 
 def test_fixture_report_builds_card(fixture_scorer: TransparencyScorer) -> None:
