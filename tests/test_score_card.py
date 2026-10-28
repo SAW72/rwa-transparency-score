@@ -118,6 +118,26 @@ def test_canonical_payload_is_stable_and_sorted() -> None:
     assert dumped == canonical_json(canonical_score_payload(SAMPLE_REPORT, FIXED_TS))
 
 
+def test_btoken_keeps_published_case_on_the_card_and_payload() -> None:
+    report = dict(SAMPLE_REPORT)
+    report["ticker"] = "bNVDA"
+    payload = canonical_score_payload(report, FIXED_TS)
+    assert payload["ticker"] == "bNVDA"
+    assert "bNVDA" in share_caption(payload, "abc123def4567890")
+    png_published = render_score_card_png(
+        report, timestamp=FIXED_TS, fingerprint="abc123def4567890", signed=False
+    )
+    upper = dict(report)
+    upper["ticker"] = "BNVDA"
+    png_upper = render_score_card_png(
+        upper, timestamp=FIXED_TS, fingerprint="abc123def4567890", signed=False
+    )
+    assert png_published != png_upper
+    ordinary = dict(SAMPLE_REPORT)
+    ordinary["ticker"] = "nvda"
+    assert canonical_score_payload(ordinary, FIXED_TS)["ticker"] == "NVDA"
+
+
 def test_hmac_roundtrip_and_tamper_detect() -> None:
     card = build_signed_card(SAMPLE_REPORT, secret=TEST_SECRET, timestamp=FIXED_TS)
     assert card.signed is True

@@ -697,6 +697,8 @@ def _cached_scorer(use_fixtures: bool) -> TransparencyScorer:
     """One client + scorer per process (and fixture/live mode).
 
     Widget reruns must not rebuild CMCClient — that would re-hit issuers/list.
+    The scorer lock and the client's reentrant flight lock keep that shared
+    Session and the issuer index single-threaded.
     """
     return _init_scorer(use_fixtures)
 

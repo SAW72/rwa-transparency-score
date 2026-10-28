@@ -14,11 +14,13 @@ bounce to localhost / metadata / RFC1918).
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import ipaddress
 import json
 import socket
+import threading
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -35,6 +37,26 @@ _BLOCKED_HOSTS = {
     "metadata.google.internal",
     "metadata.internal",
 }
+
+# Host -> public addresses checked for this context. The POST connects to
+# these addresses instead of resolving the name again.
+_pinned_webhook_ips: contextvars.ContextVar[dict[str, tuple[str, ...]] | None] = (
+    contextvars.ContextVar("rat_pinned_webhook_ips", default=None)
+)
+_dns_pin_lock = threading.Lock()
+
+
+def _remember_pin(host: str, addresses: list[str]) -> None:
+    current = dict(_pinned_webhook_ips.get() or {})
+    current[host] = tuple(addresses)
+    _pinned_webhook_ips.set(current)
+
+
+def _pinned_for(host: str) -> tuple[str, ...] | None:
+    pins = _pinned_webhook_ips.get()
+    if not pins:
+        return None
+    return pins.get(host) or None
 
 
 def _ip_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -71,8 +93,11 @@ def assert_public_https_url(url: str, *, resolve: bool = True) -> str:
     if resolve and literal is None:
         try:
             infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        except socket.gaierror:
-            infos = []
+        except socket.gaierror as exc:
+            raise ValueError("webhook URL could not be resolved") from exc
+        if not infos:
+            raise ValueError("webhook URL could not be resolved")
+        pinned: list[str] = []
         for info in infos:
             addr = info[4][0]
             try:
@@ -81,6 +106,10 @@ def assert_public_https_url(url: str, *, resolve: bool = True) -> str:
                 continue
             if _ip_blocked(resolved):
                 raise ValueError("webhook URL resolved to a private or metadata address")
+            pinned.append(addr)
+        if not pinned:
+            raise ValueError("webhook URL could not be resolved")
+        _remember_pin(host, pinned)
     return url
 
 
@@ -102,17 +131,65 @@ def sign_body(secret: str, body: str) -> str:
     return f"sha256={digest}"
 
 
+def _post_pinned(
+    url: str,
+    body: str,
+    headers: dict[str, str],
+    timeout: float,
+    host: str,
+    pinned: tuple[str, ...],
+) -> Any:
+    """POST without resolving ``host`` again. Connect to the checked addresses."""
+
+    def pinned_getaddrinfo(hostname: Any, port: Any, *args: Any, **kwargs: Any) -> Any:
+        name = str(hostname or "").strip().lower().rstrip(".")
+        if name != host:
+            return original(hostname, port, *args, **kwargs)
+        for addr in pinned:
+            if _ip_blocked(ipaddress.ip_address(addr)):
+                raise ValueError("webhook URL resolved to a private or metadata address")
+        results: list[Any] = []
+        for addr in pinned:
+            results.extend(original(addr, port, *args, **kwargs))
+        if not results:
+            raise ValueError("webhook URL could not be resolved")
+        return results
+
+    with _dns_pin_lock:
+        original = socket.getaddrinfo
+        socket.getaddrinfo = pinned_getaddrinfo  # type: ignore[assignment]
+        try:
+            return requests.post(
+                url,
+                data=body.encode("utf-8"),
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        finally:
+            socket.getaddrinfo = original  # type: ignore[assignment]
+
+
 def default_poster(url: str, body: str, headers: dict[str, str], *, timeout: float = 5.0) -> tuple[int, bool]:
     try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        current = dict(_pinned_webhook_ips.get() or {})
+        current.pop(host, None)
+        _pinned_webhook_ips.set(current)
         assert_public_https_url(url)
+        pinned = _pinned_for(host)
         # Never follow redirects — the allowlist is only valid for this URL.
-        resp = requests.post(
-            url,
-            data=body.encode("utf-8"),
-            headers=headers,
-            timeout=timeout,
-            allow_redirects=False,
-        )
+        if pinned:
+            resp = _post_pinned(url, body, headers, timeout, host, pinned)
+        else:
+            resp = requests.post(
+                url,
+                data=body.encode("utf-8"),
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            )
         code = int(resp.status_code)
         return code, 200 <= code < 300
     except Exception:  # noqa: BLE001 — delivery failure is recorded, not raised

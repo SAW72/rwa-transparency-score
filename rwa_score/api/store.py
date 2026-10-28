@@ -152,7 +152,9 @@ class Store:
             self._keys_by_id[rec.id] = rec
 
     def lookup_key(self, raw: str) -> ApiKey | None:
-        return self._keys_by_hash.get(hash_key(raw))
+        digest = hash_key(raw)
+        with self._lock:
+            return self._keys_by_hash.get(digest)
 
     def list_keys(self) -> list[ApiKey]:
         return [self._keys_by_id[i] for i in sorted(self._keys_by_id)]

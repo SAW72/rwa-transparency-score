@@ -444,6 +444,10 @@ def test_parse_rwa_map_payload_paginates() -> None:
     empty = parse_rwa_map_payload(None)
     assert empty["rwa_assets"] == []
     assert empty["has_more"] is False
+    assert empty["total_size"] == 0
+    omitted = parse_rwa_map_payload({"rwa_assets": []})
+    assert omitted["has_more"] is None
+    assert omitted["total_size"] is None
 
 
 def test_canonical_asset_type_maps_treasury_aliases() -> None:
@@ -480,7 +484,8 @@ def test_directory_has_more_uses_total_size_when_flag_omitted() -> None:
     assert not directory_has_more(
         {"has_more": False, "total_size": 2}, start=1, batch_len=2
     )
-    assert not directory_has_more({}, start=1, batch_len=250)
+    assert directory_has_more({}, start=1, batch_len=250)
+    assert not directory_has_more({}, start=1, batch_len=10)
 
 
 def test_live_map_paginates_when_only_total_size_says_more() -> None:
@@ -668,8 +673,21 @@ def test_is_cmc_plan_blocked_detects_1006_and_plan_403() -> None:
         },
     )
     assert not is_cmc_plan_blocked(500, {"status": {"error_code": 0}})
-    assert is_market_pairs_plan_block(403, None, ENDPOINT_MARKET_PAIRS)
+    assert not is_market_pairs_plan_block(403, None, ENDPOINT_MARKET_PAIRS)
     assert not is_market_pairs_plan_block(403, None, ENDPOINT_MAP)
+    assert is_market_pairs_plan_block(
+        403, {"status": {"error_code": 1006, "error_message": "plan"}}, ENDPOINT_MARKET_PAIRS
+    )
+    assert is_market_pairs_plan_block(
+        403,
+        {
+            "status": {
+                "error_code": 0,
+                "error_message": "Your API Key subscription plan doesn't support this endpoint.",
+            }
+        },
+        ENDPOINT_MARKET_PAIRS,
+    )
 
 
 def test_live_market_pairs_1006_degrades_without_raising() -> None:
@@ -686,12 +704,207 @@ def test_live_market_pairs_1006_degrades_without_raising() -> None:
     assert session.paths() == [ENDPOINT_MARKET_PAIRS]
 
 
-def test_live_market_pairs_http_403_without_json_degrades() -> None:
+def test_live_market_pairs_http_403_without_json_raises() -> None:
     session = FakeSession([FakeResponse(403, text="Forbidden")])
-    payload = _live(session).market_pairs(symbol="NVDA")
-    assert payload["plan_blocked"] is True
-    assert payload["market_pairs"] == []
-    assert session.paths() == [ENDPOINT_MARKET_PAIRS]
+    with pytest.raises(CMCError, match="HTTP 403"):
+        _live(session).market_pairs(symbol="NVDA")
+    assert len(session.calls) == 1
+
+
+def test_hard_quota_caps_are_not_retried_as_a_minute_reset() -> None:
+    for code, window in ((1009, "daily"), (1010, "monthly"), (1011, "per-IP")):
+        session = FakeSession(
+            [
+                cmc_429(error_code=code, message=f"cap {code}"),
+                cmc_ok({"rwa_assets": [{"rwa_id": 2}]}),
+            ]
+        )
+        with pytest.raises(CMCError, match=window) as excinfo:
+            _live(session, max_retries=4).rwa_info(2)
+        message = str(excinfo.value)
+        assert str(code) in message
+        assert "1008" not in message
+        assert "every minute" not in message.lower()
+        assert len(session.calls) == 1
+
+
+def test_bare_429_without_error_code_is_still_retried() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(429, text=""),
+            cmc_ok({"rwa_assets": [{"rwa_id": 2, "symbol": "NVDA"}]}),
+        ]
+    )
+    info = _live(session).rwa_info(2)
+    assert info["symbol"] == "NVDA"
+    assert len(session.calls) == 2
+
+
+def test_429_with_a_non_minute_code_is_not_retried() -> None:
+    session = FakeSession([cmc_429(error_code=1005, message="key invalid")])
+    with pytest.raises(CMCError, match="HTTP 429") as excinfo:
+        _live(session).rwa_info(2)
+    assert "every minute" not in str(excinfo.value).lower()
+    assert len(session.calls) == 1
+
+
+def test_map_full_page_without_pagination_fields_continues() -> None:
+    full = [
+        {"symbol": f"S{i}", "rwa_id": i, "asset_type": "stock"} for i in range(1, 251)
+    ]
+    session = FakeSession(
+        [
+            cmc_ok({"rwa_assets": full}),
+            cmc_ok(
+                {
+                    "has_more": False,
+                    "total_size": 251,
+                    "rwa_assets": [
+                        {"symbol": "LAST", "rwa_id": 999, "asset_type": "stock"}
+                    ],
+                }
+            ),
+        ]
+    )
+    rows = _live(session, page_gap=0).rwa_map()
+    assert rows[-1]["symbol"] == "LAST"
+    assert len(rows) == 251
+    assert len(session.calls) == 2
+
+
+def test_directory_walk_refuses_a_silent_max_page_cut() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "has_more": True,
+                    "total_size": 5,
+                    "rwa_assets": [{"symbol": "A", "rwa_id": 1, "asset_type": "stock"}],
+                }
+            )
+        ]
+    )
+    with pytest.raises(CMCError, match="still has more rows"):
+        _live(session, max_pages=1).rwa_map()
+    assert len(session.calls) == 1
+
+
+def test_market_pairs_pages_until_has_more_is_false() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "symbol": "NVDA",
+                    "rwa_id": 2,
+                    "has_more": True,
+                    "market_pairs": [{"market_id": 1}],
+                }
+            ),
+            cmc_ok(
+                {
+                    "symbol": "NVDA",
+                    "rwa_id": 2,
+                    "has_more": False,
+                    "market_pairs": [{"market_id": 2}],
+                }
+            ),
+        ]
+    )
+    payload = _live(session).market_pairs(rwa_id=2)
+    assert [row["market_id"] for row in payload["market_pairs"]] == [1, 2]
+    assert payload["pairs_partial"] is False
+    assert session.calls[0][1]["start"] == 1
+    assert session.calls[1][1]["start"] == 2
+    assert len(session.calls) == 2
+
+
+def test_market_pairs_cap_is_labeled_partial() -> None:
+    session = FakeSession(
+        [
+            cmc_ok(
+                {
+                    "symbol": "NVDA",
+                    "rwa_id": 2,
+                    "has_more": True,
+                    "market_pairs": [{"market_id": 1}],
+                }
+            ),
+            cmc_ok(
+                {
+                    "symbol": "NVDA",
+                    "rwa_id": 2,
+                    "has_more": True,
+                    "market_pairs": [{"market_id": 2}],
+                }
+            ),
+        ]
+    )
+    payload = _live(session, max_pages=1).market_pairs(rwa_id=2)
+    assert payload["pairs_partial"] is True
+    assert payload["has_more"] is True
+    assert len(session.calls) == 1
+
+
+def test_market_pairs_full_page_without_fields_continues() -> None:
+    full = [{"market_id": i} for i in range(100)]
+    session = FakeSession(
+        [
+            cmc_ok({"symbol": "NVDA", "rwa_id": 2, "market_pairs": full}),
+            cmc_ok(
+                {
+                    "symbol": "NVDA",
+                    "rwa_id": 2,
+                    "has_more": False,
+                    "market_pairs": [{"market_id": 1000}],
+                }
+            ),
+        ]
+    )
+    payload = _live(session, page_gap=0).market_pairs(rwa_id=2)
+    assert len(payload["market_pairs"]) == 101
+    assert payload["pairs_partial"] is False
+    assert len(session.calls) == 2
+
+
+def test_concurrent_session_gets_do_not_overlap() -> None:
+    import threading
+    import time
+
+    state = {"inside": 0, "max": 0}
+
+    class _Slow(FakeSession):
+        def get(self, url, params=None, timeout=None):
+            state["inside"] += 1
+            state["max"] = max(state["max"], state["inside"])
+            time.sleep(0.05)
+            try:
+                return super().get(url, params=params, timeout=timeout)
+            finally:
+                state["inside"] -= 1
+
+    session = _Slow(
+        [
+            cmc_ok({"rwa_assets": [{"rwa_id": 2, "symbol": "NVDA"}]}),
+            cmc_ok({"rwa_assets": [{"rwa_id": 3, "symbol": "AAPL"}]}),
+        ]
+    )
+    client = _live(session)
+    errors: list[BaseException] = []
+
+    def _fetch(rwa_id: int) -> None:
+        try:
+            client.rwa_info(rwa_id)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_fetch, args=(2,)), threading.Thread(target=_fetch, args=(3,))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+    assert errors == []
+    assert state["max"] == 1
+    assert len(session.calls) == 2
 
 
 def test_live_market_pairs_1006_on_http_200_degrades() -> None:

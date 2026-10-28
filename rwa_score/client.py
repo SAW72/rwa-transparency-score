@@ -14,6 +14,7 @@ Live endpoints used (Basic plan):
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import os
 import random
@@ -34,9 +35,20 @@ BASE_URL = "https://pro-api.coinmarketcap.com"
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
 
-# CMC Basic: HTTP 429 and status.error_code 1008 share the same per-minute cap.
+# CMC Basic minute cap: HTTP 429 with no code, or status.error_code 1008.
+# 1009 (daily), 1010 (monthly), and 1011 (per-IP) are different windows.
+# They are not retried and are not rewritten as 1008.
 RATE_LIMIT_HTTP = 429
 RATE_LIMIT_CMC_CODES = {1008, "1008"}
+_HARD_QUOTA_CODES = {1009, "1009", 1010, "1010", 1011, "1011"}
+_HARD_QUOTA_WINDOWS = {
+    1009: "daily",
+    "1009": "daily",
+    1010: "monthly",
+    "1010": "monthly",
+    1011: "per-IP",
+    "1011": "per-IP",
+}
 # CMC error 1006 / HTTP 403: this API key's plan does not include the endpoint.
 PLAN_BLOCK_HTTP = 403
 PLAN_BLOCK_CMC_CODES = {1006, "1006"}
@@ -309,10 +321,13 @@ def is_market_pairs_plan_block(
     payload: dict[str, Any] | None,
     path: str | None = None,
 ) -> bool:
-    """Plan-block on market-pairs: error 1006, or a related HTTP 403 on that path."""
-    if is_cmc_plan_blocked(status_code, payload):
-        return True
-    return path == ENDPOINT_MARKET_PAIRS and int(status_code) == PLAN_BLOCK_HTTP
+    """Plan-block only for documented 1006, or a 403 whose message matches the plan needles.
+
+    A bare HTTP 403, 1005, or 1007 on market-pairs is not a plan-block. ``path``
+    is kept so callers can still name the endpoint; it does not widen the match.
+    """
+    del path
+    return is_cmc_plan_blocked(status_code, payload)
 
 
 def market_pairs_plan_blocked(data: dict[str, Any] | None) -> bool:
@@ -506,66 +521,86 @@ def _normalize_directory_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _optional_total_size(payload: dict[str, Any]) -> int | None:
+    """``None`` when CMC omitted ``total_size``. Do not invent it from the page length."""
+    if "total_size" not in payload:
+        return None
+    try:
+        return int(payload.get("total_size"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_has_more(payload: dict[str, Any]) -> bool | None:
+    """``None`` when CMC omitted ``has_more``. ``False`` only when CMC sent false."""
+    if "has_more" not in payload:
+        return None
+    return bool(payload.get("has_more"))
+
+
 def directory_has_more(
     parsed: dict[str, Any] | None,
     *,
     start: int,
     batch_len: int,
+    page_limit: int = DEFAULT_PAGE_LIMIT,
 ) -> bool:
-    """Continue paging when ``has_more`` or ``total_size`` says the book is incomplete.
+    """Continue paging when the book is incomplete.
 
-    Live CMC sometimes omits ``has_more`` and only sends ``total_size``. Trust
-    either signal. ``start`` is the 1-based item offset of this page.
+    ``has_more: true`` continues. A numeric ``total_size`` continues while this
+    page ends before that total, even if ``has_more`` is false. An explicit
+    ``has_more: false`` with no larger total stops. When both fields are
+    missing, a full page (``batch_len >= page_limit``) is treated as truncated
+    and a short page stops. ``start`` is the 1-based item offset of this page.
     """
     payload = parsed if isinstance(parsed, dict) else {}
-    if payload.get("has_more"):
+    has_more = payload.get("has_more")
+    if has_more is True:
         return True
     raw_total = payload.get("total_size")
-    try:
-        total = int(raw_total) if raw_total is not None else None
-    except (TypeError, ValueError):
+    total: int | None
+    if raw_total is None:
         total = None
-    if total is None:
+    else:
+        try:
+            total = int(raw_total)
+        except (TypeError, ValueError):
+            total = None
+    if total is not None:
+        page_end = max(0, int(start) - 1) + max(0, int(batch_len))
+        return page_end < total
+    if has_more is False:
         return False
-    page_end = max(0, int(start) - 1) + max(0, int(batch_len))
-    return page_end < total
+    return max(0, int(batch_len)) >= max(1, int(page_limit))
 
 
 def parse_rwa_map_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize a CMC (or fixture) ``map`` ``data`` object, including pagination."""
-    payload = data if isinstance(data, dict) else {}
-    rows = payload.get("rwa_assets")
+    if not isinstance(data, dict):
+        return {"rwa_assets": [], "total_size": 0, "has_more": False}
+    rows = data.get("rwa_assets")
     if not isinstance(rows, list):
         rows = []
     assets = [_normalize_directory_row(row) for row in rows if isinstance(row, dict)]
-    raw_total = payload.get("total_size")
-    try:
-        total_size = int(raw_total) if raw_total is not None else len(assets)
-    except (TypeError, ValueError):
-        total_size = len(assets)
     return {
         "rwa_assets": assets,
-        "total_size": total_size,
-        "has_more": bool(payload.get("has_more")),
+        "total_size": _optional_total_size(data),
+        "has_more": _optional_has_more(data),
     }
 
 
 def parse_assets_list_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize a CMC (or fixture) ``assets/list`` ``data`` object."""
-    payload = data if isinstance(data, dict) else {}
-    rows = payload.get("rwa_assets")
+    if not isinstance(data, dict):
+        return {"rwa_assets": [], "total_size": 0, "has_more": False}
+    rows = data.get("rwa_assets")
     if not isinstance(rows, list):
         rows = []
     assets = [_normalize_directory_row(row) for row in rows if isinstance(row, dict)]
-    raw_total = payload.get("total_size")
-    try:
-        total_size = int(raw_total) if raw_total is not None else len(assets)
-    except (TypeError, ValueError):
-        total_size = len(assets)
     return {
         "rwa_assets": assets,
-        "total_size": total_size,
-        "has_more": bool(payload.get("has_more")),
+        "total_size": _optional_total_size(data),
+        "has_more": _optional_has_more(data),
     }
 
 
@@ -576,7 +611,17 @@ def parse_market_pairs_payload(data: dict[str, Any] | None) -> dict[str, Any]:
     Missing or empty input becomes an empty-but-valid structure so callers
     never have to special-case ``None``.
     """
-    payload = data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {
+            "rwa_id": None,
+            "name": "",
+            "symbol": "",
+            "num_market_pairs": 0,
+            "market_pairs": [],
+            "total_size": 0,
+            "has_more": False,
+        }
+    payload = data
     pairs = payload.get("market_pairs")
     if not isinstance(pairs, list):
         pairs = []
@@ -596,15 +641,39 @@ def parse_market_pairs_payload(data: dict[str, Any] | None) -> dict[str, Any]:
         "symbol": (payload.get("symbol") or "").upper(),
         "num_market_pairs": num_pairs,
         "market_pairs": list(pairs),
-        "total_size": payload.get("total_size", num_pairs),
-        "has_more": bool(payload.get("has_more")),
+        "total_size": _optional_total_size(payload),
+        "has_more": _optional_has_more(payload),
     }
 
 
 def _is_rate_limited(status_code: int, payload: dict[str, Any] | None) -> bool:
-    if status_code == RATE_LIMIT_HTTP:
+    """True only for the minute window: code 1008, or HTTP 429 with no code.
+
+    Daily (1009), monthly (1010), and per-IP (1011) caps are not retried.
+    """
+    code = _cmc_error_code(payload)
+    if code in _HARD_QUOTA_CODES:
+        return False
+    if code in RATE_LIMIT_CMC_CODES:
         return True
-    return _cmc_error_code(payload) in RATE_LIMIT_CMC_CODES
+    return int(status_code) == RATE_LIMIT_HTTP and code in (None, 0, "0")
+
+
+def _hard_quota_message(
+    path: str, status_code: int, payload: dict[str, Any] | None
+) -> str | None:
+    """Immediate message for 1009/1010/1011. ``None`` when this is not one of those codes."""
+    code = _cmc_error_code(payload)
+    window = _HARD_QUOTA_WINDOWS.get(code)
+    if window is None:
+        return None
+    detail = _cmc_error_message(payload)
+    extra = f" {detail}" if detail else ""
+    return (
+        f"{path} hit CoinMarketCap's {window} request cap "
+        f"(HTTP {status_code}, error_code {code}).{extra} "
+        f"This {window} cap is not retried. Wait for that {window} window to reset."
+    )
 
 
 def _rate_limit_message(path: str, status_code: int, payload: dict[str, Any] | None) -> str:
@@ -712,13 +781,31 @@ class _TTLCache:
         self._store[key] = (time.monotonic(), copy.deepcopy(value))
 
 
+def _locked(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Serialize Session, TTL cache, journal, and plan-block memo use.
+
+    Reentrant: a paged call holds the lock and then calls ``_get``, which
+    takes it again. One shared Session stays single-threaded.
+    """
+
+    @functools.wraps(method)
+    def wrapped(self: CMCClient, *args: Any, **kwargs: Any) -> Any:
+        with self._flight_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class CMCClient:
     """Thin wrapper around the CoinMarketCap Pro API.
 
-    Retries HTTP 429 and CMC error 1008 with exponential backoff + jitter
-    (bounded by ``max_wait_seconds``). ``issuers/list``, per-issuer detail, and
-    ``info`` are single-flight cached so compare cards share one response.
-    Issuer list and detail stay for the process lifetime. Info uses a short TTL.
+    Retries the minute cap (CMC error 1008, or HTTP 429 with no code) with
+    exponential backoff + jitter, bounded by ``max_wait_seconds``. Without
+    ``Retry-After`` each sleep is ``2**attempt`` plus jitter, not a full
+    minute. Daily (1009), monthly (1010), and per-IP (1011) caps raise
+    immediately. ``issuers/list``, per-issuer detail, and ``info`` are
+    single-flight cached so compare cards share one response. Issuer list
+    and detail stay for the process lifetime. Info uses a short TTL.
     """
 
     source = "live"
@@ -765,14 +852,17 @@ class CMCClient:
         self._sleep = sleeper or time.sleep
         self._cache = _TTLCache()
         self._journal = _CallJournal(self.source)
-        # One in-flight issuers/info fetch per client. The four compare cards
-        # share this client, so a second card waits instead of bursting CMC.
-        self._flight_lock = threading.Lock()
+        # One in-flight CMC call per client. Compare cards and API threads
+        # share this client; the lock covers the Session plus the caches.
+        # Reentrant so paging can call ``_get`` while the public method holds it.
+        self._flight_lock = threading.RLock()
         self._market_pairs_plan_block: dict[str, Any] | None = None
 
+    @_locked
     def begin_run(self) -> None:
         self._journal.begin_run()
 
+    @_locked
     def call_log(self) -> list[dict[str, Any]]:
         return self._journal.call_log()
 
@@ -787,6 +877,7 @@ class CMCClient:
         jitter = random.uniform(0.0, max(base * 0.25, 0.05))
         return min(base + jitter, max(remaining, 0.0), self.max_wait_seconds)
 
+    @_locked
     def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         waited = 0.0
         last_status = 0
@@ -801,6 +892,10 @@ class CMCClient:
                 last_payload = resp.json()
             except ValueError:
                 last_payload = None
+
+            quota = _hard_quota_message(path, resp.status_code, last_payload)
+            if quota is not None:
+                raise CMCError(quota)
 
             if _is_rate_limited(resp.status_code, last_payload):
                 remaining = self.max_wait_seconds - waited
@@ -878,14 +973,25 @@ class CMCClient:
                 seen.add(marker)
                 rows.append(row)
             self._record(endpoint, via="network")
-            if not directory_has_more(parsed, start=start, batch_len=len(batch)) or not batch:
+            if (
+                not directory_has_more(
+                    parsed, start=start, batch_len=len(batch), page_limit=size
+                )
+                or not batch
+            ):
                 break
             start += len(batch)
             if page_i + 1 < self.max_pages and self.page_gap:
                 self._sleep(self.page_gap)
+        else:
+            raise CMCError(
+                f"{endpoint} still has more rows after {self.max_pages} pages. "
+                "Refusing a silently truncated directory."
+            )
         self._cache.set(cache_key, rows)
         return copy.deepcopy(rows)
 
+    @_locked
     def rwa_map(
         self,
         symbol: str | None = None,
@@ -945,7 +1051,7 @@ class CMCClient:
             assets = parsed["rwa_assets"]
             meta = {
                 "truncated": directory_has_more(
-                    parsed, start=page, batch_len=len(assets)
+                    parsed, start=page, batch_len=len(assets), page_limit=size
                 ),
                 "total_size": parsed.get("total_size"),
             }
@@ -986,6 +1092,7 @@ class CMCClient:
         for sym, rows in grouped.items():
             self._cache.set(f"map:sym:{sym}:{kind}", rows)
 
+    @_locked
     def rwa_info(self, rwa_id: int) -> dict[str, Any]:
         key = f"info:{int(rwa_id)}"
         with self._flight_lock:
@@ -1000,6 +1107,7 @@ class CMCClient:
             self._record(ENDPOINT_INFO, via="network")
             return copy.deepcopy(info)
 
+    @_locked
     def issuers_list(self) -> list[dict[str, Any]]:
         with self._flight_lock:
             cached = self._cache.get("issuers_list", ttl=None)
@@ -1012,6 +1120,7 @@ class CMCClient:
             self._record(ENDPOINT_ISSUERS_LIST, via="network")
             return copy.deepcopy(issuers)
 
+    @_locked
     def issuer(self, issuer_id: str) -> dict[str, Any]:
         key = f"issuer:{issuer_id}"
         with self._flight_lock:
@@ -1025,6 +1134,7 @@ class CMCClient:
             self._record(ENDPOINT_ISSUERS, via="network")
             return copy.deepcopy(detail)
 
+    @_locked
     def crypto_quote(self, crypto_id: int) -> dict[str, Any]:
         key = f"crypto_quote:{int(crypto_id)}"
         cached = self._cache.get(key, self.crypto_quote_ttl)
@@ -1040,6 +1150,7 @@ class CMCClient:
         self._record(ENDPOINT_CRYPTO_QUOTE, via="network")
         return copy.deepcopy(quote)
 
+    @_locked
     def rwa_quotes(
         self,
         *,
@@ -1072,6 +1183,7 @@ class CMCClient:
         self._record(ENDPOINT_QUOTES, via="network")
         return copy.deepcopy(parsed)
 
+    @_locked
     def assets_list(
         self,
         *,
@@ -1104,6 +1216,7 @@ class CMCClient:
         self._record(ENDPOINT_ASSETS_LIST, via="network")
         return copy.deepcopy(parsed)
 
+    @_locked
     def assets_list_all(
         self,
         *,
@@ -1145,11 +1258,21 @@ class CMCClient:
                     continue
                 seen.add(marker)
                 rows.append(row)
-            if not directory_has_more(parsed, start=start, batch_len=len(batch)) or not batch:
+            if (
+                not directory_has_more(
+                    parsed, start=start, batch_len=len(batch), page_limit=size
+                )
+                or not batch
+            ):
                 break
             start += len(batch)
             if page_i + 1 < self.max_pages and self.page_gap:
                 self._sleep(self.page_gap)
+        else:
+            raise CMCError(
+                f"{ENDPOINT_ASSETS_LIST} still has more rows after {self.max_pages} pages. "
+                "Refusing a silently truncated directory."
+            )
         assembled = {
             "rwa_assets": rows,
             "total_size": len(rows),
@@ -1158,6 +1281,7 @@ class CMCClient:
         self._cache.set(cache_key, assembled)
         return copy.deepcopy(assembled)
 
+    @_locked
     def market_pairs(
         self,
         *,
@@ -1169,11 +1293,12 @@ class CMCClient:
         Requires exactly one of ``rwa_id`` or ``symbol``. Cached on a short TTL
         so Streamlit widget reruns do not re-burn the Basic-plan credit.
 
-        CMC error 1006 and a market-pairs HTTP 403 return a labeled empty
-        payload instead of raising — callers must not treat that as live pairs.
-        Only documented error code 1006 is remembered, and only for this
-        endpoint, until ``pairs_ttl``. A 5xx, 1002, plain or HTML 403, or a
-        body that merely contains the digits 1006 is not remembered.
+        Documented error 1006, or a 403 whose message says the plan lacks this
+        endpoint, returns a labeled empty payload. A bare 403, 1005, or 1007
+        raises. Only a real JSON 1006 is remembered, and only for this
+        endpoint, until ``pairs_ttl``. Pages continue until ``has_more`` is
+        false. Hitting ``max_pages`` while more pairs remain is labeled
+        ``pairs_partial`` instead of a silently complete book.
         """
         if rwa_id is None and not symbol:
             raise CMCError("market_pairs requires rwa_id or symbol")
@@ -1208,7 +1333,7 @@ class CMCClient:
             self._record(ENDPOINT_MARKET_PAIRS, via="cache", cached=True)
             return copy.deepcopy(parsed)
         try:
-            data = self._get(ENDPOINT_MARKET_PAIRS, params)
+            parsed = self._page_market_pairs(params)
         except CMCError as exc:
             if not isinstance(exc, CMCPlanBlockedError):
                 raise
@@ -1226,10 +1351,43 @@ class CMCClient:
             self._cache.set(key, parsed)
             self._record(ENDPOINT_MARKET_PAIRS, via="network")
             return copy.deepcopy(parsed)
-        parsed = parse_market_pairs_payload(data.get("data") or {})
         self._cache.set(key, parsed)
-        self._record(ENDPOINT_MARKET_PAIRS, via="network")
         return copy.deepcopy(parsed)
+
+    def _page_market_pairs(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Load pair pages until the book ends or ``max_pages`` is hit."""
+        limit = DEFAULT_MARKET_PAIRS_LIMIT
+        start = 1
+        merged: list[Any] = []
+        last = parse_market_pairs_payload({})
+        for _page_i in range(self.max_pages):
+            page_params = dict(params)
+            page_params["start"] = start
+            page_params["limit"] = limit
+            data = self._get(ENDPOINT_MARKET_PAIRS, page_params)
+            last = parse_market_pairs_payload(data.get("data") or {})
+            batch = list(last.get("market_pairs") or [])
+            merged.extend(batch)
+            self._record(ENDPOINT_MARKET_PAIRS, via="network")
+            if (
+                not directory_has_more(
+                    last, start=start, batch_len=len(batch), page_limit=limit
+                )
+                or not batch
+            ):
+                done = dict(last)
+                done["market_pairs"] = merged
+                done["num_market_pairs"] = max(int(done.get("num_market_pairs") or 0), len(merged))
+                done["has_more"] = False
+                done["pairs_partial"] = False
+                return done
+            start += len(batch)
+        partial = dict(last)
+        partial["market_pairs"] = merged
+        partial["num_market_pairs"] = max(int(partial.get("num_market_pairs") or 0), len(merged))
+        partial["has_more"] = True
+        partial["pairs_partial"] = True
+        return partial
 
     def _active_market_pairs_plan_block(self) -> dict[str, Any] | None:
         """Shared market-pairs 1006 memo, or None once it has expired."""
